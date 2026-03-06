@@ -499,6 +499,20 @@ func (c *IMClient) onForwardBackfillDone() {
 			c.msgBuffer.flush()
 		}
 		c.flushPendingPortalMsgs()
+
+		// Re-run ghost name refresh now that all backfill ghosts are in the DB.
+		// If contacts loaded before backfill finished, the earlier
+		// refreshGhostNamesFromContacts call (triggered by setContactsReady)
+		// may have scanned the DB before backfill ghosts existed, leaving them
+		// with fallback display names. Multi-handle contacts are especially
+		// affected because makeCloudSender does not call canonicalizeDMSender,
+		// creating phantom sender ghosts that also need display names set.
+		c.contactsReadyLock.RLock()
+		contactsReady := c.contactsReady
+		c.contactsReadyLock.RUnlock()
+		if contactsReady {
+			go c.refreshGhostNamesFromContacts(log.Logger)
+		}
 	}
 }
 
