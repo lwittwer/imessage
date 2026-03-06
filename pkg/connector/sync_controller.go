@@ -189,23 +189,36 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	ctx := context.Background()
 
-	// Get all ghost IDs from the database via the raw DB handle
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id, name FROM ghost")
+	// Use bridge_id-scoped query (matches refreshAllGhosts pattern).
+	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
+		"SELECT id FROM ghost WHERE bridge_id=$1",
+		c.Main.Bridge.ID,
+	)
 	if err != nil {
 		log.Err(err).Msg("Failed to query ghosts for contact name refresh")
 		return
 	}
 	defer rows.Close()
 
-	updated := 0
-	total := 0
+	var ghostIDs []networkid.UserID
 	for rows.Next() {
-		var ghostID, ghostName string
-		if err := rows.Scan(&ghostID, &ghostName); err != nil {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			log.Err(err).Msg("Failed to scan ghost ID")
 			continue
 		}
-		total++
-		localID := stripIdentifierPrefix(ghostID)
+		ghostIDs = append(ghostIDs, networkid.UserID(id))
+	}
+	if err := rows.Err(); err != nil {
+		log.Err(err).Msg("Ghost ID row iteration error")
+	}
+	rows.Close()
+
+	updated := 0
+	for _, ghostID := range ghostIDs {
+		// Skip ghosts with no matching contact (efficiency: avoids loading
+		// the full ghost object for participants who aren't in the address book).
+		localID := stripIdentifierPrefix(string(ghostID))
 		if localID == "" {
 			continue
 		}
@@ -213,22 +226,21 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if contact == nil || !contact.HasName() {
 			continue
 		}
-		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		if ghostName != name {
-			ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostID))
-			if err != nil || ghost == nil {
-				continue
-			}
-			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{Name: &name})
-			updated++
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostID)
+		if err != nil || ghost == nil {
+			log.Warn().Err(err).Str("ghost_id", string(ghostID)).Msg("Failed to load ghost for name refresh")
+			continue
 		}
+		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
+		// to ensure name, avatar, and identifiers are all propagated to Matrix.
+		info, err := c.GetUserInfo(ctx, ghost)
+		if err != nil || info == nil {
+			continue
+		}
+		ghost.UpdateInfo(ctx, info)
+		updated++
 	}
-	log.Info().Int("updated", updated).Int("total", total).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("updated", updated).Int("total", len(ghostIDs)).Msg("Refreshed ghost names from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
