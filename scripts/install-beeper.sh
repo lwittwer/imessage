@@ -212,6 +212,12 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
+# ── Tell Beeper the bridge is stopped during setup ────────────
+# bbctl config posts StateStarting, which makes Beeper show the bridge as
+# "Running" even though no binary is connected. Post StateBridgeUnreachable
+# so it shows as stopped while we ask setup questions and run login.
+"$BBCTL" stop "$BRIDGE_NAME" -c "$CONFIG" 2>/dev/null || true
+
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
     if fix_permissions "$CONFIG" "$WHOAMI"; then
