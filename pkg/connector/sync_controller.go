@@ -1038,11 +1038,10 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// the real chat identifier). We must look up by record_name.
 	var deletedRecordNames []string
 
-	// Collect (portalID, recordName) pairs for chats that have a group photo
-	// GUID so we can warm the photo cache after upserting the batch.
+	// Collect portal IDs for chats that have a group photo GUID so we can
+	// warm the photo cache after upserting the batch.
 	type photoRef struct {
-		portalID   string
-		recordName string
+		portalID string
 	}
 	var photoRefs []photoRef
 
@@ -1072,7 +1071,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 				Str("record_name", chat.RecordName).
 				Str("group_photo_guid", *chat.GroupPhotoGuid).
 				Msg("CloudKit chat sync: group photo GUID found")
-			photoRefs = append(photoRefs, photoRef{portalID: portalID, recordName: chat.RecordName})
+			photoRefs = append(photoRefs, photoRef{portalID: portalID})
 		}
 
 		batch = append(batch, cloudChatUpsertRow{
@@ -1114,9 +1113,20 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// Each download attempt is best-effort: failures are logged at debug level
 	// since the CloudKit "gp" asset field is often unpopulated by Apple clients.
 	if len(photoRefs) > 0 {
+		bgCtx, cancelBg := context.WithCancel(context.Background())
+		// Wire bgCtx to the client lifecycle: cancel it when the client
+		// disconnects. The warmup goroutine also cancels on exit via defer,
+		// so this watcher exits promptly in either case.
+		go func() {
+			select {
+			case <-c.stopChan:
+				cancelBg()
+			case <-bgCtx.Done():
+			}
+		}()
 		refs := photoRefs
 		go func() {
-			bgCtx := context.Background()
+			defer cancelBg()
 			photoLog := log.With().Str("component", "cloud_photo_warmup").Logger()
 			for _, ref := range refs {
 				_, existing, cacheErr := c.cloudStore.getGroupPhoto(bgCtx, ref.portalID)
