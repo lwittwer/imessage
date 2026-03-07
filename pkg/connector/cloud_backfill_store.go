@@ -1754,49 +1754,24 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 	return exists, nil
 }
 
-// getConversationReadByMe returns true if the conversation should be marked
-// as read during backfill. All non-filtered CloudKit conversations are treated
-// as read because they exist on the user's Apple devices and the user receives
-// push notifications for them. Only filtered (junk/unknown sender) chats are
-// left unread, as those are spam the user likely hasn't seen.
-// Returns false when no cloud_chat row exists for the portal (DM portals can
-// legitimately have messages without a cloud_chat row).
+// getConversationReadByMe returns true if the portal has at least one active
+// non-filtered cloud_chat row. All non-filtered CloudKit conversations are
+// marked as read during backfill; filtered (junk) chats and portals without
+// chat metadata are left unread.
 //
-// Must be called BEFORE markForwardBackfillDone, which may insert a synthetic
-// cloud_chat row with is_filtered=0 default that would defeat this check.
+// Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	// Require at least one non-deleted cloud_chat row for this portal.
-	// DM portals can legitimately have messages without cloud_chat rows;
-	// those should not be marked as read.
-	var hasChat bool
+	var total, filtered int
 	err := s.db.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM cloud_chat
-			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-		)
-	`, s.loginID, portalID).Scan(&hasChat)
+		SELECT COUNT(*),
+		       SUM(CASE WHEN COALESCE(is_filtered, 0) != 0 THEN 1 ELSE 0 END)
+		FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+	`, s.loginID, portalID).Scan(&total, &filtered)
 	if err != nil {
 		return false, err
 	}
-	if !hasChat {
-		return false, nil
-	}
-	// Treat as unread if ANY non-deleted cloud_chat row for this portal is
-	// filtered. Both queries filter on deleted=FALSE so stale soft-deleted
-	// rows (e.g., a previously-filtered chat that was re-created as
-	// unfiltered) don't poison the result.
-	var hasFiltered bool
-	err = s.db.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM cloud_chat
-			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-			  AND COALESCE(is_filtered, 0) != 0
-		)
-	`, s.loginID, portalID).Scan(&hasFiltered)
-	if err != nil {
-		return false, err
-	}
-	return !hasFiltered, nil
+	return total > 0 && filtered == 0, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
