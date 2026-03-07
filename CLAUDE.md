@@ -22,8 +22,9 @@ imessage/
 │   ├── mautrix-imessage/     # Main bridge binary entrypoint
 │   └── bbctl/                # Bridge control CLI tool
 ├── pkg/
-│   ├── connector/            # bridgev2 connector (core bridge logic, 26 Go files)
+│   ├── connector/            # bridgev2 connector (core bridge logic, 27 Go files)
 │   └── rustpushgo/           # Rust FFI wrapper (uniffi bindings + CGO shim)
+├── ipc/                      # IPC framework (JSON message passing between components)
 ├── rustpush/                 # Vendored rustpush library (Apple protocol impl in Rust)
 ├── nac-validation/           # macOS NAC validation (Objective-C/Rust)
 ├── imessage/                 # macOS chat.db + Contacts reader (Go + Objective-C)
@@ -56,6 +57,22 @@ imessage/
 | Database | SQLite (mattn/go-sqlite3) or PostgreSQL |
 | Logging | zerolog (`github.com/rs/zerolog`) |
 | CLI | `github.com/urfave/cli/v2` |
+| IPC | JSON message passing (`ipc/ipc.go`) |
+
+### Key Go Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `maunium.net/go/mautrix` | v0.26.3 | Bridge framework (bridgev2) |
+| `github.com/mattn/go-sqlite3` | v1.14.34 | SQLite driver (CGO) |
+| `github.com/rs/zerolog` | v1.34.0 | Structured logging |
+| `github.com/urfave/cli/v2` | v2.27.7 | CLI framework |
+| `gopkg.in/yaml.v3` | v3.0.1 | YAML config parsing |
+| `golang.org/x/image` | v0.36.0 | Image processing |
+| `github.com/gabriel-vasile/mimetype` | v1.4.7 | MIME type detection |
+| `go.mau.fi/util` | v0.9.6 | Shared mautrix utilities |
+| `github.com/beeper/bridge-manager` | v0.14.0 | Beeper deployment support |
+| `github.com/fsnotify/fsnotify` | v1.8.0 | File system event watching |
 
 ---
 
@@ -73,6 +90,7 @@ make install-beeper  # Build + install for Beeper
 make extract-key     # Build hardware key extraction tool (macOS only)
 make reset           # Reset bridge state
 make clean           # Remove build artifacts
+make uninstall       # Remove LaunchAgent (macOS) or display instructions (Linux)
 ```
 
 ### Build Requirements
@@ -102,6 +120,7 @@ make clean           # Remove build artifacts
 2. The Go build links the static library via CGO (`CGO_LDFLAGS=-L$(CURDIR)`)
 3. On macOS, the binary is placed inside an `.app` bundle and codesigned (`codesign --force --deep --sign -`)
 4. `bbctl` is always built as a standalone binary (no CGO)
+5. Build-time ldflags inject version, commit hash, and build timestamp
 
 ### Regenerating FFI Bindings
 
@@ -132,12 +151,21 @@ make bindings
 | `ids.go` | iMessage handle ↔ Matrix networkid conversion |
 | `capabilities.go` | Bridge feature support declarations |
 | `commands.go` | Bridge slash commands |
+| `command_contacts.go` | `/contact` slash command; contact search and DM creation |
 | `cloud_contacts.go` | iCloud contact name resolution |
 | `carddav_crypto.go` | AES-256-GCM encryption/decryption for CardDAV passwords |
 | `external_carddav.go` | External CardDAV client (Google, Nextcloud, Fastmail, etc.) |
 | `contact_merge.go` | Merging contact data from multiple sources |
+| `contacts_local_darwin.go` | macOS Contacts.app integration (loads local contacts) |
+| `contacts_local_other.go` | Stub for non-macOS platforms |
 | `audioconvert.go` | Audio format conversion for attachments |
 | `urlpreview.go` | URL link preview handling |
+| `bridgeadapter.go` | `bridgeAdapter` type; satisfies legacy `imessage.Bridge` interface for mac connector compatibility |
+| `identity_store.go` | `PersistedSessionState` type; serializes IDS/APS/IDS-identity to `session.json`; prevents "new device" notifications on re-login |
+| `dbmeta.go` | Database metadata types: `PortalMetadata`, `GhostMetadata`, `MessageMetadata`, `UserLoginMetadata` |
+| `permissions_darwin.go` | macOS permission checking and repair (Full Disk Access, Contacts, etc.) |
+| `permissions_other.go` | Stub for Linux |
+| `util.go` | `normalizePhone()`, `phoneSuffixes()` and other shared helpers |
 | `example-config.yaml` | Embedded default config (via `//go:embed`) |
 
 ### Go — Main Entrypoint (`cmd/mautrix-imessage/`)
@@ -149,6 +177,23 @@ make bindings
 | `setup_darwin.go` | macOS-specific permission setup |
 | `setup_other.go` | Linux permission setup |
 | `carddav_setup.go` | CardDAV credential configuration |
+
+### Go — Bridge Control CLI (`cmd/bbctl/`)
+
+| File | Role |
+|---|---|
+| `main.go` | Entry point; subcommands |
+| `auth.go` | Authentication commands |
+| `register.go` | Bridge registration commands |
+| `delete.go` | Bridge deletion commands |
+
+### Go — IPC Framework (`ipc/`)
+
+| File | Role |
+|---|---|
+| `ipc.go` | JSON bidirectional message passing (`Message`, `OutgoingMessage`, `Processor`); standard error codes (`ErrIPCTimeout`, `ErrUnknownCommand`, etc.) |
+
+The IPC framework is used by `bridgeadapter.go` to interface between the new bridgev2 connector and the legacy macOS `imessage.Bridge` interface.
 
 ### Rust (`pkg/rustpushgo/src/lib.rs`)
 
@@ -198,7 +243,7 @@ Default: `$HOME/.local/share/mautrix-imessage/`
 ```
 data/
 ├── config.yaml         # User configuration
-├── session.json        # rustpush session state (auto-restored on restart)
+├── session.json        # rustpush + IDS session state (auto-restored on restart)
 ├── keystore/           # Encrypted hardware key material
 ├── bridge.stdout.log   # Bridge stdout log
 ├── bridge.stderr.log   # Bridge stderr log
@@ -206,6 +251,17 @@ data/
 ```
 
 The `DATA_DIR` variable can be overridden at build time.
+
+### Database Metadata Types (`pkg/connector/dbmeta.go`)
+
+These types are stored as JSON in bridgev2 database metadata columns:
+
+| Type | Key Fields |
+|---|---|
+| `PortalMetadata` | `ThreadID`, `SenderGuid` (persistent group UUID), `GroupName` (cv_name for outbound routing) |
+| `GhostMetadata` | _(empty)_ |
+| `MessageMetadata` | `HasAttachments` |
+| `UserLoginMetadata` | `Platform`, `ChatsSynced`, `APSState`, `IDSUsers`, `IDSIdentity`, `DeviceID`, `HardwareKey`, `PreferredHandle`, iCloud account fields (`AccountUsername`, `AccountPET`, etc.), `MmeDelegateJSON` |
 
 ---
 
@@ -240,7 +296,7 @@ Defined in `.editorconfig`:
 
 ### Platform-Specific Code
 
-Use build tags or `_darwin.go` / `_other.go` file suffixes to separate macOS-only code:
+Use `_darwin.go` / `_other.go` file suffixes to separate macOS-only code:
 - `permissions_darwin.go` / `permissions_other.go`
 - `contacts_local_darwin.go` / `contacts_local_other.go`
 - `chatdb_darwin.go`
@@ -287,19 +343,30 @@ CloudKit backfill overrides mautrix defaults in `connector.go:Start()` (not `Ini
 
 iMessage handles are either `tel:+E164` phone numbers or `mailto:` email addresses. Handle ↔ Matrix networkid conversion is in `pkg/connector/ids.go`. The `preferred_handle` config overrides the default outgoing identity.
 
+### Session Persistence (`identity_store.go`)
+
+`PersistedSessionState` serializes the IDS identity, APS push state, and IDS user registration to `session.json`. This prevents Apple from treating re-login as a "new device" (which would trigger "X added a new Mac" notifications to contacts). On startup the bridge reads this file automatically. Do not delete `session.json` unless intentionally resetting the bridge.
+
 ### FFI Boundary
 
 The Go↔Rust FFI is generated by uniffi. **Do not manually edit** `pkg/rustpushgo/rustpushgo.go` or `pkg/rustpushgo/rustpushgo.h` — always regenerate with `make bindings` after changing `pkg/rustpushgo/src/lib.rs`.
 
 After regeneration, `scripts/patch_bindings.py` post-processes the generated Go file to fix import paths and compatibility issues.
 
+### Bridge Adapter (`bridgeadapter.go`)
+
+`bridgeAdapter` satisfies the legacy `imessage.Bridge` interface so the existing macOS connector code (`imessage/mac/`) can be reused without modification within the new bridgev2 architecture. It holds a `maulogger` logger, a `zerolog` logger, an `ipc.Processor`, and the platform config.
+
 ### CardDAV Password Encryption
 
 CardDAV passwords are stored encrypted (AES-256-GCM) in `config.yaml` under `carddav.password_encrypted`. Use the `carddav-setup` subcommand to set them — never store plaintext passwords in config.
 
-### Session Auto-Restore
+### IPC Framework (`ipc/`)
 
-On startup, the bridge checks for `data/session.json` and automatically restores the rustpush session if present. This is handled in `connector.go`. Do not delete `session.json` unless intentionally resetting the bridge.
+The `ipc` package provides a bidirectional JSON message-passing system used to bridge the connector with legacy components. Key types:
+- `Message` / `OutgoingMessage` — command + id + JSON data payload
+- `Processor` — dispatches inbound commands, tracks in-flight requests
+- Standard error values: `ErrIPCTimeout`, `ErrUnknownCommand`, `ErrSizeLimitExceeded`, `ErrTimeoutError`, `ErrUnsupportedError`, `ErrNotFound`
 
 ---
 
@@ -331,6 +398,12 @@ On startup, the bridge checks for `data/session.json` and automatically restores
 - Check `runtime.GOOS == "darwin"` or use `isRunningOnMacOS()` for runtime guards
 - `imessage/mac/` Objective-C files are only compiled on macOS (CGO build constraints)
 
+### Adding New Database Metadata Fields
+
+When adding fields to metadata structs in `dbmeta.go`:
+- Use `omitempty` JSON tags — bridgev2 stores these as JSON blobs
+- `UserLoginMetadata` holds persisted rustpush session data; changes here affect session restore
+
 ---
 
 ## Git Workflow
@@ -345,8 +418,10 @@ On startup, the bridge checks for `data/session.json` and automatically restores
 ## Useful Cross-References
 
 - **CloudKit integration**: `docs/cloudkit-guide.md`
-- **Apple authentication**: `docs/apple-auth-research.md`
-- **Group chat IDs**: `docs/group-id-research.md`
+- **Apple authentication / token lifecycle**: `docs/apple-auth-research.md`
+- **Group chat IDs and stability**: `docs/group-id-research.md`
 - **User install guide**: `README.md`
-- **Bridge commands**: `pkg/connector/commands.go`
+- **Bridge commands**: `pkg/connector/commands.go`, `pkg/connector/command_contacts.go`
 - **Example config**: `pkg/connector/example-config.yaml`
+- **IPC message types**: `ipc/ipc.go`
+- **Database metadata types**: `pkg/connector/dbmeta.go`
