@@ -598,14 +598,28 @@ if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
     sed -i '/video_transcoding:/a\    heic_conversion: false' "$CONFIG"
 fi
 
-# ── HEIC conversion (libheif) ─────────────────────────────────
+# ── Install libheif (required build dependency) ───────────────
+if command -v apt >/dev/null 2>&1; then
+    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
+elif command -v dnf >/dev/null 2>&1; then
+    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
+elif command -v pacman >/dev/null 2>&1; then
+    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
+elif command -v zypper >/dev/null 2>&1; then
+    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
+elif command -v apk >/dev/null 2>&1; then
+    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
+else
+    echo "  ⚠ Could not detect package manager — please install libheif manually"
+fi
+
+# ── HEIC conversion (enable/disable in config) ────────────────
 CURRENT_HEIC_CONVERSION=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
 if [ -t 0 ]; then
     echo ""
     echo "HEIC Conversion:"
     echo "  When enabled, HEIC/HEIF images are automatically converted to JPEG"
     echo "  for broad Matrix client compatibility."
-    echo "  Requires libheif."
     echo ""
     if [ "$CURRENT_HEIC_CONVERSION" = "true" ]; then
         read -p "Enable HEIC to JPEG conversion? [Y/n]: " ENABLE_HC
@@ -615,19 +629,6 @@ if [ -t 0 ]; then
                 echo "✓ HEIC conversion disabled"
                 ;;
             *)
-                if command -v apt >/dev/null 2>&1; then
-                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
-                elif command -v dnf >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
-                elif command -v pacman >/dev/null 2>&1; then
-                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
-                elif command -v zypper >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
-                elif command -v apk >/dev/null 2>&1; then
-                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
-                else
-                    echo "  ⚠ Could not detect package manager — please install libheif manually"
-                fi
                 echo "✓ HEIC conversion enabled"
                 ;;
         esac
@@ -636,19 +637,6 @@ if [ -t 0 ]; then
         case "$ENABLE_HC" in
             [yY]*)
                 sed -i "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
-                if command -v apt >/dev/null 2>&1; then
-                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
-                elif command -v dnf >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
-                elif command -v pacman >/dev/null 2>&1; then
-                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
-                elif command -v zypper >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
-                elif command -v apk >/dev/null 2>&1; then
-                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
-                else
-                    echo "  ⚠ Could not detect package manager — please install libheif manually"
-                fi
                 echo "✓ HEIC conversion enabled"
                 ;;
             *)
