@@ -908,6 +908,7 @@ if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source
 fi
 
 # ── Apple login (APNs connects here — after all questions) ───
+LOGIN_RAN=false
 if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
@@ -930,6 +931,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     # Run login from DATA_DIR so that relative paths (state/anisette/)
     # resolve to the same location as when systemd runs the bridge.
     (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
+    LOGIN_RAN=true
     echo ""
 
     # Re-check permissions after login — the config upgrader may have
@@ -951,6 +953,7 @@ fi
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
+# Re-read in case login just set it
 CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
 
 # Try to recover from backups if not set in config
@@ -966,7 +969,9 @@ if [ -z "$CURRENT_HANDLE" ]; then
     fi
 fi
 
-if [ -t 0 ]; then
+# Skip handle prompt if login just ran and already set a handle — login
+# asks "Send messages as:" so no need to ask twice.
+if [ -t 0 ] && { [ "$LOGIN_RAN" != "true" ] || [ -z "$CURRENT_HANDLE" ]; }; then
     # Get available handles from session state (available after login)
     AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
