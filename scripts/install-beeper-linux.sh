@@ -21,6 +21,16 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
+# ── Stop any running bridge instance immediately ──────────────
+# Do this before any setup work so the bridge isn't running while we ask
+# questions, patch config, or run init-db. On re-setup scenarios (bbctl delete),
+# systemd may have restarted the bridge — stop it now.
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
+fi
+
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
 # patterns as repairPermissions() / fixPermissionsOnDisk() in the Go code:
@@ -543,7 +553,7 @@ fi
 # the iCloud sync gate are answered next, THEN Apple login (APNs) happens
 # at the very end so no messages are buffered before the bridge is ready.
 _SESSION_FILE_CHECK="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage/session.json"
-if [ "$IS_FRESH_DB" = "true" ] && [ ! -f "$_SESSION_FILE_CHECK" ]; then
+if [ "$IS_FRESH_DB" = "true" ]; then
     echo ""
     echo "Initializing bridge database..."
     (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
@@ -941,8 +951,7 @@ if [ -z "$CURRENT_HANDLE" ]; then
     fi
 fi
 
-# Skip interactive prompt if login just ran (login flow already asked)
-if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
+if [ -t 0 ]; then
     # Get available handles from session state (available after login)
     AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then

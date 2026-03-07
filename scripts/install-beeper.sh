@@ -23,6 +23,12 @@ echo "  iMessage Bridge Setup (Beeper)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
+# ── Stop any running bridge instance immediately ──────────────
+# Do this before any setup work so the bridge isn't running while we ask
+# questions, patch config, or run init-db. On re-setup scenarios (bbctl delete),
+# systemd/LaunchAgent may have restarted the bridge — stop it now.
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
 # patterns as repairPermissions() / fixPermissionsOnDisk() in the Go code:
@@ -611,7 +617,7 @@ SESSION_FILE="$SESSION_DIR/session.json"
 # We kill it immediately — all config questions (video, HEIC, handle) and
 # the iCloud sync gate are answered next, THEN Apple login (APNs) happens
 # at the very end so no messages are buffered before the bridge is ready.
-if [ "$IS_FRESH_DB" = "true" ] && [ ! -f "$SESSION_FILE" ]; then
+if [ "$IS_FRESH_DB" = "true" ]; then
     echo ""
     echo "Initializing bridge database..."
     (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
