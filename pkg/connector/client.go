@@ -941,17 +941,16 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		return
 	}
 
-	// Skip stored (re-delivered) APNs messages that were already bridged in a
-	// previous session. IsStoredMessage=true marks messages Apple buffered while
-	// the bridge was offline; if their UUID is already in the Bridge DB they've
-	// been processed before (or were sent by us and echo-suppressed). Re-delivering
-	// them would create duplicate or resurrected Matrix events, especially for
-	// messages whose portals were subsequently deleted.
-	if msg.IsStoredMessage && msg.Uuid != "" {
+	// Skip APNs messages that were already bridged (e.g. via CloudKit backfill
+	// or a previous session). After the initial backfill completes and the APNs
+	// buffer flushes, delayed APNs deliveries can arrive with IsStoredMessage=false
+	// for messages that CloudKit already bridged. Check the Bridge DB for any
+	// message whose UUID is already known to prevent duplicates.
+	if msg.Uuid != "" {
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
-			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored message already in bridge DB")
+			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
 			return
 		}
 	}
