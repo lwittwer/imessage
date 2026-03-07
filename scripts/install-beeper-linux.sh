@@ -917,6 +917,13 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     fi
 fi
 
+# ── Stop bridge before applying config changes ────────────────
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
+fi
+
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
 CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)

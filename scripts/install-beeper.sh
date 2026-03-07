@@ -852,6 +852,9 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     fi
 fi
 
+# ── Stop bridge before applying config changes ────────────────
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
 CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
@@ -869,8 +872,7 @@ if [ -z "$CURRENT_HANDLE" ]; then
     fi
 fi
 
-# Skip interactive prompt if login just ran (login flow already asked)
-if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
+if [ -t 0 ]; then
     # Get available handles from session state (available after login)
     AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
