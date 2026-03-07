@@ -3502,7 +3502,10 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	if thumbData != nil {
 		thumbURL, thumbEnc, thumbErr := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
-		if thumbErr == nil {
+		if thumbErr != nil {
+			log.Warn().Err(thumbErr).Str("record_name", att.RecordName).
+				Msg("Failed to upload attachment thumbnail")
+		} else {
 			if thumbEnc != nil {
 				content.Info.ThumbnailFile = thumbEnc
 			} else {
