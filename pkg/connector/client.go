@@ -667,6 +667,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
+	if c.Main.Config.HEICConversion {
+		log.Info().Msg("HEIC conversion enabled (libheif)")
+	}
+
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
 
@@ -953,17 +957,16 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		return
 	}
 
-	// Skip stored (re-delivered) APNs messages that were already bridged in a
-	// previous session. IsStoredMessage=true marks messages Apple buffered while
-	// the bridge was offline; if their UUID is already in the Bridge DB they've
-	// been processed before (or were sent by us and echo-suppressed). Re-delivering
-	// them would create duplicate or resurrected Matrix events, especially for
-	// messages whose portals were subsequently deleted.
-	if msg.IsStoredMessage && msg.Uuid != "" {
+	// Skip APNs messages that were already bridged (e.g. via CloudKit backfill
+	// or a previous session). After the initial backfill completes and the APNs
+	// buffer flushes, delayed APNs deliveries can arrive with IsStoredMessage=false
+	// for messages that CloudKit already bridged. Check the Bridge DB for any
+	// message whose UUID is already known to prevent duplicates.
+	if msg.Uuid != "" {
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
-			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored message already in bridge DB")
+			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
 			return
 		}
 	}
@@ -1103,7 +1106,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Msg("Portal creation decision for message")
 	}
 
-	if msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != "" {
+	hasText := msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != ""
+	if hasText {
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
@@ -1129,7 +1133,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			continue
 		}
 		attID := msg.Uuid
-		if attIndex > 0 || (msg.Text != nil && *msg.Text != "") {
+		if attIndex > 0 || hasText {
 			attID = fmt.Sprintf("%s_att%d", msg.Uuid, attIndex)
 		}
 		attMsg := &attachmentMessage{
@@ -1152,7 +1156,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Data:               attMsg,
 			ID:                 makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
-				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding)
+				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
 		})
 	}
@@ -3456,19 +3460,31 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(&log, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.Main.Config.HEICConversion)
+
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+		} else if img, fmtName, _ := decodeImageData(data); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			if !isJPEG {
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
@@ -5172,7 +5188,7 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
-func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
+func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
 	fileName := att.Filename
@@ -5218,11 +5234,25 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	if inlineData != nil {
+		log := zerolog.Ctx(ctx)
+		inlineData, mimeType, fileName, heicImg = maybeConvertHEIC(log, inlineData, mimeType, fileName, heicQuality, heicConversion)
+	}
+
 	// Process images: extract dimensions, convert non-JPEG to JPEG, generate thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
 		log := zerolog.Ctx(ctx)
 		log.Debug().Str("mime_type", mimeType).Str("file_name", fileName).Int("data_len", len(inlineData)).Msg("Processing image attachment")
 		if mimeType == "image/gif" {
@@ -5230,20 +5260,20 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			if err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, fmtName, isJPEG := decodeImageData(inlineData); img != nil {
+		} else if img, fmtName, _ := decodeImageData(inlineData); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Bool("is_jpeg", isJPEG).Msg("Image decoded successfully")
-			// Re-encode non-JPEG images (PNG, TIFF, etc.) as JPEG for compatibility
-			if !isJPEG {
+			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Msg("Image decoded successfully")
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					inlineData = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
-					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded image as JPEG")
+					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded TIFF as JPEG")
 				} else {
-					log.Warn().Err(err).Msg("Failed to re-encode image as JPEG")
+					log.Warn().Err(err).Msg("Failed to re-encode TIFF as JPEG")
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
