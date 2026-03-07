@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/urfave/cli/v2"
@@ -19,13 +20,22 @@ var stopCommand = &cli.Command{
 	ArgsUsage: "BRIDGE",
 	Before:    requiresAuth,
 	Action:    cmdStop,
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:    "bridge-config",
-			Aliases: []string{"c"},
-			Usage:   "Bridge config file path (to read AS token)",
-		},
-	},
+}
+
+func findBridgeConfig() (string, error) {
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dataDir = filepath.Join(home, ".local", "share")
+	}
+	path := filepath.Join(dataDir, "mautrix-imessage", "config.yaml")
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("config not found at %s", path)
+	}
+	return path, nil
 }
 
 func readASToken(configPath string) (string, error) {
@@ -51,9 +61,9 @@ func cmdStop(ctx *cli.Context) error {
 	}
 	bridge := ctx.Args().Get(0)
 
-	configPath := ctx.String("bridge-config")
-	if configPath == "" {
-		return fmt.Errorf("you must specify --bridge-config / -c with the bridge config file path")
+	configPath, err := findBridgeConfig()
+	if err != nil {
+		return err
 	}
 	asToken, err := readASToken(configPath)
 	if err != nil {
