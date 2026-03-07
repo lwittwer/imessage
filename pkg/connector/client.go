@@ -1446,7 +1446,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 
 // safeCloudDownloadGroupPhoto wraps the FFI call with panic recovery and a
 // 90-second timeout, matching the pattern used by safeCloudDownloadAttachment.
-func safeCloudDownloadGroupPhoto(client *rustpushgo.Client, recordName string) ([]byte, error) {
+func safeCloudDownloadGroupPhoto(ctx context.Context, client *rustpushgo.Client, recordName string) ([]byte, error) {
 	type dlResult struct {
 		data []byte
 		err  error
@@ -1476,6 +1476,8 @@ func safeCloudDownloadGroupPhoto(client *rustpushgo.Client, recordName string) (
 			Str("record_name", recordName).
 			Msg("CloudDownloadGroupPhoto timed out after 90s — inner goroutine leaked until FFI unblocks")
 		return nil, fmt.Errorf("CloudDownloadGroupPhoto timed out after 90s")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -1501,7 +1503,7 @@ func (c *IMClient) fetchAndCacheGroupPhoto(ctx context.Context, log zerolog.Logg
 		return nil, 0
 	}
 	log.Debug().Str("record_name", recordName).Msg("group_photo: attempting CloudKit download")
-	data, dlErr := safeCloudDownloadGroupPhoto(c.client, recordName)
+	data, dlErr := safeCloudDownloadGroupPhoto(ctx, c.client, recordName)
 	if dlErr != nil {
 		log.Debug().Err(dlErr).Str("record_name", recordName).
 			Msg("group_photo: CloudKit download failed (expected if Apple did not write gp asset)")
