@@ -576,7 +576,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 		meta.IDSUsers = ""
 		meta.IDSIdentity = ""
 		meta.APSState = ""
-		_ = c.UserLogin.Save(ctx)
+		if err := c.UserLogin.Save(ctx); err != nil {
+			log.Error().Err(err).Msg("Failed to persist cleared login state after key loss")
+		}
 		c.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Message:    "Signing keys lost — please re-login to iMessage",
@@ -1087,7 +1089,9 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// hasMessageUUID checks cloud_message regardless of the deleted flag,
 	// so soft-deleted UUIDs from prior portal deletions still match.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe)
+		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
+			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
+		}
 	}
 	if createPortal || sender.IsFromMe {
 		log.Info().
@@ -1831,7 +1835,9 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
+		}
 	}
 
 	// If the outbound message has a URL but no link previews from the client,
@@ -2015,7 +2021,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent attachment UUID; echo may be delivered as duplicate")
+		}
 	}
 
 	return &bridgev2.MatrixMessageResponse{
@@ -2474,7 +2482,11 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 func (c *IMClient) resolveContactDisplayname(identifier string) string {
 	localID := stripIdentifierPrefix(identifier)
 	if c.contacts != nil {
-		if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && contact.HasName() {
+		contact, contactErr := c.contacts.GetContactInfo(localID)
+		if contactErr != nil {
+			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+		}
+		if contact != nil && contact.HasName() {
 			return c.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
@@ -2502,7 +2514,11 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	localID := stripIdentifierPrefix(identifier)
 	var contact *imessage.Contact
 	if c.contacts != nil {
-		contact, _ = c.contacts.GetContactInfo(localID)
+		var contactErr error
+		contact, contactErr = c.contacts.GetContactInfo(localID)
+		if contactErr != nil {
+			zerolog.Ctx(ctx).Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 	}
 
 	if contact != nil && contact.HasName() {
@@ -3217,6 +3233,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 	}
 	var atts []cloudAttachmentRow
 	if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+		c.Main.Bridge.Log.Warn().Err(err).Str("guid", row.GUID).
+			Msg("Failed to unmarshal attachment JSON, skipping attachments for this message")
 		return nil
 	}
 
@@ -3587,7 +3605,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		loaded := 0
 		for recordName, jsonBytes := range cachedJSON {
 			var content event.MessageEventContent
-			if err := json.Unmarshal(jsonBytes, &content); err == nil {
+			if err := json.Unmarshal(jsonBytes, &content); err != nil {
+				log.Debug().Err(err).Str("record_name", recordName).
+					Msg("Pre-upload: skipping corrupted attachment cache entry")
+			} else {
 				// Skip stale cache entries for non-MP4 videos that need transcoding
 				if content.Info != nil && content.Info.MimeType == "video/quicktime" {
 					continue
@@ -3627,6 +3648,8 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		portalDone := donePortals[row.PortalID]
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			log.Warn().Err(err).Str("guid", row.GUID).
+				Msg("Pre-upload: failed to unmarshal attachment JSON, skipping message")
 			continue
 		}
 		sender := c.makeCloudSender(row)
@@ -3756,6 +3779,8 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		}
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			log.Warn().Err(err).Str("guid", row.GUID).
+				Msg("Forward backfill: failed to unmarshal attachment JSON, skipping message")
 			continue
 		}
 		sender := c.makeCloudSender(row)
@@ -4980,7 +5005,11 @@ func (c *IMClient) buildGroupName(members []string) string {
 		name := ""
 		var contact *imessage.Contact
 		if c.contacts != nil {
-			contact, _ = c.contacts.GetContactInfo(lookupID)
+			var contactErr error
+			contact, contactErr = c.contacts.GetContactInfo(lookupID)
+			if contactErr != nil {
+				c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", lookupID).Msg("Failed to resolve contact info")
+			}
 		}
 
 		if contact != nil && contact.HasName() {
