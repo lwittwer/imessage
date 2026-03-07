@@ -1759,12 +1759,16 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 // as read because they exist on the user's Apple devices and the user receives
 // push notifications for them. Only filtered (junk/unknown sender) chats are
 // left unread, as those are spam the user likely hasn't seen.
+// Returns false when no cloud_chat row exists for the portal (DM portals can
+// legitimately have messages without a cloud_chat row).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
 	var isFiltered int
 	err := s.db.QueryRow(ctx, `
-		SELECT COALESCE(MAX(is_filtered), 0)
+		SELECT is_filtered
 		FROM cloud_chat
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		ORDER BY is_filtered ASC
+		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFiltered)
 	if err == sql.ErrNoRows {
 		return false, nil
