@@ -551,11 +551,13 @@ if [ "$IS_FRESH_DB" = "true" ] && [ ! -f "$_SESSION_FILE_CHECK" ]; then
     elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
         sudo systemctl stop mautrix-imessage
     fi
-    (cd "$DATA_DIR" && "$BINARY" -n -c "$CONFIG" >/dev/null 2>&1) &
+    (cd "$DATA_DIR" && exec "$BINARY" -n -c "$CONFIG" >/dev/null 2>&1) &
     _BRIDGE_INIT_PID=$!
     sleep 5
     kill "$_BRIDGE_INIT_PID" 2>/dev/null || true
     wait "$_BRIDGE_INIT_PID" 2>/dev/null || true
+    # Belt-and-suspenders: ensure no stray bridge process remains
+    pkill -f "$(basename "$BINARY")" 2>/dev/null || true
     echo "✓ Bridge initialized (stopped) — answering setup questions"
 fi
 
