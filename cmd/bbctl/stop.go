@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/urfave/cli/v2"
+	"gopkg.in/yaml.v3"
 
 	"maunium.net/go/mautrix/bridgev2/status"
 
@@ -39,20 +38,27 @@ func findBridgeConfig() (string, error) {
 }
 
 func readASToken(configPath string) (string, error) {
-	f, err := os.Open(configPath)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "as_token:") {
-			token := strings.TrimSpace(strings.TrimPrefix(line, "as_token:"))
-			return token, nil
-		}
+	var cfg struct {
+		ASToken    string `yaml:"as_token"`
+		Appservice struct {
+			ASToken string `yaml:"as_token"`
+		} `yaml:"appservice"`
 	}
-	return "", fmt.Errorf("as_token not found in config")
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("failed to parse config: %w", err)
+	}
+	token := cfg.Appservice.ASToken
+	if token == "" {
+		token = cfg.ASToken
+	}
+	if token == "" {
+		return "", fmt.Errorf("as_token not found in config")
+	}
+	return token, nil
 }
 
 func cmdStop(ctx *cli.Context) error {
