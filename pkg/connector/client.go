@@ -1213,10 +1213,21 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	// Persist the tapback UUID so cross-restart APNs re-deliveries are caught
-	// by the hasMessageUUID check above. Uses INSERT OR IGNORE on the primary key.
+	// by the hasMessageUUID check above. Uses persistTapbackUUID (not
+	// persistMessageUUID) to set tapback_type, preventing getConversationReadByMe
+	// from treating the synthetic row as a substantive message and spuriously
+	// flipping the conversation to unread for incoming reactions.
+	// APNs TapbackType is a 0-6 index; cloud_message stores raw 2000-2006 / 3000-3006.
 	if msg.Uuid != "" && c.cloudStore != nil {
 		sender := c.makeEventSender(msg.Sender)
-		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
+		storedType := uint32(2000) // sentinel default (Love) when TapbackType is nil
+		if msg.TapbackType != nil {
+			storedType = *msg.TapbackType + 2000
+			if msg.TapbackRemove {
+				storedType += 1000 // removals: 3000-3006, matching TapbackRemoveOffset
+			}
+		}
+		if err := c.cloudStore.persistTapbackUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe, storedType); err != nil {
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist tapback UUID; duplicates may occur on restart")
 		}
 	}
@@ -1241,13 +1252,13 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	// Deduplicate: skip edits already processed to prevent duplicate edit events
-	// from stale APNs re-delivery on reconnect. Same pattern as handleTapback.
-	if msg.Uuid != "" && c.cloudStore != nil {
-		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
-			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping edit already in message store")
-			return
-		}
+	// Skip stored (backfilled) edit messages to prevent duplicate edit events
+	// on APNs reconnect re-delivery. Edits are never CloudKit-backfilled so
+	// cloud_message UUID persistence is not useful; IsStoredMessage is the
+	// right signal here (same pattern as handleRename).
+	if msg.IsStoredMessage {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored edit message")
+		return
 	}
 
 	targetGUID := ptrStringOr(msg.EditTargetUuid, "")
@@ -1258,14 +1269,6 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
 		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	}
-
-	// Persist the edit UUID for cross-restart APNs re-delivery dedup.
-	if msg.Uuid != "" && c.cloudStore != nil {
-		sender := c.makeEventSender(msg.Sender)
-		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
-			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist edit UUID; duplicates may occur on restart")
-		}
 	}
 
 	newText := ptrStringOr(msg.EditNewText, "")
