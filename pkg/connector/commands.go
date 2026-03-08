@@ -286,7 +286,11 @@ func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IM
 	// Strip URI prefix for a cleaner display.
 	id := strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:")
 	if strings.HasPrefix(portalID, "gid:") {
-		return "Group " + strings.TrimPrefix(portalID, "gid:")[:8] + "…"
+		trimmed := strings.TrimPrefix(portalID, "gid:")
+		if len(trimmed) > 8 {
+			trimmed = trimmed[:8]
+		}
+		return "Group " + trimmed + "…"
 	}
 	return id
 }
