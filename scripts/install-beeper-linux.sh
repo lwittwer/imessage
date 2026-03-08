@@ -21,6 +21,18 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
+# ── Stop bridge for the duration of setup ─────────────────────
+# systemctl stop prevents Restart=always from kicking in (systemd only
+# auto-restarts after process exits, not after admin stop). No need to
+# mask — masking fails when the unit file already exists on disk.
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+    echo "✓ Stopped running bridge"
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
+    echo "✓ Stopped running bridge"
+fi
+
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
 # patterns as repairPermissions() / fixPermissionsOnDisk() in the Go code:
@@ -191,6 +203,9 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
+# No bridge-state override needed here — the bridge will post its own
+# state when it actually starts at the end of setup.
+
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
     if fix_permissions "$CONFIG" "$WHOAMI"; then
@@ -281,16 +296,6 @@ if [ -t 0 ]; then
         sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
         if [ "$ENABLE_BACKFILL" = "true" ]; then
             echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
-            echo ""
-            echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
-            echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
-            echo "are available for backfill."
-            echo ""
-            read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
-            case "$ICLOUD_SYNCED" in
-                [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
-                *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
-            esac
         else
             echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
         fi
@@ -546,6 +551,30 @@ BKEOF
     fi
 fi
 
+# ── Brief init start (fresh install only) ────────────────────
+# On a fresh install with no prior session, start the bridge briefly so it
+# creates the DB schema and appears in Beeper as "stopped" during setup.
+# We kill it immediately — all config questions (video, HEIC, handle) and
+# the iCloud sync gate are answered next, THEN Apple login (APNs) happens
+# at the very end so no messages are buffered before the bridge is ready.
+_SESSION_FILE_CHECK="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage/session.json"
+if [ "$IS_FRESH_DB" = "true" ]; then
+    echo ""
+    echo "Initializing bridge database..."
+    (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
+    echo "✓ Bridge database initialized — answering setup questions"
+fi
+
+# ── Ensure bridge is stopped during setup ─────────────────────
+# bbctl config posts StateStarting which makes Beeper show "Running".
+# Stopping the systemd service disconnects the websocket, which makes
+# Beeper detect it as unreachable and overrides the stale state.
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
+fi
+
 # ── Check for existing login / prompt if needed ──────────────
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
@@ -595,110 +624,6 @@ if [ "$NEEDS_LOGIN" = "false" ]; then
         NEEDS_LOGIN=true
         FORCE_CLEAR_STATE=true
     fi
-fi
-
-if [ "$NEEDS_LOGIN" = "true" ]; then
-    echo ""
-    echo "┌─────────────────────────────────────────────────┐"
-    echo "│  No valid iMessage login found — starting login │"
-    echo "└─────────────────────────────────────────────────┘"
-    echo ""
-    # Stop the bridge if running (otherwise it holds the DB lock)
-    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-        systemctl --user stop mautrix-imessage
-    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        sudo systemctl stop mautrix-imessage
-    fi
-
-    if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
-        echo "Clearing stale local state before login..."
-        rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
-        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
-    fi
-
-    # Run login from DATA_DIR so that relative paths (state/anisette/)
-    # resolve to the same location as when systemd runs the bridge.
-    (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
-    echo ""
-
-    # Re-check permissions after login — the config upgrader may have
-    # corrupted them even with -n if repairPermissions couldn't determine
-    # the username.
-    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
-        if fix_permissions "$CONFIG" "$WHOAMI"; then
-            echo "✓ Fixed permissions after login: @${WHOAMI}:beeper.com → admin"
-        fi
-    fi
-fi
-
-# ── Preferred handle (runs every time, can reconfigure) ────────
-HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
-CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
-
-# Try to recover from backups if not set in config
-if [ -z "$CURRENT_HANDLE" ]; then
-    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
-        CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
-        CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
-        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
-    fi
-fi
-
-# Skip interactive prompt if login just ran (login flow already asked)
-if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
-    # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
-    if [ -n "$AVAILABLE_HANDLES" ]; then
-        echo ""
-        echo "Preferred handle (your iMessage sender address):"
-        i=1
-        declare -a HANDLE_LIST=()
-        while IFS= read -r h; do
-            MARKER=""
-            if [ "$h" = "$CURRENT_HANDLE" ]; then
-                MARKER=" (current)"
-            fi
-            echo "  $i) $h$MARKER"
-            HANDLE_LIST+=("$h")
-            i=$((i + 1))
-        done <<< "$AVAILABLE_HANDLES"
-
-        if [ -n "$CURRENT_HANDLE" ]; then
-            read -p "Choice [keep current]: " HANDLE_CHOICE
-        else
-            read -p "Choice [1]: " HANDLE_CHOICE
-        fi
-
-        if [ -n "$HANDLE_CHOICE" ]; then
-            if [ "$HANDLE_CHOICE" -ge 1 ] 2>/dev/null && [ "$HANDLE_CHOICE" -le "${#HANDLE_LIST[@]}" ] 2>/dev/null; then
-                CURRENT_HANDLE="${HANDLE_LIST[$((HANDLE_CHOICE - 1))]}"
-            fi
-        elif [ -z "$CURRENT_HANDLE" ] && [ ${#HANDLE_LIST[@]} -gt 0 ]; then
-            CURRENT_HANDLE="${HANDLE_LIST[0]}"
-        fi
-    elif [ -n "$CURRENT_HANDLE" ]; then
-        echo ""
-        echo "Preferred handle: $CURRENT_HANDLE"
-        read -p "New handle, or Enter to keep current: " NEW_HANDLE
-        if [ -n "$NEW_HANDLE" ]; then
-            CURRENT_HANDLE="$NEW_HANDLE"
-        fi
-    fi
-fi
-
-# Write preferred handle to config (add key if missing, patch if present)
-if [ -n "${CURRENT_HANDLE:-}" ]; then
-    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
-        sed -i "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
-    else
-        sed -i "/^network:/a\\    preferred_handle: '$CURRENT_HANDLE'" "$CONFIG"
-    fi
-    echo "✓ Preferred handle: $CURRENT_HANDLE"
-    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
 # ── Ensure video_transcoding key exists in config ──────────────
@@ -953,6 +878,156 @@ step "Starting bridge..."
 exec "$BINARY" -n -c "$CONFIG"
 BODY_EOF
 chmod +x "$DATA_DIR/start.sh"
+
+# ── iCloud sync gate (CloudKit + fresh DB) ───────────────────
+# Runs before Apple login so that iCloud is fully synced before APNs first
+# connects.  This ensures CloudKit backfill can deduplicate any messages that
+# Apple buffers and delivers the moment the bridge registers with APNs.
+_ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────┐"
+    echo "│  Last step: sync iCloud Messages before starting            │"
+    echo "│                                                             │"
+    echo "│  On your iPhone, iPad, Mac, or OpenBubbles:                 │"
+    echo "│    Settings → [Your Name] → iCloud → Messages → Sync Now    │"
+    echo "│                                                             │"
+    echo "│  Wait for sync to complete, then press Y to start.          │"
+    echo "└─────────────────────────────────────────────────────────────┘"
+    echo ""
+    read -p "Have you synced iCloud Messages and are ready to start? [y/N]: " _sync_ready
+    case "$_sync_ready" in
+        [yY]*) echo "✓ Starting bridge" ;;
+        *)
+            echo ""
+            echo "Re-run 'make install-beeper' after syncing iCloud Messages."
+            exit 0
+            ;;
+    esac
+fi
+
+# ── Apple login (APNs connects here — after all questions) ───
+LOGIN_RAN=false
+if [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No valid iMessage login found — starting login │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+        systemctl --user stop mautrix-imessage
+    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+        sudo systemctl stop mautrix-imessage
+    fi
+
+    if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
+        echo "Clearing stale local state before login..."
+        rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
+        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+    fi
+
+    # Run login from DATA_DIR so that relative paths (state/anisette/)
+    # resolve to the same location as when systemd runs the bridge.
+    (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
+    LOGIN_RAN=true
+    echo ""
+
+    # Re-check permissions after login — the config upgrader may have
+    # corrupted them even with -n if repairPermissions couldn't determine
+    # the username.
+    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+        if fix_permissions "$CONFIG" "$WHOAMI"; then
+            echo "✓ Fixed permissions after login: @${WHOAMI}:beeper.com → admin"
+        fi
+    fi
+fi
+
+# ── Stop bridge before applying config changes ────────────────
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
+fi
+
+# ── Preferred handle (runs every time, can reconfigure) ────────
+HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
+# Re-read in case login just set it
+CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
+
+# Try to recover from backups if not set in config
+if [ -z "$CURRENT_HANDLE" ]; then
+    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
+        CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
+    fi
+    if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
+        CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
+    fi
+    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
+        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
+    fi
+fi
+
+# Skip handle prompt if login just ran and already set a handle — login
+# asks "Send messages as:" so no need to ask twice.
+if [ -t 0 ] && { [ "$LOGIN_RAN" != "true" ] || [ -z "$CURRENT_HANDLE" ]; }; then
+    # Get available handles from session state (available after login)
+    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    if [ -n "$AVAILABLE_HANDLES" ]; then
+        echo ""
+        echo "Preferred handle (your iMessage sender address):"
+        i=1
+        declare -a HANDLE_LIST=()
+        while IFS= read -r h; do
+            MARKER=""
+            if [ "$h" = "$CURRENT_HANDLE" ]; then
+                MARKER=" (current)"
+            fi
+            echo "  $i) $h$MARKER"
+            HANDLE_LIST+=("$h")
+            i=$((i + 1))
+        done <<< "$AVAILABLE_HANDLES"
+
+        if [ -n "$CURRENT_HANDLE" ]; then
+            read -p "Choice [keep current]: " HANDLE_CHOICE
+        else
+            read -p "Choice [1]: " HANDLE_CHOICE
+        fi
+
+        if [ -n "$HANDLE_CHOICE" ]; then
+            if [ "$HANDLE_CHOICE" -ge 1 ] 2>/dev/null && [ "$HANDLE_CHOICE" -le "${#HANDLE_LIST[@]}" ] 2>/dev/null; then
+                CURRENT_HANDLE="${HANDLE_LIST[$((HANDLE_CHOICE - 1))]}"
+            fi
+        elif [ -z "$CURRENT_HANDLE" ] && [ ${#HANDLE_LIST[@]} -gt 0 ]; then
+            CURRENT_HANDLE="${HANDLE_LIST[0]}"
+        fi
+    elif [ -n "$CURRENT_HANDLE" ]; then
+        echo ""
+        echo "Preferred handle: $CURRENT_HANDLE"
+        read -p "New handle, or Enter to keep current: " NEW_HANDLE
+        if [ -n "$NEW_HANDLE" ]; then
+            CURRENT_HANDLE="$NEW_HANDLE"
+        fi
+    else
+        # list-handles returned empty (e.g. session not yet populated).
+        # Fall back to manual entry so the bridge doesn't start without a handle.
+        echo ""
+        echo "Could not detect handles automatically."
+        read -p "Enter your iMessage handle (e.g. tel:+12345678900 or mailto:you@icloud.com): " CURRENT_HANDLE
+    fi
+fi
+
+# Write preferred handle to config (add key if missing, patch if present)
+if [ -n "${CURRENT_HANDLE:-}" ]; then
+    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
+        sed -i "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
+    else
+        sed -i "/^network:/a\\    preferred_handle: '$CURRENT_HANDLE'" "$CONFIG"
+    fi
+    echo "✓ Preferred handle: $CURRENT_HANDLE"
+    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
+fi
 
 # ── Install / update systemd service ─────────────────────────
 # Detect whether systemd user sessions work. In containers (LXC) or when
