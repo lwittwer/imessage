@@ -1234,15 +1234,6 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	// Skip stored (backfilled) edit messages to prevent duplicate edit events
-	// on APNs reconnect re-delivery. Edits are never CloudKit-backfilled so
-	// cloud_message UUID persistence is not useful; IsStoredMessage is the
-	// right signal here (same pattern as handleRename).
-	if msg.IsStoredMessage {
-		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored edit message")
-		return
-	}
-
 	targetGUID := ptrStringOr(msg.EditTargetUuid, "")
 
 	// Resolve portal by target message UUID first. Edit reflections from the
