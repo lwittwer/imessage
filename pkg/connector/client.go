@@ -529,7 +529,6 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 	}
 
 	loadedGuids := 0
-	loadedNames := 0
 	for _, portal := range portals {
 		if portal.Receiver != c.UserLogin.ID {
 			continue // Skip portals for other users
@@ -552,9 +551,6 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 	}
 	if loadedGuids > 0 {
 		log.Info().Int("count", loadedGuids).Msg("Pre-populated sender_guid cache from database")
-	}
-	if loadedNames > 0 {
-		log.Info().Int("count", loadedNames).Msg("Pre-populated group name cache from database")
 	}
 }
 
