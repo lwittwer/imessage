@@ -1015,6 +1015,36 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		return
 	}
 
+	// SMS/RCS group reactions and other messages often arrive from the iPhone
+	// relay with an empty participant list (the relay omits the group members
+	// for 1-on-1-style SMS payloads). makePortalKey() then falls back to just
+	// [sender, our_number] and computes a DM portal key, splitting the group
+	// chat into spurious DM portals.
+	//
+	// If the computed portal key looks like a DM (no comma-separator, no gid:
+	// prefix) but we know the sender is a member of an existing group portal,
+	// redirect to that group portal instead. Never create a new group portal
+	// via this redirect path — only redirect to portals that already exist in
+	// Matrix (MXID != "").
+	if msg.IsSms {
+		isComputedDM := !strings.HasPrefix(string(portalKey.ID), "gid:") &&
+			!strings.Contains(string(portalKey.ID), ",")
+		if isComputedDM && msg.Sender != nil {
+			if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+				if existing, _ := c.Main.Bridge.GetExistingPortalByKey(
+					context.Background(), groupKey,
+				); existing != nil && existing.MXID != "" {
+					log.Debug().
+						Str("sender", *msg.Sender).
+						Str("dm_portal", string(portalKey.ID)).
+						Str("group_portal", string(groupKey.ID)).
+						Msg("Redirecting SMS message from DM portal to sender's group portal")
+					portalKey = groupKey
+				}
+			}
+		}
+	}
+
 	// Track SMS portals so outbound replies use the correct service type
 	if msg.IsSms {
 		c.markPortalSMS(string(portalKey.ID))
