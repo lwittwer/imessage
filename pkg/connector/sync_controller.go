@@ -221,7 +221,6 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
 	}
-	rows.Close()
 
 	updated := 0
 	for _, g := range ghosts {
