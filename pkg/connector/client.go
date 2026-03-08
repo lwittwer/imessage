@@ -134,6 +134,12 @@ type IMClient struct {
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
 
+	// SMS reaction echo suppression: tracks UUIDs of SMS reaction messages sent
+	// from Matrix so the outgoing echo from the iPhone relay is not processed as
+	// a duplicate plain-text message in the Matrix room.
+	recentSmsReactionEchoes     map[string]time.Time
+	recentSmsReactionEchoesLock sync.Mutex
+
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
 	recentOutboundUnsends     map[string]time.Time
@@ -954,6 +960,10 @@ func (c *IMClient) UpdateUsers(users *rustpushgo.WrappedIdsUsers) {
 func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	if c.wasUnsent(msg.Uuid) {
 		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing re-delivery of unsent message")
+		return
+	}
+	if c.wasSmsReactionEcho(msg.Uuid) {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing SMS reaction echo")
 		return
 	}
 
@@ -2299,10 +2309,11 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
-		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
+		c.trackSmsReactionEcho(uuid)
 		// Return nil: SMS reactions are sent as plain text, not as structured
 		// tapbacks, so there is no database.Reaction to store. The remove path
 		// (HandleMatrixReactionRemove) reads the target from the Matrix event
@@ -2342,7 +2353,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
-		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		c.trackSmsReactionEcho(uuid)
 		return err
 	}
 
@@ -5917,6 +5929,28 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 	defer c.recentUnsendsLock.Unlock()
 	if t, ok := c.recentUnsends[uuid]; ok {
 		return time.Since(t) < 5*time.Minute
+	}
+	return false
+}
+
+func (c *IMClient) trackSmsReactionEcho(uuid string) {
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	c.recentSmsReactionEchoes[strings.ToUpper(uuid)] = time.Now()
+	for k, t := range c.recentSmsReactionEchoes {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.recentSmsReactionEchoes, k)
+		}
+	}
+}
+
+func (c *IMClient) wasSmsReactionEcho(uuid string) bool {
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	key := strings.ToUpper(uuid)
+	if _, ok := c.recentSmsReactionEchoes[key]; ok {
+		delete(c.recentSmsReactionEchoes, key)
+		return true
 	}
 	return false
 }
