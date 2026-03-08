@@ -1039,7 +1039,11 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	if msg.IsSms {
 		isComputedDM := !strings.HasPrefix(string(portalKey.ID), "gid:") &&
 			!strings.Contains(string(portalKey.ID), ",")
-		if isComputedDM && msg.Sender != nil {
+		// Only redirect when the payload has no participant list — that is the
+		// known broken relay shape where the iPhone omits group members. A
+		// genuine 1:1 SMS carries the remote participant in msg.Participants,
+		// so len > 0 means this is a real DM and must NOT be redirected.
+		if isComputedDM && len(msg.Participants) == 0 && msg.Sender != nil {
 			if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
 				if existing, _ := c.Main.Bridge.GetExistingPortalByKey(
 					context.Background(), groupKey,
@@ -5937,6 +5941,9 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 }
 
 func (c *IMClient) trackSmsReactionEcho(uuid string) {
+	if uuid == "" {
+		return
+	}
 	c.recentSmsReactionEchoesLock.Lock()
 	defer c.recentSmsReactionEchoesLock.Unlock()
 	c.recentSmsReactionEchoes[strings.ToUpper(uuid)] = time.Now()
@@ -5948,6 +5955,9 @@ func (c *IMClient) trackSmsReactionEcho(uuid string) {
 }
 
 func (c *IMClient) wasSmsReactionEcho(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
 	c.recentSmsReactionEchoesLock.Lock()
 	defer c.recentSmsReactionEchoesLock.Unlock()
 	key := strings.ToUpper(uuid)
