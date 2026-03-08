@@ -136,111 +136,45 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-	// Migration: add record_name column if missing (SQLite doesn't support IF NOT EXISTS on ALTER)
-	var hasRecordName int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='record_name'`).Scan(&hasRecordName)
-	if hasRecordName == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN record_name TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("failed to add record_name column: %w", err)
+	// Migrations: add missing columns to cloud_chat (SQLite doesn't support IF NOT EXISTS on ALTER).
+	// fwd_backfill_done: set to 1 when FetchMessages(forward) completes for a portal so that
+	// preUploadCloudAttachments skips those portals on restart. Default 0 means "not yet done".
+	// deleted: soft-deletes cloud_chat rows alongside cloud_message rows so restore-chat can
+	// recover group name and participants.
+	for _, col := range []struct{ name, def string }{
+		{"record_name", "TEXT NOT NULL DEFAULT ''"},
+		{"group_id", "TEXT NOT NULL DEFAULT ''"},
+		{"group_photo_guid", "TEXT"},
+		{"deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
+		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
+		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT 0"},
+	} {
+		var exists int
+		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name=$1`, col.name).Scan(&exists)
+		if exists == 0 {
+			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_chat ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+				return fmt.Errorf("failed to add %s column to cloud_chat: %w", col.name, err)
+			}
 		}
 	}
 
-	// Migration: add group_id column if missing
-	var hasGroupID int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='group_id'`).Scan(&hasGroupID)
-	if hasGroupID == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN group_id TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("failed to add group_id column: %w", err)
-		}
-	}
-
-	// Migration: add group_photo_guid column if missing
-	var hasGroupPhotoGuid int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='group_photo_guid'`).Scan(&hasGroupPhotoGuid)
-	if hasGroupPhotoGuid == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN group_photo_guid TEXT`); err != nil {
-			return fmt.Errorf("failed to add group_photo_guid column: %w", err)
-		}
-	}
-
-
-	// Migration: add deleted column to cloud_chat if missing.
-	// Soft-deletes cloud_chat rows alongside cloud_message rows so that
-	// restore-chat can recover group name and participants.
-	var hasChatDeleted int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='deleted'`).Scan(&hasChatDeleted)
-	if hasChatDeleted == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
-			return fmt.Errorf("failed to add deleted column to cloud_chat: %w", err)
-		}
-	}
-
-	// Migration: add is_filtered column to cloud_chat if missing
-	var hasIsFiltered int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='is_filtered'`).Scan(&hasIsFiltered)
-	if hasIsFiltered == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN is_filtered INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("failed to add is_filtered column: %w", err)
-		}
-	}
-
-	// Migration: add rich content columns to cloud_message if missing
-	richCols := []struct {
-		name string
-		def  string
-	}{
+	// Migrations: add missing columns to cloud_message.
+	for _, col := range []struct{ name, def string }{
 		{"subject", "TEXT"},
 		{"tapback_type", "INTEGER"},
 		{"tapback_target_guid", "TEXT"},
 		{"tapback_emoji", "TEXT"},
 		{"attachments_json", "TEXT"},
-	}
-	for _, col := range richCols {
+		{"date_read_ms", "BIGINT NOT NULL DEFAULT 0"},
+		{"record_name", "TEXT NOT NULL DEFAULT ''"},
+		{"has_body", "BOOLEAN NOT NULL DEFAULT TRUE"},
+	} {
 		var exists int
 		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
 		if exists == 0 {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
-				return fmt.Errorf("failed to add %s column: %w", col.name, err)
+				return fmt.Errorf("failed to add %s column to cloud_message: %w", col.name, err)
 			}
-		}
-	}
-
-	// Migration: add date_read_ms column to cloud_message if missing
-	var hasDateReadMS int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name='date_read_ms'`).Scan(&hasDateReadMS)
-	if hasDateReadMS == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_message ADD COLUMN date_read_ms BIGINT NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("failed to add date_read_ms column: %w", err)
-		}
-	}
-
-	// Migration: add record_name column to cloud_message if missing
-	var hasMsgRecordName int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name='record_name'`).Scan(&hasMsgRecordName)
-	if hasMsgRecordName == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_message ADD COLUMN record_name TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("failed to add record_name column to cloud_message: %w", err)
-		}
-	}
-
-	// Migration: add has_body column to cloud_message if missing
-	var hasHasBody int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name='has_body'`).Scan(&hasHasBody)
-	if hasHasBody == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_message ADD COLUMN has_body BOOLEAN NOT NULL DEFAULT TRUE`); err != nil {
-			return fmt.Errorf("failed to add has_body column: %w", err)
-		}
-	}
-
-	// Migration: add fwd_backfill_done column to cloud_chat if missing.
-	// Set to 1 when FetchMessages(forward) completes for a portal so that
-	// preUploadCloudAttachments skips those portals on restart instead of
-	// re-uploading every attachment. Default 0 means "not yet done".
-	var hasFwdBackfillDone int
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='fwd_backfill_done'`).Scan(&hasFwdBackfillDone)
-	if hasFwdBackfillDone == 0 {
-		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN fwd_backfill_done BOOLEAN NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("failed to add fwd_backfill_done column: %w", err)
 		}
 	}
 
