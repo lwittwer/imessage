@@ -2030,7 +2030,14 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	_ = matrixEdited
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart)
+
+	// When FileName is set, Body contains the caption text rather than the filename.
+	var caption *string
+	if msg.Content.FileName != "" && msg.Content.Body != "" {
+		caption = &msg.Content.Body
+	}
+
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -2038,16 +2045,6 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
 		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
-	}
-
-	// Send caption as a follow-up text message if present.
-	// When FileName is set, Body contains the caption text rather than the filename.
-	if msg.Content.FileName != "" && msg.Content.Body != "" {
-		caption := msg.Content.Body
-		_, captionErr := c.client.SendMessage(conv, caption, c.handle, nil, nil)
-		if captionErr != nil {
-			zerolog.Ctx(ctx).Warn().Err(captionErr).Msg("Failed to send caption for attachment")
-		}
 	}
 
 	return &bridgev2.MatrixMessageResponse{

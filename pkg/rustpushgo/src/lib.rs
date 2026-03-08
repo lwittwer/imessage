@@ -2798,6 +2798,7 @@ impl Client {
         handle: String,
         reply_guid: Option<String>,
         reply_part: Option<String>,
+        body: Option<String>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
@@ -2828,11 +2829,20 @@ impl Client {
             |_current, _total| {},
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload attachment: {}", e) })?;
 
-        let parts = vec![IndexedMessagePart {
+        let mut parts = vec![IndexedMessagePart {
             part: MessagePart::Attachment(attachment.clone()),
             idx: None,
             ext: None,
         }];
+        if let Some(ref caption) = body {
+            if !caption.is_empty() {
+                parts.push(IndexedMessagePart {
+                    part: MessagePart::Text(caption.clone(), Default::default()),
+                    idx: None,
+                    ext: None,
+                });
+            }
+        }
 
         let mut msg = MessageInst::new(
             conv.clone(),
@@ -2860,11 +2870,20 @@ impl Client {
                     using_number: handle.clone(),
                     from_handle: None,
                 };
-                let sms_parts = vec![IndexedMessagePart {
+                let mut sms_parts = vec![IndexedMessagePart {
                     part: MessagePart::Attachment(attachment),
                     idx: None,
                     ext: None,
                 }];
+                if let Some(ref caption) = body {
+                    if !caption.is_empty() {
+                        sms_parts.push(IndexedMessagePart {
+                            part: MessagePart::Text(caption.clone(), Default::default()),
+                            idx: None,
+                            ext: None,
+                        });
+                    }
+                }
                 let mut sms_msg = MessageInst::new(
                     conv,
                     &handle,
