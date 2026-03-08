@@ -1769,7 +1769,7 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC
+		ORDER BY timestamp_ms DESC, rowid DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
 	if err == nil {
