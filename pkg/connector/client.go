@@ -2354,8 +2354,11 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 			}
 		}
 		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		if err != nil {
+			return err
+		}
 		c.trackSmsReactionEcho(uuid)
-		return err
+		return nil
 	}
 
 	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
