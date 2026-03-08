@@ -134,6 +134,12 @@ type IMClient struct {
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
 
+	// SMS reaction echo suppression: tracks UUIDs of SMS reaction messages sent
+	// from Matrix so the outgoing echo from the iPhone relay is not processed as
+	// a duplicate plain-text message in the Matrix room.
+	recentSmsReactionEchoes     map[string]time.Time
+	recentSmsReactionEchoesLock sync.Mutex
+
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
 	recentOutboundUnsends     map[string]time.Time
@@ -952,6 +958,10 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing re-delivery of unsent message")
 		return
 	}
+	if c.wasSmsReactionEcho(msg.Uuid) {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing SMS reaction echo")
+		return
+	}
 
 	// Skip APNs messages that were already bridged (e.g. via CloudKit backfill
 	// or a previous session). After the initial backfill completes and the APNs
@@ -1009,6 +1019,40 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Strs("participants", msg.Participants).
 			Msg("Dropping message: could not resolve portal key (no participants/sender)")
 		return
+	}
+
+	// SMS/RCS group reactions and other messages often arrive from the iPhone
+	// relay with an empty participant list (the relay omits the group members
+	// for 1-on-1-style SMS payloads). makePortalKey() then falls back to just
+	// [sender, our_number] and computes a DM portal key, splitting the group
+	// chat into spurious DM portals.
+	//
+	// If the computed portal key looks like a DM (no comma-separator, no gid:
+	// prefix) but we know the sender is a member of an existing group portal,
+	// redirect to that group portal instead. Never create a new group portal
+	// via this redirect path — only redirect to portals that already exist in
+	// Matrix (MXID != "").
+	if msg.IsSms {
+		isComputedDM := !strings.HasPrefix(string(portalKey.ID), "gid:") &&
+			!strings.Contains(string(portalKey.ID), ",")
+		// Only redirect when the payload has no participant list — that is the
+		// known broken relay shape where the iPhone omits group members. A
+		// genuine 1:1 SMS carries the remote participant in msg.Participants,
+		// so len > 0 means this is a real DM and must NOT be redirected.
+		if isComputedDM && len(msg.Participants) == 0 && msg.Sender != nil {
+			if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+				if existing, _ := c.Main.Bridge.GetExistingPortalByKey(
+					context.Background(), groupKey,
+				); existing != nil && existing.MXID != "" {
+					log.Debug().
+						Str("sender", *msg.Sender).
+						Str("dm_portal", string(portalKey.ID)).
+						Str("group_portal", string(groupKey.ID)).
+						Msg("Redirecting SMS message from DM portal to sender's group portal")
+					portalKey = groupKey
+				}
+			}
+		}
 	}
 
 	// Track SMS portals so outbound replies use the correct service type
@@ -2265,10 +2309,11 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
-		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
+		c.trackSmsReactionEcho(uuid)
 		// Return nil: SMS reactions are sent as plain text, not as structured
 		// tapbacks, so there is no database.Reaction to store. The remove path
 		// (HandleMatrixReactionRemove) reads the target from the Matrix event
@@ -2308,8 +2353,12 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
-		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
-		return err
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		if err != nil {
+			return err
+		}
+		c.trackSmsReactionEcho(uuid)
+		return nil
 	}
 
 	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
@@ -5883,6 +5932,34 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 	defer c.recentUnsendsLock.Unlock()
 	if t, ok := c.recentUnsends[uuid]; ok {
 		return time.Since(t) < 5*time.Minute
+	}
+	return false
+}
+
+func (c *IMClient) trackSmsReactionEcho(uuid string) {
+	if uuid == "" {
+		return
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	c.recentSmsReactionEchoes[strings.ToUpper(uuid)] = time.Now()
+	for k, t := range c.recentSmsReactionEchoes {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.recentSmsReactionEchoes, k)
+		}
+	}
+}
+
+func (c *IMClient) wasSmsReactionEcho(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	key := strings.ToUpper(uuid)
+	if _, ok := c.recentSmsReactionEchoes[key]; ok {
+		delete(c.recentSmsReactionEchoes, key)
+		return true
 	}
 	return false
 }
