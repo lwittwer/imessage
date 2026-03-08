@@ -2829,20 +2829,15 @@ impl Client {
             |_current, _total| {},
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload attachment: {}", e) })?;
 
-        let mut parts = vec![IndexedMessagePart {
+        let parts = vec![IndexedMessagePart {
             part: MessagePart::Attachment(attachment.clone()),
             idx: None,
             ext: None,
         }];
-        if let Some(ref caption) = body {
-            if !caption.is_empty() {
-                parts.push(IndexedMessagePart {
-                    part: MessagePart::Text(caption.clone(), Default::default()),
-                    idx: Some(0),
-                    ext: None,
-                });
-            }
-        }
+
+        // Captions are sent via the subject field in the iMessage plist,
+        // not as a separate text part in the XML body.
+        let subject = body.clone().filter(|s| !s.is_empty());
 
         let mut msg = MessageInst::new(
             conv.clone(),
@@ -2853,7 +2848,7 @@ impl Client {
                 reply_guid: reply_guid.clone(),
                 reply_part: reply_part.clone(),
                 service,
-                subject: None,
+                subject,
                 app: None,
                 link_meta: None,
                 voice: is_voice,
@@ -2875,15 +2870,7 @@ impl Client {
                     idx: None,
                     ext: None,
                 }];
-                if let Some(ref caption) = body {
-                    if !caption.is_empty() {
-                        sms_parts.push(IndexedMessagePart {
-                            part: MessagePart::Text(caption.clone(), Default::default()),
-                            idx: Some(0),
-                            ext: None,
-                        });
-                    }
-                }
+                let sms_subject = body.filter(|s| !s.is_empty());
                 let mut sms_msg = MessageInst::new(
                     conv,
                     &handle,
@@ -2893,7 +2880,7 @@ impl Client {
                         reply_guid: reply_guid,
                         reply_part: reply_part,
                         service: sms_service,
-                        subject: None,
+                        subject: sms_subject,
                         app: None,
                         link_meta: None,
                         voice: is_voice,
