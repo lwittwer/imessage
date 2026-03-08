@@ -2838,7 +2838,7 @@ impl Client {
             if !caption.is_empty() {
                 parts.push(IndexedMessagePart {
                     part: MessagePart::Text(caption.clone(), Default::default()),
-                    idx: None,
+                    idx: Some(0),
                     ext: None,
                 });
             }
@@ -2879,7 +2879,7 @@ impl Client {
                     if !caption.is_empty() {
                         sms_parts.push(IndexedMessagePart {
                             part: MessagePart::Text(caption.clone(), Default::default()),
-                            idx: None,
+                            idx: Some(0),
                             ext: None,
                         });
                     }
