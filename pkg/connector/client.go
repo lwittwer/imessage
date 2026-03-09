@@ -2121,7 +2121,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		return nil, fmt.Errorf("failed to download media: %w", err)
 	}
 
-	fileName := msg.Content.Body
+	fileName := msg.Content.FileName
+	if fileName == "" {
+		fileName = msg.Content.Body
+	}
 	if fileName == "" {
 		fileName = "file"
 	}
@@ -2183,7 +2186,14 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	_ = matrixEdited
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart)
+
+	// When FileName is set, Body contains the caption text rather than the filename.
+	var caption *string
+	if msg.Content.FileName != "" && msg.Content.Body != "" {
+		caption = &msg.Content.Body
+	}
+
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
