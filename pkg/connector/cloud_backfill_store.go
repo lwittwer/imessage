@@ -1754,30 +1754,47 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 	return exists, nil
 }
 
-// getConversationReadByMe returns true if the portal has no unread incoming
-// messages — i.e., the user has read the entire conversation on the iMessage
-// side. This is approximated by checking if any incoming messages exist that
-// are newer than the latest outgoing message (if we sent a reply, we must have
-// read everything before it). Returns false if there are no incoming messages.
+// getConversationReadByMe returns true when the most recent non-tapback message
+// in the conversation was sent by the user (is_from_me=true), meaning the user
+// has read everything in the thread. If there are no messages in the local
+// store, falls back to checking for a non-filtered cloud_chat row (portals with
+// chat metadata but no stored messages are treated as read).
+// Filtered (junk) chats and portals with no cloud_chat metadata are left unread.
+//
+// Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	// Strategy: if the newest message in the portal is from_me, the user has
-	// seen the conversation. If the newest is NOT from_me, they might not have.
-	// This is a heuristic — CloudKit doesn't store "I read their message".
+	// Primary check: direction of the most recent non-tapback message.
+	// Reactions (tapback_type IS NOT NULL) are excluded: an incoming reaction
+	// to something you sent does not create an unread state. The filter finds
+	// the last substantive message and uses its direction as the read signal.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
-		SELECT is_from_me
-		FROM cloud_message
+		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-		ORDER BY timestamp_ms DESC, guid DESC
+		  AND tapback_type IS NULL
+		ORDER BY timestamp_ms DESC, rowid DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
-	if err == sql.ErrNoRows {
-		return false, nil
+	if err == nil {
+		// Latest message direction determines read state:
+		// outgoing → user has read the conversation; incoming → leave unread.
+		return isFromMe, nil
+	} else if err != sql.ErrNoRows {
+		return false, err
 	}
+	// No messages in the local store — fall back to checking for a
+	// non-filtered cloud_chat row. Portals with chat metadata but no
+	// stored messages are treated as read.
+	var count int
+	err = s.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		  AND COALESCE(is_filtered, 0) = 0
+	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
 	}
-	return isFromMe, nil
+	return count > 0, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
