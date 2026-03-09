@@ -30,6 +30,11 @@ import (
 // Increment this to trigger a token clear on the next bootstrap.
 const cloudSyncVersion = 4
 
+// maxCloudSyncPages is the upper bound on CloudKit pagination loops.
+// Each CloudKit zone sync (messages, chats, attachments) breaks after this many
+// pages so a runaway response can never loop forever.
+const maxCloudSyncPages = 10000
+
 // cloudChatSyncVersion is bumped when chat-specific sync logic changes in a
 // way that requires a one-time full re-download of the chatManateeZone only
 // (not messages). This avoids the expensive message re-download that
@@ -189,9 +194,9 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	ctx := context.Background()
 
-	// Use bridge_id-scoped query (matches refreshAllGhosts pattern).
+	// Use bridge_id-scoped query and fetch the current name for diff-gating.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id FROM ghost WHERE bridge_id=$1",
+		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -200,24 +205,28 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	defer rows.Close()
 
-	var ghostIDs []networkid.UserID
+	type ghostEntry struct {
+		id   networkid.UserID
+		name string
+	}
+	var ghosts []ghostEntry
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			log.Err(err).Msg("Failed to scan ghost ID")
 			continue
 		}
-		ghostIDs = append(ghostIDs, networkid.UserID(id))
+		ghosts = append(ghosts, ghostEntry{networkid.UserID(id), name})
 	}
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
 	}
 
 	updated := 0
-	for _, ghostID := range ghostIDs {
+	for _, g := range ghosts {
 		// Skip ghosts with no matching contact (efficiency: avoids loading
 		// the full ghost object for participants who aren't in the address book).
-		localID := stripIdentifierPrefix(string(ghostID))
+		localID := stripIdentifierPrefix(string(g.id))
 		if localID == "" {
 			continue
 		}
@@ -225,9 +234,22 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if contact == nil || !contact.HasName() {
 			continue
 		}
-		ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostID)
+		// Diff-gate: compute the expected displayname and skip if it matches
+		// the stored name. This prevents unnecessary Matrix profile update API
+		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
+		// UpdateInfo always makes an API call; diffing here is our only guard).
+		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
+		if g.name == expectedName {
+			continue
+		}
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
 		if err != nil || ghost == nil {
-			log.Warn().Err(err).Str("ghost_id", string(ghostID)).Msg("Failed to load ghost for name refresh")
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
 			continue
 		}
 		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
@@ -239,7 +261,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		ghost.UpdateInfo(ctx, info)
 		updated++
 	}
-	log.Info().Int("updated", updated).Int("total", len(ghostIDs)).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
@@ -773,7 +795,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	consecutiveErrors := 0
 	const maxConsecutiveAttErrors = 3
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -846,7 +868,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	totalPages := 0
 	consecutiveErrors := 0
 	const maxConsecutiveChatErrors = 3
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -905,41 +927,34 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	return counts, token, nil
 }
 
-// safeCloudSyncMessages wraps the FFI call with panic recovery.
+// safeFFICall wraps an FFI call with panic recovery.
 // UniFFI deserialization panics on malformed buffers; this prevents bridge crashes.
-func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncMessagesPage, err error) {
+func safeFFICall[T any](name string, fn func() (T, error)) (result T, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncMessages").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncMessages: %v", r)
+			log.Error().Str("ffi_method", name).Str("stack", string(debug.Stack())).Msgf("FFI panic recovered: %v", r)
+			err = fmt.Errorf("FFI panic in %s: %v", name, r)
 		}
 	}()
-	return client.CloudSyncMessages(token)
+	return fn()
 }
 
-// safeCloudSyncChats wraps the FFI call with panic recovery.
-func safeCloudSyncChats(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncChatsPage, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncChats").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncChats: %v", r)
-		}
-	}()
-	return client.CloudSyncChats(token)
+func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncMessagesPage, error) {
+	return safeFFICall("CloudSyncMessages", func() (rustpushgo.WrappedCloudSyncMessagesPage, error) {
+		return client.CloudSyncMessages(token)
+	})
 }
 
-// safeCloudSyncAttachments wraps the FFI call with panic recovery.
-func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncAttachmentsPage, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncAttachments").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncAttachments: %v", r)
-		}
-	}()
-	return client.CloudSyncAttachments(token)
+func safeCloudSyncChats(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncChatsPage, error) {
+	return safeFFICall("CloudSyncChats", func() (rustpushgo.WrappedCloudSyncChatsPage, error) {
+		return client.CloudSyncChats(token)
+	})
+}
+
+func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+	return safeFFICall("CloudSyncAttachments", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+		return client.CloudSyncAttachments(token)
+	})
 }
 
 func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {
@@ -957,7 +972,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 3
 	totalPages := 0
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
