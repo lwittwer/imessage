@@ -189,9 +189,9 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	ctx := context.Background()
 
-	// Use bridge_id-scoped query (matches refreshAllGhosts pattern).
+	// Use bridge_id-scoped query and fetch the current name for diff-gating.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id FROM ghost WHERE bridge_id=$1",
+		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -200,14 +200,18 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	defer rows.Close()
 
-	var ghostIDs []networkid.UserID
+	type ghostEntry struct {
+		id   networkid.UserID
+		name string
+	}
+	var ghosts []ghostEntry
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			log.Err(err).Msg("Failed to scan ghost ID")
 			continue
 		}
-		ghostIDs = append(ghostIDs, networkid.UserID(id))
+		ghosts = append(ghosts, ghostEntry{networkid.UserID(id), name})
 	}
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
@@ -215,10 +219,10 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	rows.Close()
 
 	updated := 0
-	for _, ghostID := range ghostIDs {
+	for _, g := range ghosts {
 		// Skip ghosts with no matching contact (efficiency: avoids loading
 		// the full ghost object for participants who aren't in the address book).
-		localID := stripIdentifierPrefix(string(ghostID))
+		localID := stripIdentifierPrefix(string(g.id))
 		if localID == "" {
 			continue
 		}
@@ -226,9 +230,22 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if contact == nil || !contact.HasName() {
 			continue
 		}
-		ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostID)
+		// Diff-gate: compute the expected displayname and skip if it matches
+		// the stored name. This prevents unnecessary Matrix profile update API
+		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
+		// UpdateInfo always makes an API call; diffing here is our only guard).
+		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
+		if g.name == expectedName {
+			continue
+		}
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
 		if err != nil || ghost == nil {
-			log.Warn().Err(err).Str("ghost_id", string(ghostID)).Msg("Failed to load ghost for name refresh")
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
 			continue
 		}
 		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
@@ -240,7 +257,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		ghost.UpdateInfo(ctx, info)
 		updated++
 	}
-	log.Info().Int("updated", updated).Int("total", len(ghostIDs)).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
