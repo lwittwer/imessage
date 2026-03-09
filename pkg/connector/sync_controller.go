@@ -202,7 +202,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
 		`SELECT id, COALESCE(name, '') FROM ghost
 		 WHERE bridge_id=$1
-		    OR (bridge_id IS NULL AND name IS NULL
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
 		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
