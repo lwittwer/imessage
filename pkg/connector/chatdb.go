@@ -230,7 +230,6 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				Timestamp:        msg.Time.Add(time.Duration(i+1) * time.Millisecond),
 				StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
 			})
-
 		}
 	}
 

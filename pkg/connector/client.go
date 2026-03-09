@@ -3106,7 +3106,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					c.onForwardBackfillDone()
 					return
 				}
-
 				// Compute read state BEFORE markForwardBackfillDone, which may
 				// insert a synthetic cloud_chat row with is_filtered=0 default
 				// that would defeat the "no chat row → unread" safeguard.
