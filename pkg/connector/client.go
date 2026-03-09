@@ -3096,6 +3096,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Beeper clients display as "Read at [now]". Instead, rely on
 			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
+				// Skip read-state evaluation for portals that already completed
+				// their initial forward backfill. Delayed re-syncs (15s/60s/3min)
+				// and version-bump re-syncs should not send a read receipt that
+				// overrides the authoritative Matrix read state set by real-time
+				// APNs messages after initial backfill.
+				if cloudStoreDone.isForwardBackfillDone(context.Background(), portalID) {
+					cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+					c.onForwardBackfillDone()
+					return
+				}
 				// Compute read state BEFORE markForwardBackfillDone, which may
 				// insert a synthetic cloud_chat row with is_filtered=0 default
 				// that would defeat the "no chat row → unread" safeguard.
@@ -3499,9 +3509,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		}
 	}
 
-	// Live Photo handling: when HasAvid is true on an attachment, the download
-	// step will fetch both the lqa (HEIC still) and avid (video) from the same
-	// CloudKit record and return two BackfillMessages.
+	// Live Photo handling: when HasAvid is true on an attachment, only the lqa
+	// (HEIC still) is bridged. The avid (MOV video) is intentionally skipped.
 	if len(downloadable) == 0 {
 		return nil
 	}

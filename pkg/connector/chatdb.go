@@ -12,7 +12,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-
+	"image"
+	"image/jpeg"
 	"path/filepath"
 	"sort"
 	"strings"
