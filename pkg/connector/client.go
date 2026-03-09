@@ -1179,11 +1179,17 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	// Live Photo handling: bridge both the still image and the video.
+	// Live Photo handling: skip iris=true MOV companions; bridge only the HEIC still.
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
+		// Skip Live Photo MOV companions — only the HEIC still is bridged (mirrors
+		// CloudKit's avid-skip logic). For sent Live Photos the APNs echo delivers
+		// the MOV (iris=true); the HEIC arrives via CloudKit backfill.
+		if att.Iris {
 			continue
 		}
 		attID := msg.Uuid
