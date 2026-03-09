@@ -22,9 +22,10 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 const iMessageMaxFileSize = 2000 * 1024 * 1024 // 2 GB
+const capabilityID = "fi.mau.imessage.capabilities.2025_03"
 
 var caps = &event.RoomFeatures{
-	ID: "fi.mau.imessage.capabilities.2025_03",
+	ID: capabilityID,
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
 		event.FmtBold:   event.CapLevelDropped,
@@ -93,7 +94,7 @@ var capsDM *event.RoomFeatures
 func init() {
 	c := *caps
 	capsDM = &c
-	capsDM.ID = "fi.mau.imessage.capabilities.2025_03+dm"
+	capsDM.ID = capabilityID + "+dm"
 }
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{
