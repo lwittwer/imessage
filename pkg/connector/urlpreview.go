@@ -17,12 +17,16 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-// ogMetaRegex matches <meta property="og:..." content="..."> in either attribute order,
-// supporting both single and double quoted attribute values.
+// ogMetaRegex matches <meta property="og:..." content="..."> in either
+// attribute order. Double-quoted values only — virtually all og: tags use
+// double quotes, and separating quote types avoids apostrophes in content
+// (e.g. content="It's happening") from terminating the match early.
+//
+// Group 1 = og property name, Group 2 = content value in both alternations.
 var ogMetaRegex = regexp.MustCompile(
-	`(?i)<meta\s+[^>]*(?:property|name)=["']og:([^"']+)["'][^>]*content=["']([^"']*)["'][^>]*/?>` +
+	`(?i)<meta\s+[^>]*(?:property|name)="og:([^"]+)"[^>]*content="([^"]*)"[^>]*/?\s*>` +
 		`|` +
-		`(?i)<meta\s+[^>]*content=["']([^"']*)["'][^>]*(?:property|name)=["']og:([^"']+)["'][^>]*/?>`,
+		`(?i)<meta\s+[^>]*content="([^"]*)"[^>]*(?:property|name)="og:([^"]+)"[^>]*/?\s*>`,
 )
 
 // fetchURLPreview builds a BeeperLinkPreview by fetching the target URL's Open Graph
@@ -170,8 +174,10 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 	for _, match := range ogMetaRegex.FindAllStringSubmatch(htmlStr, -1) {
 		var prop, content string
 		if match[1] != "" {
+			// First alternation: property then content
 			prop, content = match[1], match[2]
 		} else {
+			// Second alternation: content then property (groups swapped)
 			prop, content = match[4], match[3]
 		}
 		prop = strings.ToLower(prop)
