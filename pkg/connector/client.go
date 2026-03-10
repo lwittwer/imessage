@@ -1954,12 +1954,10 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	log := zerolog.Ctx(ctx)
 	body := content.Body
 
-	// Explicit empty previews means the client disabled URL previews.
-	// Mirrors mautrix-whatsapp and telegramgo behavior.
-	if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
-		log.Debug().Msg("Client explicitly disabled link previews, sending plain text")
-		return body
-	}
+	// Note: we intentionally do NOT treat empty BeeperLinkPreviews ([]) as
+	// "explicitly disabled." Beeper sends [] when it can't generate a preview
+	// itself (e.g. bare domains like "x.com"), but our bridge has its own
+	// og: scraper that can often succeed. So we fall through to auto-detection.
 
 	// Priority 1: Explicit BeeperLinkPreviews from Matrix
 	if len(content.BeeperLinkPreviews) > 0 {
@@ -1976,11 +1974,12 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
 
-	// Priority 2: Auto-detect URL and fetch preview from homeserver
+	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
 	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
+		// Try homeserver preview first
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
 				title = lp.Title
@@ -1988,6 +1987,15 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+			}
+		}
+		// Fall back to our own og: scraping if homeserver didn't provide metadata
+		if title == "" && desc == "" {
+			ogData := fetchPageMetadata(ctx, fetchURL)
+			title = ogData["title"]
+			desc = ogData["description"]
+			if title != "" || desc != "" {
+				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
 			}
 		}
 		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
@@ -2023,11 +2031,12 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		}
 	}
 
-	// If the outbound message has a URL and the client didn't explicitly manage
-	// preview state, add com.beeper.linkpreviews so Beeper renders it.
-	// nil means the client didn't set previews at all; empty slice means
-	// explicitly disabled (mirrors mautrix-whatsapp / telegramgo semantics).
-	if msg.Content.BeeperLinkPreviews == nil {
+	// If the outbound message has a URL and the client didn't provide previews,
+	// add com.beeper.linkpreviews so Beeper renders it. Fire the double puppet
+	// edit for both nil (field omitted) and empty slice (client couldn't preview)
+	// since the bridge has its own og: scraper that can often succeed where
+	// the client couldn't.
+	if len(msg.Content.BeeperLinkPreviews) == 0 {
 		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" && isLikelyURL(detectedURL) {
 			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
 		}
