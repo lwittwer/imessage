@@ -57,31 +57,9 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 			if preview.Title == "" {
 				preview.Title = targetURL
 			}
-			// If homeserver returned an image, re-upload it through the intent
-			// so it gets encrypted for E2EE rooms (the homeserver's mxc:// URL
-			// is a plain upload that won't work in encrypted rooms).
-			if preview.ImageURL != "" && intent != nil {
-				data, err := bridge.Bot.DownloadMedia(ctx, preview.ImageURL, nil)
-				if err == nil && len(data) > 0 {
-					mime := preview.ImageType
-					if mime == "" {
-						mime = "image/jpeg"
-					}
-					mxcURL, encFile, err := intent.UploadMedia(ctx, roomID, data, "preview", mime)
-					if err == nil {
-						if encFile != nil {
-							preview.ImageEncryption = encFile
-							preview.ImageURL = encFile.URL
-						} else {
-							preview.ImageURL = mxcURL
-						}
-						return preview
-					}
-					log.Debug().Err(err).Msg("Failed to re-upload homeserver preview image")
-				} else if err != nil {
-					log.Debug().Err(err).Msg("Failed to download homeserver preview image for re-upload")
-				}
-				// Fall through to og: scraping if re-upload failed
+			// If homeserver already returned an image, we're done
+			if preview.ImageURL != "" {
+				return preview
 			}
 		}
 	}
