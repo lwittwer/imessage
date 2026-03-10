@@ -1,7 +1,6 @@
 package connector
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -173,8 +172,10 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 	}
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Note: Do NOT set Accept-Encoding manually. Go's Transport automatically
+	// handles gzip and transparently decompresses. Setting it explicitly
+	// disables auto-decompression, causing us to read raw gzip bytes.
 
 	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
@@ -186,20 +187,9 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 		return result
 	}
 
-	// Handle gzip-compressed responses
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return result
-		}
-		defer gr.Close()
-		reader = gr
-	}
-
 	// Read first 512KB — og: meta tags should be in <head> but some sites
 	// (e.g. CNN) inline hundreds of KB of CSS/JS before their meta tags.
-	data, _ := io.ReadAll(io.LimitReader(reader, 512*1024))
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if len(data) == 0 {
 		return result
 	}
