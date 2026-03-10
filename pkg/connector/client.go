@@ -20,6 +20,7 @@ import (
 	"image"
 	"image/jpeg"
 	"math"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -76,7 +77,6 @@ type failedAttachmentEntry struct {
 }
 
 const maxAttachmentRetries = 3
-const sendMessageTimeout = 60 * time.Second
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
@@ -1949,6 +1949,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	body := content.Body
 
 	// Explicit empty previews means the client disabled URL previews.
+	// Mirrors mautrix-whatsapp and telegramgo behavior.
 	if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
 		log.Debug().Msg("Client explicitly disabled link previews, sending plain text")
 		return body
@@ -1957,46 +1958,27 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	// Priority 1: Explicit BeeperLinkPreviews from Matrix
 	if len(content.BeeperLinkPreviews) > 0 {
 		lp := content.BeeperLinkPreviews[0]
-		matched := sanitizeRichLinkURL(lp.MatchedURL)
-		canonical := sanitizeRichLinkURL(lp.CanonicalURL)
-		if matched == "" {
-			matched = sanitizeRichLinkURL(urlRegex.FindString(body))
-		}
-		if matched == "" && canonical != "" {
-			matched = canonical
-		}
-		if canonical == "" && matched != "" {
-			canonical = normalizeURL(matched)
-		} else if canonical != "" {
-			canonical = normalizeURL(canonical)
-		}
-		if matched != "" {
-			title := sanitizeRichLinkSidebandField(lp.Title)
-			description := sanitizeRichLinkSidebandField(lp.Description)
-			log.Debug().
-				Str("matched_url", matched).
-				Str("canonical_url", canonical).
-				Str("title", title).
-				Msg("Encoding Beeper link preview for iMessage")
-			return "\x00RL\x01" + matched + "\x01" + canonical + "\x01" + title + "\x01" + description + "\x00" + body
+		canonical := lp.CanonicalURL
+		if canonical == "" {
+			canonical = lp.MatchedURL
 		}
 		log.Debug().
 			Str("matched_url", lp.MatchedURL).
-			Str("canonical_url", lp.CanonicalURL).
+			Str("canonical_url", canonical).
 			Str("title", lp.Title).
-			Msg("Skipping malformed Beeper link preview (missing URL), sending plain text")
-		return body
+			Msg("Encoding Beeper link preview for iMessage")
+		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
 
 	// Priority 2: Auto-detect URL and fetch preview from homeserver
-	if detectedURL := urlRegex.FindString(body); detectedURL != "" {
+	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
-				title = sanitizeRichLinkSidebandField(lp.Title)
-				desc = sanitizeRichLinkSidebandField(lp.Description)
+				title = lp.Title
+				desc = lp.Description
 				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
@@ -2006,59 +1988,6 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	}
 
 	return body
-}
-
-func sanitizeRichLinkSidebandField(value string) string {
-	value = strings.ReplaceAll(value, "\x00", " ")
-	value = strings.ReplaceAll(value, "\x01", " ")
-	return strings.TrimSpace(value)
-}
-
-func sanitizeRichLinkURL(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.ReplaceAll(value, "\x00", "")
-	value = strings.ReplaceAll(value, "\x01", "")
-	if value == "" {
-		return ""
-	}
-	return urlRegex.FindString(value)
-}
-
-func safeSendMessage(ctx context.Context, client *rustpushgo.Client, conv rustpushgo.WrappedConversation, text, handle string, replyGuid, replyPart *string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	type sendResult struct {
-		uuid string
-		err  error
-	}
-	ch := make(chan sendResult, 1)
-	go func() {
-		var res sendResult
-		defer func() {
-			if r := recover(); r != nil {
-				stack := string(debug.Stack())
-				log.Error().Str("ffi_method", "SendMessage").
-					Str("stack", stack).
-					Msgf("FFI panic recovered: %v", r)
-				res = sendResult{err: fmt.Errorf("FFI panic in SendMessage: %v", r)}
-			}
-			ch <- res
-		}()
-		uuid, err := client.SendMessage(conv, text, handle, replyGuid, replyPart)
-		res = sendResult{uuid: uuid, err: err}
-	}()
-	select {
-	case res := <-ch:
-		return res.uuid, res.err
-	case <-time.After(sendMessageTimeout):
-		log.Error().Str("ffi_method", "SendMessage").
-			Dur("timeout", sendMessageTimeout).
-			Msg("SendMessage timed out — inner goroutine leaked until FFI unblocks")
-		return "", fmt.Errorf("SendMessage timed out after %s", sendMessageTimeout)
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
 }
 
 func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
@@ -2076,7 +2005,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := safeSendMessage(ctx, c.client, conv, textToSend, c.handle, replyGuid, replyPart)
+	uuid, err := c.client.SendMessage(conv, textToSend, c.handle, replyGuid, replyPart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -2090,8 +2019,10 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	// If the outbound message has a URL and the client didn't explicitly manage
 	// preview state, add com.beeper.linkpreviews so Beeper renders it.
+	// nil means the client didn't set previews at all; empty slice means
+	// explicitly disabled (mirrors mautrix-whatsapp / telegramgo semantics).
 	if msg.Content.BeeperLinkPreviews == nil {
-		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" {
+		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" && isLikelyURL(detectedURL) {
 			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
 		}
 	}
@@ -2383,7 +2314,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
-		uuid, err := safeSendMessage(ctx, c.client, conv, reactionText, c.handle, &targetGUID, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
@@ -2427,7 +2358,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
-		uuid, err := safeSendMessage(ctx, c.client, conv, reactionText, c.handle, &targetGUID, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
 		if err != nil {
 			return err
 		}
@@ -6276,6 +6207,55 @@ func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 // urlRegex matches URLs in message text for rich link matching.
 // Matches explicit schemes (https://...) and bare domains (example.com, example.com/path).
 var urlRegex = regexp.MustCompile(`(?:https?://\S+|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/\S*)?)`)
+
+// isLikelyURL validates that a regex-matched string is actually a URL and not
+// a filename or other dotted identifier. Uses url.Parse for validation,
+// mirroring mautrix-whatsapp's approach. Bare domains (google.com, www.example.com)
+// are accepted as long as they parse as valid URLs with a real host.
+func isLikelyURL(s string) bool {
+	normalized := s
+	if !strings.HasPrefix(normalized, "http://") && !strings.HasPrefix(normalized, "https://") {
+		normalized = "https://" + normalized
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	// Must have at least one dot (rules out bare words).
+	dot := strings.LastIndex(host, ".")
+	if dot < 0 {
+		return false
+	}
+	tld := strings.ToLower(host[dot+1:])
+	if tld == "" {
+		return false
+	}
+	// Reject common file extensions that the greedy bare-domain regex matches
+	// (e.g. "config.yaml", "main.go", "notes.txt"). Only applied when the
+	// original string had no scheme — explicit http(s):// URLs are always trusted.
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") && parsed.Path == "" {
+		switch tld {
+		case "go", "rs", "py", "rb", "js", "ts", "tsx", "jsx", "sh", "bash", "zsh",
+			"c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "scala", "swift",
+			"m", "mm", "pl", "pm", "r", "lua", "zig", "v", "d", "ex", "exs",
+			"md", "txt", "log", "csv", "tsv", "diff", "patch",
+			"json", "yaml", "yml", "toml", "xml", "ini", "cfg", "conf",
+			"html", "css", "scss", "less", "sass",
+			"png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "ico", "tiff",
+			"mp3", "mp4", "wav", "flac", "ogg", "avi", "mkv", "mov", "webm",
+			"zip", "tar", "gz", "bz2", "xz", "rar", "7z",
+			"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+			"lock", "sum", "mod", "bak", "tmp", "swp", "o", "so", "dylib", "a",
+			"wasm", "bin", "exe", "dll", "dmg", "iso", "img", "apk", "ipa":
+			return false
+		}
+	}
+	return true
+}
 
 // normalizeURL ensures a URL has a scheme for HTTP fetching.
 func normalizeURL(u string) string {
