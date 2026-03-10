@@ -4273,7 +4273,10 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 
 	// Query all ghost IDs from the bridge database.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id FROM ghost WHERE bridge_id=$1",
+		`SELECT id FROM ghost
+		 WHERE bridge_id=$1
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
+		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
