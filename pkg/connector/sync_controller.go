@@ -1245,17 +1245,22 @@ var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 // Rule 3: Messages create conversations. Never discard a message because
 //         we haven't seen the chat record yet.
 func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.WrappedCloudSyncMessage) string {
-	// Check if chat_id is a UUID (= group conversation)
-	if msg.CloudChatId != "" && uuidPattern.MatchString(msg.CloudChatId) {
-		return "gid:" + strings.ToLower(msg.CloudChatId)
-	}
-
-	// Try to look up the chat record for non-UUID chat_ids
-	// (e.g., "iMessage;-;+16692858317" or "chat12345...")
+	// Try chat record lookup FIRST. The cloud_chat table stores the
+	// authoritative portal_id (computed from style + participants by
+	// resolvePortalIDForCloudChat). This correctly handles DMs, self-chat,
+	// and groups — even when CloudChatId is a UUID that could be mistaken
+	// for a group. The query matches by cloud_chat_id, record_name, or
+	// group_id, so UUID chat_ids match via the group_id column.
 	if msg.CloudChatId != "" {
 		if portalID, err := c.cloudStore.getChatPortalID(ctx, msg.CloudChatId); err == nil && portalID != "" {
 			return portalID
 		}
+	}
+
+	// Fallback: if no chat record exists yet, treat UUID chat_ids as groups.
+	// This handles messages that arrive before their chat record is synced.
+	if msg.CloudChatId != "" && uuidPattern.MatchString(msg.CloudChatId) {
+		return "gid:" + strings.ToLower(msg.CloudChatId)
 	}
 
 	// DM: derive from sender
@@ -1279,23 +1284,6 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 				resolved = c.resolveExistingDMPortalID(string(resolved))
 				return string(resolved)
 			}
-		}
-	}
-
-	// Self-chat (Notes to Self): is_from_me messages where CloudChatId is in
-	// "chat<numeric>" format (not service;-;handle). If sender is our own
-	// handle, route to self-chat portal using our primary handle.
-	if msg.IsFromMe {
-		if msg.Sender != "" {
-			normalized := normalizeIdentifierForPortalID(msg.Sender)
-			if normalized != "" && c.isMyHandle(normalized) {
-				return normalized
-			}
-		}
-		// Sender may be empty for is_from_me; use our primary handle.
-		normalized := normalizeIdentifierForPortalID(c.handle)
-		if normalized != "" {
-			return normalized
 		}
 	}
 
