@@ -1282,6 +1282,23 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 		}
 	}
 
+	// Self-chat (Notes to Self): is_from_me messages where CloudChatId is in
+	// "chat<numeric>" format (not service;-;handle). If sender is our own
+	// handle, route to self-chat portal using our primary handle.
+	if msg.IsFromMe {
+		if msg.Sender != "" {
+			normalized := normalizeIdentifierForPortalID(msg.Sender)
+			if normalized != "" && c.isMyHandle(normalized) {
+				return normalized
+			}
+		}
+		// Sender may be empty for is_from_me; use our primary handle.
+		normalized := normalizeIdentifierForPortalID(c.handle)
+		if normalized != "" {
+			return normalized
+		}
+	}
+
 	return ""
 }
 
