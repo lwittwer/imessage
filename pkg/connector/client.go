@@ -20,6 +20,7 @@ import (
 	"image"
 	"image/jpeg"
 	"math"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -1947,6 +1948,13 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	log := zerolog.Ctx(ctx)
 	body := content.Body
 
+	// Explicit empty previews means the client disabled URL previews.
+	// Mirrors mautrix-whatsapp and telegramgo behavior.
+	if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
+		log.Debug().Msg("Client explicitly disabled link previews, sending plain text")
+		return body
+	}
+
 	// Priority 1: Explicit BeeperLinkPreviews from Matrix
 	if len(content.BeeperLinkPreviews) > 0 {
 		lp := content.BeeperLinkPreviews[0]
@@ -1963,7 +1971,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	}
 
 	// Priority 2: Auto-detect URL and fetch preview from homeserver
-	if detectedURL := urlRegex.FindString(body); detectedURL != "" {
+	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
@@ -2009,10 +2017,12 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		}
 	}
 
-	// If the outbound message has a URL but no link previews from the client,
-	// edit the Matrix event to add com.beeper.linkpreviews so Beeper renders them.
-	if len(msg.Content.BeeperLinkPreviews) == 0 {
-		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" {
+	// If the outbound message has a URL and the client didn't explicitly manage
+	// preview state, add com.beeper.linkpreviews so Beeper renders it.
+	// nil means the client didn't set previews at all; empty slice means
+	// explicitly disabled (mirrors mautrix-whatsapp / telegramgo semantics).
+	if msg.Content.BeeperLinkPreviews == nil {
+		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" && isLikelyURL(detectedURL) {
 			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
 		}
 	}
@@ -6197,6 +6207,55 @@ func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 // urlRegex matches URLs in message text for rich link matching.
 // Matches explicit schemes (https://...) and bare domains (example.com, example.com/path).
 var urlRegex = regexp.MustCompile(`(?:https?://\S+|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/\S*)?)`)
+
+// isLikelyURL validates that a regex-matched string is actually a URL and not
+// a filename or other dotted identifier. Uses url.Parse for validation,
+// mirroring mautrix-whatsapp's approach. Bare domains (google.com, www.example.com)
+// are accepted as long as they parse as valid URLs with a real host.
+func isLikelyURL(s string) bool {
+	normalized := s
+	if !strings.HasPrefix(normalized, "http://") && !strings.HasPrefix(normalized, "https://") {
+		normalized = "https://" + normalized
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	// Must have at least one dot (rules out bare words).
+	dot := strings.LastIndex(host, ".")
+	if dot < 0 {
+		return false
+	}
+	tld := strings.ToLower(host[dot+1:])
+	if tld == "" {
+		return false
+	}
+	// Reject common file extensions that the greedy bare-domain regex matches
+	// (e.g. "config.yaml", "main.go", "notes.txt"). Only applied when the
+	// original string had no scheme — explicit http(s):// URLs are always trusted.
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") && parsed.Path == "" {
+		switch tld {
+		case "go", "rs", "py", "rb", "js", "ts", "tsx", "jsx", "sh", "bash", "zsh",
+			"c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "scala", "swift",
+			"m", "mm", "pl", "pm", "r", "lua", "zig", "v", "d", "ex", "exs",
+			"md", "txt", "log", "csv", "tsv", "diff", "patch",
+			"json", "yaml", "yml", "toml", "xml", "ini", "cfg", "conf",
+			"html", "css", "scss", "less", "sass",
+			"png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "ico", "tiff",
+			"mp3", "mp4", "wav", "flac", "ogg", "avi", "mkv", "mov", "webm",
+			"zip", "tar", "gz", "bz2", "xz", "rar", "7z",
+			"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+			"lock", "sum", "mod", "bak", "tmp", "swp", "o", "so", "dylib", "a",
+			"wasm", "bin", "exe", "dll", "dmg", "iso", "img", "apk", "ipa":
+			return false
+		}
+	}
+	return true
+}
 
 // normalizeURL ensures a URL has a scheme for HTTP fetching.
 func normalizeURL(u string) string {
