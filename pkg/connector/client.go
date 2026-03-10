@@ -5382,8 +5382,16 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// the portal ID might be an inactive number that rustpush can't send to.
 	sendTo := c.resolveSendTarget(portalID)
 
+	// For self-chats, only include one participant. Duplicating our own
+	// handle (e.g. [self, self]) causes rustpush to reject the message
+	// with NoValidTargets because all targets belong to the sender.
+	participants := []string{c.handle, sendTo}
+	if c.isMyHandle(sendTo) {
+		participants = []string{sendTo}
+	}
+
 	return rustpushgo.WrappedConversation{
-		Participants: []string{c.handle, sendTo},
+		Participants: participants,
 		IsSms:        isSms,
 	}
 }
