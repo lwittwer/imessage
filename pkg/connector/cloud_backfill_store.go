@@ -1258,6 +1258,27 @@ func (s *cloudBackfillStore) portalHasChat(ctx context.Context, portalID string)
 	return count > 0, nil
 }
 
+// portalIsExplicitlyDeleted returns true if the given portal_id has a
+// cloud_chat row with deleted=TRUE. This indicates the user or Apple
+// explicitly deleted the conversation; messages for such portals must not
+// be ingested during CloudKit sync (they would resurrect zombie portals).
+//
+// Unlike portalHasChat (which requires a live row), this returns false for
+// portals that simply have no cloud_chat row — e.g. recycle-bin-only chats
+// on a fresh sync whose chat record never appeared in the main zone. Those
+// portals are allowed through so their main-zone messages are stored.
+func (s *cloudBackfillStore) portalIsExplicitlyDeleted(ctx context.Context, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
+		s.loginID, portalID,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 type softDeletedPortalInfo struct {
 	NewestTS int64
 	Deleted  bool

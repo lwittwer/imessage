@@ -261,6 +261,29 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 					Msg("DELETE-SEED: failed to check live chat state for recoverable chat")
 			}
 
+			// If this portal already has messages in the main CloudKit zone (stored
+			// during Phase 2 message sync), it is a recycle-bin-only chat whose
+			// messages appeared in messageManateeZone — not a true deletion. Seed a
+			// live cloud_chat row so createPortalsFromCloudSync picks it up, and skip
+			// the tombstone entirely. This fixes fresh-backfill for chats that were
+			// deleted before the bridge's first ever sync (they appear in the recycle
+			// bin zone but their messages are still in the main zone).
+			if hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID); msgErr == nil && hasMessages {
+				dn := ""
+				if chat.DisplayName != nil {
+					dn = *chat.DisplayName
+				}
+				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, dn, "", chat.Participants)
+				log.Info().
+					Str("portal_id", portalID).
+					Str("record_name", chat.RecordName).
+					Msg("DELETE-SEED: recycle-bin chat has main-zone messages, seeding live chat row instead of tombstone")
+				continue
+			} else if msgErr != nil {
+				log.Warn().Err(msgErr).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to check portal messages for recoverable chat")
+			}
+
 			participantsJSON, err := json.Marshal(chat.Participants)
 			if err != nil {
 				log.Warn().Err(err).Str("portal_id", portalID).
@@ -1863,6 +1886,20 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 // uuidPattern matches a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// isNumericSuffix returns true if s is non-empty and contains only ASCII digits.
+// Used to identify CloudKit self-chat identifiers of the form "chat<digits>".
+func isNumericSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // resolveConversationID determines the canonical portal ID for a cloud message.
 //
 // Rule 1: If chat_id is a UUID → it's a group conversation → "gid:<lowercase-uuid>"
@@ -1938,7 +1975,23 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 	// determined. CloudKit uses unique "chat<numeric>" identifiers for self-chat
 	// instead of the user's phone number, so the handler above can't extract a
 	// valid recipient. Route to the user's own handle (Notes to Self portal).
+	//
+	// Guard: only fall back to self-chat when the CloudChatId looks like an
+	// actual self-chat identifier (empty, or starts with "chat" + digits).
+	// If it contains "@", ";", or matches UUID/phone patterns it belongs to a
+	// remote DM or group — return "" so the message is skipped rather than
+	// misrouted to self-chat. This prevents deleted/splintered remote-chat
+	// messages from polluting the Notes to Self portal.
 	if msg.IsFromMe {
+		chatID := msg.CloudChatId
+		// Require an explicit "chat<digits>" identifier to route to self-chat.
+		// Empty chat_id is too broad — from-me messages from any conversation can
+		// arrive with no chat_id and must be skipped rather than dumped into Notes
+		// to Self. Genuine Notes-to-Self messages use Apple's "chat<digits>" format.
+		isSelfChatID := strings.HasPrefix(strings.ToLower(chatID), "chat") && isNumericSuffix(chatID[4:])
+		if !isSelfChatID {
+			return ""
+		}
 		normalized := normalizeIdentifierForPortalID(c.handle)
 		if normalized != "" {
 			return normalized
@@ -2038,25 +2091,44 @@ func (c *IMClient) ingestCloudMessages(
 			continue
 		}
 
-		// Skip messages for portals with no active (non-deleted) cloud_chat
-		// record. This covers two cases:
-		//  1. Orphaned messages: CloudChatId is empty AND no chat record exists.
-		//     Apple omits filtered/junk chats from the chat zone entirely.
-		//  2. Soft-deleted chats: The user deleted the conversation (from Beeper
-		//     or Apple). The cloud_chat record has deleted=TRUE. We do NOT revive
-		//     it here — only explicit recovery (RecoverChat APNs, !restore-chat)
-		//     should un-delete a chat. CloudKit re-sync always re-delivers stale
-		//     messages for deleted chats; auto-reviving them causes zombie portals.
-		// Phase 1 (chat sync) always runs before Phase 2 (message sync), so
-		// all legitimate chats have records by the time we get here.
+		// Skip messages for portals that have been explicitly deleted/tombstoned.
+		// A cloud_chat row with deleted=TRUE means the user or Apple deleted this
+		// conversation. CloudKit re-sync always re-delivers stale messages for
+		// deleted chats; we must NOT revive them here — only explicit recovery
+		// (RecoverChat APNs, !restore-chat) should un-delete a portal.
+		//
+		// Portals with NO cloud_chat row at all are allowed through when the
+		// message has a non-empty CloudChatId. This covers recycle-bin-only chats
+		// on fresh backfill: the chat was deleted before the bridge's first sync
+		// so it never appeared in the main chat zone, but its messages are still
+		// in the main message zone. seedDeletedChatsFromRecycleBin (runs after
+		// this sync) seeds live cloud_chat rows for them.
 		if c.cloudStore != nil {
-			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && !hasChat {
+			if isTombstoned, err := c.cloudStore.portalIsExplicitlyDeleted(ctx, portalID); err == nil && isTombstoned {
 				log.Debug().
 					Str("guid", msg.Guid).
 					Str("portal_id", portalID).
 					Str("sender", msg.Sender).
 					Str("cloud_chat_id", msg.CloudChatId).
-					Msg("Skipping message for deleted/orphaned chat")
+					Msg("Skipping message for tombstoned/explicitly-deleted chat")
+				counts.Filtered++
+				continue
+			}
+		}
+
+		// Skip orphaned messages: no CloudChatId AND no cloud_chat record for the
+		// resolved portal. Apple omits filtered/junk chats from the chat zone
+		// entirely; messages from those chats have no chat_id and represent spam
+		// or unknown-sender conversations the user never sees in iMessage.
+		// Messages with a non-empty CloudChatId are allowed through even without
+		// a cloud_chat row — they may belong to recycle-bin-only chats.
+		if msg.CloudChatId == "" && c.cloudStore != nil {
+			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && !hasChat {
+				log.Debug().
+					Str("guid", msg.Guid).
+					Str("portal_id", portalID).
+					Str("sender", msg.Sender).
+					Msg("Skipping orphaned message (no chat_id, no chat record)")
 				counts.Filtered++
 				continue
 			}
