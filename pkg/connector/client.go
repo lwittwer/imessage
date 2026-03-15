@@ -2235,6 +2235,9 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	c.notifyRestoreStatus(opts, "Restoring **%s** — syncing iCloud history…", displayName)
 
 	// Stage 1: restore prerequisites (undelete + metadata seeding).
+	// Lock only covers DB mutations. Network I/O (metadata refresh,
+	// recycle bin recovery, Apple APNs) runs after unlock to avoid
+	// starving concurrent restores during slow CloudKit calls.
 	c.restoreMu.Lock()
 	if err := c.cloudStore.setRestoreOverride(ctx, portalID); err != nil {
 		log.Warn().Err(err).Msg("Failed to persist restore override")
@@ -2267,18 +2270,25 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	} else {
 		log.Info().Int("undeleted", undeleted).Msg("Undeleted cloud_message rows for restore")
 	}
-	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
-		c.refreshRecoveredChatMetadata(log, portalID, opts.Participants)
-	}
+	needsRecoverMessages := false
 	if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err != nil {
 		log.Warn().Err(err).Msg("Failed to check portal messages during restore")
 	} else if !hasMessages {
+		needsRecoverMessages = true
+	}
+	c.restoreMu.Unlock()
+
+	// Network I/O: refresh metadata and recover messages outside the mutex.
+	// The restorePipelines map already prevents per-portal concurrency.
+	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
+		c.refreshRecoveredChatMetadata(log, portalID, opts.Participants)
+	}
+	if needsRecoverMessages {
 		c.recoverMessagesFromRecycleBin(log, portalID, opts.Participants)
 	}
 	if opts.RecoverOnApple {
 		c.recoverChatOnApple(portalID)
 	}
-	c.restoreMu.Unlock()
 
 	// Stage 2: Attempt to import CloudKit message history.
 	//
@@ -2292,6 +2302,22 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	// resolveConversationID. When cloud_chat rows for other portals are
 	// soft-deleted at that moment, from-me messages can be misrouted to the
 	// self-chat portal, corrupting it.
+
+	// Create a context that cancels on shutdown so CloudKit fetches
+	// are bounded and interruptible.
+	fetchCtx, fetchCancel := context.WithCancel(context.Background())
+	defer fetchCancel()
+	if c.stopChan != nil {
+		stopCh := c.stopChan
+		go func() {
+			select {
+			case <-stopCh:
+				fetchCancel()
+			case <-fetchCtx.Done():
+			}
+		}()
+	}
+
 	const maxRestoreAttempts = 4
 	historyImported := false
 	for attempt := range maxRestoreAttempts {
@@ -2300,14 +2326,21 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 			c.notifyRestoreStatus(opts, "Restore for **%s** is still syncing. Retrying in %s.", displayName, delay.Round(time.Second))
 			select {
 			case <-time.After(delay):
-			case <-c.stopChan:
-				log.Info().Int("attempt", attempt).Msg("Restore pipeline stopped during retry wait; recreating portal with whatever is available")
-				// Fall through to the unconditional resync below.
-				goto recreate
+			case <-fetchCtx.Done():
+				log.Info().Int("attempt", attempt).Msg("Restore pipeline stopped during retry wait")
+			}
+			if fetchCtx.Err() != nil {
+				break
 			}
 		}
 
-		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(log.With().Int("attempt", attempt+1).Logger(), portalID)
+		attemptCtx, attemptCancel := context.WithTimeout(fetchCtx, 2*time.Minute)
+		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID)
+		attemptCancel()
+
+		if fetchCtx.Err() != nil {
+			break
+		}
 		if importErr != nil {
 			log.Warn().Err(importErr).Int("attempt", attempt+1).Msg("Targeted restore fetch failed")
 		} else if imported > 0 {
@@ -2355,7 +2388,13 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		}
 	}
 
-recreate:
+	// If shutdown was the reason we exited the retry loop, don't create
+	// portals or send messages — just exit cleanly.
+	if fetchCtx.Err() != nil {
+		log.Info().Msg("Restore pipeline: shutdown detected, skipping portal recreation")
+		return
+	}
+
 	// Always recreate the portal regardless of whether we found history.
 	// The old code always did this — without it, a failed/delayed fetch means
 	// the portal never comes back at all. The normal CloudKit sync will
@@ -2772,7 +2811,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 // fetchAndResyncRecoveredChat fetches messages from CloudKit for a recovered
 // chat, imports them into the local cache, then queues ChatResync.
 func (c *IMClient) fetchAndResyncRecoveredChat(log zerolog.Logger, portalKey networkid.PortalKey, portalID string) {
-	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(log, portalID)
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to import CloudKit messages for recovered chat")
 	} else {
@@ -2814,15 +2853,13 @@ func (c *IMClient) safeCloudFetchRecent(log zerolog.Logger, chatID *string, maxP
 // imports matched rows into cloud_message for the given portal.
 // Returns (importedCount, diagnostic, error). diagnostic is non-nil when the
 // unfiltered fallback ran (all targeted fetches returned 0).
-func (c *IMClient) fetchRecoveredMessagesFromCloudKit(log zerolog.Logger, portalID string) (int, *restoreFetchDiagnostic, error) {
+func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string) (int, *restoreFetchDiagnostic, error) {
 	if c.cloudStore == nil {
 		return 0, nil, fmt.Errorf("cloud store not initialized")
 	}
 	if c.client == nil {
 		return 0, nil, fmt.Errorf("rustpush client not initialized")
 	}
-
-	ctx := context.Background()
 
 	// Resolve the CloudKit chat_id for this portal.
 	cloudChatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID)
@@ -2886,7 +2923,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(log zerolog.Logger, portal
 
 	var matched []rustpushgo.WrappedCloudSyncMessage
 	tryTargetedFetch := func(chatID string) {
-		if chatID == "" {
+		if chatID == "" || ctx.Err() != nil {
 			return
 		}
 		chatIDCopy := chatID
@@ -2940,6 +2977,9 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(log zerolog.Logger, portal
 	}
 
 	var diag *restoreFetchDiagnostic
+	if len(matched) == 0 && ctx.Err() != nil {
+		return 0, nil, ctx.Err()
+	}
 	if len(matched) == 0 {
 		log.Info().Str("portal_id", portalID).
 			Msg("All targeted fetches returned 0 — falling back to unfiltered CloudFetchRecentMessages")
