@@ -2360,7 +2360,30 @@ recreate:
 	// The old code always did this — without it, a failed/delayed fetch means
 	// the portal never comes back at all. The normal CloudKit sync will
 	// backfill history when messages become available in the main zone.
-	c.refreshRecoveredPortalAfterCloudSync(log, portalKey, opts.Source)
+	//
+	// When no history was imported, send a bot notice into the restored room
+	// so the user sees the chat in Beeper (empty rooms may be hidden) and
+	// understands why there's no message history.
+	var postCreate func(context.Context, *bridgev2.Portal)
+	if !historyImported {
+		postCreate = func(ctx context.Context, portal *bridgev2.Portal) {
+			if portal == nil || portal.MXID == "" {
+				return
+			}
+			notice := "Chat restored from iCloud. No message history was available — messages may have expired from Apple's recycle bin."
+			_, err := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    notice,
+				},
+			}, nil)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", string(portal.ID)).
+					Msg("Failed to send empty-restore notice to room")
+			}
+		}
+	}
+	c.queueRecoveredPortalResync(log, portalKey, opts.Source, postCreate)
 	if historyImported {
 		c.notifyRestoreStatus(opts, "Restore of **%s** complete — history backfill is running.", displayName)
 	} else {
@@ -3026,7 +3049,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(log zerolog.Logger, portal
 	return len(rows), diag, nil
 }
 
-func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string) {
+func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, postCreate func(context.Context, *bridgev2.Portal)) {
 	portalID := string(portalKey.ID)
 
 	// Use the newest BACKFILLABLE content timestamp. Placeholder rows from
@@ -3059,6 +3082,7 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 			LogContext: func(lc zerolog.Context) zerolog.Context {
 				return lc.Str("source", source)
 			},
+			PostHandleFunc: postCreate,
 		},
 		GetChatInfoFunc: c.GetChatInfo,
 		LatestMessageTS: latestMessageTS,
@@ -3066,7 +3090,7 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 }
 
 func (c *IMClient) refreshRecoveredPortalAfterCloudSync(log zerolog.Logger, portalKey networkid.PortalKey, source string) {
-	c.queueRecoveredPortalResync(log, portalKey, source)
+	c.queueRecoveredPortalResync(log, portalKey, source, nil)
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
