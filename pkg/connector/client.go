@@ -1938,10 +1938,54 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 }
 
+func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	deleteType := "MoveToRecycleBin"
+	if msg.IsPermanentDelete {
+		deleteType = "PermanentDelete"
+	}
+
+	log.Info().
+		Str("delete_type", deleteType).
+		Int("uuid_count", len(msg.DeleteMessageUuids)).
+		Msg("Processing per-message delete")
+
+	for _, targetUUID := range msg.DeleteMessageUuids {
+		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
+		if portalKey.ID == "" {
+			log.Debug().
+				Str("target_uuid", targetUUID).
+				Msg("Message UUID not found in bridge DB, skipping")
+			continue
+		}
+
+		log.Info().
+			Str("target_uuid", targetUUID).
+			Str("portal_id", string(portalKey.ID)).
+			Msg("Sending redaction for deleted message")
+
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventMessageRemove,
+				PortalKey: portalKey,
+				Sender:    c.makeEventSender(msg.Sender),
+				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
+			},
+			TargetMessage: makeMessageID(targetUUID),
+		})
+	}
+}
+
 func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	deleteType := "MoveToRecycleBin"
 	if msg.IsPermanentDelete {
 		deleteType = "PermanentDelete"
+	}
+
+	// Per-message delete: DeleteMessageUuids is populated, chat-level fields are empty.
+	// Route to handleMessageDelete which does per-message redaction via the bridge DB.
+	if len(msg.DeleteMessageUuids) > 0 {
+		c.handleMessageDelete(log, msg)
+		return
 	}
 
 	// chatdb backend: preserve master behavior — ignore Apple-initiated deletes.
