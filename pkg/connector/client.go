@@ -4928,6 +4928,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	// otherwise fall back to QueueRemoteEvent.
 	for _, row := range tapbackRows {
 		sender := c.makeCloudSender(row)
+		sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 		if sender.Sender == "" && !sender.IsFromMe {
 			continue
 		}
@@ -4967,6 +4968,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
 	sender := c.makeCloudSender(row)
+	sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 	ts := time.UnixMilli(row.TimestampMS)
 
 	// Skip messages with no resolvable sender. These are typically iMessage
