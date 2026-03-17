@@ -122,7 +122,7 @@ pub struct IMClient {
 
 impl IMClient {
     pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSNGMIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
-        let interest = conn.request_topics(vec!["com.apple.private.alloy.sms", "com.apple.madrid"]).await;
+        let interest = conn.request_topics(vec!["com.apple.private.alloy.sms", "com.apple.private.alloy.gelato", "com.apple.madrid"]).await;
         let _ = Self::setup_conn(&conn).await;
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -200,7 +200,7 @@ impl IMClient {
                 certified_context: None,
             }))
         }
-        if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
+        if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms", "com.apple.private.alloy.gelato"]).await? {
             let recieved = self.process_msg(received).await;
             if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
             recieved

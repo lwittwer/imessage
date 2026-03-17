@@ -870,7 +870,6 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		Str("component", "imessage").
 		Str("msg_uuid", msg.Uuid).
 		Logger()
-
 	// Send delivery receipt if requested
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
 		go func() {
@@ -1047,11 +1046,21 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// for messages that CloudKit already bridged. Check the Bridge DB for any
 	// message whose UUID is already known to prevent duplicates.
 	if msg.Uuid != "" {
+		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
-			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
-			return
+			// Only skip if the existing message is in the SAME portal.
+			// Apple's SMS relay can reuse UUIDs across different short-code
+			// conversations, causing false-positive dedup drops.
+			if dbMsgs[0].Room.ID == portalKey.ID {
+				log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
+				return
+			}
+			log.Info().Str("uuid", msg.Uuid).
+				Str("existing_portal", string(dbMsgs[0].Room.ID)).
+				Str("new_portal", string(portalKey.ID)).
+				Msg("UUID collision across portals — allowing message through")
 		}
 		// Also check for UUID_* suffix variants (e.g. UUID_att0, UUID_att1, UUID_avid).
 		// Two past regressions left image messages in the bridge DB with suffixed
@@ -5088,6 +5097,23 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	evtType := bridgev2.RemoteEventReaction
 	if isRemove {
 		evtType = bridgev2.RemoteEventReactionRemove
+	}
+
+	// Pre-filter: skip reactions already in the bridge DB to avoid flooding
+	// the portal event channel with no-op duplicates on every restart.
+	// CloudKit re-imports all reactions on bootstrap, but the bridge framework's
+	// dedup (handleRemoteReaction) processes them sequentially through the
+	// portal event channel — 2000+ duplicate reactions can block real messages
+	// for minutes. Checking the reaction table here is a cheap PK lookup that
+	// prevents the queue from filling with known duplicates.
+	if !isRemove {
+		targetMsgID := makeMessageID(targetGUID)
+		existing, err := c.Main.Bridge.DB.Reaction.GetByIDWithoutMessagePart(
+			context.Background(), c.UserLogin.ID, targetMsgID, sender.Sender, "",
+		)
+		if err == nil && existing != nil {
+			return nil
+		}
 	}
 
 	// Reactions are sent as remote events, not backfill messages.
