@@ -4230,6 +4230,30 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				}
 			}
 		}
+		if chatInfo.Avatar == nil && c.chatDB != nil && len(memberList) > 0 {
+			photoLog := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
+			chatGUID := c.chatDB.findGroupChatGUIDByMembers(memberList, c)
+			if chatGUID != "" {
+				att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
+				if attErr != nil {
+					photoLog.Warn().Err(attErr).Str("chat_guid", chatGUID).Msg("group_photo: chatdb avatar lookup error")
+				} else if att != nil {
+					photoData, readErr := att.Read()
+					if readErr != nil {
+						photoLog.Warn().Err(readErr).Str("chat_guid", chatGUID).Msg("group_photo: failed to read chatdb avatar file")
+					} else if len(photoData) > 0 {
+						hash := sha256.Sum256(photoData)
+						avatarID := networkid.AvatarID(fmt.Sprintf("chatdb-avatar:%x", hash[:8]))
+						photoLog.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from chatdb")
+						cachedData := photoData
+						chatInfo.Avatar = &bridgev2.Avatar{
+							ID:  avatarID,
+							Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
+						}
+					}
+				}
+			}
+		}
 
 		// Persist sender_guid to portal metadata for gid: portals.
 		// Only persist iMessage protocol-level group names (cv_name) to
