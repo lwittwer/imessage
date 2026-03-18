@@ -8001,13 +8001,24 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			if len(group.indices) <= 1 {
 				continue
 			}
-			primaryIdx := group.indices[0]
-			for _, idx := range group.indices[1:] {
-				skip[idx] = true
-				log.Info().
-					Str("skip_portal", string(entries[idx].portalKey.ID)).
-					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
-					Msg("Merging DM portal for contact with multiple phone numbers")
+			// Prefer the entry whose portal ID matches the canonical handle.
+			firstPortalID := string(entries[group.indices[0]].portalKey.ID)
+			canonical := c.canonicalContactHandle(firstPortalID)
+			primaryIdx := group.indices[0] // default: most recent
+			for _, idx := range group.indices {
+				if string(entries[idx].portalKey.ID) == canonical {
+					primaryIdx = idx
+					break
+				}
+			}
+			for _, idx := range group.indices {
+				if idx != primaryIdx {
+					skip[idx] = true
+					log.Info().
+						Str("skip_portal", string(entries[idx].portalKey.ID)).
+						Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
+						Msg("Merging DM portal for contact with multiple handles")
+				}
 			}
 		}
 
