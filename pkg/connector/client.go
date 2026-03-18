@@ -4229,9 +4229,10 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 					Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
 				}
 			}
-		} else if c.chatDB != nil {
+		}
+		if chatInfo.Avatar == nil && c.chatDB != nil && len(memberList) > 0 {
 			photoLog := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
-			chatGUID := c.chatDB.findGroupChatGUID(portalID, c)
+			chatGUID := c.chatDB.findGroupChatGUIDByMembers(memberList, c)
 			if chatGUID != "" {
 				att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
 				if attErr != nil {
