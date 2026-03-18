@@ -223,6 +223,10 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				continue
 			}
 			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
+			if msg.ReplyToGUID != "" {
+				replyToID := makeMessageID(msg.ReplyToGUID)
+				attCm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+			}
 			backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
 				ConvertedMessage: attCm,
 				Sender:           sender,
@@ -326,12 +330,17 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 		}
 	}
 
-	return &bridgev2.ConvertedMessage{
+	cm := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:    event.EventMessage,
 			Content: content,
 		}},
-	}, nil
+	}
+	if msg.ReplyToGUID != "" {
+		replyToID := makeMessageID(msg.ReplyToGUID)
+		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+	}
+	return cm, nil
 }
 
 func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
