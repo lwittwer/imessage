@@ -109,6 +109,14 @@ WHERE message.item_type=$1 AND message.group_action_type=$2 AND chat.guid=$3
 ORDER BY message.date DESC LIMIT 1
 `
 
+const groupAvatarFromPropsQuery = `
+SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), attachment.transfer_name
+FROM chat
+JOIN attachment ON instr(chat.properties, CAST(attachment.guid AS BLOB)) > 0
+WHERE chat.guid=$1
+LIMIT 1
+`
+
 const chatQuery = `
 SELECT chat_identifier, service_name, COALESCE(display_name, ''), group_id
 FROM chat
@@ -219,6 +227,11 @@ func (mac *macOSDatabase) prepareMessages() error {
 	if err != nil {
 		mac.log.Warnln("Failed to prepare group action query:", err)
 		mac.groupActionQuery = nil
+	}
+	mac.groupAvatarFromPropsQuery, err = mac.chatDB.Prepare(groupAvatarFromPropsQuery)
+	if err != nil {
+		mac.log.Warnln("Failed to prepare group avatar from properties query:", err)
+		mac.groupAvatarFromPropsQuery = nil
 	}
 	mac.limitedMessagesQuery, err = mac.chatDB.Prepare(limitedMessagesQuery)
 	if err != nil {
@@ -518,16 +531,29 @@ func (mac *macOSDatabase) ResolveIdentifier(identifier string) (guid string, err
 }
 
 func (mac *macOSDatabase) GetGroupAvatar(chatID string) (*imessage.Attachment, error) {
-	if mac.groupActionQuery == nil {
-		return nil, nil
+	if mac.groupActionQuery != nil {
+		row := mac.groupActionQuery.QueryRow(imessage.ItemTypeAvatar, imessage.GroupActionSetAvatar, chatID)
+		var avatar imessage.Attachment
+		err := row.Scan(&avatar.PathOnDisk, &avatar.MimeType, &avatar.FileName)
+		if err == nil {
+			return &avatar, nil
+		} else if err != sql.ErrNoRows {
+			return nil, err
+		}
 	}
-	row := mac.groupActionQuery.QueryRow(imessage.ItemTypeAvatar, imessage.GroupActionSetAvatar, chatID)
-	var avatar imessage.Attachment
-	err := row.Scan(&avatar.PathOnDisk, &avatar.MimeType, &avatar.FileName)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	// Fallback: the group photo GUID is embedded in the chat properties
+	// binary plist BLOB. Match it against attachment GUIDs directly.
+	if mac.groupAvatarFromPropsQuery != nil {
+		row := mac.groupAvatarFromPropsQuery.QueryRow(chatID)
+		var avatar imessage.Attachment
+		err := row.Scan(&avatar.PathOnDisk, &avatar.MimeType, &avatar.FileName)
+		if err == nil {
+			return &avatar, nil
+		} else if err != sql.ErrNoRows {
+			return nil, err
+		}
 	}
-	return &avatar, err
+	return nil, nil
 }
 
 func (mac *macOSDatabase) Stop() {
