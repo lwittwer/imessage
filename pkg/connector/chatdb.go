@@ -158,7 +158,8 @@ func (db *chatDB) findGroupChatGUIDByMembers(members []string, c *IMClient) stri
 
 // chatDBReplyTarget returns the correct MessageOptionalPartID for a reply,
 // mapping chat.db balloon-part index to the emitted part IDs:
-// bp=0 → base GUID (text body); bp>=1 → {guid}_att{bp-1} (attachment).
+// bp<=0 → base GUID (text body); bp>=1 → {guid}_att{bp-1} (attachment).
+// Negative part values are normalised to 0 (base-message semantics).
 func chatDBReplyTarget(replyGUID string, replyPart int) *networkid.MessageOptionalPartID {
 	targetID := replyGUID
 	if replyPart >= 1 {
