@@ -48,6 +48,7 @@ type macOSDatabase struct {
 	chatQuery                    *sql.Stmt
 	chatGUIDQuery                *sql.Stmt
 	groupActionQuery             *sql.Stmt
+	groupAvatarFromPropsQuery    *sql.Stmt
 	recentChatsQuery             *sql.Stmt
 	messageGUIDsSinceQuery       *sql.Stmt
 	groupMemberQuery             *sql.Stmt
