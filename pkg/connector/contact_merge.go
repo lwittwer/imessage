@@ -191,18 +191,12 @@ func contactKeyFromContact(contact *imessage.Contact) string {
 	if contact == nil || !contact.HasName() {
 		return ""
 	}
-	phones := make([]string, 0, len(contact.Phones))
-	for _, p := range contact.Phones {
-		n := normalizePhoneForPortalID(p)
-		if n != "" {
-			phones = append(phones, n)
-		}
-	}
-	if len(phones) <= 1 {
+	ids := contactPortalIDs(contact)
+	if len(ids) <= 1 {
 		return ""
 	}
-	sort.Strings(phones)
-	return strings.Join(phones, "|")
+	sort.Strings(ids)
+	return strings.Join(ids, "|")
 }
 
 // contactPortalIDs returns all portal ID strings for a contact's phone numbers
