@@ -8094,7 +8094,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	synced := 0
 	for _, entry := range entries {
 		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.chatGUID)
 		chatGUID := entry.chatGUID
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
@@ -8143,7 +8143,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 }
 
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
@@ -8184,6 +8184,30 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			}
 		}
 		chatInfo.Members = members
+
+		// Set group avatar from chat.db (local group action message, or
+		// chat.properties BLOB fallback for avatars set on another device).
+		if c.chatDB != nil && chatGUID != "" {
+			avatarStart := time.Now()
+			att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
+			if attErr != nil {
+				c.Main.Bridge.Log.Warn().Err(attErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: chatdb avatar lookup error (initial sync)")
+			} else if att != nil {
+				photoData, readErr := att.Read()
+				if readErr != nil {
+					c.Main.Bridge.Log.Warn().Err(readErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: failed to read chatdb avatar file (initial sync)")
+				} else if len(photoData) > 0 {
+					hash := sha256.Sum256(photoData)
+					avatarID := networkid.AvatarID(fmt.Sprintf("chatdb-avatar:%x", hash[:8]))
+					cachedData := photoData
+					chatInfo.Avatar = &bridgev2.Avatar{
+						ID:  avatarID,
+						Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
+					}
+					c.Main.Bridge.Log.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: setting avatar from chatdb (initial sync)")
+				}
+			}
+		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
 		portalID := addIdentifierPrefix(parsed.LocalID)
