@@ -99,7 +99,7 @@ ORDER BY message.date ASC
 `
 
 const groupActionQuery = `
-SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), attachment.transfer_name
+SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), COALESCE(attachment.transfer_name, '')
 FROM message
 JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
 JOIN chat              ON chat_message_join.chat_id = chat.ROWID
@@ -110,7 +110,7 @@ ORDER BY message.date DESC LIMIT 1
 `
 
 const groupAvatarFromPropsQuery = `
-SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), attachment.transfer_name
+SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), COALESCE(attachment.transfer_name, '')
 FROM chat
 JOIN attachment ON instr(chat.properties, CAST(attachment.guid AS BLOB)) > 0
 WHERE chat.guid=$1
