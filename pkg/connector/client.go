@@ -8188,13 +8188,14 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 		// Set group avatar from chat.db (local group action message, or
 		// chat.properties BLOB fallback for avatars set on another device).
 		if c.chatDB != nil && chatGUID != "" {
+			avatarStart := time.Now()
 			att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
 			if attErr != nil {
-				c.Main.Bridge.Log.Warn().Err(attErr).Str("chat_guid", chatGUID).Msg("group_photo: chatdb avatar lookup error (initial sync)")
+				c.Main.Bridge.Log.Warn().Err(attErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: chatdb avatar lookup error (initial sync)")
 			} else if att != nil {
 				photoData, readErr := att.Read()
 				if readErr != nil {
-					c.Main.Bridge.Log.Warn().Err(readErr).Str("chat_guid", chatGUID).Msg("group_photo: failed to read chatdb avatar file (initial sync)")
+					c.Main.Bridge.Log.Warn().Err(readErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: failed to read chatdb avatar file (initial sync)")
 				} else if len(photoData) > 0 {
 					hash := sha256.Sum256(photoData)
 					avatarID := networkid.AvatarID(fmt.Sprintf("chatdb-avatar:%x", hash[:8]))
@@ -8203,7 +8204,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 						ID:  avatarID,
 						Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
 					}
-					c.Main.Bridge.Log.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from chatdb (initial sync)")
+					c.Main.Bridge.Log.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: setting avatar from chatdb (initial sync)")
 				}
 			}
 		}
