@@ -519,14 +519,24 @@ func convertHEICToJPEG(data []byte, mimeType, fileName string, quality int, log 
 	return jpegBytes, "image/jpeg", newName, goImg, nil
 }
 
-// maybeConvertHEIC checks whether HEIC conversion is enabled and the MIME type
-// is HEIC/HEIF. If so, it converts to JPEG and returns the updated data, MIME
-// type, filename, and the decoded image (for dimension/thumbnail extraction
-// without re-decoding). On failure or if conversion is not applicable, it
-// returns the original values unchanged and a nil image.
+// maybeConvertHEIC handles HEIC/HEIF images. When conversion is enabled, it
+// converts to JPEG and returns the updated data, MIME type, filename, and the
+// decoded image. When conversion is disabled but the MIME type is HEIC/HEIF,
+// it decodes the image for dimension/thumbnail extraction while returning the
+// original data unchanged. Returns a nil image only for non-HEIC types or on
+// decode failure.
 func maybeConvertHEIC(log *zerolog.Logger, data []byte, mimeType, fileName string, quality int, enabled bool) ([]byte, string, string, image.Image) {
-	if !enabled || !isHEIC(mimeType) || len(data) == 0 {
+	if !isHEIC(mimeType) || len(data) == 0 {
 		return data, mimeType, fileName, nil
+	}
+
+	if !enabled {
+		// Decode for dimensions/thumbnail only, keep original HEIC data
+		img, err := decodeHEICImage(data)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to decode HEIC for dimensions")
+		}
+		return data, mimeType, fileName, img
 	}
 
 	// Check for animated/multi-frame HEIC
