@@ -1617,22 +1617,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 
 	// Compute new portal ID from the NEW participant list using the same
 	// normalization / dedup / sort logic as makePortalKey's group branch.
-	sorted := make([]string, 0, len(msg.NewParticipants))
-	for _, p := range msg.NewParticipants {
-		normalized := normalizeIdentifierForPortalID(p)
-		if normalized == "" || c.isMyHandle(normalized) {
-			continue
-		}
-		sorted = append(sorted, normalized)
-	}
-	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-	sort.Strings(sorted)
-	deduped := sorted[:0]
-	for i, s := range sorted {
-		if i == 0 || s != sorted[i-1] {
-			deduped = append(deduped, s)
-		}
-	}
+	deduped := c.buildCanonicalParticipantList(msg.NewParticipants)
 	newPortalIDStr := strings.Join(deduped, ",")
 	oldPortalIDStr := string(oldPortalKey.ID)
 
@@ -6077,6 +6062,31 @@ func normalizeIdentifierForPortalID(identifier string) string {
 	return id
 }
 
+// buildCanonicalParticipantList normalizes, deduplicates, and sorts a
+// participant list into the canonical form used for comma-based portal IDs.
+// Any self handles are filtered out and replaced with the single canonical
+// c.handle. Accepts both raw and pre-normalized inputs (normalization is
+// idempotent).
+func (c *IMClient) buildCanonicalParticipantList(participants []string) []string {
+	sorted := make([]string, 0, len(participants))
+	for _, p := range participants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" || c.isMyHandle(normalized) {
+			continue
+		}
+		sorted = append(sorted, normalized)
+	}
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sort.Strings(sorted)
+	deduped := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			deduped = append(deduped, s)
+		}
+	}
+	return deduped
+}
+
 // normalizePhoneIdentifierForPortalID canonicalizes phone-like identifiers while
 // preserving short-code semantics (e.g. "242733" stays "242733", not "+242733").
 func normalizePhoneIdentifierForPortalID(local string) string {
@@ -6616,11 +6626,6 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 		if !strings.HasPrefix(portalIDStr, "gid:") {
 			continue
 		}
-		c.UserLogin.Log.Debug().
-			Str("candidate_portal", portalIDStr).
-			Strs("incoming_participants", normalizedParts).
-			Strs("cached_participants", parts).
-			Msg("Participant cache match candidate for gid resolution")
 		if participantSetsMatch(parts, normalizedParts, c.handle) {
 			c.imGroupParticipantsMu.RUnlock()
 			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
@@ -6641,20 +6646,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    whole point is to find portals where the guid differs (another client
 	//    using a different gid for the same group).
 	c.ensureGroupPortalIndex()
-	sorted := make([]string, 0, len(normalizedParts))
-	for _, p := range normalizedParts {
-		if !c.isMyHandle(p) {
-			sorted = append(sorted, p)
-		}
-	}
-	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-	sort.Strings(sorted)
-	deduped := sorted[:0]
-	for i, s := range sorted {
-		if i == 0 || s != sorted[i-1] {
-			deduped = append(deduped, s)
-		}
-	}
+	deduped := c.buildCanonicalParticipantList(normalizedParts)
 
 	overlap := make(map[string]int)
 	c.groupPortalMu.RLock()
@@ -6705,7 +6697,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    (e.g., gid: portals from CloudKit sync that haven't received
 	//    live messages yet, so imGroupParticipants is empty).
 	//    Only consider group portals (gid: or comma-based). DM portals
-	//    can accidentally match via ±1 participant tolerance because a
+	//    could match if self-inclusion differs between participant lists because a
 	//    DM's [self, A] is one member short of a group's [self, A, B].
 	if c.cloudStore != nil {
 		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts, c.handle)
@@ -6776,24 +6768,8 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			}
 		} else {
 			// Fallback: build a participant-based ID for groups without a UUID.
-			sorted := make([]string, 0, len(participants))
-			for _, p := range participants {
-				normalized := normalizeIdentifierForPortalID(p)
-				if normalized == "" || c.isMyHandle(normalized) {
-					continue
-				}
-				sorted = append(sorted, normalized)
-			}
-			sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-			sort.Strings(sorted)
-			deduped := sorted[:0]
-			for i, s := range sorted {
-				if i == 0 || s != sorted[i-1] {
-					deduped = append(deduped, s)
-				}
-			}
-			sorted = deduped
-			computedID := strings.Join(sorted, ",")
+			deduped := c.buildCanonicalParticipantList(participants)
+			computedID := strings.Join(deduped, ",")
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
