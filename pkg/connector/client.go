@@ -177,6 +177,12 @@ type IMClient struct {
 	recentOutboundUnsends     map[string]time.Time
 	recentOutboundUnsendsLock sync.Mutex
 
+	// Delivery receipt dedup: tracks UUIDs for which a delivery receipt
+	// (command 101) has already been sent this session. Prevents redundant
+	// receipts when APNs re-delivers the same message on reconnect.
+	recentDeliveryReceipts     map[string]time.Time
+	recentDeliveryReceiptsLock sync.Mutex
+
 	// Outbound delete echo suppression: tracks portal IDs where a chat delete
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
 	smsPortals     map[string]bool
@@ -872,12 +878,16 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		Logger()
 	// Send delivery receipt if requested
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
-		go func() {
-			conv := c.makeConversation(msg.Participants, msg.GroupName)
-			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
-				log.Warn().Err(err).Msg("Failed to send delivery receipt")
-			}
-		}()
+		if c.trackDeliveryReceipt(msg.Uuid) {
+			go func() {
+				conv := c.makeConversation(msg.Participants, msg.GroupName)
+				if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
+					log.Warn().Err(err).Msg("Failed to send delivery receipt")
+				}
+			}()
+		} else {
+			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping duplicate delivery receipt")
+		}
 	}
 
 	if msg.IsDelivered {
@@ -894,10 +904,20 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		return
 	}
 	if msg.IsError {
-		log.Warn().
+		statusStr := ptrStringOr(msg.ErrorStatusStr, "")
+		status := ptrUint64Or(msg.ErrorStatus, 0)
+
+		// Apple Message Protection delivery confirmations are informational,
+		// not actionable errors. Downgrade to Debug to reduce log noise.
+		logEvent := log.Warn()
+		if statusStr == "ec-com.apple.messageprotection-6" && status == 200 {
+			logEvent = log.Debug()
+		}
+
+		logEvent.
 			Str("for_uuid", ptrStringOr(msg.ErrorForUuid, "")).
-			Uint64("status", ptrUint64Or(msg.ErrorStatus, 0)).
-			Str("status_str", ptrStringOr(msg.ErrorStatusStr, "")).
+			Uint64("status", status).
+			Str("status_str", statusStr).
 			Msg("Received iMessage error")
 		return
 	}
@@ -3233,6 +3253,17 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 				Str("sender", *msg.Sender).
 				Str("resolved_portal", string(portalKey.ID)).
 				Msg("Resolved read receipt portal via group member lookup")
+			goto resolved
+		}
+	}
+
+	// Fall back to bridge DB message lookup — msg.Uuid is the target message's
+	// UUID, which may already be stored. This tells us exactly which portal
+	// the read message belongs to, avoiding sender-based guessing.
+	if candidateKey := c.resolvePortalByTargetMessage(log, msg.Uuid); candidateKey.ID != "" {
+		// Validate the resolved portal still exists before accepting it.
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, candidateKey); p != nil && p.MXID != "" {
+			portalKey = candidateKey
 			goto resolved
 		}
 	}
@@ -7845,6 +7876,30 @@ func (c *IMClient) trackUnsend(uuid string) {
 			delete(c.recentUnsends, k)
 		}
 	}
+}
+
+// trackDeliveryReceipt records a delivery receipt as sent and returns true,
+// or returns false if one was already sent for this UUID this session.
+// An empty UUID is allowed through unconditionally (can't dedup without a key).
+func (c *IMClient) trackDeliveryReceipt(uuid string) bool {
+	if uuid == "" {
+		return true
+	}
+	c.recentDeliveryReceiptsLock.Lock()
+	defer c.recentDeliveryReceiptsLock.Unlock()
+	key := strings.ToUpper(uuid)
+	now := time.Now()
+	// GC old entries on each call (same pattern as trackSmsReactionEcho).
+	for k, t := range c.recentDeliveryReceipts {
+		if now.Sub(t) > 5*time.Minute {
+			delete(c.recentDeliveryReceipts, k)
+		}
+	}
+	if _, exists := c.recentDeliveryReceipts[key]; exists {
+		return false
+	}
+	c.recentDeliveryReceipts[key] = now
+	return true
 }
 
 func (c *IMClient) wasUnsent(uuid string) bool {
