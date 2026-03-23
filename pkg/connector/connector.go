@@ -387,6 +387,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
+		recentDeliveryReceipts:  make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
 		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
 		sharedAlbumRooms:        make(map[string]id.RoomID),
