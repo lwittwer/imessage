@@ -6574,61 +6574,69 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	// 1. Check imGroupGuids cache: does any existing portal already have
 	//    this guid cached? (covers comma-based portals that previously
 	//    received messages with this same guid)
+	//
+	// Snapshot matching entries under lock, then process outside the iteration
+	// to avoid a "concurrent map iteration and map write" panic.
+	type guidCandidate struct {
+		portalIDStr string
+		guid        string
+	}
+	var guidCandidates []guidCandidate
 	c.imGroupGuidsMu.RLock()
 	for portalIDStr, guid := range c.imGroupGuids {
 		if strings.ToLower(guid) == normalizedGuid {
-			c.imGroupGuidsMu.RUnlock()
-			if c.guidCacheMatchIsStale(portalIDStr, participants) {
-				c.UserLogin.Log.Warn().
-					Str("gid_portal_id", gidPortalID).
-					Str("candidate_portal", portalIDStr).
-					Str("stale_guid", guid).
-					Msg("Skipping stale guid cache entry: participant mismatch — clearing")
-				// Self-heal: remove from in-memory cache
-				c.imGroupGuidsMu.Lock()
-				if c.imGroupGuids[portalIDStr] == guid {
-					delete(c.imGroupGuids, portalIDStr)
-				}
-				c.imGroupGuidsMu.Unlock()
-				// Self-heal: clear stale SenderGuid from DB metadata.
-				// MUST be synchronous — portalToConversation (Site E) lazily
-				// loads metadata into cache and would re-poison it.
-				staleKey := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-				if stalePortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, staleKey); err != nil {
-					c.UserLogin.Log.Warn().Err(err).
-						Str("portal_id", portalIDStr).
-						Msg("Failed to look up portal for stale guid self-heal")
-				} else if stalePortal != nil {
-					if meta, ok := stalePortal.Metadata.(*PortalMetadata); ok && meta.SenderGuid == guid {
-						meta.SenderGuid = ""
-						stalePortal.Metadata = meta
-						if err := stalePortal.Save(ctx); err != nil {
-							c.UserLogin.Log.Warn().Err(err).
-								Str("portal_id", portalIDStr).
-								Msg("Failed to clear stale SenderGuid from DB metadata")
-						} else {
-							c.UserLogin.Log.Info().
-								Str("portal_id", portalIDStr).
-								Str("cleared_guid", guid).
-								Msg("Cleared stale SenderGuid from DB metadata")
-						}
-					}
-				}
-				c.imGroupGuidsMu.RLock()
-				continue
-			}
-			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
-				c.UserLogin.Log.Info().
-					Str("gid_portal_id", gidPortalID).
-					Str("resolved_portal", portalIDStr).
-					Msg("Resolved unknown gid to existing portal via guid cache")
-				return networkid.PortalID(portalIDStr)
-			}
-			c.imGroupGuidsMu.RLock()
+			guidCandidates = append(guidCandidates, guidCandidate{portalIDStr, guid})
 		}
 	}
 	c.imGroupGuidsMu.RUnlock()
+	for _, cand := range guidCandidates {
+		if c.guidCacheMatchIsStale(cand.portalIDStr, participants) {
+			c.UserLogin.Log.Warn().
+				Str("gid_portal_id", gidPortalID).
+				Str("candidate_portal", cand.portalIDStr).
+				Str("stale_guid", cand.guid).
+				Msg("Skipping stale guid cache entry: participant mismatch — clearing")
+			// Self-heal: remove from in-memory cache
+			c.imGroupGuidsMu.Lock()
+			if c.imGroupGuids[cand.portalIDStr] == cand.guid {
+				delete(c.imGroupGuids, cand.portalIDStr)
+			}
+			c.imGroupGuidsMu.Unlock()
+			// Self-heal: clear stale SenderGuid from DB metadata.
+			// MUST be synchronous — portalToConversation (Site E) lazily
+			// loads metadata into cache and would re-poison it.
+			staleKey := networkid.PortalKey{ID: networkid.PortalID(cand.portalIDStr), Receiver: c.UserLogin.ID}
+			if stalePortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, staleKey); err != nil {
+				c.UserLogin.Log.Warn().Err(err).
+					Str("portal_id", cand.portalIDStr).
+					Msg("Failed to look up portal for stale guid self-heal")
+			} else if stalePortal != nil {
+				if meta, ok := stalePortal.Metadata.(*PortalMetadata); ok && meta.SenderGuid == cand.guid {
+					meta.SenderGuid = ""
+					stalePortal.Metadata = meta
+					if err := stalePortal.Save(ctx); err != nil {
+						c.UserLogin.Log.Warn().Err(err).
+							Str("portal_id", cand.portalIDStr).
+							Msg("Failed to clear stale SenderGuid from DB metadata")
+					} else {
+						c.UserLogin.Log.Info().
+							Str("portal_id", cand.portalIDStr).
+							Str("cleared_guid", cand.guid).
+							Msg("Cleared stale SenderGuid from DB metadata")
+					}
+				}
+			}
+			continue
+		}
+		key := networkid.PortalKey{ID: networkid.PortalID(cand.portalIDStr), Receiver: c.UserLogin.ID}
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+			c.UserLogin.Log.Info().
+				Str("gid_portal_id", gidPortalID).
+				Str("resolved_portal", cand.portalIDStr).
+				Msg("Resolved unknown gid to existing portal via guid cache")
+			return networkid.PortalID(cand.portalIDStr)
+		}
+	}
 
 	// Build normalized participant set for matching.
 	if len(participants) == 0 {
@@ -6649,28 +6657,30 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    participant sets. Comma-based portals are intentionally excluded here
 	//    because step 3 (groupPortalIndex) handles them using the authoritative
 	//    portal ID rather than the potentially-stale in-memory cache.
+	//
+	// Snapshot matching portal IDs under lock, then process outside the iteration
+	// to avoid a "concurrent map iteration and map write" panic.
+	var partCandidates []string
 	c.imGroupParticipantsMu.RLock()
 	for portalIDStr, parts := range c.imGroupParticipants {
-		if portalIDStr == gidPortalID {
-			continue
-		}
-		if !strings.HasPrefix(portalIDStr, "gid:") {
+		if portalIDStr == gidPortalID || !strings.HasPrefix(portalIDStr, "gid:") {
 			continue
 		}
 		if participantSetsMatch(parts, normalizedParts, c.handle) {
-			c.imGroupParticipantsMu.RUnlock()
-			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
-				c.UserLogin.Log.Info().
-					Str("gid_portal_id", gidPortalID).
-					Str("resolved_portal", portalIDStr).
-					Msg("Resolved unknown gid to existing portal via participant cache")
-				return networkid.PortalID(portalIDStr)
-			}
-			c.imGroupParticipantsMu.RLock()
+			partCandidates = append(partCandidates, portalIDStr)
 		}
 	}
 	c.imGroupParticipantsMu.RUnlock()
+	for _, portalIDStr := range partCandidates {
+		key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+			c.UserLogin.Log.Info().
+				Str("gid_portal_id", gidPortalID).
+				Str("resolved_portal", portalIDStr).
+				Msg("Resolved unknown gid to existing portal via participant cache")
+			return networkid.PortalID(portalIDStr)
+		}
+	}
 
 	// 3. Check comma-based portals via groupPortalIndex fuzzy matching.
 	//    We intentionally skip the guid mismatch rejection here because the
