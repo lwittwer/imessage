@@ -873,7 +873,15 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	// Send delivery receipt if requested
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Msg("Panic in SendDeliveryReceipt")
+				}
+			}()
 			conv := c.makeConversation(msg.Participants, msg.GroupName)
+			if c.client == nil {
+				return
+			}
 			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
 				log.Warn().Err(err).Msg("Failed to send delivery receipt")
 			}
@@ -2602,7 +2610,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 			var token *string
 			const maxChatScanPages = 30
 			for page := 0; page < maxChatScanPages; page++ {
-				chatsPage, pageErr := c.client.CloudSyncChats(token)
+				chatsPage, pageErr := safeCloudSyncChats(c.client, token)
 				if pageErr != nil {
 					log.Warn().Err(pageErr).Int("page", page).
 						Msg("CloudSyncChats page failed during main-zone name scan")
@@ -3701,6 +3709,9 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 		return nil
 	}
 	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return nil
+	}
 	return c.client.SendTyping(conv, msg.IsTyping, c.handle)
 }
 
@@ -3709,6 +3720,9 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		return nil
 	}
 	conv := c.portalToConversation(receipt.Portal)
+	if conv.IsSms {
+		return nil
+	}
 	var forUuid *string
 	if receipt.ExactMessage != nil {
 		uuid := string(receipt.ExactMessage.ID)
@@ -3727,6 +3741,9 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 
 	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return fmt.Errorf("edits are not supported for SMS conversations")
+	}
 	targetGUID := string(msg.EditTarget.ID)
 
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
@@ -3742,10 +3759,13 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return fmt.Errorf("message retraction is not supported for SMS conversations")
+	}
+
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
-
-	conv := c.portalToConversation(msg.Portal)
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
