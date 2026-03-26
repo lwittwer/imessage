@@ -1142,6 +1142,11 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// Track SMS portals so outbound replies use the correct service type.
 	// Unconditional so SMS→iMessage transitions are reflected immediately.
 	c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
+	// Persist IsSms to PortalMetadata for existing portals (handles SMS↔iMessage
+	// transitions). For brand-new portals, GetExistingPortalByKey returns nil and
+	// the goroutine exits without persisting — that case is covered by the
+	// GetChatInfo ExtraUpdates hook, which reads isPortalSMS() (already set above)
+	// when the framework calls GetChatInfo to create the new portal.
 	go func(pk networkid.PortalKey, isSms bool) {
 		bgCtx := context.Background()
 		portal, portalErr := c.Main.Bridge.GetExistingPortalByKey(bgCtx, pk)
@@ -4346,6 +4351,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			c.imGroupNamesMu.RLock()
 			protocolName := c.imGroupNames[portalID]
 			c.imGroupNamesMu.RUnlock()
+			isSms := c.isPortalSMS(portalID)
 			chatInfo.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
 				meta, ok := p.Metadata.(*PortalMetadata)
 				if !ok {
@@ -4358,6 +4364,10 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				}
 				if protocolName != "" && meta.GroupName != protocolName {
 					meta.GroupName = protocolName
+					changed = true
+				}
+				if meta.IsSms != isSms {
+					meta.IsSms = isSms
 					changed = true
 				}
 				if changed {

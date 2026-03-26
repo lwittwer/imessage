@@ -333,6 +333,12 @@ func portalIDToChatGUIDs(portalID string) []string {
 	if localID == "" {
 		return nil
 	}
+	// Strip legacy (sms...) suffix from pre-fix portal IDs so chat.db GUID
+	// candidates match: "tel:+12155167207(smsft)" → localID "+12155167207(smsft)"
+	// → stripped "+12155167207", producing "any;-;+12155167207" which matches chat.db.
+	if idx := strings.Index(localID, "(sms"); idx > 0 {
+		localID = localID[:idx]
+	}
 	return []string{
 		"any;-;" + localID,
 		"iMessage;-;" + localID,
