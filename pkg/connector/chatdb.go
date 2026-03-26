@@ -345,18 +345,25 @@ func identifierToPortalID(id imessage.Identifier) networkid.PortalID {
 	if id.IsGroup {
 		return networkid.PortalID(id.String())
 	}
-	if strings.HasPrefix(id.LocalID, "+") {
-		return networkid.PortalID("tel:" + id.LocalID)
+	localID := id.LocalID
+	// Strip Apple SMS service suffixes: "+12155167207(smsft)" → "+12155167207",
+	// "787473(smsft)" → "787473". These are native Apple formats that appear in
+	// chat.db for SMS Forwarding service types.
+	if idx := strings.Index(localID, "(sms"); idx > 0 {
+		localID = localID[:idx]
 	}
-	if strings.Contains(id.LocalID, "@") {
-		return networkid.PortalID("mailto:" + id.LocalID)
+	if strings.HasPrefix(localID, "+") {
+		return networkid.PortalID("tel:" + localID)
+	}
+	if strings.Contains(localID, "@") {
+		return networkid.PortalID("mailto:" + localID)
 	}
 	// Short codes and numeric-only identifiers (e.g., "242733") are SMS-based.
 	// Rustpush creates these with "tel:" prefix, so we must match.
-	if isNumeric(id.LocalID) {
-		return networkid.PortalID("tel:" + id.LocalID)
+	if isNumeric(localID) {
+		return networkid.PortalID("tel:" + localID)
 	}
-	return networkid.PortalID(id.LocalID)
+	return networkid.PortalID(localID)
 }
 
 // ============================================================================
