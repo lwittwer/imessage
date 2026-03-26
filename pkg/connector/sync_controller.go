@@ -1731,6 +1731,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
+		// Mark SMS status in-memory so guards work immediately during this sync
+		// session. Persistence is handled by GetChatInfo ExtraUpdates when the
+		// portal is created/resynced via createPortalsFromCloudSync.
+		if strings.EqualFold(chat.Service, "SMS") {
+			c.updatePortalSMS(portalID, true)
+		}
+
 		participantsJSON, jsonErr := json.Marshal(chat.Participants)
 		if jsonErr != nil {
 			return counts, jsonErr
