@@ -4915,6 +4915,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		if sender.Sender == "" && !sender.IsFromMe {
 			continue
 		}
+		sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 		tapbackType := *row.TapbackType
 		isRemove := tapbackType >= 3000
@@ -4961,6 +4962,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	if sender.Sender == "" && !sender.IsFromMe {
 		return nil
 	}
+	sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 	// Skip system/service messages (group renames, participant changes, etc.).
 	// Two complementary signals:
