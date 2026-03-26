@@ -596,6 +596,9 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 				c.imGroupGuidsMu.Unlock()
 				loadedGuids++
 			}
+			if meta.IsSms {
+				c.updatePortalSMS(string(portal.ID), true)
+			}
 			// NOTE: Do NOT pre-populate imGroupNames from portal metadata.
 			// The metadata GroupName can be stale (polluted by previous CloudKit
 			// sync cycles). Loading it on startup would cause resolveGroupName
@@ -873,7 +876,15 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	// Send delivery receipt if requested
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Msg("Panic in SendDeliveryReceipt")
+				}
+			}()
 			conv := c.makeConversation(msg.Participants, msg.GroupName)
+			if c.client == nil {
+				return
+			}
 			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
 				log.Warn().Err(err).Msg("Failed to send delivery receipt")
 			}
@@ -1128,10 +1139,29 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		}
 	}
 
-	// Track SMS portals so outbound replies use the correct service type
-	if msg.IsSms {
-		c.markPortalSMS(string(portalKey.ID))
-	}
+	// Track SMS portals so outbound replies use the correct service type.
+	// Unconditional so SMS→iMessage transitions are reflected immediately.
+	c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
+	// Persist IsSms to PortalMetadata for existing portals (handles SMS↔iMessage
+	// transitions). For brand-new portals, GetExistingPortalByKey returns nil and
+	// the goroutine exits without persisting — that case is covered by the
+	// GetChatInfo ExtraUpdates hook, which reads isPortalSMS() (already set above)
+	// when the framework calls GetChatInfo to create the new portal.
+	go func(pk networkid.PortalKey, isSms bool) {
+		bgCtx := context.Background()
+		portal, portalErr := c.Main.Bridge.GetExistingPortalByKey(bgCtx, pk)
+		if portalErr == nil && portal != nil {
+			meta := &PortalMetadata{}
+			if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+				*meta = *existing
+			}
+			if meta.IsSms != isSms {
+				meta.IsSms = isSms
+				portal.Metadata = meta
+				_ = portal.Save(bgCtx)
+			}
+		}
+	}(portalKey, msg.IsSms)
 
 	// Only create new portals after CloudKit sync is done.
 	cloudSyncDone := c.isCloudSyncDone()
@@ -2587,7 +2617,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 			var token *string
 			const maxChatScanPages = 30
 			for page := 0; page < maxChatScanPages; page++ {
-				chatsPage, pageErr := c.client.CloudSyncChats(token)
+				chatsPage, pageErr := safeCloudSyncChats(c.client, token)
 				if pageErr != nil {
 					log.Warn().Err(pageErr).Int("page", page).
 						Msg("CloudSyncChats page failed during main-zone name scan")
@@ -3680,6 +3710,9 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 		return nil
 	}
 	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return nil
+	}
 	return c.client.SendTyping(conv, msg.IsTyping, c.handle)
 }
 
@@ -3688,6 +3721,9 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		return nil
 	}
 	conv := c.portalToConversation(receipt.Portal)
+	if conv.IsSms {
+		return nil
+	}
 	var forUuid *string
 	if receipt.ExactMessage != nil {
 		uuid := string(receipt.ExactMessage.ID)
@@ -3697,7 +3733,22 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		}
 		forUuid = &uuid
 	}
-	return c.client.SendReadReceipt(conv, c.handle, forUuid)
+	err := c.client.SendReadReceipt(conv, c.handle, forUuid)
+	if err != nil {
+		errStr := err.Error()
+		// Suppress non-actionable failures: IDS lookup errors (6001) for
+		// urn:biz: business chat portals and edge cases between restart and SMS
+		// state restoration; NoValidTargets for contacts with no reachable handle.
+		// All other errors propagate normally so real network/auth failures surface.
+		if strings.Contains(errStr, "6001") || strings.Contains(errStr, "NoValidTargets") {
+			zerolog.Ctx(ctx).Warn().Err(err).
+				Str("portal_id", string(receipt.Portal.ID)).
+				Msg("Read receipt failed (non-actionable, suppressed)")
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
@@ -3706,6 +3757,9 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 
 	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return fmt.Errorf("edits are not supported for SMS conversations")
+	}
 	targetGUID := string(msg.EditTarget.ID)
 
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
@@ -3721,10 +3775,13 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	conv := c.portalToConversation(msg.Portal)
+	if conv.IsSms {
+		return fmt.Errorf("message retraction is not supported for SMS conversations")
+	}
+
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
-
-	conv := c.portalToConversation(msg.Portal)
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
@@ -3928,7 +3985,13 @@ func (c *IMClient) portalToChatGUID(portalID string) string {
 	if strings.HasPrefix(portalID, "gid:") {
 		return service + ";+;" + strings.TrimPrefix(portalID, "gid:")
 	}
-	return service + ";-;" + strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:")
+	cleanID := strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:")
+	// Strip legacy (sms...) suffix from pre-fix portal IDs so the chat GUID
+	// passed to Rust is well-formed (e.g., "SMS;-;+12155167207" not "SMS;-;+12155167207(smsft)").
+	if idx := strings.Index(cleanID, "(sms"); idx > 0 {
+		cleanID = cleanID[:idx]
+	}
+	return service + ";-;" + cleanID
 }
 
 // deleteFromApple sends MoveToRecycleBin via APNs and deletes known CloudKit
@@ -4241,6 +4304,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			c.imGroupNamesMu.RLock()
 			protocolName := c.imGroupNames[portalID]
 			c.imGroupNamesMu.RUnlock()
+			isSms := c.isPortalSMS(portalID)
 			chatInfo.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
 				meta, ok := p.Metadata.(*PortalMetadata)
 				if !ok {
@@ -4253,6 +4317,10 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				}
 				if protocolName != "" && meta.GroupName != protocolName {
 					meta.GroupName = protocolName
+					changed = true
+				}
+				if meta.IsSms != isSms {
+					meta.IsSms = isSms
 					changed = true
 				}
 				if changed {
@@ -4319,6 +4387,22 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// private_chat_portal_meta, the framework derives it from the ghost's
 		// display name, which auto-updates when contacts are edited.
 		chatInfo.Members = members
+
+		// Persist IsSms so CloudKit-created portals (no suffix, no live APNs
+		// message yet) survive restarts. Mirrors the group ExtraUpdates pattern.
+		isSms := c.isPortalSMS(portalID)
+		chatInfo.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
+			meta, ok := p.Metadata.(*PortalMetadata)
+			if !ok {
+				meta = &PortalMetadata{}
+			}
+			if meta.IsSms != isSms {
+				meta.IsSms = isSms
+				p.Metadata = meta
+				return true
+			}
+			return false
+		}
 	}
 
 	return chatInfo, nil
@@ -6100,6 +6184,12 @@ func normalizeIdentifierForPortalID(identifier string) string {
 	if id == "" {
 		return ""
 	}
+	// Strip Apple SMS service suffixes: "+12155167207(smsft)" → "+12155167207",
+	// "787473(smsft)" → "787473". Must happen before any other processing so
+	// the suffix never reaches isNumeric / normalizePhone checks.
+	if idx := strings.Index(id, "(sms"); idx > 0 {
+		id = id[:idx]
+	}
 
 	if strings.HasPrefix(id, "mailto:") {
 		return "mailto:" + strings.ToLower(strings.TrimPrefix(id, "mailto:"))
@@ -7055,7 +7145,14 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 
 	// For DMs, resolve the best sendable identifier. For merged contacts,
 	// the portal ID might be an inactive number that rustpush can't send to.
-	sendTo := c.resolveSendTarget(portalID)
+	// Strip any legacy (sms...) suffix before resolution — resolveSendTarget
+	// calls lookupContact → stripIdentifierPrefix, which would pass the suffix
+	// through to contact lookup and break alternate-handle resolution.
+	cleanPortalID := portalID
+	if idx := strings.Index(cleanPortalID, "(sms"); idx > 0 {
+		cleanPortalID = cleanPortalID[:idx]
+	}
+	sendTo := c.resolveSendTarget(cleanPortalID)
 
 	// For self-chats, only include one participant. Duplicating our own
 	// handle (e.g. [self, self]) causes rustpush to reject the message
@@ -7781,16 +7878,22 @@ func mimeToMsgType(mime string) event.MessageType {
 	}
 }
 
-func (c *IMClient) markPortalSMS(portalID string) {
+func (c *IMClient) updatePortalSMS(portalID string, isSms bool) {
 	c.smsPortalsLock.Lock()
 	defer c.smsPortalsLock.Unlock()
-	c.smsPortals[portalID] = true
+	c.smsPortals[portalID] = isSms
 }
 
 func (c *IMClient) isPortalSMS(portalID string) bool {
 	c.smsPortalsLock.RLock()
 	defer c.smsPortalsLock.RUnlock()
-	return c.smsPortals[portalID]
+	if c.smsPortals[portalID] {
+		return true
+	}
+	// Fallback for legacy portals that still have the raw suffix in their ID
+	// (pre-fix DB entries that survive without a full reset). Such portals can
+	// never transition to iMessage — their IDs are malformed by definition.
+	return strings.Contains(portalID, "(sms")
 }
 
 func (c *IMClient) trackUnsend(uuid string) {
@@ -7986,6 +8089,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		chatGUID  string
 		portalKey networkid.PortalKey
 		info      *imessage.ChatInfo
+		isSms     bool
 	}
 	var entries []chatEntry
 	for _, chat := range chats {
@@ -7995,6 +8099,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		}
 		parsed := imessage.ParseIdentifier(chat.ChatGUID)
 		var portalKey networkid.PortalKey
+		isSms := parsed.Service == "SMS"
 		if parsed.IsGroup {
 			members := make([]string, 0, len(info.Members)+1)
 			members = append(members, addIdentifierPrefix(c.handle))
@@ -8012,10 +8117,14 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				Receiver: c.UserLogin.ID,
 			}
 		}
+		if isSms {
+			c.updatePortalSMS(string(portalKey.ID), true)
+		}
 		entries = append(entries, chatEntry{
 			chatGUID:  chat.ChatGUID,
 			portalKey: portalKey,
 			info:      info,
+			isSms:     isSms,
 		})
 	}
 
@@ -8084,12 +8193,24 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		done := make(chan struct{})
 		chatInfo := c.chatDBInfoToBridgev2(entry.info)
 		chatGUID := entry.chatGUID
+		isSms := entry.isSms
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+					if isSms {
+						meta := &PortalMetadata{}
+						if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+							*meta = *existing
+						}
+						if !meta.IsSms {
+							meta.IsSms = true
+							portal.Metadata = meta
+							_ = portal.Save(ctx)
+						}
+					}
 					close(done)
 				},
 				LogContext: func(lc zerolog.Context) zerolog.Context {
@@ -8164,7 +8285,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			Membership: event.MembershipJoin,
 		}
 		for _, memberID := range info.Members {
-			userID := makeUserID(addIdentifierPrefix(memberID))
+			userID := makeUserID(addIdentifierPrefix(stripSmsSuffix(memberID)))
 			members.MemberMap[userID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{Sender: userID},
 				Membership:  event.MembershipJoin,
@@ -8173,7 +8294,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(parsed.LocalID)
+		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
 		otherUser := makeUserID(portalID)
 		isSelfChat := c.isMyHandle(portalID)
 
