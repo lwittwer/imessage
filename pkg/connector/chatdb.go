@@ -110,6 +110,18 @@ func (db *chatDB) findGroupChatGUID(portalID string, c *IMClient) string {
 	return ""
 }
 
+// chatDBReplyTarget returns the correct MessageOptionalPartID for a reply,
+// mapping chat.db balloon-part index to the emitted part IDs:
+// bp<=0 -> base GUID (text body); bp>=1 -> {guid}_att{bp-1} (attachment).
+// Negative part values are normalized to 0 (base-message semantics).
+func chatDBReplyTarget(replyGUID string, replyPart int) *networkid.MessageOptionalPartID {
+	targetID := replyGUID
+	if replyPart >= 1 {
+		targetID = fmt.Sprintf("%s_att%d", replyGUID, replyPart-1)
+	}
+	return &networkid.MessageOptionalPartID{MessageID: makeMessageID(targetID)}
+}
+
 // FetchMessages retrieves historical messages from chat.db for backfill.
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
@@ -223,6 +235,9 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				continue
 			}
 			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
+			if msg.ReplyToGUID != "" {
+				attCm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
+			}
 			backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
 				ConvertedMessage: attCm,
 				Sender:           sender,
@@ -345,12 +360,16 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 		}
 	}
 
-	return &bridgev2.ConvertedMessage{
+	cm := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:    event.EventMessage,
 			Content: content,
 		}},
-	}, nil
+	}
+	if msg.ReplyToGUID != "" {
+		cm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
+	}
+	return cm, nil
 }
 
 func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {

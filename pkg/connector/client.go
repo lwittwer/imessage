@@ -1445,8 +1445,13 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
-		TargetMessage: makeMessageID(targetGUID),
-		Emoji:         emoji,
+		TargetMessage: makeMessageID(func() string {
+			if msg.TapbackTargetPart != nil && *msg.TapbackTargetPart >= 1 {
+				return fmt.Sprintf("%s_att%d", targetGUID, *msg.TapbackTargetPart-1)
+			}
+			return targetGUID
+		}()),
+		Emoji: emoji,
 	})
 }
 
@@ -3783,7 +3788,8 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		return nil, nil
 	}
 
-	_, err := c.client.SendTapback(conv, string(msg.TargetMessage.ID), 0, reaction, emoji, false, c.handle)
+	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
@@ -3823,7 +3829,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 		return nil
 	}
 
-	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
+	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
 	return err
 }
 
@@ -5085,13 +5092,19 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	}
 	emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
 
-	// Parse target GUID from "p:0/GUID" format
+	// Parse target GUID from "p:N/GUID" format, preserving the part index.
 	targetGUID := row.TapbackTargetGUID
+	bp := 0
 	if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
+		fmt.Sscanf(parts[0], "p:%d", &bp)
 		targetGUID = parts[1]
 	}
 	if targetGUID == "" {
 		return nil
+	}
+	targetID := targetGUID
+	if bp >= 1 {
+		targetID = fmt.Sprintf("%s_att%d", targetGUID, bp-1)
 	}
 
 	evtType := bridgev2.RemoteEventReaction
@@ -5107,7 +5120,7 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	// for minutes. Checking the reaction table here is a cheap PK lookup that
 	// prevents the queue from filling with known duplicates.
 	if !isRemove {
-		targetMsgID := makeMessageID(targetGUID)
+		targetMsgID := makeMessageID(targetID)
 		existing, err := c.Main.Bridge.DB.Reaction.GetByIDWithoutMessagePart(
 			context.Background(), c.UserLogin.ID, targetMsgID, sender.Sender, "",
 		)
@@ -5129,7 +5142,7 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 			Sender:    sender,
 			Timestamp: ts,
 		},
-		TargetMessage: makeMessageID(targetGUID),
+		TargetMessage: makeMessageID(targetID),
 		Emoji:         emoji,
 	})
 	return nil
@@ -7301,8 +7314,11 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	}
 
 	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
-		replyToID := makeMessageID(*msg.ReplyGuid)
-		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+		bp := 0
+		if msg.ReplyPart != nil {
+			fmt.Sscanf(*msg.ReplyPart, "%d:", &bp)
+		}
+		cm.ReplyTo = chatDBReplyTarget(*msg.ReplyGuid, bp)
 	}
 
 	return cm, nil
@@ -7475,8 +7491,11 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	}
 
 	if attMsg.WrappedMessage.ReplyGuid != nil && *attMsg.WrappedMessage.ReplyGuid != "" {
-		replyToID := makeMessageID(*attMsg.WrappedMessage.ReplyGuid)
-		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+		bp := 0
+		if attMsg.WrappedMessage.ReplyPart != nil {
+			fmt.Sscanf(*attMsg.WrappedMessage.ReplyPart, "%d:", &bp)
+		}
+		cm.ReplyTo = chatDBReplyTarget(*attMsg.WrappedMessage.ReplyGuid, bp)
 	}
 
 	return cm, nil
@@ -7485,6 +7504,18 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 // ============================================================================
 // Static helpers
 // ============================================================================
+
+// extractTapbackTarget splits a message ID that may contain an _attN suffix into
+// the bare UUID and the iMessage tapback part index (0 = text body, ≥1 = attachment).
+// The _attN index is 0-based (att0 = first attachment = part 1 in iMessage).
+func extractTapbackTarget(messageID string) (string, uint64) {
+	if idx := strings.Index(messageID, "_att"); idx > 0 {
+		var attIndex uint64
+		fmt.Sscanf(messageID[idx+4:], "%d", &attIndex)
+		return messageID[:idx], attIndex + 1
+	}
+	return messageID, 0
+}
 
 // extractReplyInfo converts a bridgev2 reply-to database message into the
 // iMessage reply_guid and reply_part strings expected by rustpush.
@@ -7495,16 +7526,20 @@ func extractReplyInfo(replyTo *database.Message) (*string, *string) {
 		return nil, nil
 	}
 	guid := string(replyTo.ID)
-	// Strip attachment suffixes like _att0, _att1 — iMessage expects a pure UUID
+	// Strip attachment suffixes like _att0, _att1 — iMessage expects a pure UUID,
+	// but we derive the balloon-part index from the suffix to set reply_part correctly.
+	bp := 0
 	if idx := strings.Index(guid, "_att"); idx > 0 {
+		fmt.Sscanf(guid[idx+4:], "%d", &bp)
+		bp++
 		guid = guid[:idx]
 	}
 	// iMessage thread_originator_part format is "bp:type:length" where:
-	//   bp = balloon part index (0 for normal messages)
+	//   bp = balloon part index (0 for text body, ≥1 for attachments)
 	//   type = part type (0 for text)
 	//   length = character count of the original message text
 	// We use 0 as the length since we don't have the original text available.
-	part := "0:0:0"
+	part := fmt.Sprintf("%d:0:0", bp)
 	return &guid, &part
 }
 
