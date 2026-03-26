@@ -386,7 +386,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(addIdentifierPrefix(msg.Sender.LocalID)),
+		Sender:   makeUserID(addIdentifierPrefix(stripSmsSuffix(msg.Sender.LocalID))),
 	}
 }
 

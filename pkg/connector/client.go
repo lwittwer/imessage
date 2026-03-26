@@ -8417,7 +8417,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 			Membership: event.MembershipJoin,
 		}
 		for _, memberID := range info.Members {
-			userID := makeUserID(addIdentifierPrefix(memberID))
+			userID := makeUserID(addIdentifierPrefix(stripSmsSuffix(memberID)))
 			members.MemberMap[userID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{Sender: userID},
 				Membership:  event.MembershipJoin,
@@ -8450,7 +8450,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(parsed.LocalID)
+		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
 		otherUser := makeUserID(portalID)
 		isSelfChat := c.isMyHandle(portalID)
 
