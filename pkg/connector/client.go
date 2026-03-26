@@ -6842,9 +6842,17 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			aliasedID, hasAlias := c.gidAliases[gidID]
 			c.gidAliasesMu.RUnlock()
 			if hasAlias {
-				if len(participants) > 0 && c.guidCacheMatchIsStale(aliasedID, participants) {
+				// Canonicalize participants (collapses alternate self handles to
+				// c.handle) before staleness check so a valid alias is never
+				// evicted just because APNs reported self with a different identifier.
+				canonical := c.buildCanonicalParticipantList(participants)
+				if len(canonical) > 0 && c.guidCacheMatchIsStale(aliasedID, canonical) {
 					c.gidAliasesMu.Lock()
-					delete(c.gidAliases, gidID)
+					// Compare-before-delete: another handler may have repaired
+					// the alias between our RLock read and this write lock.
+					if c.gidAliases[gidID] == aliasedID {
+						delete(c.gidAliases, gidID)
+					}
 					c.gidAliasesMu.Unlock()
 					c.UserLogin.Log.Warn().
 						Str("gid_id", gidID).
