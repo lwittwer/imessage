@@ -6454,10 +6454,14 @@ func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *s
 	c.groupPortalMu.RUnlock()
 
 	for existingID, sharedCount := range overlap {
-		existingSize := len(strings.Split(existingID, ","))
+		existingMembers := strings.Split(existingID, ",")
+		existingSize := len(existingMembers)
 		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
 		if diff > 1 {
 			continue
+		}
+		if diff == 1 && !participantSetsMatch(candidateMembers, existingMembers, c.handle) {
+			continue // diff=1 for a non-self member → different group
 		}
 
 		// If we have a sender_guid, reject fuzzy matches with a different
@@ -6750,10 +6754,14 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	candidateSize := len(deduped)
 	var exactMatch, fuzzyMatch string
 	for existingID, sharedCount := range overlap {
-		existingSize := len(strings.Split(existingID, ","))
+		existingMembers := strings.Split(existingID, ",")
+		existingSize := len(existingMembers)
 		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
 		if diff > 1 {
 			continue
+		}
+		if diff == 1 && !participantSetsMatch(deduped, existingMembers, c.handle) {
+			continue // diff=1 for a non-self member → different group
 		}
 		key := networkid.PortalKey{ID: networkid.PortalID(existingID), Receiver: c.UserLogin.ID}
 		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
@@ -6834,7 +6842,18 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			aliasedID, hasAlias := c.gidAliases[gidID]
 			c.gidAliasesMu.RUnlock()
 			if hasAlias {
-				portalID = networkid.PortalID(aliasedID)
+				if len(participants) > 0 && c.guidCacheMatchIsStale(aliasedID, participants) {
+					c.gidAliasesMu.Lock()
+					delete(c.gidAliases, gidID)
+					c.gidAliasesMu.Unlock()
+					c.UserLogin.Log.Warn().
+						Str("gid_id", gidID).
+						Str("stale_alias", aliasedID).
+						Msg("Cleared stale gid alias: participant mismatch")
+					// Fall through to normal resolution below
+				} else {
+					portalID = networkid.PortalID(aliasedID)
+				}
 			}
 			if portalID == "" {
 				// Check if a portal with this exact gid already exists.
