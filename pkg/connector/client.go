@@ -6582,14 +6582,24 @@ func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey,
 }
 
 // guidCacheMatchIsStale returns true if a guid cache entry for a comma-based
-// portal is provably stale — the portal ID's participants don't match the
-// incoming message's participants. Returns false (not provably stale) for
-// non-comma portals, when no participant info is available, or when participants match.
+// portal is provably stale — the incoming participants contain members not
+// present in the cached portal. Returns false (not provably stale) for
+// non-comma portals, when no participant info is available, or when all
+// incoming participants are present in the portal's member set.
+//
+// This intentionally uses a subset check rather than a symmetric match:
+// typing and read-receipt payloads may only include [sender, target] without
+// the full group roster, so missing portal members are expected and do not
+// indicate staleness.
 func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []string) bool {
 	if !strings.Contains(portalIDStr, ",") || len(rawParticipants) == 0 {
 		return false
 	}
 	portalParts := strings.Split(portalIDStr, ",")
+	portalSet := make(map[string]bool, len(portalParts))
+	for _, p := range portalParts {
+		portalSet[p] = true
+	}
 	// Canonicalize incoming participants (collapses alternate self handles
 	// to c.handle, deduplicates, sorts) so all callsites get consistent
 	// behavior regardless of whether they pre-canonicalize.
@@ -6597,7 +6607,15 @@ func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []s
 	if len(canonical) == 0 {
 		return false
 	}
-	return !participantSetsMatch(portalParts, canonical, c.isMyHandle)
+	// Only flag as stale if incoming participants contain members NOT in
+	// the portal's set (and not self handles). This correctly handles
+	// partial payloads where the incoming list is a subset of the portal.
+	for _, p := range canonical {
+		if !portalSet[p] && !c.isMyHandle(p) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveExistingGroupByGid tries to find an existing group portal that matches
