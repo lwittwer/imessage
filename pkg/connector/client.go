@@ -1438,10 +1438,11 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		evtType = bridgev2.RemoteEventReactionRemove
 	}
 
-	tapbackTargetID := targetGUID
-	if msg.TapbackTargetPart != nil && *msg.TapbackTargetPart >= 1 {
-		tapbackTargetID = fmt.Sprintf("%s_att%d", targetGUID, *msg.TapbackTargetPart-1)
+	tapbackPart := 0
+	if msg.TapbackTargetPart != nil {
+		tapbackPart = int(*msg.TapbackTargetPart)
 	}
+	tapbackTargetMsgID := c.resolveTapbackTargetID(targetGUID, tapbackPart)
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
@@ -1450,7 +1451,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
-		TargetMessage: makeMessageID(tapbackTargetID),
+		TargetMessage: tapbackTargetMsgID,
 		Emoji:         emoji,
 	})
 }
@@ -5106,10 +5107,7 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	if targetGUID == "" {
 		return nil
 	}
-	targetID := targetGUID
-	if bp >= 1 {
-		targetID = fmt.Sprintf("%s_att%d", targetGUID, bp-1)
-	}
+	targetMsgID := c.resolveTapbackTargetID(targetGUID, bp)
 
 	evtType := bridgev2.RemoteEventReaction
 	if isRemove {
@@ -5124,7 +5122,6 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	// for minutes. Checking the reaction table here is a cheap PK lookup that
 	// prevents the queue from filling with known duplicates.
 	if !isRemove {
-		targetMsgID := makeMessageID(targetID)
 		existing, err := c.Main.Bridge.DB.Reaction.GetByIDWithoutMessagePart(
 			context.Background(), c.UserLogin.ID, targetMsgID, sender.Sender, "",
 		)
@@ -5146,7 +5143,7 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 			Sender:    sender,
 			Timestamp: ts,
 		},
-		TargetMessage: makeMessageID(targetID),
+		TargetMessage: targetMsgID,
 		Emoji:         emoji,
 	})
 	return nil
@@ -7503,6 +7500,26 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	}
 
 	return cm, nil
+}
+
+// resolveTapbackTargetID constructs the message ID for a tapback target,
+// handling backward compatibility with messages stored before part-targeting
+// was introduced. For bp >= 1 it tries the suffixed ID (e.g. "uuid_att0")
+// first; if that message doesn't exist in the bridge DB it falls back to the
+// bare UUID, which is how pre-existing messages were stored.
+func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.MessageID {
+	if bp >= 1 {
+		suffixed := fmt.Sprintf("%s_att%d", targetGUID, bp-1)
+		suffixedID := makeMessageID(suffixed)
+		msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(
+			context.Background(), c.UserLogin.ID, suffixedID,
+		)
+		if err == nil && msg != nil {
+			return suffixedID
+		}
+		// Suffixed ID not found — fall back to bare UUID for old messages.
+	}
+	return makeMessageID(targetGUID)
 }
 
 // ============================================================================
