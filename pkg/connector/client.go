@@ -1438,6 +1438,11 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		evtType = bridgev2.RemoteEventReactionRemove
 	}
 
+	tapbackTargetID := targetGUID
+	if msg.TapbackTargetPart != nil && *msg.TapbackTargetPart >= 1 {
+		tapbackTargetID = fmt.Sprintf("%s_att%d", targetGUID, *msg.TapbackTargetPart-1)
+	}
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
 			Type:      evtType,
@@ -1445,13 +1450,8 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
-		TargetMessage: makeMessageID(func() string {
-			if msg.TapbackTargetPart != nil && *msg.TapbackTargetPart >= 1 {
-				return fmt.Sprintf("%s_att%d", targetGUID, *msg.TapbackTargetPart-1)
-			}
-			return targetGUID
-		}()),
-		Emoji: emoji,
+		TargetMessage: makeMessageID(tapbackTargetID),
+		Emoji:         emoji,
 	})
 }
 
