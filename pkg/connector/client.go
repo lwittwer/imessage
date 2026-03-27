@@ -8104,7 +8104,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			members := make([]string, 0, len(info.Members)+1)
 			members = append(members, addIdentifierPrefix(c.handle))
 			for _, m := range info.Members {
-				members = append(members, addIdentifierPrefix(m))
+				members = append(members, addIdentifierPrefix(stripSmsSuffix(m)))
 			}
 			sort.Strings(members)
 			portalKey = networkid.PortalKey{
