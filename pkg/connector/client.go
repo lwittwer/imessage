@@ -4931,9 +4931,11 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		tapbackType := *row.TapbackType
 		isRemove := tapbackType >= 3000
 
-		// Parse target GUID from "p:0/GUID" format.
+		// Parse target GUID and balloon-part index from "p:N/GUID" format.
 		targetGUID := row.TapbackTargetGUID
+		bp := 0
 		if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
+			fmt.Sscanf(parts[0], "p:%d", &bp)
 			targetGUID = parts[1]
 		}
 		if targetGUID == "" {
@@ -4947,10 +4949,19 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 			ts := time.UnixMilli(row.TimestampMS)
 			idx := tapbackType - 2000
 			emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
+			// Map balloon-part index to bridge part ID:
+			// bp 0 = text body (nil TargetPart → first part),
+			// bp >= 1 = attachment (att0, att1, …).
+			var targetPart *networkid.PartID
+			if bp >= 1 {
+				p := networkid.PartID(fmt.Sprintf("att%d", bp-1))
+				targetPart = &p
+			}
 			targetMsg.Reactions = append(targetMsg.Reactions, &bridgev2.BackfillReaction{
-				Sender:    sender,
-				Emoji:     emoji,
-				Timestamp: ts,
+				Sender:     sender,
+				Emoji:      emoji,
+				Timestamp:  ts,
+				TargetPart: targetPart,
 			})
 		} else {
 			// Fall back to QueueRemoteEvent for removes and out-of-batch targets.
