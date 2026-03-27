@@ -1142,37 +1142,9 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// Track SMS portals so outbound replies use the correct service type.
 	// Unconditional so SMS→iMessage transitions are reflected immediately.
 	c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
-	// Persist IsSms to PortalMetadata for existing portals (handles SMS↔iMessage
-	// transitions). For brand-new portals, GetExistingPortalByKey returns nil and
-	// the goroutine exits without persisting — that case is covered by the
-	// GetChatInfo ExtraUpdates hook, which reads isPortalSMS() (already set above)
-	// when the framework calls GetChatInfo to create the new portal.
-	go func(pk networkid.PortalKey, isSms bool) {
-		bgCtx := context.Background()
-		portal, portalErr := c.Main.Bridge.GetExistingPortalByKey(bgCtx, pk)
-		if portalErr != nil {
-			c.UserLogin.Log.Warn().Err(portalErr).
-				Str("portal_id", string(pk.ID)).
-				Msg("Failed to look up portal for IsSms persistence")
-			return
-		}
-		if portal == nil {
-			return
-		}
-		meta := &PortalMetadata{}
-		if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-			*meta = *existing
-		}
-		if meta.IsSms != isSms {
-			meta.IsSms = isSms
-			portal.Metadata = meta
-			if err := portal.Save(bgCtx); err != nil {
-				c.UserLogin.Log.Warn().Err(err).
-					Str("portal_id", string(pk.ID)).
-					Msg("Failed to persist IsSms metadata")
-			}
-		}
-	}(portalKey, msg.IsSms)
+	// IsSms persistence is handled by the GetChatInfo ExtraUpdates hook, which
+	// reads isPortalSMS() (already set above via updatePortalSMS). This avoids
+	// a race between a detached goroutine and the framework's own metadata updates.
 
 	// Only create new portals after CloudKit sync is done.
 	cloudSyncDone := c.isCloudSyncDone()
