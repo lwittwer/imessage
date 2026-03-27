@@ -1993,7 +1993,7 @@ func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Con
 // whose participants overlap with the given normalized participant list.
 // Used to find duplicate group portals that have the same members but different
 // group UUIDs. Participants are compared after normalization (tel:/mailto: prefix).
-func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string) ([]string, error) {
+func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string, isSelf func(string) bool) ([]string, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> '' AND deleted=FALSE`,
 		s.loginID,
@@ -2031,7 +2031,7 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 				normalized = append(normalized, n)
 			}
 		}
-		if participantSetsMatch(normalized, normalizedTarget) {
+		if participantSetsMatch(normalized, normalizedTarget, isSelf) {
 			matches = append(matches, portalID)
 			seen[portalID] = true
 		}
@@ -2040,9 +2040,10 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 }
 
 // participantSetsMatch checks if two normalized participant sets are equivalent
-// (same members, ignoring order). Allows ±1 member difference to handle cases
-// where self is included in one set but not the other.
-func participantSetsMatch(a, b []string) bool {
+// (same members, ignoring order). Allows a difference of exactly 1 only if the
+// single differing member is self (checked via isSelf predicate, which should
+// test against all known user handles). Pass nil isSelf to disallow any difference.
+func participantSetsMatch(a, b []string, isSelf func(string) bool) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
@@ -2054,20 +2055,27 @@ func participantSetsMatch(a, b []string) bool {
 	for _, p := range b {
 		setB[p] = true
 	}
-	// Count members in A not in B, and vice versa.
+	// Count members in A not in B, and vice versa; track whether ALL
+	// differing members are self handles.
+	allDiffAreSelf := true
 	diff := 0
 	for p := range setA {
 		if !setB[p] {
 			diff++
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
 	for p := range setB {
 		if !setA[p] {
 			diff++
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
-	// Allow ±1 difference (self may be in one set but not the other).
-	return diff <= 1
+	return diff == 0 || (allDiffAreSelf && isSelf != nil)
 }
 
 // deleteLocalChatByGroupID removes all local cloud_chat and cloud_message records

@@ -1705,22 +1705,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 
 	// Compute new portal ID from the NEW participant list using the same
 	// normalization / dedup / sort logic as makePortalKey's group branch.
-	sorted := make([]string, 0, len(msg.NewParticipants))
-	for _, p := range msg.NewParticipants {
-		normalized := normalizeIdentifierForPortalID(p)
-		if normalized == "" || c.isMyHandle(normalized) {
-			continue
-		}
-		sorted = append(sorted, normalized)
-	}
-	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-	sort.Strings(sorted)
-	deduped := sorted[:0]
-	for i, s := range sorted {
-		if i == 0 || s != sorted[i-1] {
-			deduped = append(deduped, s)
-		}
-	}
+	deduped := c.buildCanonicalParticipantList(msg.NewParticipants)
 	newPortalIDStr := strings.Join(deduped, ",")
 	oldPortalIDStr := string(oldPortalKey.ID)
 
@@ -1749,10 +1734,18 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	}
 
 	// Cache sender_guid and group_name under the (possibly new) portal ID.
+	// For comma-based portals and gid: portals, cache the sender_guid so
+	// future messages can be resolved to this portal. This is skipped for
+	// other portal ID formats to avoid poisoning the cache with unrelated
+	// sender_guids.
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
-		c.imGroupGuidsMu.Lock()
-		c.imGroupGuids[string(finalPortalKey.ID)] = *msg.SenderGuid
-		c.imGroupGuidsMu.Unlock()
+		portalIDStr := string(finalPortalKey.ID)
+		isGidPortal := strings.HasPrefix(portalIDStr, "gid:")
+		if strings.Contains(portalIDStr, ",") || isGidPortal {
+			c.imGroupGuidsMu.Lock()
+			c.imGroupGuids[portalIDStr] = *msg.SenderGuid
+			c.imGroupGuidsMu.Unlock()
+		}
 	}
 	if msg.GroupName != nil && *msg.GroupName != "" {
 		c.imGroupNamesMu.Lock()
@@ -2011,8 +2004,23 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 		aliasedID, hasAlias := c.gidAliases[gidID]
 		c.gidAliasesMu.RUnlock()
 		if hasAlias {
-			portalKey.ID = networkid.PortalID(aliasedID)
-			return portalKey
+			if c.guidCacheMatchIsStale(aliasedID, msg.DeleteChatParticipants) {
+				c.gidAliasesMu.Lock()
+				// Compare-before-delete: another handler may have repaired
+				// the alias between our RLock read and this write lock.
+				if c.gidAliases[gidID] == aliasedID {
+					delete(c.gidAliases, gidID)
+				}
+				c.gidAliasesMu.Unlock()
+				log.Warn().
+					Str("gid_id", gidID).
+					Str("stale_alias", aliasedID).
+					Msg("Cleared stale gid alias in handleDeleteChat: participant mismatch")
+				// Fall through to direct gid: lookup / resolveExistingGroupByGid
+			} else {
+				portalKey.ID = networkid.PortalID(aliasedID)
+				return portalKey
+			}
 		}
 		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey); existing != nil && existing.MXID != "" {
 			return portalKey
@@ -3293,7 +3301,10 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 		c.imGroupGuidsMu.RLock()
 		for portalIDStr, guid := range c.imGroupGuids {
-			if guid == *msg.SenderGuid {
+			if strings.EqualFold(guid, *msg.SenderGuid) {
+				if c.guidCacheMatchIsStale(portalIDStr, msg.Participants) {
+					continue
+				}
 				portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
 				c.imGroupGuidsMu.RUnlock()
 				log.Debug().
@@ -3442,7 +3453,10 @@ func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		// Fall back to cache lookup for legacy portals
 		c.imGroupGuidsMu.RLock()
 		for portalIDStr, guid := range c.imGroupGuids {
-			if guid == *msg.SenderGuid {
+			if strings.EqualFold(guid, *msg.SenderGuid) {
+				if c.guidCacheMatchIsStale(portalIDStr, msg.Participants) {
+					continue
+				}
 				portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
 				c.imGroupGuidsMu.RUnlock()
 				log.Debug().
@@ -4319,7 +4333,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// names to stale values from CloudKit or metadata, and produce
 		// unwanted bridge bot "name changed" events.
 		if portal.MXID == "" || portal.Name == "" {
-			groupName := c.resolveGroupName(ctx, portalID)
+			groupName, _ := c.resolveGroupName(ctx, portalID)
 			chatInfo.Name = &groupName
 		}
 
@@ -6277,6 +6291,31 @@ func normalizeIdentifierForPortalID(identifier string) string {
 	return id
 }
 
+// buildCanonicalParticipantList normalizes, deduplicates, and sorts a
+// participant list into the canonical form used for comma-based portal IDs.
+// Any self handles are filtered out and replaced with the single canonical
+// c.handle. Accepts both raw and pre-normalized inputs (normalization is
+// idempotent).
+func (c *IMClient) buildCanonicalParticipantList(participants []string) []string {
+	sorted := make([]string, 0, len(participants))
+	for _, p := range participants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" || c.isMyHandle(normalized) {
+			continue
+		}
+		sorted = append(sorted, normalized)
+	}
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sort.Strings(sorted)
+	deduped := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			deduped = append(deduped, s)
+		}
+	}
+	return deduped
+}
+
 // normalizePhoneIdentifierForPortalID canonicalizes phone-like identifiers while
 // preserving short-code semantics (e.g. "242733" stays "242733", not "+242733").
 func normalizePhoneIdentifierForPortalID(local string) string {
@@ -6566,10 +6605,14 @@ func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *s
 	c.groupPortalMu.RUnlock()
 
 	for existingID, sharedCount := range overlap {
-		existingSize := len(strings.Split(existingID, ","))
+		existingMembers := strings.Split(existingID, ",")
+		existingSize := len(existingMembers)
 		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
 		if diff > 1 {
 			continue
+		}
+		if diff == 1 && !participantSetsMatch(candidateMembers, existingMembers, c.isMyHandle) {
+			continue // diff=1 for a non-self member → different group
 		}
 
 		// If we have a sender_guid, reject fuzzy matches with a different
@@ -6707,6 +6750,56 @@ func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey,
 	return networkid.PortalKey{}, false
 }
 
+// guidCacheMatchIsStale returns true if a guid cache entry for a comma-based
+// portal is provably stale — the incoming participants contain members not
+// present in the cached portal. Returns false (not provably stale) for
+// non-comma portals, when no participant info is available, or when all
+// incoming participants are present in the portal's member set.
+//
+// This intentionally uses a subset check rather than a symmetric match:
+// typing and read-receipt payloads may only include [sender, target] without
+// the full group roster, so missing portal members are expected and do not
+// indicate staleness.
+func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []string) bool {
+	if len(rawParticipants) == 0 {
+		return false
+	}
+	// For gid: portal IDs (no comma), resolve participants from the cache
+	// so gid->gid aliases can be validated and self-heal when stale.
+	var portalParts []string
+	if !strings.Contains(portalIDStr, ",") {
+		c.imGroupParticipantsMu.RLock()
+		cached := c.imGroupParticipants[portalIDStr]
+		c.imGroupParticipantsMu.RUnlock()
+		if len(cached) == 0 {
+			return false // no participant info to compare against
+		}
+		portalParts = cached
+	} else {
+		portalParts = strings.Split(portalIDStr, ",")
+	}
+	portalSet := make(map[string]bool, len(portalParts))
+	for _, p := range portalParts {
+		portalSet[p] = true
+	}
+	// Canonicalize incoming participants (collapses alternate self handles
+	// to c.handle, deduplicates, sorts) so all callsites get consistent
+	// behavior regardless of whether they pre-canonicalize.
+	canonical := c.buildCanonicalParticipantList(rawParticipants)
+	if len(canonical) == 0 {
+		return false
+	}
+	// Only flag as stale if incoming participants contain members NOT in
+	// the portal's set (and not self handles). This correctly handles
+	// partial payloads where the incoming list is a subset of the portal.
+	for _, p := range canonical {
+		if !portalSet[p] && !c.isMyHandle(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveExistingGroupByGid tries to find an existing group portal that matches
 // the incoming message when the gid (sender_guid) doesn't match any known portal.
 // This handles the case where another rustpush client (like OpenBubbles) uses a
@@ -6728,6 +6821,45 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	for portalIDStr, guid := range c.imGroupGuids {
 		if strings.ToLower(guid) == normalizedGuid {
 			c.imGroupGuidsMu.RUnlock()
+			if c.guidCacheMatchIsStale(portalIDStr, participants) {
+				c.UserLogin.Log.Warn().
+					Str("gid_portal_id", gidPortalID).
+					Str("candidate_portal", portalIDStr).
+					Str("stale_guid", guid).
+					Msg("Skipping stale guid cache entry: participant mismatch — clearing")
+				// Self-heal: remove from in-memory cache
+				c.imGroupGuidsMu.Lock()
+				if c.imGroupGuids[portalIDStr] == guid {
+					delete(c.imGroupGuids, portalIDStr)
+				}
+				c.imGroupGuidsMu.Unlock()
+				// Self-heal: clear stale SenderGuid from DB metadata.
+				// MUST be synchronous — portalToConversation (Site E) lazily
+				// loads metadata into cache and would re-poison it.
+				staleKey := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+				if stalePortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, staleKey); err != nil {
+					c.UserLogin.Log.Warn().Err(err).
+						Str("portal_id", portalIDStr).
+						Msg("Failed to look up portal for stale guid self-heal")
+				} else if stalePortal != nil {
+					if meta, ok := stalePortal.Metadata.(*PortalMetadata); ok && meta.SenderGuid == guid {
+						meta.SenderGuid = ""
+						stalePortal.Metadata = meta
+						if err := stalePortal.Save(ctx); err != nil {
+							c.UserLogin.Log.Warn().Err(err).
+								Str("portal_id", portalIDStr).
+								Msg("Failed to clear stale SenderGuid from DB metadata")
+						} else {
+							c.UserLogin.Log.Info().
+								Str("portal_id", portalIDStr).
+								Str("cleared_guid", guid).
+								Msg("Cleared stale SenderGuid from DB metadata")
+						}
+					}
+				}
+				c.imGroupGuidsMu.RLock()
+				continue
+			}
 			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
 			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
 				c.UserLogin.Log.Info().
@@ -6756,18 +6888,19 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 		return networkid.PortalID(gidPortalID)
 	}
 
-	// 2. Check imGroupParticipants cache: find portals (including other gid:
-	//    portals) with matching participant sets. Skip DM portals — they
-	//    can accidentally match via ±1 participant tolerance.
+	// 2. Check imGroupParticipants cache: find gid: portals with matching
+	//    participant sets. Comma-based portals are intentionally excluded here
+	//    because step 3 (groupPortalIndex) handles them using the authoritative
+	//    portal ID rather than the potentially-stale in-memory cache.
 	c.imGroupParticipantsMu.RLock()
 	for portalIDStr, parts := range c.imGroupParticipants {
 		if portalIDStr == gidPortalID {
 			continue
 		}
-		if !strings.HasPrefix(portalIDStr, "gid:") && !strings.Contains(portalIDStr, ",") {
+		if !strings.HasPrefix(portalIDStr, "gid:") {
 			continue
 		}
-		if participantSetsMatch(parts, normalizedParts) {
+		if participantSetsMatch(parts, normalizedParts, c.isMyHandle) {
 			c.imGroupParticipantsMu.RUnlock()
 			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
 			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
@@ -6787,20 +6920,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    whole point is to find portals where the guid differs (another client
 	//    using a different gid for the same group).
 	c.ensureGroupPortalIndex()
-	sorted := make([]string, 0, len(normalizedParts))
-	for _, p := range normalizedParts {
-		if !c.isMyHandle(p) {
-			sorted = append(sorted, p)
-		}
-	}
-	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-	sort.Strings(sorted)
-	deduped := sorted[:0]
-	for i, s := range sorted {
-		if i == 0 || s != sorted[i-1] {
-			deduped = append(deduped, s)
-		}
-	}
+	deduped := c.buildCanonicalParticipantList(normalizedParts)
 
 	overlap := make(map[string]int)
 	c.groupPortalMu.RLock()
@@ -6812,21 +6932,43 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	c.groupPortalMu.RUnlock()
 
 	candidateSize := len(deduped)
+	var exactMatch, fuzzyMatch string
 	for existingID, sharedCount := range overlap {
-		existingSize := len(strings.Split(existingID, ","))
+		existingMembers := strings.Split(existingID, ",")
+		existingSize := len(existingMembers)
 		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
 		if diff > 1 {
 			continue
 		}
+		if diff == 1 && !participantSetsMatch(deduped, existingMembers, c.isMyHandle) {
+			continue // diff=1 for a non-self member → different group
+		}
 		key := networkid.PortalKey{ID: networkid.PortalID(existingID), Receiver: c.UserLogin.ID}
 		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
-			c.UserLogin.Log.Info().
-				Str("gid_portal_id", gidPortalID).
-				Str("resolved_portal", existingID).
-				Int("participant_diff", diff).
-				Msg("Resolved unknown gid to existing comma-based portal via fuzzy match")
-			return networkid.PortalID(existingID)
+			if diff == 0 {
+				exactMatch = existingID
+				break // Can't do better than exact
+			}
+			if fuzzyMatch == "" {
+				fuzzyMatch = existingID
+			}
 		}
+	}
+	if exactMatch != "" {
+		c.UserLogin.Log.Info().
+			Str("gid_portal_id", gidPortalID).
+			Str("resolved_portal", exactMatch).
+			Int("participant_diff", 0).
+			Msg("Resolved unknown gid to existing comma-based portal via fuzzy match")
+		return networkid.PortalID(exactMatch)
+	}
+	if fuzzyMatch != "" {
+		c.UserLogin.Log.Info().
+			Str("gid_portal_id", gidPortalID).
+			Str("resolved_portal", fuzzyMatch).
+			Int("participant_diff", 1).
+			Msg("Resolved unknown gid to existing comma-based portal via fuzzy match")
+		return networkid.PortalID(fuzzyMatch)
 	}
 
 	// 4. Fall back to cloud_chat DB for portals not in memory caches
@@ -6836,7 +6978,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    can accidentally match via ±1 participant tolerance because a
 	//    DM's [self, A] is one member short of a group's [self, A, B].
 	if c.cloudStore != nil {
-		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts)
+		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts, c.isMyHandle)
 		if err == nil {
 			for _, matchPortalID := range matches {
 				if matchPortalID == gidPortalID {
@@ -6880,8 +7022,31 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			aliasedID, hasAlias := c.gidAliases[gidID]
 			c.gidAliasesMu.RUnlock()
 			if hasAlias {
-				portalID = networkid.PortalID(aliasedID)
-			} else {
+				// Canonicalize participants (collapses alternate self handles to
+				// c.handle) before staleness check so a valid alias is never
+				// evicted just because APNs reported self with a different identifier.
+				// Guard on raw participants first: buildCanonicalParticipantList always
+				// injects c.handle, so canonical is never empty even when the message
+				// carried no participant info — a [self]-only list must not trigger eviction.
+				canonical := c.buildCanonicalParticipantList(participants)
+				if len(participants) > 0 && len(canonical) > 0 && c.guidCacheMatchIsStale(aliasedID, canonical) {
+					c.gidAliasesMu.Lock()
+					// Compare-before-delete: another handler may have repaired
+					// the alias between our RLock read and this write lock.
+					if c.gidAliases[gidID] == aliasedID {
+						delete(c.gidAliases, gidID)
+					}
+					c.gidAliasesMu.Unlock()
+					c.UserLogin.Log.Warn().
+						Str("gid_id", gidID).
+						Str("stale_alias", aliasedID).
+						Msg("Cleared stale gid alias: participant mismatch")
+					// Fall through to normal resolution below
+				} else {
+					portalID = networkid.PortalID(aliasedID)
+				}
+			}
+			if portalID == "" {
 				// Check if a portal with this exact gid already exists.
 				ctx := context.Background()
 				gidKey := networkid.PortalKey{ID: networkid.PortalID(gidID), Receiver: c.UserLogin.ID}
@@ -6903,24 +7068,8 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			}
 		} else {
 			// Fallback: build a participant-based ID for groups without a UUID.
-			sorted := make([]string, 0, len(participants))
-			for _, p := range participants {
-				normalized := normalizeIdentifierForPortalID(p)
-				if normalized == "" || c.isMyHandle(normalized) {
-					continue
-				}
-				sorted = append(sorted, normalized)
-			}
-			sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-			sort.Strings(sorted)
-			deduped := sorted[:0]
-			for i, s := range sorted {
-				if i == 0 || s != sorted[i-1] {
-					deduped = append(deduped, s)
-				}
-			}
-			sorted = deduped
-			computedID := strings.Join(sorted, ",")
+			deduped := c.buildCanonicalParticipantList(participants)
+			computedID := strings.Join(deduped, ",")
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
@@ -7271,34 +7420,37 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 }
 
 // resolveGroupName determines the best display name for a group portal.
+// Returns the name and whether it came from an authoritative source
+// (imGroupNames cache or CloudKit display_name). When authoritative is
+// false, the name was generated from contact-resolved participant names.
 // Priority: 1) in-memory cache (user-set iMessage group name from real-time
 //
 //	   protocol cv_name, e.g. when someone explicitly renames a group)
 //	2) CloudKit display_name (user-set group name persisted to iCloud,
 //	   the "name" field on CKChatRecord = cv_name from chat.db)
-//	3) contact-resolved member names via buildGroupName
-func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
+//	3) contact-resolved member names via buildGroupName (non-authoritative)
+func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) (name string, authoritative bool) {
 	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
-	name := c.imGroupNames[portalID]
+	cached := c.imGroupNames[portalID]
 	c.imGroupNamesMu.RUnlock()
-	if name != "" {
-		return name
+	if cached != "" {
+		return cached, true
 	}
 
 	// 2) CloudKit display_name (user-set group name from iCloud).
 	if c.cloudStore != nil {
 		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
-			return dn
+			return dn, true
 		}
 	}
 
-	// 3) Build from contact-resolved member names
+	// 3) Build from contact-resolved member names (fallback, non-authoritative)
 	members := c.resolveGroupMembers(ctx, portalID)
 	if len(members) == 0 {
-		return "Group Chat"
+		return "Group Chat", false
 	}
-	return c.buildGroupName(members)
+	return c.buildGroupName(members), false
 }
 
 // buildGroupName creates a human-readable group name from member identifiers
