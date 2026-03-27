@@ -280,6 +280,10 @@ func portalIDToChatGUIDs(portalID string) []string {
 	if localID == "" {
 		return nil
 	}
+	// Strip legacy (sms...) suffix from pre-fix portal IDs so chat.db GUID
+	// candidates match: "tel:+12155167207(smsft)" → localID "+12155167207(smsft)"
+	// → stripped "+12155167207", producing "any;-;+12155167207" which matches chat.db.
+	localID = stripSmsSuffix(localID)
 	return []string{
 		"any;-;" + localID,
 		"iMessage;-;" + localID,
@@ -292,18 +296,23 @@ func identifierToPortalID(id imessage.Identifier) networkid.PortalID {
 	if id.IsGroup {
 		return networkid.PortalID(id.String())
 	}
-	if strings.HasPrefix(id.LocalID, "+") {
-		return networkid.PortalID("tel:" + id.LocalID)
+	localID := id.LocalID
+	// Strip Apple SMS service suffixes: "+12155167207(smsft)" → "+12155167207",
+	// "787473(smsft)" → "787473". These are native Apple formats that appear in
+	// chat.db for SMS Forwarding service types.
+	localID = stripSmsSuffix(localID)
+	if strings.HasPrefix(localID, "+") {
+		return networkid.PortalID("tel:" + localID)
 	}
-	if strings.Contains(id.LocalID, "@") {
-		return networkid.PortalID("mailto:" + id.LocalID)
+	if strings.Contains(localID, "@") {
+		return networkid.PortalID("mailto:" + localID)
 	}
 	// Short codes and numeric-only identifiers (e.g., "242733") are SMS-based.
 	// Rustpush creates these with "tel:" prefix, so we must match.
-	if isNumeric(id.LocalID) {
-		return networkid.PortalID("tel:" + id.LocalID)
+	if isNumeric(localID) {
+		return networkid.PortalID("tel:" + localID)
 	}
-	return networkid.PortalID(id.LocalID)
+	return networkid.PortalID(localID)
 }
 
 // ============================================================================
@@ -320,7 +329,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(addIdentifierPrefix(msg.Sender.LocalID)),
+		Sender:   makeUserID(addIdentifierPrefix(stripSmsSuffix(msg.Sender.LocalID))),
 	}
 }
 

@@ -54,6 +54,18 @@ func stripNonBase64(s string) string {
 	return b.String()
 }
 
+// stripSmsSuffix removes Apple SMS service suffixes such as "(smsfp)" or
+// "(smsft)" that appear on identifiers in chat.db.
+func stripSmsSuffix(id string) string {
+	if idx := strings.Index(id, "(sms"); idx > 0 {
+		// Verify the suffix is at the end of the string with a closing paren.
+		if closeIdx := strings.Index(id[idx:], ")"); closeIdx >= 0 && idx+closeIdx+1 == len(id) {
+			return id[:idx]
+		}
+	}
+	return id
+}
+
 // stripIdentifierPrefix removes tel: or mailto: prefix from an identifier.
 func stripIdentifierPrefix(id string) string {
 	id = strings.TrimPrefix(id, "tel:")
