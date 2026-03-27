@@ -6592,10 +6592,23 @@ func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey,
 // the full group roster, so missing portal members are expected and do not
 // indicate staleness.
 func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []string) bool {
-	if !strings.Contains(portalIDStr, ",") || len(rawParticipants) == 0 {
+	if len(rawParticipants) == 0 {
 		return false
 	}
-	portalParts := strings.Split(portalIDStr, ",")
+	// For gid: portal IDs (no comma), resolve participants from the cache
+	// so gid->gid aliases can be validated and self-heal when stale.
+	var portalParts []string
+	if !strings.Contains(portalIDStr, ",") {
+		c.imGroupParticipantsMu.RLock()
+		cached := c.imGroupParticipants[portalIDStr]
+		c.imGroupParticipantsMu.RUnlock()
+		if len(cached) == 0 {
+			return false // no participant info to compare against
+		}
+		portalParts = cached
+	} else {
+		portalParts = strings.Split(portalIDStr, ",")
+	}
 	portalSet := make(map[string]bool, len(portalParts))
 	for _, p := range portalParts {
 		portalSet[p] = true
