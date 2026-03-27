@@ -88,6 +88,13 @@ func TestParticipantSetsMatch(t *testing.T) {
 			want:   false,
 		},
 		{
+			name:   "both diffs are self handles (phone vs email)",
+			a:      []string{"tel:+15551111111", self},
+			b:      []string{"tel:+15551111111", selfEmail},
+			isSelf: isSelf,
+			want:   true,
+		},
+		{
 			name:   "duplicates in input",
 			a:      []string{"tel:+15551111111", "tel:+15551111111"},
 			b:      []string{"tel:+15551111111"},

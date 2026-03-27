@@ -1907,7 +1907,11 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 		if hasAlias {
 			if c.guidCacheMatchIsStale(aliasedID, msg.DeleteChatParticipants) {
 				c.gidAliasesMu.Lock()
-				delete(c.gidAliases, gidID)
+				// Compare-before-delete: another handler may have repaired
+				// the alias between our RLock read and this write lock.
+				if c.gidAliases[gidID] == aliasedID {
+					delete(c.gidAliases, gidID)
+				}
 				c.gidAliasesMu.Unlock()
 				log.Warn().
 					Str("gid_id", gidID).
@@ -6586,16 +6590,14 @@ func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []s
 		return false
 	}
 	portalParts := strings.Split(portalIDStr, ",")
-	incomingParts := make([]string, 0, len(rawParticipants))
-	for _, p := range rawParticipants {
-		if n := normalizeIdentifierForPortalID(p); n != "" {
-			incomingParts = append(incomingParts, n)
-		}
-	}
-	if len(incomingParts) == 0 {
+	// Canonicalize incoming participants (collapses alternate self handles
+	// to c.handle, deduplicates, sorts) so all callsites get consistent
+	// behavior regardless of whether they pre-canonicalize.
+	canonical := c.buildCanonicalParticipantList(rawParticipants)
+	if len(canonical) == 0 {
 		return false
 	}
-	return !participantSetsMatch(portalParts, incomingParts, c.isMyHandle)
+	return !participantSetsMatch(portalParts, canonical, c.isMyHandle)
 }
 
 // resolveExistingGroupByGid tries to find an existing group portal that matches

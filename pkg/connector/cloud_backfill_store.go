@@ -2055,26 +2055,27 @@ func participantSetsMatch(a, b []string, isSelf func(string) bool) bool {
 	for _, p := range b {
 		setB[p] = true
 	}
-	// Count members in A not in B, and vice versa; track the differing member.
+	// Count members in A not in B, and vice versa; track whether ALL
+	// differing members are self handles.
+	allDiffAreSelf := true
 	diff := 0
-	var diffMember string
 	for p := range setA {
 		if !setB[p] {
 			diff++
-			diffMember = p
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
 	for p := range setB {
 		if !setA[p] {
 			diff++
-			diffMember = p
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
-	if diff == 0 {
-		return true
-	}
-	// Allow exactly 1 difference only when that member is self.
-	return diff == 1 && isSelf != nil && isSelf(diffMember)
+	return diff == 0 || (allDiffAreSelf && isSelf != nil)
 }
 
 // deleteLocalChatByGroupID removes all local cloud_chat and cloud_message records
