@@ -821,7 +821,7 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		newName, _ := c.resolveGroupName(ctx, portalID)
+		newName := c.resolveGroupName(ctx, portalID)
 		if newName == "" || newName == portal.Name {
 			continue
 		}
