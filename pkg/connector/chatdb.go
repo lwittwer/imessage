@@ -188,6 +188,10 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			continue
 		}
 		sender := chatDBMakeEventSender(msg, c)
+		if sender.Sender == "" && !sender.IsFromMe {
+			continue
+		}
+		sender = c.canonicalizeDMSender(params.Portal.PortalKey, sender)
 
 		// Strip U+FFFC (object replacement character) — inline attachment
 		// placeholders from NSAttributedString that render as blank

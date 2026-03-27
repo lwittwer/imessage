@@ -561,8 +561,9 @@ func (c *IMClient) onForwardBackfillDone() {
 		// refreshGhostNamesFromContacts call (triggered by setContactsReady)
 		// may have scanned the DB before backfill ghosts existed, leaving them
 		// with fallback display names. Multi-handle contacts are especially
-		// affected because makeCloudSender does not call canonicalizeDMSender,
-		// creating phantom sender ghosts that also need display names set.
+		// affected because canonicalizeDMSender only remaps within the same
+		// portal, so multi-handle senders still create additional ghosts
+		// that also need display names set.
 		c.contactsReadyLock.RLock()
 		contactsReady := c.contactsReady
 		c.contactsReadyLock.RUnlock()
@@ -4915,6 +4916,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		if sender.Sender == "" && !sender.IsFromMe {
 			continue
 		}
+		sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 		tapbackType := *row.TapbackType
 		isRemove := tapbackType >= 3000
@@ -4961,6 +4963,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	if sender.Sender == "" && !sender.IsFromMe {
 		return nil
 	}
+	sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 	// Skip system/service messages (group renames, participant changes, etc.).
 	// Two complementary signals:
