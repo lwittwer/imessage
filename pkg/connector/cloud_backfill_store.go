@@ -1242,6 +1242,64 @@ func (s *cloudBackfillStore) listRestoreOverrides(ctx context.Context) []string 
 	return out
 }
 
+// rekeyPortalID migrates all local CloudKit cache state keyed by portal_id to
+// a new portal ID after the bridge re-IDs a portal.
+func (s *cloudBackfillStore) rekeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
+	if s == nil || oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
+		return nil
+	}
+
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for _, query := range []string{
+			`UPDATE cloud_chat SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+		} {
+			if _, err := s.db.Exec(ctx, query, s.loginID, oldPortalID, newPortalID); err != nil {
+				return fmt.Errorf("rekey portal_id %s -> %s: %w", oldPortalID, newPortalID, err)
+			}
+		}
+
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO group_photo_cache (login_id, portal_id, ts, data)
+			SELECT login_id, $3, ts, data
+			FROM group_photo_cache
+			WHERE login_id=$1 AND portal_id=$2
+			ON CONFLICT (login_id, portal_id) DO UPDATE
+				SET ts=MAX(group_photo_cache.ts, excluded.ts),
+				    data=CASE
+				        WHEN excluded.ts >= group_photo_cache.ts THEN excluded.data
+				        ELSE group_photo_cache.data
+				    END
+		`, s.loginID, oldPortalID, newPortalID); err != nil {
+			return fmt.Errorf("rekey group_photo_cache %s -> %s: %w", oldPortalID, newPortalID, err)
+		}
+		if _, err := s.db.Exec(ctx,
+			`DELETE FROM group_photo_cache WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, oldPortalID,
+		); err != nil {
+			return fmt.Errorf("cleanup old group_photo_cache %s: %w", oldPortalID, err)
+		}
+
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO restore_override (login_id, portal_id, updated_ts)
+			SELECT login_id, $3, updated_ts
+			FROM restore_override
+			WHERE login_id=$1 AND portal_id=$2
+			ON CONFLICT (login_id, portal_id) DO UPDATE
+				SET updated_ts=MAX(restore_override.updated_ts, excluded.updated_ts)
+		`, s.loginID, oldPortalID, newPortalID); err != nil {
+			return fmt.Errorf("rekey restore_override %s -> %s: %w", oldPortalID, newPortalID, err)
+		}
+		if _, err := s.db.Exec(ctx,
+			`DELETE FROM restore_override WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, oldPortalID,
+		); err != nil {
+			return fmt.Errorf("cleanup old restore_override %s: %w", oldPortalID, err)
+		}
+		return nil
+	})
+}
+
 // portalHasChat returns true if the given portal_id has at least one
 // cloud_chat record (i.e., the conversation was included in CloudKit chat
 // sync). Portals with no chat record are orphaned — typically junk/spam
@@ -2600,11 +2658,11 @@ func (s *cloudBackfillStore) debugFindPortalsByIdentifierSuffix(ctx context.Cont
 // record has synced, and whether it's filtered/deleted). Used by !msg-debug
 // to distinguish "chat not synced yet" from "chat synced but messages missing".
 type debugChatInfo struct {
-	Found      bool
-	Deleted    bool
-	IsFiltered int64
+	Found       bool
+	Deleted     bool
+	IsFiltered  int64
 	CloudChatID string
-	GroupID    string
+	GroupID     string
 }
 
 func (s *cloudBackfillStore) debugChatInfo(ctx context.Context, portalID string) (debugChatInfo, error) {

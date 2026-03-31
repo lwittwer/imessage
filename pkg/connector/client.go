@@ -1752,8 +1752,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	// sender_guids.
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
 		portalIDStr := string(finalPortalKey.ID)
-		isGidPortal := strings.HasPrefix(portalIDStr, "gid:")
-		if strings.Contains(portalIDStr, ",") || isGidPortal {
+		if shouldCacheSenderGUIDForPortal(portalIDStr, *msg.SenderGuid) {
 			c.imGroupGuidsMu.Lock()
 			c.imGroupGuids[portalIDStr] = *msg.SenderGuid
 			c.imGroupGuidsMu.Unlock()
@@ -5125,6 +5124,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	var messages []*bridgev2.BackfillMessage
 	var tapbackRows []cloudMessageRow
 	messageByGUID := make(map[string]*bridgev2.BackfillMessage)
+	messageByID := make(map[networkid.MessageID]*bridgev2.BackfillMessage)
 
 	for _, row := range rows {
 		if row.TapbackType != nil && *row.TapbackType >= 2000 {
@@ -5133,9 +5133,10 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		}
 		converted := c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)
 		messages = append(messages, converted...)
-		// Key by row GUID so tapbacks can find their target. A row may
-		// produce multiple BackfillMessages (text + attachments); attach
-		// the reaction to the first one (text, or first attachment).
+		for _, msg := range converted {
+			messageByID[msg.ID] = msg
+		}
+		// Key the bare row GUID for body tapbacks and attachment-only rows.
 		if len(converted) > 0 {
 			messageByGUID[row.GUID] = converted[0]
 		}
@@ -5166,19 +5167,11 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 
 		// Removes can't use BackfillReaction (framework only supports add).
 		// Tapbacks targeting messages outside this batch also fall back.
-		targetMsg, inBatch := messageByGUID[targetGUID]
+		targetMsg, targetPart, inBatch := resolveInBatchTapbackTarget(messageByGUID, messageByID, targetGUID, bp)
 		if !isRemove && inBatch {
 			ts := time.UnixMilli(row.TimestampMS)
 			idx := tapbackType - 2000
 			emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
-			// Map balloon-part index to bridge part ID:
-			// bp 0 = text body (nil TargetPart → first part),
-			// bp >= 1 = attachment (att0, att1, …).
-			var targetPart *networkid.PartID
-			if bp >= 1 {
-				p := networkid.PartID(fmt.Sprintf("att%d", bp-1))
-				targetPart = &p
-			}
 			targetMsg.Reactions = append(targetMsg.Reactions, &bridgev2.BackfillReaction{
 				Sender:     sender,
 				Emoji:      emoji,
@@ -6482,6 +6475,12 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	if err != nil {
 		return result, portal, err
 	}
+	if c.cloudStore != nil {
+		err = c.cloudStore.rekeyPortalID(ctx, oldID, newID)
+		if err != nil {
+			return result, portal, err
+		}
+	}
 
 	// Move group name cache
 	if name, ok := c.imGroupNames[oldID]; ok {
@@ -6527,6 +6526,19 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	}
 
 	return result, portal, nil
+}
+
+func shouldCacheSenderGUIDForPortal(portalID, senderGUID string) bool {
+	if portalID == "" || senderGUID == "" {
+		return false
+	}
+	if strings.Contains(portalID, ",") {
+		return true
+	}
+	if strings.HasPrefix(portalID, "gid:") {
+		return strings.EqualFold(portalID, "gid:"+senderGUID)
+	}
+	return false
 }
 
 // resolveExistingGroupPortalID checks whether an existing group portal matches
@@ -7783,6 +7795,25 @@ func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.M
 		// Suffixed ID not found — fall back to bare UUID for old messages.
 	}
 	return makeMessageID(targetGUID)
+}
+
+func resolveInBatchTapbackTarget(
+	messageByGUID map[string]*bridgev2.BackfillMessage,
+	messageByID map[networkid.MessageID]*bridgev2.BackfillMessage,
+	targetGUID string,
+	bp int,
+) (*bridgev2.BackfillMessage, *networkid.PartID, bool) {
+	if bp >= 1 {
+		suffixedID := makeMessageID(fmt.Sprintf("%s_att%d", targetGUID, bp-1))
+		if targetMsg, ok := messageByID[suffixedID]; ok {
+			return targetMsg, nil, true
+		}
+	}
+	targetMsg, ok := messageByGUID[targetGUID]
+	if !ok {
+		return nil, nil, false
+	}
+	return targetMsg, nil, true
 }
 
 // ============================================================================
