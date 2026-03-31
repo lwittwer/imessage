@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"github.com/lrhodin/imessage/imessage"
@@ -85,6 +86,12 @@ func (cs *ContactStore) testContactQuery() bool {
 
 func gostring(s *C.NSString) string { return C.GoString(C.nsstring2cstring(s)) }
 
+func isEmailIdentifier(identifier string) bool {
+	identifier = strings.TrimPrefix(identifier, "tel:")
+	identifier = strings.TrimPrefix(identifier, "mailto:")
+	return strings.Contains(identifier, "@")
+}
+
 func cncontactToContact(ns *C.CNContact, includeAvatar bool) *imessage.Contact {
 	if ns == nil {
 		return nil
@@ -139,10 +146,10 @@ func (cs *ContactStore) GetContactInfo(identifier string) (*imessage.Contact, er
 	defer C.free(unsafe.Pointer(cStr))
 
 	var cnContact *C.CNContact
-	if identifier[0] == '+' {
-		cnContact = C.meowGetContactByPhone(cs.int, cStr)
-	} else {
+	if isEmailIdentifier(identifier) {
 		cnContact = C.meowGetContactByEmail(cs.int, cStr)
+	} else {
+		cnContact = C.meowGetContactByPhone(cs.int, cStr)
 	}
 	goContact := cncontactToContact(cnContact, true)
 

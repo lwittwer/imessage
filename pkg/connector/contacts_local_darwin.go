@@ -3,6 +3,8 @@
 package connector
 
 import (
+	"sync"
+
 	"github.com/rs/zerolog"
 
 	"github.com/lrhodin/imessage/imessage"
@@ -12,8 +14,10 @@ import (
 // localContactSource wraps the macOS Contacts framework as a contactSource.
 // Used when backfill_source=chatdb (no iCloud, local-only).
 type localContactSource struct {
-	store    *mac.ContactStore
-	contacts []*imessage.Contact
+	store *mac.ContactStore
+
+	mu       sync.RWMutex
+	snapshot *contactSnapshot
 }
 
 func newLocalContactSource(log zerolog.Logger) contactSource {
@@ -35,7 +39,10 @@ func (l *localContactSource) SyncContacts(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
-	l.contacts = contacts
+	snapshot := newContactSnapshot(contacts)
+	l.mu.Lock()
+	l.snapshot = snapshot
+	l.mu.Unlock()
 	log.Info().Int("count", len(contacts)).Msg("Loaded local macOS contacts")
 	return nil
 }
@@ -45,5 +52,15 @@ func (l *localContactSource) GetContactInfo(identifier string) (*imessage.Contac
 }
 
 func (l *localContactSource) GetAllContacts() []*imessage.Contact {
-	return l.contacts
+	l.mu.RLock()
+	snapshot := l.snapshot
+	l.mu.RUnlock()
+	return snapshot.getAllContacts()
+}
+
+func (l *localContactSource) lookupDisplayContact(localID string) *imessage.Contact {
+	l.mu.RLock()
+	snapshot := l.snapshot
+	l.mu.RUnlock()
+	return snapshot.lookup(localID)
 }

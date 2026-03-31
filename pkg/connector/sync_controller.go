@@ -758,13 +758,13 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 
 	updated := 0
 	for _, g := range ghosts {
-		// Skip ghosts with no matching contact (efficiency: avoids loading
-		// the full ghost object for participants who aren't in the address book).
-		localID := stripIdentifierPrefix(string(g.id))
+		contact, localID, err := c.lookupContactForDisplay(string(g.id))
 		if localID == "" {
 			continue
 		}
-		contact, _ := c.contacts.GetContactInfo(localID)
+		if err != nil {
+			log.Debug().Err(err).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 		if contact == nil || !contact.HasName() {
 			// No contact found (or contact has no name). If the ghost also has
 			// no display name, still set an identifier-based fallback so clients
@@ -845,6 +845,12 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 
 		newName, authoritative := c.resolveGroupName(ctx, portalID)
 		if newName == "" || newName == portal.Name {
+			continue
+		}
+		// Don't overwrite an existing portal name with a contact-derived
+		// fallback — only authoritative sources (user-set iMessage group
+		// names from the in-memory cache or CloudKit) should rename.
+		if !authoritative && portal.Name != "" {
 			continue
 		}
 
@@ -1731,11 +1737,14 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		// Mark SMS status in-memory so guards work immediately during this sync
-		// session. Persistence is handled by GetChatInfo ExtraUpdates when the
-		// portal is created/resynced via createPortalsFromCloudSync.
+		// Update SMS flag from CloudKit chat service type. If a stale
+		// CloudKit record briefly clears the flag for a legitimately-SMS
+		// portal, the next live SMS message will re-set it immediately
+		// via handleMessage's unconditional updatePortalSMS call.
 		if strings.EqualFold(chat.Service, "SMS") {
 			c.updatePortalSMS(portalID, true)
+		} else if strings.EqualFold(chat.Service, "iMessage") {
+			c.updatePortalSMS(portalID, false)
 		}
 
 		participantsJSON, jsonErr := json.Marshal(chat.Participants)
@@ -1929,7 +1938,7 @@ var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 
 // hexGroupPattern matches bare hex strings of 40+ characters (SHA1 hashes
 // used as CloudKit group identifiers for SMS groups).
-var hexGroupPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40,}$`)
+var hexGroupPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40,128}$`)
 
 // isNumericSuffix returns true if s is non-empty and contains only ASCII digits.
 // Used to identify CloudKit self-chat identifiers of the form "chat<digits>".

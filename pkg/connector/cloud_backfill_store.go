@@ -1242,6 +1242,64 @@ func (s *cloudBackfillStore) listRestoreOverrides(ctx context.Context) []string 
 	return out
 }
 
+// rekeyPortalID migrates all local CloudKit cache state keyed by portal_id to
+// a new portal ID after the bridge re-IDs a portal.
+func (s *cloudBackfillStore) rekeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
+	if s == nil || oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
+		return nil
+	}
+
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for _, query := range []string{
+			`UPDATE cloud_chat SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+		} {
+			if _, err := s.db.Exec(ctx, query, s.loginID, oldPortalID, newPortalID); err != nil {
+				return fmt.Errorf("rekey portal_id %s -> %s: %w", oldPortalID, newPortalID, err)
+			}
+		}
+
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO group_photo_cache (login_id, portal_id, ts, data)
+			SELECT login_id, $3, ts, data
+			FROM group_photo_cache
+			WHERE login_id=$1 AND portal_id=$2
+			ON CONFLICT (login_id, portal_id) DO UPDATE
+				SET ts=MAX(group_photo_cache.ts, excluded.ts),
+				    data=CASE
+				        WHEN excluded.ts >= group_photo_cache.ts THEN excluded.data
+				        ELSE group_photo_cache.data
+				    END
+		`, s.loginID, oldPortalID, newPortalID); err != nil {
+			return fmt.Errorf("rekey group_photo_cache %s -> %s: %w", oldPortalID, newPortalID, err)
+		}
+		if _, err := s.db.Exec(ctx,
+			`DELETE FROM group_photo_cache WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, oldPortalID,
+		); err != nil {
+			return fmt.Errorf("cleanup old group_photo_cache %s: %w", oldPortalID, err)
+		}
+
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO restore_override (login_id, portal_id, updated_ts)
+			SELECT login_id, $3, updated_ts
+			FROM restore_override
+			WHERE login_id=$1 AND portal_id=$2
+			ON CONFLICT (login_id, portal_id) DO UPDATE
+				SET updated_ts=MAX(restore_override.updated_ts, excluded.updated_ts)
+		`, s.loginID, oldPortalID, newPortalID); err != nil {
+			return fmt.Errorf("rekey restore_override %s -> %s: %w", oldPortalID, newPortalID, err)
+		}
+		if _, err := s.db.Exec(ctx,
+			`DELETE FROM restore_override WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, oldPortalID,
+		); err != nil {
+			return fmt.Errorf("cleanup old restore_override %s: %w", oldPortalID, err)
+		}
+		return nil
+	})
+}
+
 // portalHasChat returns true if the given portal_id has at least one
 // cloud_chat record (i.e., the conversation was included in CloudKit chat
 // sync). Portals with no chat record are orphaned — typically junk/spam
@@ -1993,7 +2051,7 @@ func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Con
 // whose participants overlap with the given normalized participant list.
 // Used to find duplicate group portals that have the same members but different
 // group UUIDs. Participants are compared after normalization (tel:/mailto: prefix).
-func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string, selfHandle string) ([]string, error) {
+func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string, isSelf func(string) bool) ([]string, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> '' AND deleted=FALSE`,
 		s.loginID,
@@ -2031,7 +2089,7 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 				normalized = append(normalized, n)
 			}
 		}
-		if participantSetsMatch(normalized, normalizedTarget, selfHandle) {
+		if participantSetsMatch(normalized, normalizedTarget, isSelf) {
 			matches = append(matches, portalID)
 			seen[portalID] = true
 		}
@@ -2041,9 +2099,9 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 
 // participantSetsMatch checks if two normalized participant sets are equivalent
 // (same members, ignoring order). Allows a difference of exactly 1 only if the
-// single differing member is selfHandle (self may be in one set but not the other).
-// Pass an empty selfHandle to disallow any difference.
-func participantSetsMatch(a, b []string, selfHandle string) bool {
+// single differing member is self (checked via isSelf predicate, which should
+// test against all known user handles). Pass nil isSelf to disallow any difference.
+func participantSetsMatch(a, b []string, isSelf func(string) bool) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
@@ -2055,27 +2113,27 @@ func participantSetsMatch(a, b []string, selfHandle string) bool {
 	for _, p := range b {
 		setB[p] = true
 	}
-	// Count members in A not in B, and vice versa; track the differing member.
-	normalizedSelf := normalizeIdentifierForPortalID(selfHandle)
+	// Count members in A not in B, and vice versa; track whether ALL
+	// differing members are self handles.
+	allDiffAreSelf := true
 	diff := 0
-	var diffMember string
 	for p := range setA {
 		if !setB[p] {
 			diff++
-			diffMember = p
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
 	for p := range setB {
 		if !setA[p] {
 			diff++
-			diffMember = p
+			if isSelf == nil || !isSelf(p) {
+				allDiffAreSelf = false
+			}
 		}
 	}
-	if diff == 0 {
-		return true
-	}
-	// Allow exactly 1 difference only when that member is self.
-	return diff == 1 && normalizedSelf != "" && diffMember == normalizedSelf
+	return diff == 0 || (allDiffAreSelf && isSelf != nil)
 }
 
 // deleteLocalChatByGroupID removes all local cloud_chat and cloud_message records
@@ -2600,11 +2658,11 @@ func (s *cloudBackfillStore) debugFindPortalsByIdentifierSuffix(ctx context.Cont
 // record has synced, and whether it's filtered/deleted). Used by !msg-debug
 // to distinguish "chat not synced yet" from "chat synced but messages missing".
 type debugChatInfo struct {
-	Found      bool
-	Deleted    bool
-	IsFiltered int64
+	Found       bool
+	Deleted     bool
+	IsFiltered  int64
 	CloudChatID string
-	GroupID    string
+	GroupID     string
 }
 
 func (s *cloudBackfillStore) debugChatInfo(ctx context.Context, portalID string) (debugChatInfo, error) {
