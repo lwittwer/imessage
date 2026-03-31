@@ -597,13 +597,16 @@ func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IM
 	}
 	// For DM portals, try to resolve a contact name.
 	if client != nil && !isGroup {
-		contact := client.lookupContact(portalID)
+		contact, localID, err := client.lookupContactForDisplay(portalID)
+		if err != nil {
+			client.Main.Bridge.Log.Debug().Err(err).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 		if contact != nil && contact.HasName() {
 			name := client.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
 				Nickname:  contact.Nickname,
-				ID:        stripIdentifierPrefix(portalID),
+				ID:        localID,
 			})
 			if name != "" {
 				return name
@@ -611,7 +614,7 @@ func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IM
 		}
 	}
 	// Strip URI prefix for a cleaner display.
-	id := strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:")
+	id := stripIdentifierPrefix(portalID)
 	if strings.HasPrefix(portalID, "gid:") {
 		trimmed := strings.TrimPrefix(portalID, "gid:")
 		if len(trimmed) > 8 {

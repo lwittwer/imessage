@@ -2332,7 +2332,6 @@ func restoreRetryDelay(attempt int) time.Duration {
 	}
 }
 
-
 func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	defer c.finishRestoreBackfillPipeline(opts.PortalID)
 
@@ -3156,7 +3155,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 			Msg("Unfiltered scan complete")
 		diag = &restoreFetchDiagnostic{
 			UnfilteredTotal: len(unfiltered),
-			SampleChatIDs:  sampleIDs,
+			SampleChatIDs:   sampleIDs,
 		}
 	}
 
@@ -4535,20 +4534,17 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 // given identifier (e.g. "tel:+1234567890"). Falls back to formatting the
 // raw identifier if no contact is found.
 func (c *IMClient) resolveContactDisplayname(identifier string) string {
-	localID := stripIdentifierPrefix(identifier)
-	if c.contacts != nil {
-		contact, contactErr := c.contacts.GetContactInfo(localID)
-		if contactErr != nil {
-			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
-		}
-		if contact != nil && contact.HasName() {
-			return c.Main.Config.FormatDisplayname(DisplaynameParams{
-				FirstName: contact.FirstName,
-				LastName:  contact.LastName,
-				Nickname:  contact.Nickname,
-				ID:        localID,
-			})
-		}
+	contact, localID, contactErr := c.lookupContactForDisplay(identifier)
+	if contactErr != nil {
+		c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+	}
+	if contact != nil && contact.HasName() {
+		return c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
 	}
 	return c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 }
@@ -4565,41 +4561,61 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		Identifiers: []string{identifier},
 	}
 
-	// Try contact info from cloud contacts (iCloud CardDAV)
-	localID := stripIdentifierPrefix(identifier)
-	var contact *imessage.Contact
+	displayContact, localID, displayErr := c.lookupContactForDisplay(identifier)
+	if displayErr != nil {
+		zerolog.Ctx(ctx).Debug().Err(displayErr).Str("id", localID).Msg("Failed to resolve contact info")
+	}
+
+	if displayContact != nil {
+		for _, phone := range displayContact.Phones {
+			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
+		}
+		for _, email := range displayContact.Emails {
+			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
+		}
+		if displayContact.HasName() {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: displayContact.FirstName,
+				LastName:  displayContact.LastName,
+				Nickname:  displayContact.Nickname,
+				ID:        localID,
+			})
+			ui.Name = &name
+		}
+	}
+
+	var nativeContact *imessage.Contact
 	if c.contacts != nil {
 		var contactErr error
-		contact, contactErr = c.contacts.GetContactInfo(localID)
+		nativeContact, contactErr = c.contacts.GetContactInfo(localID)
 		if contactErr != nil {
 			zerolog.Ctx(ctx).Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
 	}
 
-	if contact != nil && contact.HasName() {
+	if nativeContact != nil && len(nativeContact.Avatar) > 0 {
+		avatarHash := sha256.Sum256(nativeContact.Avatar)
+		avatarData := nativeContact.Avatar // capture for closure
+		ui.Avatar = &bridgev2.Avatar{
+			ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+			Get: func(ctx context.Context) ([]byte, error) {
+				return avatarData, nil
+			},
+		}
+	}
+
+	if ui.Name != nil {
+		return ui, nil
+	}
+
+	if nativeContact != nil && nativeContact.HasName() {
 		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
+			FirstName: nativeContact.FirstName,
+			LastName:  nativeContact.LastName,
+			Nickname:  nativeContact.Nickname,
 			ID:        localID,
 		})
 		ui.Name = &name
-		for _, phone := range contact.Phones {
-			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-		}
-		for _, email := range contact.Emails {
-			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
-		}
-		if len(contact.Avatar) > 0 {
-			avatarHash := sha256.Sum256(contact.Avatar)
-			avatarData := contact.Avatar // capture for closure
-			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return avatarData, nil
-				},
-			}
-		}
 		return ui, nil
 	}
 
@@ -7403,16 +7419,10 @@ func (c *IMClient) buildGroupName(members []string) string {
 		if c.isMyHandle(memberID) {
 			continue // skip self
 		}
-		// Strip tel:/mailto: prefix for contact lookup
-		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
-		var contact *imessage.Contact
-		if c.contacts != nil {
-			var contactErr error
-			contact, contactErr = c.contacts.GetContactInfo(lookupID)
-			if contactErr != nil {
-				c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", lookupID).Msg("Failed to resolve contact info")
-			}
+		contact, localID, contactErr := c.lookupContactForDisplay(memberID)
+		if contactErr != nil {
+			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
 
 		if contact != nil && contact.HasName() {
@@ -7420,11 +7430,11 @@ func (c *IMClient) buildGroupName(members []string) string {
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
 				Nickname:  contact.Nickname,
-				ID:        lookupID,
+				ID:        localID,
 			})
 		}
 		if name == "" {
-			name = lookupID // raw phone/email without prefix
+			name = localID // raw phone/email without prefix
 		}
 		names = append(names, name)
 	}

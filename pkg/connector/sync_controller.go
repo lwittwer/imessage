@@ -758,13 +758,13 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 
 	updated := 0
 	for _, g := range ghosts {
-		// Skip ghosts with no matching contact (efficiency: avoids loading
-		// the full ghost object for participants who aren't in the address book).
-		localID := stripIdentifierPrefix(string(g.id))
+		contact, localID, err := c.lookupContactForDisplay(string(g.id))
 		if localID == "" {
 			continue
 		}
-		contact, _ := c.contacts.GetContactInfo(localID)
+		if err != nil {
+			log.Debug().Err(err).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 		if contact == nil || !contact.HasName() {
 			// No contact found (or contact has no name). If the ghost also has
 			// no display name, still set an identifier-based fallback so clients

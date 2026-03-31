@@ -43,16 +43,27 @@ void meowRequestAuth(CNContactStore* store) {
 	}];
 }
 
+static NSArray<CNContact*>* meowEnumerateAllContacts(CNContactStore* store, NSArray* keysToFetch, NSError** error) {
+	NSMutableArray<CNContact*>* contacts = [NSMutableArray array];
+	CNContactFetchRequest* request = [[CNContactFetchRequest alloc] initWithKeysToFetch:keysToFetch];
+	BOOL ok = [store enumerateContactsWithFetchRequest:request
+	                                             error:error
+	                                        usingBlock:^(CNContact * _Nonnull contact, BOOL * _Nonnull stop) {
+		[contacts addObject:contact];
+	}];
+	if (!ok) {
+		return NULL;
+	}
+	return contacts;
+}
+
 NSArray<CNContact*>* meowGetContactList(CNContactStore* store) {
 	NSArray* keysToFetch = @[
 		CNContactGivenNameKey, CNContactFamilyNameKey, CNContactNicknameKey,
 		CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
 	];
 	NSError* error;
-	NSString *containerId = store.defaultContainerIdentifier;
-	NSPredicate *predicate = [CNContact predicateForContactsInContainerWithIdentifier:containerId];
-	NSArray* contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keysToFetch error:&error];
-	return contacts;
+	return meowEnumerateAllContacts(store, keysToFetch, &error);
 }
 CNContact* meowGetContactArrayItem(NSArray<CNContact*>* arr, unsigned long i) { return [arr objectAtIndex:i]; }
 
@@ -118,13 +129,8 @@ unsigned long meowGetArrayLength(NSArray* arr) {
 
 int meowTestContactQuery(CNContactStore* store) {
 	NSArray* keysToFetch = @[CNContactGivenNameKey];
-	NSString *containerId = store.defaultContainerIdentifier;
-	if (containerId == nil) {
-		return 0;
-	}
-	NSPredicate *predicate = [CNContact predicateForContactsInContainerWithIdentifier:containerId];
 	NSError* error;
-	NSArray* contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keysToFetch error:&error];
+	NSArray* contacts = meowEnumerateAllContacts(store, keysToFetch, &error);
 	if (error != nil || contacts == nil) {
 		return 0;
 	}
