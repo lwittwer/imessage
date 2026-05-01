@@ -78,12 +78,12 @@ The one-time winget installs needed for the dev-env script are documented at the
 
 - `pkg/rustpushgo/rustpushgo.go` and `pkg/rustpushgo/rustpushgo.h` are generated.
 - `pkg/rustpushgo/target/` is build output.
-- `data/config.yaml` and `data/registration.yaml` are generated runtime artifacts, not source-of-truth defaults.
+- `data/config.yaml` and `data/registration.yaml` are generated runtime artifacts when using repo-local development state, not source-of-truth defaults. Installed runs usually use `~/.local/share/mautrix-imessage/config.yaml` instead.
 
 ### Path and toolchain constraints
 
 - The repo path must not contain spaces. The `Makefile` hard-fails because CGO and linker paths break.
-- Top-level Go module targets Go `1.25.x` (`go.mod` uses `toolchain go1.25.7`).
+- Top-level Go module targets Go `1.25.x` (`go.mod` uses `go 1.25.0` and `toolchain go1.25.9`).
 - `tools/extract-key/` is its own Go module pinned to Go `1.20` so it can still build on older macOS systems.
 - Linux dependency bootstrapping is handled by `scripts/bootstrap-linux.sh`.
 
@@ -94,7 +94,13 @@ The one-time winget installs needed for the dev-env script are documented at the
 - `make build` produces `mautrix-imessage-v2.app`.
 - Native NAC validation uses `nac-validation/` and Apple frameworks.
 - `chat.db` backfill and local contacts require Full Disk Access.
-- Useful runtime command after a build:
+- Useful runtime command after a build for an installed config:
+
+```bash
+./mautrix-imessage-v2.app/Contents/MacOS/mautrix-imessage-v2 -c ~/.local/share/mautrix-imessage/config.yaml
+```
+
+- If using repo-local development state and `data/config.yaml` exists, run:
 
 ```bash
 ./mautrix-imessage-v2.app/Contents/MacOS/mautrix-imessage-v2 -c data/config.yaml
@@ -162,8 +168,10 @@ Several behaviors are duplicated across Go code and shell installers. If you cha
 
 ## Runtime and stateful behavior
 
-- The bridge keeps runtime state under `data/` during local development and under `~/.local/share/mautrix-imessage/` during install flows.
-- Logs commonly end up in `~/.local/share/mautrix-imessage/bridge.stdout.log` and `bridge.stderr.log`.
+- The bridge may keep runtime state under `data/` during repo-local development, but install flows use `~/.local/share/mautrix-imessage/` by default. Do not assume `data/` exists on a machine that is running an installed LaunchAgent or systemd service.
+- macOS installer LaunchAgents write stdout/stderr to `~/.local/share/mautrix-imessage/bridge.stdout.log` and `~/.local/share/mautrix-imessage/bridge.stderr.log`.
+- Structured bridge logs may also be under `~/.local/share/mautrix-imessage/logs/bridge.log` with rotated siblings in the same directory. When debugging runtime behavior on this machine, check the top-level stdout/stderr files first, then `logs/bridge.log`.
+- Linux systemd installs usually surface logs through `journalctl --user -u mautrix-imessage -f` or `journalctl -u mautrix-imessage -f`.
 - `tools/nac-relay/` stores relay credentials and cert material under `~/Library/Application Support/nac-relay/`.
 - `cmd/bbctl` stores config under the user's config dir, typically `~/Library/Application Support/bbctl/config.json` on macOS or the Linux equivalent from `os.UserConfigDir()`.
 - Beeper install flows now use `~/.local/share/mautrix-imessage/bbctl`. An older full-repo clone at `~/.local/share/mautrix-imessage/bridge-manager` can interfere with `make install-beeper` and may need to be removed.
