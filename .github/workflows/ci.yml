@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [master, refactor]
+  pull_request:
+    branches: [master, refactor]
+  # Manual trigger — useful when bumping third_party/rustpush-upstream.sha
+  # locally and wanting to re-run the full verify pipeline on a branch
+  # without pushing a test commit.
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # Lint – quick static analysis
+  # ───────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: go vet (imessage)
+        run: go vet ./imessage/...
+
+      - name: go vet (bbctl)
+        run: go vet ./cmd/bbctl/...
+
+  # ───────────────────────────────────────────────────────────────
+  # Unit tests – pure-Go packages (no Rust/CGO bridge needed)
+  # ───────────────────────────────────────────────────────────────
+  test-imessage:
+    name: Test imessage/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run tests
+        run: go test -count=1 ./imessage/...
+
+  # NOTE: pkg/connector/ tests require the Rust static library (librustpushgo.a)
+  # and are run as part of the build jobs below (after `make build`).
+
+  # ───────────────────────────────────────────────────────────────
+  # Full build – Rust + Go on macOS and Linux
+  # ───────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build (macOS)
+    # Manual-dispatch only. macOS runs on the Apple Silicon GitHub-hosted
+    # runner; every push/PR doesn't need to burn a macOS slot since Linux
+    # already catches the vast majority of breakage. Trigger this job
+    # explicitly via Actions → CI → "Run workflow" when you want macOS
+    # parity coverage (e.g. after bumping third_party/rustpush-upstream.sha
+    # or touching platform-gated code in pkg/rustpushgo or local_config).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14          # Apple Silicon (ARM64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          brew install libolm protobuf
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+          key: cargo-macos-arm64-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+          restore-keys: cargo-macos-arm64-
+
+      - name: Verify pinned rustpush SHA file
+        run: |
+          PIN_FILE=third_party/rustpush-upstream.sha
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing — refactor branch requires a pinned OpenBubbles/rustpush SHA"
+            exit 1
+          fi
+          PIN=$(tr -d '[:space:]' < "$PIN_FILE")
+          if [ -z "$PIN" ]; then
+            echo "::error::$PIN_FILE is empty"
+            exit 1
+          fi
+          echo "Pinned rustpush SHA: $PIN"
+
+      - name: Build
+        run: make build
+
+      - name: Test pkg/connector/
+        env:
+          CGO_CFLAGS: -I/opt/homebrew/include
+          CGO_LDFLAGS: -L/opt/homebrew/lib
+        run: go test -count=1 ./pkg/connector/...
+
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential cmake pkg-config git curl \
+            libolm-dev libclang-dev libssl-dev libunicorn-dev \
+            protobuf-compiler sqlite3
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+          key: cargo-linux-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+          restore-keys: cargo-linux-
+
+      - name: Verify pinned rustpush SHA file
+        run: |
+          PIN_FILE=third_party/rustpush-upstream.sha
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing — refactor branch requires a pinned OpenBubbles/rustpush SHA"
+            exit 1
+          fi
+          PIN=$(tr -d '[:space:]' < "$PIN_FILE")
+          if [ -z "$PIN" ]; then
+            echo "::error::$PIN_FILE is empty"
+            exit 1
+          fi
+          echo "Pinned rustpush SHA: $PIN"
+
+      - name: Build
+        run: make build
+
+      - name: Test pkg/connector/
+        run: go test -count=1 ./pkg/connector/...

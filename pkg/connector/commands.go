@@ -33,17 +33,79 @@ import (
 	"github.com/lrhodin/imessage/imessage"
 )
 
+// Help sections for Apple-service commands added by this bridge. Orders slot
+// in after bridgev2's built-in sections (General=0, Auth=10, Chats=20,
+// Admin=50), so `!im help` renders each service as its own heading at the
+// bottom instead of lumping everything under "General".
+var (
+	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
+	HelpSectionFindMy        = commands.HelpSection{Name: "Find My", Order: 70}
+	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
+	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
+)
+
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
+// Pass disableFaceTime=true to skip every !facetime* handler — used by
+// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
+// keep the bridge's FT wrapper out of their chat.
+//
 // Register these in main.go's PostInit hook:
 //
-//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands()...)
-func BridgeCommands() []*commands.FullHandler {
-	return []*commands.FullHandler{
+//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
+func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
+	cmds := []*commands.FullHandler{
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
 	}
+	if !disableFaceTime {
+		cmds = append(cmds,
+			cmdFaceTime,
+			cmdFaceTimeSend,
+			cmdFaceTimeClear,
+			cmdFaceTimeInvalidatePeer,
+			cmdFaceTimeRotateIdentity,
+			cmdFaceTimeState,
+			cmdFaceTimeSessionLink,
+			cmdFaceTimeUseLink,
+			cmdFaceTimeDeleteLink,
+			cmdFaceTimeLetMeIn,
+			cmdFaceTimeLetMeInApprove,
+			cmdFaceTimeLetMeInDeny,
+			cmdFaceTimeCreateSession,
+			cmdFaceTimeRing,
+			cmdFaceTimeAddMembers,
+			cmdFaceTimeRemoveMembers,
+		)
+	}
+	cmds = append(cmds,
+		cmdFindMy,
+		cmdFindMyAcceptShare,
+		cmdFindMyDeleteItem,
+		cmdFindMyRenameBeacon,
+		cmdFindMyStateJSON,
+		cmdFindMyDevices,
+		cmdFindMyFriends,
+		cmdFindMyFriendsImport,
+		cmdSharedAlbums,
+		cmdSharedSubscribe,
+		cmdSharedSubscribeToken,
+		cmdSharedUnsubscribe,
+		cmdSharedState,
+		cmdSharedAssetsJSON,
+		cmdSharedDeleteAssets,
+		cmdDeleteRoom,
+		cmdStatuskitState,
+		cmdStatuskitShare,
+		cmdStatuskitResetKeys,
+		cmdStatuskitRollKeys,
+		cmdStatuskitRequestHandles,
+		cmdStatuskitClearInterest,
+		cmdStatuskitInviteToChannel,
+		cmdStatuskitInviteAll,
+	)
+	return cmds
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with
