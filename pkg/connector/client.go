@@ -2832,41 +2832,43 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		return
 	}
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	newName := ptrStringOr(msg.NewChatName, "")
+	newName := strings.TrimSpace(ptrStringOr(msg.NewChatName, ""))
+	if isPlaceholderGroupName(newName) {
+		log.Debug().Str("name", newName).Msg("Skipping placeholder group rename")
+		return
+	}
 
 	// Update the cached iMessage group name to the NEW name so outbound
 	// messages (portalToConversation) use it. makePortalKey cached whatever
 	// was in the conversation envelope (msg.GroupName), which may be the old
 	// name. Also persist to portal metadata so it survives restarts.
-	if newName != "" {
-		portalID := string(portalKey.ID)
-		c.imGroupNamesMu.Lock()
-		c.imGroupNames[portalID] = newName
-		c.imGroupNamesMu.Unlock()
+	portalID := string(portalKey.ID)
+	c.imGroupNamesMu.Lock()
+	c.imGroupNames[portalID] = newName
+	c.imGroupNamesMu.Unlock()
 
-		go func() {
-			ctx := context.Background()
-			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-			if err == nil && portal != nil {
-				meta := &PortalMetadata{}
-				if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-					*meta = *existing
-				}
-				if meta.GroupName != newName {
-					meta.GroupName = newName
-					portal.Metadata = meta
-					_ = portal.Save(ctx)
-				}
+	go func() {
+		ctx := context.Background()
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if err == nil && portal != nil {
+			meta := &PortalMetadata{}
+			if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+				*meta = *existing
 			}
-			// Also correct the stale CloudKit display_name in cloud_chat
-			// so resolveGroupName doesn't fall back to the old name.
-			if c.cloudStore != nil {
-				if err := c.cloudStore.updateDisplayNameByPortalID(ctx, portalID, newName); err != nil {
-					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to update cloud_chat display_name after rename")
-				}
+			if meta.GroupName != newName {
+				meta.GroupName = newName
+				portal.Metadata = meta
+				_ = portal.Save(ctx)
 			}
-		}()
-	}
+		}
+		// Also correct the stale CloudKit display_name in cloud_chat
+		// so resolveGroupName doesn't fall back to the old name.
+		if c.cloudStore != nil {
+			if err := c.cloudStore.updateDisplayNameByPortalID(ctx, portalID, newName); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to update cloud_chat display_name after rename")
+			}
+		}
+	}()
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
@@ -9341,7 +9343,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		c.imGroupNamesMu.RUnlock()
 		if name == "" {
 			// Not in memory cache - try loading from portal metadata
-			if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.GroupName != "" {
+			if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.GroupName != "" && !isPlaceholderGroupName(meta.GroupName) {
 				name = meta.GroupName
 				c.imGroupNamesMu.Lock()
 				c.imGroupNames[portalID] = name
