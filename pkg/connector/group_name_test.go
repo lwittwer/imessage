@@ -37,6 +37,26 @@ func TestIsPlaceholderGroupName(t *testing.T) {
 	}
 }
 
+func TestIsRawIdentifierGroupName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"alice@example.com, bob@example.com", true},
+		{"+1 (415) 555-0100, 415-555-0101", true},
+		{"Alice, Bob", false},
+		{"Alice, bob@example.com", false},
+		{"Group Chat", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRawIdentifierGroupName(tt.name); got != tt.want {
+				t.Fatalf("isRawIdentifierGroupName(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldApplyGroupNameRefresh(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -49,12 +69,14 @@ func TestShouldApplyGroupNameRefresh(t *testing.T) {
 		{"whitespace new rejected", "", "  ", true, false},
 		{"exact noop rejected", "The Fam", "The Fam", true, false},
 		{"authoritative custom over custom allowed", "Old", "New", true, true},
-		{"authoritative group chat over custom allowed", "Old", "Group Chat", true, true},
+		{"authoritative group chat over custom rejected", "Old", "Group Chat", true, false},
 		{"fallback placeholder over empty rejected", "", "Group Chat", false, false},
 		{"fallback over custom rejected", "The Fam", "Alice, Bob", false, false},
 		{"fallback over empty placeholder allowed", "", "Alice, Bob", false, true},
 		{"fallback over group chat placeholder allowed", "Group Chat", "Alice, Bob", false, true},
 		{"fallback over mixed-case placeholder allowed", "group chat", "Alice, Bob", false, true},
+		{"fallback over raw identifiers allowed", "alice@example.com, bob@example.com", "Alice, Bob", false, true},
+		{"raw fallback over group chat allowed", "Group Chat", "alice@example.com, bob@example.com", false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -105,18 +127,24 @@ func TestNormalizeAndDedupeSenders(t *testing.T) {
 	}
 }
 
-func TestResolveGroupMembersForDisplayRequiresContactsReady(t *testing.T) {
+func TestResolveGroupMembersForDisplayFallsBackBeforeContactsReady(t *testing.T) {
 	c := &IMClient{
 		contactsReady: false,
 	}
-	if got := c.resolveGroupMembersForDisplay(t.Context(), "mailto:a@example.com,mailto:b@example.com"); got != nil {
-		t.Fatalf("resolveGroupMembersForDisplay() = %#v, want nil when contacts are unavailable", got)
+	got := c.resolveGroupMembersForDisplay(t.Context(), "mailto:a@example.com,mailto:b@example.com")
+	want := []string{"mailto:a@example.com", "mailto:b@example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("resolveGroupMembersForDisplay() len = %d, want %d before contacts are ready: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("resolveGroupMembersForDisplay()[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 
 	c.contacts = testContactSource{}
 	c.contactsReady = true
-	got := c.resolveGroupMembersForDisplay(t.Context(), "mailto:a@example.com,mailto:b@example.com")
-	want := []string{"mailto:a@example.com", "mailto:b@example.com"}
+	got = c.resolveGroupMembersForDisplay(t.Context(), "mailto:a@example.com,mailto:b@example.com")
 	if len(got) != len(want) {
 		t.Fatalf("resolveGroupMembersForDisplay() len = %d, want %d: %#v", len(got), len(want), got)
 	}
@@ -124,5 +152,21 @@ func TestResolveGroupMembersForDisplayRequiresContactsReady(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("resolveGroupMembersForDisplay()[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestResolveAuthoritativeGroupNameIgnoresPlaceholder(t *testing.T) {
+	c := &IMClient{
+		imGroupNames: map[string]string{
+			"gid:placeholder": "Group Chat",
+			"gid:custom":      "The Fam",
+		},
+	}
+
+	if got, ok := c.resolveAuthoritativeGroupName(t.Context(), "gid:placeholder"); ok || got != "" {
+		t.Fatalf("resolveAuthoritativeGroupName() = %q, %v; want no authoritative placeholder", got, ok)
+	}
+	if got, ok := c.resolveAuthoritativeGroupName(t.Context(), "gid:custom"); !ok || got != "The Fam" {
+		t.Fatalf("resolveAuthoritativeGroupName() = %q, %v; want custom authoritative name", got, ok)
 	}
 }

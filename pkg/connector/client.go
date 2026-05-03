@@ -111,18 +111,53 @@ func isPlaceholderGroupName(name string) bool {
 	return trimmed == "" || strings.EqualFold(trimmed, "Group Chat")
 }
 
+func isRawIdentifierGroupName(name string) bool {
+	parts := strings.Split(name, ",")
+	hasPart := false
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		hasPart = true
+		if strings.Contains(part, "@") {
+			at := strings.Index(part, "@")
+			if at > 0 && at == strings.LastIndex(part, "@") && at < len(part)-1 && !strings.ContainsAny(part, " \t") {
+				continue
+			}
+			return false
+		}
+		digits := 0
+		for _, r := range part {
+			if r >= '0' && r <= '9' {
+				digits++
+			} else if r != '+' && r != '-' && r != '(' && r != ')' && r != ' ' && r != '.' {
+				return false
+			}
+		}
+		if digits < 7 {
+			return false
+		}
+	}
+	return hasPart
+}
+
+func isRefreshableGroupName(name string) bool {
+	return isPlaceholderGroupName(name) || isRawIdentifierGroupName(name)
+}
+
 func shouldApplyGroupNameRefresh(currentName, newName string, authoritative bool) bool {
 	newName = strings.TrimSpace(newName)
 	if newName == "" || newName == currentName {
 		return false
 	}
-	if authoritative {
-		return true
-	}
 	if isPlaceholderGroupName(newName) {
 		return false
 	}
-	return isPlaceholderGroupName(currentName)
+	if authoritative {
+		return true
+	}
+	return isRefreshableGroupName(currentName)
 }
 
 const maxAttachmentRetries = 3
@@ -2914,7 +2949,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 			c.imGroupGuidsMu.Unlock()
 		}
 	}
-	if msg.GroupName != nil && *msg.GroupName != "" {
+	if msg.GroupName != nil && *msg.GroupName != "" && !isPlaceholderGroupName(*msg.GroupName) {
 		c.imGroupNamesMu.Lock()
 		c.imGroupNames[string(finalPortalKey.ID)] = *msg.GroupName
 		c.imGroupNamesMu.Unlock()
@@ -8994,7 +9029,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// the correct cv_name from APNs overrides any stale data.
 		// bridgev2's updateName deduplicates — no state event if the
 		// name is already correct.
-		if groupName != nil && *groupName != "" {
+		if groupName != nil && *groupName != "" && !isPlaceholderGroupName(*groupName) {
 			c.imGroupNamesMu.Lock()
 			old := c.imGroupNames[string(portalID)]
 			c.imGroupNames[string(portalID)] = *groupName
@@ -9044,42 +9079,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 				normalizedParticipants = normalized
 			}
 		}
-		if len(normalizedParticipants) > 0 {
-			parts := append([]string(nil), normalizedParticipants...)
-			pk := portalKey
-			go func() {
-				if !c.contactsAreReady() {
-					return
-				}
-				ctx := context.Background()
-				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, pk)
-				if err != nil || portal == nil || portal.MXID == "" || !isPlaceholderGroupName(portal.Name) {
-					return
-				}
-				candidate, authoritative := c.resolveAuthoritativeGroupName(ctx, string(pk.ID))
-				if candidate == "" {
-					candidate = c.buildGroupName(parts)
-				}
-				if !shouldApplyGroupNameRefresh(portal.Name, candidate, authoritative) {
-					return
-				}
-				c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
-					EventMeta: simplevent.EventMeta{
-						Type:      bridgev2.RemoteEventChatInfoChange,
-						PortalKey: pk,
-						LogContext: func(lc zerolog.Context) zerolog.Context {
-							return lc.Str("portal_id", string(pk.ID)).Str("source", "participant_name_repair")
-						},
-					},
-					ChatInfoChange: &bridgev2.ChatInfoChange{
-						ChatInfo: &bridgev2.ChatInfo{
-							Name:                       &candidate,
-							ExcludeChangesFromTimeline: true,
-						},
-					},
-				})
-			}()
-		}
+		c.queueParticipantNameRepair(portalKey, normalizedParticipants)
 
 		// Cache the original-case sender_guid so outbound messages reuse the
 		// same UUID casing and Apple Messages recipients match them to the
@@ -9104,7 +9104,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			persistGuid = *senderGuid
 		}
 		persistName := ""
-		if groupName != nil {
+		if groupName != nil && !isPlaceholderGroupName(*groupName) {
 			persistName = *groupName
 		}
 		// Persist participants to cloud_chat so portalToConversation can
@@ -9207,6 +9207,65 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 	}
 
 	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
+}
+
+func (c *IMClient) queueParticipantNameRepair(portalKey networkid.PortalKey, normalizedParticipants []string) {
+	if len(normalizedParticipants) == 0 {
+		return
+	}
+
+	parts := append([]string(nil), normalizedParticipants...)
+	go func() {
+		delay := 100 * time.Millisecond
+		for attempt := 0; attempt < 8; attempt++ {
+			if attempt > 0 {
+				time.Sleep(delay)
+				if delay < 2*time.Second {
+					delay *= 2
+					if delay > 2*time.Second {
+						delay = 2 * time.Second
+					}
+				}
+			}
+			if !c.contactsAreReady() {
+				continue
+			}
+
+			ctx := context.Background()
+			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if err != nil || portal == nil || portal.MXID == "" {
+				continue
+			}
+			if !isRefreshableGroupName(portal.Name) {
+				return
+			}
+
+			candidate, authoritative := c.resolveAuthoritativeGroupName(ctx, string(portalKey.ID))
+			if candidate == "" {
+				candidate = c.buildGroupName(parts)
+			}
+			if !shouldApplyGroupNameRefresh(portal.Name, candidate, authoritative) {
+				return
+			}
+
+			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatInfoChange,
+					PortalKey: portalKey,
+					LogContext: func(lc zerolog.Context) zerolog.Context {
+						return lc.Str("portal_id", string(portalKey.ID)).Str("source", "participant_name_repair")
+					},
+				},
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					ChatInfo: &bridgev2.ChatInfo{
+						Name:                       &candidate,
+						ExcludeChangesFromTimeline: true,
+					},
+				},
+			})
+			return
+		}
+	}()
 }
 
 // makeReceiptPortalKey handles receipt messages where participants may be empty.
@@ -9393,9 +9452,6 @@ func normalizeAndDedupeSenders(senders []string) []string {
 }
 
 func (c *IMClient) resolveGroupMembersForDisplay(ctx context.Context, portalID string) []string {
-	if !c.contactsAreReady() {
-		return nil
-	}
 	if members := c.resolveGroupMembers(ctx, portalID); len(members) > 0 {
 		return members
 	}
@@ -9414,12 +9470,12 @@ func (c *IMClient) resolveAuthoritativeGroupName(ctx context.Context, portalID s
 	c.imGroupNamesMu.RLock()
 	cached := c.imGroupNames[portalID]
 	c.imGroupNamesMu.RUnlock()
-	if cached != "" {
+	if cached != "" && !isPlaceholderGroupName(cached) {
 		return cached, true
 	}
 
 	if c.cloudStore != nil {
-		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
+		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" && !isPlaceholderGroupName(dn) {
 			return dn, true
 		}
 	}

@@ -328,7 +328,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			// bin zone but their messages are still in the main zone).
 			if hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID); msgErr == nil && hasMessages {
 				dn := ""
-				if chat.DisplayName != nil {
+				if chat.DisplayName != nil && !isPlaceholderGroupName(*chat.DisplayName) {
 					dn = *chat.DisplayName
 				}
 				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, dn, "", chat.Participants)
@@ -383,7 +383,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
 			name := friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, portalID)
 			isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
-			if chat.DisplayName != nil && *chat.DisplayName != "" && (name == portalID || name == strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:") || (isGroup && strings.HasPrefix(name, "Group "))) {
+			if chat.DisplayName != nil && *chat.DisplayName != "" && !isPlaceholderGroupName(*chat.DisplayName) && (name == portalID || name == strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:") || (isGroup && strings.HasPrefix(name, "Group "))) {
 				name = *chat.DisplayName
 			}
 			if isGroup && strings.HasPrefix(name, "Group ") && len(chat.Participants) > 0 {
@@ -393,7 +393,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 						normalized = append(normalized, n)
 					}
 				}
-				if len(normalized) > 0 && c.contactsAreReady() {
+				if len(normalized) > 0 {
 					if built := c.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 						name = built
 					}
@@ -1202,7 +1202,7 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 
 		newName, authoritative := c.resolveGroupName(ctx, portalID)
 		if !shouldApplyGroupNameRefresh(portal.Name, newName, authoritative) {
-			if !authoritative && !isPlaceholderGroupName(newName) && !isPlaceholderGroupName(portal.Name) && newName != portal.Name {
+			if !authoritative && !isPlaceholderGroupName(newName) && !isRefreshableGroupName(portal.Name) && newName != portal.Name {
 				log.Debug().
 					Str("portal_id", portalID).
 					Str("current_name", portal.Name).

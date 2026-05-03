@@ -299,7 +299,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 				// the old portalID-equality check from triggering.
 				name := ""
 				seedDisplayName := ""
-				if chat.DisplayName != nil && *chat.DisplayName != "" {
+				if chat.DisplayName != nil && *chat.DisplayName != "" && !isPlaceholderGroupName(*chat.DisplayName) {
 					name = *chat.DisplayName
 					seedDisplayName = *chat.DisplayName
 				}
@@ -317,7 +317,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 							normalized = append(normalized, n)
 						}
 					}
-					if len(normalized) > 0 && client.contactsAreReady() {
+					if len(normalized) > 0 {
 						if built := client.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 							name = built
 						}
@@ -653,7 +653,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 // then falls back to formatting the portal_id.
 func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IMClient, key networkid.PortalKey, portalID string) string {
 	if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
-		if !isPlaceholderGroupName(portal.Name) {
+		if !isRefreshableGroupName(portal.Name) {
 			return portal.Name
 		}
 	}
