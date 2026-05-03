@@ -393,8 +393,8 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 						normalized = append(normalized, n)
 					}
 				}
-				if len(normalized) > 0 {
-					if built := c.buildGroupName(normalized); built != "" && built != "Group Chat" {
+				if len(normalized) > 0 && c.contactsAreReady() {
+					if built := c.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 						name = built
 					}
 				}
@@ -1176,7 +1176,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 // numbers / email addresses as the room name. This also picks up contact
 // edits on subsequent periodic syncs.
 func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
-	if c.contacts == nil {
+	if !c.contactsAreReady() {
 		return
 	}
 	ctx := context.Background()
@@ -1201,25 +1201,14 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		total++
 
 		newName, authoritative := c.resolveGroupName(ctx, portalID)
-		if newName == "" || newName == portal.Name {
-			continue
-		}
-		// Don't overwrite an existing portal name with a contact-derived
-		// fallback — only authoritative sources (user-set iMessage group
-		// names from the in-memory cache or CloudKit) should rename.
-		if !authoritative && portal.Name != "" {
-			continue
-		}
-
-		// Don't overwrite an existing custom name (e.g. "The Fam") with a
-		// participant-generated fallback. Real name changes arrive via
-		// handleRename / APNs envelope and update imGroupNames directly.
-		if portal.Name != "" && !authoritative {
-			log.Debug().
-				Str("portal_id", portalID).
-				Str("current_name", portal.Name).
-				Str("fallback_name", newName).
-				Msg("Skipping fallback rename for portal with existing name")
+		if !shouldApplyGroupNameRefresh(portal.Name, newName, authoritative) {
+			if !authoritative && !isPlaceholderGroupName(newName) && !isPlaceholderGroupName(portal.Name) && newName != portal.Name {
+				log.Debug().
+					Str("portal_id", portalID).
+					Str("current_name", portal.Name).
+					Str("fallback_name", newName).
+					Msg("Skipping fallback rename for portal with existing name")
+			}
 			continue
 		}
 

@@ -93,16 +93,36 @@ type failedAttachmentEntry struct {
 type restoreStatusFunc func(format string, args ...any)
 
 type restorePipelineOptions struct {
-	PortalID       string
-	PortalKey      networkid.PortalKey
-	Source         string
-	DisplayName    string
-	Participants   []string
-	ChatID         string
-	GroupID        string
-	GroupPhotoGuid string
-	RecoverOnApple bool
-	Notify         restoreStatusFunc
+	PortalID        string
+	PortalKey       networkid.PortalKey
+	Source          string
+	DisplayName     string
+	SeedDisplayName string
+	Participants    []string
+	ChatID          string
+	GroupID         string
+	GroupPhotoGuid  string
+	RecoverOnApple  bool
+	Notify          restoreStatusFunc
+}
+
+func isPlaceholderGroupName(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	return trimmed == "" || strings.EqualFold(trimmed, "Group Chat")
+}
+
+func shouldApplyGroupNameRefresh(currentName, newName string, authoritative bool) bool {
+	newName = strings.TrimSpace(newName)
+	if newName == "" || newName == currentName {
+		return false
+	}
+	if authoritative {
+		return true
+	}
+	if isPlaceholderGroupName(newName) {
+		return false
+	}
+	return isPlaceholderGroupName(currentName)
 }
 
 const maxAttachmentRetries = 3
@@ -3842,13 +3862,13 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	c.recentlyDeletedPortalsMu.Lock()
 	delete(c.recentlyDeletedPortals, portalID)
 	c.recentlyDeletedPortalsMu.Unlock()
-	if len(opts.Participants) > 0 || opts.DisplayName != "" || opts.ChatID != "" || opts.GroupID != "" || opts.GroupPhotoGuid != "" {
+	if len(opts.Participants) > 0 || opts.SeedDisplayName != "" || opts.ChatID != "" || opts.GroupID != "" || opts.GroupPhotoGuid != "" {
 		c.cloudStore.seedChatFromRecycleBin(
 			ctx,
 			portalID,
 			opts.ChatID,
 			opts.GroupID,
-			opts.DisplayName,
+			opts.SeedDisplayName,
 			opts.GroupPhotoGuid,
 			opts.Participants,
 		)
@@ -8964,6 +8984,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			computedID := strings.Join(deduped, ",")
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
+		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
 		// Cache the actual iMessage group name (cv_name) so outbound
 		// messages can route to the correct conversation. Also push a
 		// room name update when the envelope name differs from what's
@@ -9007,6 +9028,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// can find them immediately. The cloud_chat DB write happens async
 		// and may not complete before GetChatInfo is called during portal
 		// creation, which would cause the group name to resolve as "Group Chat".
+		var normalizedParticipants []string
 		if len(participants) > 0 {
 			normalized := make([]string, 0, len(participants))
 			for _, p := range participants {
@@ -9019,9 +9041,45 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 				c.imGroupParticipantsMu.Lock()
 				c.imGroupParticipants[string(portalID)] = normalized
 				c.imGroupParticipantsMu.Unlock()
+				normalizedParticipants = normalized
 			}
 		}
-		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
+		if len(normalizedParticipants) > 0 {
+			parts := append([]string(nil), normalizedParticipants...)
+			pk := portalKey
+			go func() {
+				if !c.contactsAreReady() {
+					return
+				}
+				ctx := context.Background()
+				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, pk)
+				if err != nil || portal == nil || portal.MXID == "" || !isPlaceholderGroupName(portal.Name) {
+					return
+				}
+				candidate, authoritative := c.resolveAuthoritativeGroupName(ctx, string(pk.ID))
+				if candidate == "" {
+					candidate = c.buildGroupName(parts)
+				}
+				if !shouldApplyGroupNameRefresh(portal.Name, candidate, authoritative) {
+					return
+				}
+				c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+					EventMeta: simplevent.EventMeta{
+						Type:      bridgev2.RemoteEventChatInfoChange,
+						PortalKey: pk,
+						LogContext: func(lc zerolog.Context) zerolog.Context {
+							return lc.Str("portal_id", string(pk.ID)).Str("source", "participant_name_repair")
+						},
+					},
+					ChatInfoChange: &bridgev2.ChatInfoChange{
+						ChatInfo: &bridgev2.ChatInfo{
+							Name:                       &candidate,
+							ExcludeChangesFromTimeline: true,
+						},
+					},
+				})
+			}()
+		}
 
 		// Cache the original-case sender_guid so outbound messages reuse the
 		// same UUID casing and Apple Messages recipients match them to the
@@ -9311,6 +9369,63 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 	return strings.Split(portalID, ",")
 }
 
+func (c *IMClient) contactsAreReady() bool {
+	if c.contacts == nil {
+		return false
+	}
+	c.contactsReadyLock.RLock()
+	defer c.contactsReadyLock.RUnlock()
+	return c.contactsReady
+}
+
+func normalizeAndDedupeSenders(senders []string) []string {
+	seen := make(map[string]bool, len(senders))
+	normalized := make([]string, 0, len(senders))
+	for _, sender := range senders {
+		n := normalizeIdentifierForPortalID(sender)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		normalized = append(normalized, n)
+	}
+	return normalized
+}
+
+func (c *IMClient) resolveGroupMembersForDisplay(ctx context.Context, portalID string) []string {
+	if !c.contactsAreReady() {
+		return nil
+	}
+	if members := c.resolveGroupMembers(ctx, portalID); len(members) > 0 {
+		return members
+	}
+	if c.cloudStore == nil {
+		return nil
+	}
+	senders, err := c.cloudStore.getSenderHistoryByPortalID(ctx, portalID)
+	if err != nil {
+		c.Main.Bridge.Log.Debug().Err(err).Str("portal_id", portalID).Msg("Failed to load sender history for group display name")
+		return nil
+	}
+	return normalizeAndDedupeSenders(senders)
+}
+
+func (c *IMClient) resolveAuthoritativeGroupName(ctx context.Context, portalID string) (name string, ok bool) {
+	c.imGroupNamesMu.RLock()
+	cached := c.imGroupNames[portalID]
+	c.imGroupNamesMu.RUnlock()
+	if cached != "" {
+		return cached, true
+	}
+
+	if c.cloudStore != nil {
+		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
+			return dn, true
+		}
+	}
+	return "", false
+}
+
 // resolveGroupName determines the best display name for a group portal.
 // Returns the name and whether it came from an authoritative source
 // (imGroupNames cache or CloudKit display_name). When authoritative is
@@ -9322,23 +9437,12 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 //	   the "name" field on CKChatRecord = cv_name from chat.db)
 //	3) contact-resolved member names via buildGroupName (non-authoritative)
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) (name string, authoritative bool) {
-	// 1) In-memory cache (populated from real-time iMessage rename messages)
-	c.imGroupNamesMu.RLock()
-	cached := c.imGroupNames[portalID]
-	c.imGroupNamesMu.RUnlock()
-	if cached != "" {
-		return cached, true
-	}
-
-	// 2) CloudKit display_name (user-set group name from iCloud).
-	if c.cloudStore != nil {
-		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
-			return dn, true
-		}
+	if name, ok := c.resolveAuthoritativeGroupName(ctx, portalID); ok {
+		return name, true
 	}
 
 	// 3) Build from contact-resolved member names (fallback, non-authoritative)
-	members := c.resolveGroupMembers(ctx, portalID)
+	members := c.resolveGroupMembersForDisplay(ctx, portalID)
 	if len(members) == 0 {
 		return "Group Chat", false
 	}

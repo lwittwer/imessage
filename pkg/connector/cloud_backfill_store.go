@@ -1550,6 +1550,35 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 	return normalized, nil
 }
 
+func (s *cloudBackfillStore) getSenderHistoryByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(sender, '') AS sender
+		FROM cloud_message
+		WHERE login_id=$1
+		  AND portal_id=$2
+		  AND deleted=FALSE
+		  AND NOT is_from_me
+		  AND COALESCE(sender, '') <> ''
+		GROUP BY COALESCE(sender, '')
+		ORDER BY MIN(timestamp_ms), sender`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var senders []string
+	for rows.Next() {
+		var sender string
+		if err := rows.Scan(&sender); err != nil {
+			return nil, err
+		}
+		senders = append(senders, sender)
+	}
+	return senders, rows.Err()
+}
+
 // getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
 // This is the user-set group name (cv_name from the iMessage protocol), NOT an
 // auto-generated label. Returns empty string if none found or if the group is unnamed.
