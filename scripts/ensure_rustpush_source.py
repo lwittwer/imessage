@@ -133,6 +133,17 @@ def replace_line_once(path: Path, old: str, new: str, message: str) -> None:
         return
 
 
+def replace_line_prefix_once(path: Path, old: str, new: str, message: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not line.startswith(old):
+            continue
+        print(message)
+        lines[i] = line.replace(old, new, 1)
+        path.write_text("".join(lines), encoding="utf-8")
+        return
+
+
 def patch_keychain(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     marker = "Ignoring exclusion of ourselves"
@@ -181,7 +192,7 @@ def apply_source_patches(rustpush_dir: Path) -> None:
         "    pub expiration: SystemTime,",
         "Making FetchedToken.expiration pub...",
     )
-    replace_line_once(
+    replace_line_prefix_once(
         rustpush_dir / "apple-private-apis/icloud-auth/src/lib.rs",
         "pub use client::{AppleAccount, LoginState,",
         "pub use client::{AppleAccount, FetchedToken, LoginState,",
