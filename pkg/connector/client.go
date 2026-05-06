@@ -5575,7 +5575,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
 	}
-	targetGUID := string(msg.EditTarget.ID)
+	targetGUID, _ := extractTapbackTarget(string(msg.EditTarget.ID))
 
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
@@ -5596,10 +5596,11 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
 	}
 
+	targetGUID, _ := extractTapbackTarget(string(msg.TargetMessage.ID))
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	c.trackOutboundUnsend(targetGUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	_, err := c.client.SendUnsend(conv, targetGUID, 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
@@ -10599,7 +10600,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			members := make([]string, 0, len(info.Members)+1)
 			members = append(members, addIdentifierPrefix(c.handle))
 			for _, m := range info.Members {
-				members = append(members, addIdentifierPrefix(stripSmsSuffix(m)))
+				members = append(members, normalizeIdentifierForPortalID(stripSmsSuffix(m)))
 			}
 			sort.Strings(members)
 			portalKey = networkid.PortalKey{
@@ -10843,7 +10844,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 			Membership: event.MembershipJoin,
 		}
 		for _, memberID := range info.Members {
-			userID := makeUserID(addIdentifierPrefix(stripSmsSuffix(memberID)))
+			userID := makeUserID(normalizeIdentifierForPortalID(stripSmsSuffix(memberID)))
 			members.MemberMap[userID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{Sender: userID},
 				Membership:  event.MembershipJoin,
@@ -10876,7 +10877,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string
 		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
+		portalID := normalizeIdentifierForPortalID(stripSmsSuffix(parsed.LocalID))
 		otherUser := makeUserID(portalID)
 		isSelfChat := c.isMyHandle(portalID)
 

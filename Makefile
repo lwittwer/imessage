@@ -16,6 +16,7 @@ RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -n
 # Override at invocation time, e.g.:
 #   make RUSTPUSH_DIR=rustpush-master build
 RUSTPUSH_DIR ?= third_party/rustpush-upstream
+FALLBACK_RUSTPUSH_DIR ?= third_party/rustpush-upstream
 # rustpush source strategy:
 #   fork (default): clone cameronaaron/rustpush which has all bridge-compat
 #                   fixes already applied — no runtime patching needed.

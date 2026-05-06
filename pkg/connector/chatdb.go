@@ -385,7 +385,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(addIdentifierPrefix(stripSmsSuffix(msg.Sender.LocalID))),
+		Sender:   makeUserID(normalizeIdentifierForPortalID(stripSmsSuffix(msg.Sender.LocalID))),
 	}
 }
 
@@ -564,5 +564,3 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 		}},
 	}, nil
 }
-
-

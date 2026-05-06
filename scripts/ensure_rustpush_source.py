@@ -79,6 +79,10 @@ def ensure_checkout(rustpush_dir: Path, pin: str) -> None:
     run("git", "-C", str(rustpush_dir), "submodule", "sync", "--recursive", env=env)
     run("git", "-C", str(rustpush_dir), "submodule", "update", "--init", "--recursive", env=env)
 
+    current = capture("git", "-C", str(rustpush_dir), "rev-parse", "HEAD")
+    if current != pin:
+        sys.exit(f"error: rustpush checkout is at {current}, expected {pin}")
+
 
 def ensure_fairplay_certs(rustpush_dir: Path) -> None:
     fairplay_dir = rustpush_dir / "certs/fairplay"
