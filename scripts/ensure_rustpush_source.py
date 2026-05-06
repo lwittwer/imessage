@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import os
 import shutil
 import subprocess
@@ -104,12 +105,20 @@ def overlay_open_absinthe(rustpush_dir: Path) -> None:
 
 
 def directories_differ(left: Path, right: Path) -> bool:
-    result = subprocess.run(
-        ["diff", "-rq", str(left), str(right)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    if not right.exists():
+        return True
+    comparison = filecmp.dircmp(left, right)
+    if comparison.left_only or comparison.right_only or comparison.funny_files:
+        return True
+    _, mismatches, errors = filecmp.cmpfiles(
+        left,
+        right,
+        comparison.common_files,
+        shallow=False,
     )
-    return result.returncode != 0
+    if mismatches or errors:
+        return True
+    return any(directories_differ(left / subdir, right / subdir) for subdir in comparison.common_dirs)
 
 
 def replace_line_once(path: Path, old: str, new: str, message: str) -> None:
