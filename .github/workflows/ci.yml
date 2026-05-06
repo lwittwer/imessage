@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master, refactor]
+    branches: [master, refactor, personal]
   pull_request:
-    branches: [master, refactor]
+    branches: [master, refactor, personal]
   # Manual trigger — useful when bumping third_party/rustpush-upstream.sha
   # locally and wanting to re-run the full verify pipeline on a branch
   # without pushing a test commit.

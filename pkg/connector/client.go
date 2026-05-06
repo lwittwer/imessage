@@ -160,6 +160,11 @@ func shouldApplyGroupNameRefresh(currentName, newName string, authoritative bool
 	return isRefreshableGroupName(currentName)
 }
 
+func (c *IMClient) isGroupPortalSignal(participants []string, groupName *string) bool {
+	hasRealGroupName := groupName != nil && !isPlaceholderGroupName(*groupName)
+	return c.getUniqueParticipantCount(participants) > 2 || hasRealGroupName
+}
+
 const maxAttachmentRetries = 3
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
@@ -8954,7 +8959,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
+	isGroup := c.isGroupPortalSignal(participants, groupName)
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,

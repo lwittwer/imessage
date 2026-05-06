@@ -33,6 +33,20 @@ if defined CARGO_TARGET_DIR (
 
 set "RUST_LIB=%CARGO_OUT%\rustpushgo.lib"
 
+REM Prepare the pinned rustpush checkout before any Cargo command. This mirrors
+REM make ensure-rustpush-source for the default third_party\rustpush-upstream path.
+echo.
+echo === Preparing rustpush source ===
+pushd "%REPO%"
+python3 scripts\ensure_rustpush_source.py
+if errorlevel 1 (
+    echo.
+    echo ERROR: ensure_rustpush_source.py failed.
+    popd
+    exit /b 1
+)
+popd
+
 REM Build the static lib if it's missing. Safe to re-run: cargo is incremental.
 if not exist "%RUST_LIB%" (
     echo rustpushgo.lib missing at %RUST_LIB% — running cargo build...

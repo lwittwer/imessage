@@ -5,6 +5,9 @@ import (
 
 	"github.com/lrhodin/imessage/imessage"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 type testContactSource struct{}
@@ -85,6 +88,46 @@ func TestShouldApplyGroupNameRefresh(t *testing.T) {
 				t.Fatalf("shouldApplyGroupNameRefresh(%q, %q, %v) = %v, want %v", tt.currentName, tt.newName, tt.authoritative, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMakePortalKeyPlaceholderGroupNameUsesDMPeer(t *testing.T) {
+	c := &IMClient{
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("test-login")}},
+		allHandles: []string{
+			"mailto:self@example.com",
+		},
+	}
+	groupName := "Group Chat"
+	sender := "mailto:peer@example.com"
+	senderGuid := "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+
+	got := c.makePortalKey(
+		[]string{"mailto:self@example.com", "mailto:peer@example.com"},
+		&groupName,
+		&sender,
+		&senderGuid,
+	)
+
+	if got.ID != "mailto:peer@example.com" {
+		t.Fatalf("makePortalKey() ID = %q, want DM peer portal", got.ID)
+	}
+	if got.Receiver != "test-login" {
+		t.Fatalf("makePortalKey() Receiver = %q, want test-login", got.Receiver)
+	}
+}
+
+func TestMakePortalKeyRealTwoPersonGroupNameStaysGroup(t *testing.T) {
+	c := &IMClient{
+		allHandles: []string{"mailto:self@example.com"},
+	}
+	groupName := "Project Thread"
+
+	if !c.isGroupPortalSignal(
+		[]string{"mailto:self@example.com", "mailto:peer@example.com"},
+		&groupName,
+	) {
+		t.Fatal("isGroupPortalSignal() rejected named two-person group")
 	}
 }
 
