@@ -198,3 +198,30 @@ statuskit_share_on_startup: false
 		t.Error("StatusKitShareOnStartup should preserve explicit false")
 	}
 }
+
+func TestIMConfig_UnmarshalYAML_StatusKitNotificationsDefault(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if !c.StatusKitNotifications {
+		t.Error("StatusKitNotifications should default to true when omitted")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_StatusKitNotificationsExplicitFalse(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+statuskit_notifications: false
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if c.StatusKitNotifications {
+		t.Error("StatusKitNotifications should preserve explicit false")
+	}
+}

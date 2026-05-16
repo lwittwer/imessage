@@ -132,6 +132,9 @@ func (c *IMConfig) UnmarshalYAML(node *yaml.Node) error {
 	if !yamlMapHasKey(node, "statuskit_share_on_startup") {
 		c.StatusKitShareOnStartup = true
 	}
+	if !yamlMapHasKey(node, "statuskit_notifications") {
+		c.StatusKitNotifications = true
+	}
 	err := node.Decode((*umIMConfig)(c))
 	if err != nil {
 		return err
