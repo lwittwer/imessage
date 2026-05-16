@@ -6740,6 +6740,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}()
 	}
 
+	if params.Portal == nil || params.ThreadRoot != "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+	portalID := string(params.Portal.ID)
+	if portalID == "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
 	// When the user has capped max_initial_messages, skip backward backfill
 	// entirely. Forward backfill already delivered the capped N messages;
 	// returning empty here marks the backward task as done immediately.
@@ -6762,16 +6772,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	count := params.Count
 	if count <= 0 {
 		count = 50
-	}
-
-	if params.Portal == nil || params.ThreadRoot != "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-	portalID := string(params.Portal.ID)
-	if portalID == "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
 	// Guard: if this portal was recently deleted, only backfill if there are

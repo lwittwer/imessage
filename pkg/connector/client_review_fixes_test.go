@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"context"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -53,5 +54,15 @@ func TestResolveInBatchTapbackTargetFallsBackToBareGUID(t *testing.T) {
 	target, targetPart, ok := resolveInBatchTapbackTarget(messageByGUID, messageByID, "guid", 0)
 	if !ok || target != msg || targetPart != nil {
 		t.Fatalf("expected bare guid target, got target=%#v part=%#v ok=%v", target, targetPart, ok)
+	}
+}
+
+func TestFetchMessagesRejectsNilPortalBeforeBackendSelection(t *testing.T) {
+	resp, err := (&IMClient{}).FetchMessages(context.Background(), bridgev2.FetchMessagesParams{})
+	if err != nil {
+		t.Fatalf("FetchMessages returned error: %v", err)
+	}
+	if resp == nil || resp.HasMore || resp.Forward {
+		t.Fatalf("unexpected response: %#v", resp)
 	}
 }
