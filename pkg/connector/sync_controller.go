@@ -728,11 +728,11 @@ func (c *IMClient) notifyRecycleBinCandidates(log zerolog.Logger) {
 	var sb strings.Builder
 	sb.WriteString("**Chats blocked from Apple's recycle bin:**\n\n")
 	sb.WriteString("These chats have messages in Apple's \"Recently Deleted\" and were not created during backfill. ")
-	sb.WriteString("If any were restored on your iPhone and should appear here, use `!restore-chat` to bring them back.\n\n")
+	sb.WriteString("If any were restored on your iPhone and should appear here, use `restore-chat` to bring them back.\n\n")
 	for i, c := range candidates {
 		sb.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, c.displayName))
 	}
-	sb.WriteString(fmt.Sprintf("\nUse `!restore-chat` to restore any of these chats."))
+	sb.WriteString(fmt.Sprintf("\nUse `restore-chat` to restore any of these chats."))
 
 	content := format.RenderMarkdown(sb.String(), true, false)
 	content.MsgType = event.MsgNotice
@@ -858,13 +858,38 @@ const statusKitInterInviteDelay = 1500 * time.Millisecond
 // and never re-attempted.
 const statusKitLastInviteKeyPrefix = "statuskit.last_invite."
 
+// statusKitLastPostInviteShareKey stores the last time we published our
+// current StatusKit state immediately after changing the sharing ACL. OB has
+// Android zen-mode hooks that keep its channel status fresh; the bridge's only
+// truthful state is "available", so publish that state after successful
+// invites, but coalesce invite sweeps into a single channel publish.
+const statusKitLastPostInviteShareKey = "statuskit.last_post_invite_share"
+
+const statusKitPostInviteShareMinSpacing = 5 * time.Minute
+
 // statusKitInvitedOkKeyPrefix marks handles that received a StatusKit
-// invite which IDS accepted (no error, targets > 0). Once marked, bridge
-// never re-invites that handle. Matches OB-Android's one-shot latch via
-// `config == zenModeIsShared` — invite per chat activation, never again.
-// Peer iOS may treat repeat invites from a device it already has keys
-// for as spam.
+// invite which IDS accepted (no error, targets > 0). Soft-latched: if a
+// reshare from the peer has been observed (statusKitReshareSeenKeyPrefix),
+// the latch is permanent (matches OB-Android one-invite-per-chat-activation;
+// peer has our keys, repeat invites trip spam heuristics). If no reshare has
+// been observed and the latch is older than statusKitInvitedOkTTL, it is
+// treated as expired — IDS-accepted dispatch is not the same as peer
+// reciprocation, and a peer that never reshared probably never got the
+// invite (cert-stale, ratchet, transient IDS issue).
 const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
+
+// statusKitReshareSeenKeyPrefix marks handles whose StatusKit reshare we have
+// actually observed (proof of reciprocation, written by OnReshareSender).
+// Used by the soft-latch logic to distinguish "invite dispatched and peer
+// replied" (permanent latch) from "invite dispatched but peer never replied"
+// (TTL'd latch).
+const statusKitReshareSeenKeyPrefix = "statuskit.reshare_seen."
+
+// statusKitInvitedOkTTL is how long the dispatch latch holds before being
+// treated as expired in the absence of an observed reshare. Long enough that
+// repeat-invite spam heuristics on peer iOS don't fire on healthy peers, short
+// enough that a stuck-on-dispatch peer recovers within a week.
+const statusKitInvitedOkTTL = 7 * 24 * time.Hour
 
 // statusKitPerHandleMinSpacing is the minimum time between failed-retry
 // invites. Only applies on the periodic tick path to handles that did NOT
@@ -902,8 +927,15 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
 	}
+	// Mark the sweep as running so the new-portal hook
+	// (inviteSingleHandleToStatusSharing) skips its FFI call during this
+	// window. The sweep paces invites at statusKitInterInviteDelay; without
+	// this gate, a bootstrap burst of fresh DM portals would race the sweep
+	// and spawn unpaced concurrent invites.
+	c.statusKitSweepRunning.Store(true)
 	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
 	defer func() {
+		c.statusKitSweepRunning.Store(false)
 		if r := recover(); r != nil {
 			log.Warn().Interface("panic", r).Msg("inviteContactsToStatusSharing panicked — skipped")
 		}
@@ -973,21 +1005,46 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 
 	now := time.Now()
 	var pending []string
-	var skippedKnown, skippedSpacing, skippedAlreadySent int
+	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired int
 	for _, h := range allGhosts {
 		if _, known := knownSet[h]; known {
 			skippedKnown++
 			continue
 		}
-		// One-shot latch: if we've previously sent this handle an invite
-		// that IDS accepted, never re-send. Matches OB's one-invite-per-
-		// chat-activation model; repeated invites to the same peer
-		// produce no additional reshares and may trip spam heuristics.
-		// User-invoked retry (bypassLatch) intentionally overrides this
-		// so `!statuskit-invite-all` can re-drive every known peer.
-		if !bypassLatch && c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+h)) != "" {
-			skippedAlreadySent++
-			continue
+		// Soft latch: if we've previously dispatched an invite to this handle
+		// AND we've observed a reshare from them, never re-send (matches OB's
+		// one-invite-per-chat-activation; peer iOS treats repeat invites from
+		// a peer they already have keys for as spam).
+		//
+		// If the dispatch latch is set but no reshare has been observed AND
+		// the latch is older than statusKitInvitedOkTTL, treat it as expired:
+		// IDS-accept ≠ peer-receipt, and a peer that never reciprocated
+		// probably never received the invite (cert-stale, ratchet drift,
+		// transient IDS issue). Re-invite on the next sweep.
+		//
+		// User-invoked retry (bypassLatch) ignores both layers.
+		if !bypassLatch {
+			latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+h))
+			if latchedAt != "" {
+				reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+h)) != ""
+				if !reshareSeen {
+					if normalized := normalizeIdentifierForPortalID(h); normalized != h {
+						reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized)) != ""
+					}
+				}
+				if reshareSeen {
+					skippedAlreadySent++
+					continue
+				}
+				if ts, parseErr := time.Parse(time.RFC3339, latchedAt); parseErr == nil && now.Sub(ts) < statusKitInvitedOkTTL {
+					skippedAlreadySent++
+					continue
+				}
+				// Latch present but no reshare observed and TTL elapsed —
+				// re-invite. Don't clear the latch yet; the next successful
+				// dispatch will refresh the timestamp via the existing Set.
+				softExpired++
+			}
 		}
 		if respectSpacing {
 			last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
@@ -1005,6 +1062,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		Int("total_targets", len(allGhosts)).
 		Int("already_keyed", skippedKnown).
 		Int("already_invited_ok", skippedAlreadySent).
+		Int("soft_expired_retrying", softExpired).
 		Int("spacing_skip", skippedSpacing).
 		Int("pending", len(pending)).
 		Bool("respect_spacing", respectSpacing).
@@ -1030,8 +1088,29 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	const perInviteTimeout = 30 * time.Second
 
 	for i, h := range pending {
+		// In-memory single-flight: skip if another path (new-portal hook,
+		// post-backfill hook, prior sweep iteration) already has an FFI
+		// call in flight for this handle. The DB-side dispatch latch is
+		// written after the FFI returns, so without this guard concurrent
+		// callers both miss the latch and double-invoke. Peer iOS treats
+		// repeat invites as spam.
+		if _, loaded := c.inviteInFlight.LoadOrStore(h, struct{}{}); loaded {
+			log.Debug().Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: skipping — already in flight")
+			continue
+		}
 		inviteDone := make(chan error, 1)
 		go func(handle string) {
+			defer c.inviteInFlight.Delete(handle)
+			// Per-handle panic isolation: a panic inside the FFI must not
+			// crash the bridge or leave the parent select waiting forever
+			// (the channel is unbuffered enough that a missed send hangs
+			// until the 30s timeout and burns one slot of pacing). Convert
+			// to an error so the loop logs and moves on.
+			defer func() {
+				if r := recover(); r != nil {
+					inviteDone <- fmt.Errorf("InviteToStatusSharing panicked: %v\n%s", r, debug.Stack())
+				}
+			}()
 			inviteDone <- c.client.InviteToStatusSharing(sender, []string{handle})
 		}(h)
 
@@ -1050,6 +1129,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+h), nowStr)
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
 				log.Info().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
+				log.Info().Str("handle", h).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
 			}
 		case <-time.After(perInviteTimeout):
 			timeoutCount++
@@ -1070,6 +1150,172 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		}
 	}
 	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", sender).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
+	if okCount > 0 {
+		c.publishStatusKitAvailableAfterInvite(log, "invite sweep")
+	}
+}
+
+func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reason string) {
+	if c.client == nil {
+		return
+	}
+	// Serialize the cooldown read / publish / cooldown write across
+	// concurrent callers. Without this, two callers (e.g. a sweep finishing
+	// at the same time as a new-portal hook) can both pass the cooldown
+	// check while the KV row is still empty/stale and double-publish.
+	c.statusKitShareMu.Lock()
+	defer c.statusKitShareMu.Unlock()
+
+	ctx := context.Background()
+	now := time.Now()
+	last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastPostInviteShareKey))
+	if last != "" {
+		if ts, parseErr := time.Parse(time.RFC3339, last); parseErr == nil && now.Sub(ts) < statusKitPostInviteShareMinSpacing {
+			log.Debug().
+				Str("reason", reason).
+				Time("last_share_at", ts).
+				Dur("min_spacing", statusKitPostInviteShareMinSpacing).
+				Msg("StatusKit post-invite share_status skipped by cooldown")
+			return
+		}
+	}
+
+	if err := c.safeRefreshPetTokenThrottled(); err != nil {
+		log.Debug().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status: PET refresh skipped")
+	}
+	sk, err := c.client.GetStatuskitClient()
+	if err != nil || sk == nil {
+		log.Debug().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status skipped — client not ready")
+		return
+	}
+	if err := sk.ShareStatus(true, nil); err != nil {
+		log.Warn().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status failed")
+		return
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastPostInviteShareKey), now.Format(time.RFC3339))
+	log.Info().Str("reason", reason).Msg("StatusKit post-invite share_status(available) published")
+}
+
+// inviteSingleHandleToStatusSharing dispatches a StatusKit keysharing invite
+// to one peer handle without iterating the full portal sweep. Wired from the
+// new-portal-creation hook in client.go GetChatInfo so a contact who messages
+// the bridge for the first time mid-uptime gets our key immediately instead
+// of waiting up to 4h for the periodic tick. Mirrors OB's setActiveChat
+// trigger (chat_manager.dart:64-78) — OB invites on chat-open; the bridge's
+// non-UI analog is "portal materialized for the first time."
+//
+// Applies the same skip checks as the sweep: not-ready guard, self-alias,
+// group portal, peer-already-keyed, dispatch-latch (with reshare-seen and
+// TTL semantics). Same 30s per-invite timeout. KV updates on success match
+// the sweep so the periodic tick correctly skips this handle next.
+func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("inviteSingleHandleToStatusSharing panicked — skipped")
+		}
+	}()
+
+	if c.client == nil || c.handle == "" || c.UserLogin == nil {
+		return
+	}
+	if handle == "" || isGroupPortalID(handle) {
+		return
+	}
+	if handle == c.handle {
+		return
+	}
+	for _, h := range c.allHandles {
+		if h == handle {
+			return
+		}
+	}
+
+	// Skip while a sweep is running. The sweep paces invites at
+	// statusKitInterInviteDelay and writes the DB latch after each FFI
+	// call; running this hook concurrently would race the latch and
+	// emit unpaced FFI calls. The next sweep (or the soft-expired
+	// re-invite path) will pick this peer up if needed.
+	if c.statusKitSweepRunning.Load() {
+		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): sweep in progress; skipping")
+		return
+	}
+
+	ctx := context.Background()
+
+	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+		for _, known := range sk.GetKnownHandles() {
+			if known == handle {
+				log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): peer already keyed; skipping")
+				return
+			}
+		}
+	}
+
+	now := time.Now()
+	latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle))
+	if latchedAt != "" {
+		reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle)) != ""
+		if !reshareSeen {
+			if normalized := normalizeIdentifierForPortalID(handle); normalized != handle {
+				reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized)) != ""
+			}
+		}
+		if reshareSeen {
+			log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): reshare already seen; skipping")
+			return
+		}
+		if ts, parseErr := time.Parse(time.RFC3339, latchedAt); parseErr == nil && now.Sub(ts) < statusKitInvitedOkTTL {
+			log.Debug().Str("handle", handle).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
+			return
+		}
+	}
+
+	// In-memory single-flight: claim the slot after the cheap DB checks
+	// but before dispatching the FFI. Two concurrent callers (e.g. sweep
+	// reaching this handle while the new-portal hook also fires for the
+	// same fresh portal) would otherwise both pass the latch check (since
+	// the DB latch is written *after* the FFI returns) and double-invoke.
+	// Delete is on the FFI goroutine's defer, not this function's: the
+	// parent select can return on its 30s timeout while the FFI is still
+	// running, and we must not free the slot until the FFI itself ends.
+	if _, loaded := c.inviteInFlight.LoadOrStore(handle, struct{}{}); loaded {
+		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): already in flight; skipping")
+		return
+	}
+
+	sender := c.handle
+	log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): dispatching")
+
+	const perInviteTimeout = 30 * time.Second
+	inviteDone := make(chan error, 1)
+	go func() {
+		defer c.inviteInFlight.Delete(handle)
+		// Per-handle panic isolation — same shape as the sweep's loop
+		// goroutine. A panic inside the FFI must not crash the bridge.
+		defer func() {
+			if r := recover(); r != nil {
+				inviteDone <- fmt.Errorf("InviteToStatusSharing panicked: %v\n%s", r, debug.Stack())
+			}
+		}()
+		inviteDone <- c.client.InviteToStatusSharing(sender, []string{handle})
+	}()
+
+	select {
+	case err := <-inviteDone:
+		if err != nil {
+			log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
+			return
+		}
+		nowStr := now.Format(time.RFC3339)
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), nowStr)
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), nowStr)
+		log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): ok")
+		c.publishStatusKitAvailableAfterInvite(log, "new portal invite")
+	case <-time.After(perInviteTimeout):
+		log.Warn().Str("sender", sender).Str("handle", handle).Dur("timeout", perInviteTimeout).Msg("StatusKit invite (new portal): timed out — abandoning")
+	case <-c.stopChan:
+		return
+	}
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
@@ -1636,6 +1882,19 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		Bool("bootstrap", isBootstrap).
 		Dur("elapsed", time.Since(backfillStart)).
 		Msg("CloudKit sync pass complete")
+
+	// Fourth phase: pull StatusKit peer keys from CloudKit. On the bootstrap
+	// path, this phase is deferred to the end of runCloudSyncController
+	// (after portals + ghosts exist) so subscribeToContactPresence has
+	// handles to subscribe to — calling it during bootstrap would subscribe
+	// to an empty ghost table and leave injected keys un-wired. Steady-state
+	// cycles fire it from here normally.
+	// Best-effort — a failure here doesn't block the rest of the cycle.
+	if !isBootstrap {
+		if err := c.syncCloudStatusKitPeers(ctx, log); err != nil {
+			log.Info().Err(err).Msg("StatusKit-CloudKit phase: errored (continuing)")
+		}
+	}
 
 	// Only persist sync version if the sync actually received data.
 	// If the re-sync returned 0 records (e.g. CloudKit changes feed

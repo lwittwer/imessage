@@ -4,6 +4,7 @@ pub mod local_config;
 #[cfg(not(target_os = "macos"))]
 pub mod anisette;
 mod statuskitgo;
+mod statuskit_cloudkit;
 #[cfg(test)]
 mod test_hwinfo;
 
@@ -1443,6 +1444,13 @@ pub struct WrappedTokenProvider {
         Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
         Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
     )>>,
+    // Serializes concurrent callers into `ensure_mme_delegate_bytes_seeded`
+    // so a cold start with empty `mme_delegate_bytes` produces ONE
+    // login_apple_delegates POST regardless of how many CloudKit/contacts
+    // call sites raced into self-heal at the same time. The actual storage
+    // is still `mme_delegate_bytes`; this lock just guards the populate
+    // path.
+    mme_self_heal_lock: tokio::sync::Mutex<()>,
 }
 
 /// Helper: create CloudKit + Keychain clients from a WrappedTokenProvider.
@@ -1796,6 +1804,14 @@ impl WrappedTokenProvider {
     /// up the URL on a single canonical shape regardless of which of the
     /// three persisted shapes is on disk (see normalize comment for details).
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
+        // Try self-heal first; if it fails (no PET / Apple omitted the
+        // delegate / network error), don't propagate — get_contacts_url's
+        // contract is "Ok(None) when we don't have a CardDAV URL", and a
+        // contacts lookup with no URL is recoverable. The self-heal logs
+        // the failure mode itself.
+        if let Err(e) = self.ensure_mme_delegate_bytes_seeded().await {
+            debug!("get_contacts_url: self-heal did not populate bytes: {:?}", e);
+        }
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let Some(bytes) = bytes_guard.as_ref() else {
             return Ok(None);
@@ -2006,6 +2022,98 @@ impl WrappedTokenProvider {
         Ok(adsid)
     }
 
+    /// Lazily fetch the MobileMe delegate from Apple if our wrapper's bytes
+    /// are not seeded yet. Recovers from the "switched from master to
+    /// refactor with persisted credentials but no persisted MmeDelegateJSON"
+    /// path — restore_token_provider stores `None`, and without this
+    /// self-heal the first CloudKit / contacts call errors out with
+    /// "MobileMe delegate not seeded" until the user manually re-logs in.
+    ///
+    /// Concurrency: serialized by `mme_self_heal_lock` with a check-lock-
+    /// recheck. First caller acquires the heal lock and does the network
+    /// round-trip; concurrent callers wait, then take the populated bytes
+    /// and short-circuit on the recheck.
+    ///
+    /// Diagnostic logging distinguishes `delegates.mobileme = None` (Apple
+    /// returned a response that omitted the com.apple.mobileme entry) from
+    /// `login_apple_delegates errored` so the bridge logs make it clear
+    /// which way the self-heal went sideways.
+    ///
+    /// Persistence: this method only populates the in-memory cache. The
+    /// existing `persistMmeDelegate` ticker in pkg/connector/client.go
+    /// picks up the new bytes on its next tick and writes them to
+    /// UserLoginMetadata, so subsequent restarts skip self-heal.
+    async fn ensure_mme_delegate_bytes_seeded(&self) -> Result<(), WrappedError> {
+        if self.mme_delegate_bytes.lock().await.is_some() {
+            return Ok(());
+        }
+
+        let _heal_guard = self.mme_self_heal_lock.lock().await;
+
+        if self.mme_delegate_bytes.lock().await.is_some() {
+            return Ok(());
+        }
+
+        info!("Self-healing MobileMe delegate: cached bytes empty, fetching fresh from Apple");
+
+        // login_apple_delegates panics on no-PET (auth.rs:361
+        // `panic!("No pet!")`), so guard against a cold/expired PET
+        // with get_gsa_token, which auto-refreshes via login_email_pass
+        // when the cached PET is stale.
+        if self.inner.get_gsa_token("com.apple.gs.idms.pet").await.is_none() {
+            return Err(WrappedError::GenericError {
+                msg: "MobileMe self-heal: no PET token available (Apple may require re-login)".into(),
+            });
+        }
+
+        let delegates = {
+            let account = self.account.lock().await;
+            login_apple_delegates(
+                &*account,
+                None,
+                &*self.os_config,
+                &[LoginDelegate::MobileMe],
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("MobileMe self-heal: login_apple_delegates errored: {}", e),
+            })?
+        };
+
+        let Some(mobileme) = delegates.mobileme else {
+            warn!(
+                "MobileMe self-heal: login_apple_delegates returned delegates.mobileme = None \
+                 (Apple did not include com.apple.mobileme in the response). CloudKit/contacts \
+                 services remain unavailable until re-login."
+            );
+            return Err(WrappedError::GenericError {
+                msg: "MobileMe self-heal: Apple omitted com.apple.mobileme delegate".into(),
+            });
+        };
+
+        // Match the serialization shape produced by the login path
+        // (lib.rs login.finish: `{"tokens": {...}, "com.apple.mobileme": {...}}`).
+        let mut tokens_dict = plist::Dictionary::new();
+        for (k, v) in &mobileme.tokens {
+            tokens_dict.insert(k.clone(), plist::Value::String(v.clone()));
+        }
+        let mut root = plist::Dictionary::new();
+        root.insert("tokens".to_string(), plist::Value::Dictionary(tokens_dict));
+        root.insert(
+            "com.apple.mobileme".to_string(),
+            plist::Value::Dictionary(mobileme.config.clone()),
+        );
+        let mut buf = Vec::new();
+        plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("MobileMe self-heal: serialize delegate to plist: {}", e),
+            })?;
+
+        *self.mme_delegate_bytes.lock().await = Some(buf);
+        info!("MobileMe self-heal: delegate fetched and cached in-memory; persistMmeDelegate ticker will save to disk");
+        Ok(())
+    }
+
     /// Parse the stored MobileMe delegate plist bytes into whatever typed form
     /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
     /// `T` is inferred from the receiving function's signature at the call site —
@@ -2017,6 +2125,7 @@ impl WrappedTokenProvider {
     /// etc.) regardless of which shape was stored. See `normalize_mme_delegate_dict`
     /// below for the three shapes we accept.
     pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(&self) -> Result<T, WrappedError> {
+        self.ensure_mme_delegate_bytes_seeded().await?;
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let bytes = bytes_guard.as_ref().ok_or(WrappedError::GenericError {
             msg: "MobileMe delegate not seeded — call seed_mme_delegate_json first".into(),
@@ -2265,6 +2374,7 @@ pub async fn restore_token_provider(
         os_config,
         mme_delegate_bytes: tokio::sync::Mutex::new(None),
         keychain_clients_cache: tokio::sync::Mutex::new(None),
+        mme_self_heal_lock: tokio::sync::Mutex::new(()),
     }))
 }
 
@@ -4346,6 +4456,9 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
             if let MessageType::SMS { from_handle: Some(from_handle), .. } = &normal.service {
+                // Apple's SMS relay puts the forwarding iPhone's handle in the APNs
+                // envelope sender, causing the bridge to misidentify it as IsFromMe.
+                // The true sender of an inbound SMS is stored in from_handle.
                 if let Some(sender) = normalize_sms_sender_handle(from_handle) {
                     w.sender = Some(sender);
                 }
@@ -4729,7 +4842,15 @@ pub trait StatusCallback: Send + Sync {
     /// the Go side only learns ONE alias per peer and cannot resolve presence
     /// updates that arrive on any of the others. Stamping each sender into the
     /// learned-sender cache preserves all aliases across overwrites.
-    fn on_reshare_sender(&self, sender: String);
+    ///
+    /// `channel_id` is the StatusKit channel the reshare carried. Pairing it
+    /// with the sender handle lets the Go side build a (channel_id ↔ aliases)
+    /// cluster across all reshare events: two senders observed on the same
+    /// channel id are aliases of the same peer. The cluster powers a
+    /// transitive resolver that maps presence updates from a previously-
+    /// unknown alias to the DM portal of any sibling alias that does
+    /// resolve via the standard chain.
+    fn on_reshare_sender(&self, sender: String, channel_id: String);
 }
 
 // ============================================================================
@@ -4866,13 +4987,13 @@ fn resolve_xdg_data_dir() -> String {
     "state".to_string()
 }
 
-fn subsystem_state_path(file_name: &str) -> String {
+pub(crate) fn subsystem_state_path(file_name: &str) -> String {
     let xdg_dir = resolve_xdg_data_dir();
     let _ = std::fs::create_dir_all(&xdg_dir);
     format!("{}/{}", xdg_dir, file_name)
 }
 
-fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     match std::fs::read(path) {
         Ok(data) => match plist::from_bytes(&data) {
             Ok(state) => Some(state),
@@ -4889,7 +5010,7 @@ fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     }
 }
 
-fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
+pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
     // Write to a sibling tmp file, then atomic-rename. Sidesteps EACCES
     // when the existing file at `path` is owned by a UID different from
     // the current bridge process (stranded from a prior deploy under a
@@ -5406,8 +5527,8 @@ impl LoginSession {
                     .map(|r| {
                         let not_expired = r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false);
                         let hash_matches = r.data_hash == MULTIPLEX_SERVICE.hash_data();
-                        if !not_expired { info!("MULTIPLEX registration expired — will re-register"); }
-                        if !hash_matches { info!("MULTIPLEX data_hash changed (sub_services or client_data updated) — will re-register"); }
+                        if !not_expired { warn!("StatusKit: MULTIPLEX registration expired — will re-register (peer iOS may take ~5min to refresh keysharing routing)"); }
+                        if !hash_matches { warn!("StatusKit: MULTIPLEX data_hash changed (sub_services or client_data updated) — will re-register (peer iOS may take ~5min to refresh keysharing routing)"); }
                         not_expired && hash_matches
                     })
                     .unwrap_or(false);
@@ -5503,6 +5624,7 @@ impl LoginSession {
                 os_config: os_config.clone(),
                 mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
                 keychain_clients_cache: tokio::sync::Mutex::new(None),
+                mme_self_heal_lock: tokio::sync::Mutex::new(()),
             })),
             account_persist: Some(account_persist),
         })
@@ -5850,55 +5972,6 @@ async fn download_icon_change_photo(
                 }
             }
         }
-    }
-}
-
-// ============================================================================
-// Client
-// ============================================================================
-
-#[derive(uniffi::Object)]
-pub struct WrappedFindMyClient {
-    inner: Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-impl WrappedFindMyClient {
-    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
-        let state = self.inner.state.state.lock().await;
-        serialize_state_json(&*state)
-    }
-
-    pub async fn sync_item_positions(&self) -> Result<(), WrappedError> {
-        self.inner.sync_item_positions().await?;
-        Ok(())
-    }
-
-    pub async fn accept_item_share(&self, circle_id: String) -> Result<(), WrappedError> {
-        self.inner.accept_item_share(&circle_id).await?;
-        Ok(())
-    }
-
-    pub async fn update_beacon_name(
-        &self,
-        associated_beacon: String,
-        role_id: i64,
-        name: String,
-        emoji: String,
-    ) -> Result<(), WrappedError> {
-        let record = rustpush::findmy::BeaconNamingRecord {
-            associated_beacon,
-            role_id,
-            name,
-            emoji,
-        };
-        self.inner.update_beacon_name(&record).await?;
-        Ok(())
-    }
-
-    pub async fn delete_shared_item(&self, id: String, remove_beacon: bool) -> Result<(), WrappedError> {
-        self.inner.delete_shared_item(&id, remove_beacon).await?;
-        Ok(())
     }
 }
 
@@ -6295,7 +6368,7 @@ impl WrappedPasswordsClient {
 
 #[derive(uniffi::Object)]
 pub struct WrappedStatusKitClient {
-    inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
+    pub(crate) inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
     interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
@@ -6559,7 +6632,6 @@ pub struct Client {
     token_provider: Option<Arc<WrappedTokenProvider>>,
     cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>>,
     cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>>,
-    findmy_client: tokio::sync::Mutex<Option<Arc<WrappedFindMyClient>>>,
     facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
     statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
@@ -7072,8 +7144,10 @@ pub async fn new_client(
                                     // upstream's HashMap only keeps the last
                                     // `from`, so without this, presence
                                     // updates for overwritten aliases have
-                                    // no portal mapping.
-                                    cb.on_reshare_sender(sender.clone());
+                                    // no portal mapping. Channel id is
+                                    // forwarded so the Go side can cluster
+                                    // (channel_id ↔ aliases) across reshares.
+                                    cb.on_reshare_sender(sender.clone(), parsed.channel.clone());
                                     cb.on_keys_received();
                                 }
                                 Ok(true)
@@ -7238,6 +7312,8 @@ pub async fn new_client(
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                 cb.on_status_update(user, mode, allowed);
+                            } else {
+                                warn!("StatusKit: status update arrived before callback installed — dropping (user={}, mode={:?})", user, mode);
                             }
                             pending.fetch_sub(1, Ordering::Relaxed);
                             continue;
@@ -7275,9 +7351,20 @@ pub async fn new_client(
                                         info!("StatusKit key-sharing message received — state.keys gained {} new channel(s), sender={:?}", new_channels.len(), upstream_sender);
                                         if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                             if let Some(sender) = upstream_sender {
-                                                cb.on_reshare_sender(sender);
+                                                // Fire one callback per newly-added
+                                                // channel so the Go-side cluster
+                                                // captures (channel_id, sender) for
+                                                // each. A single keysharing message
+                                                // typically adds exactly one channel,
+                                                // but iterating handles the rare
+                                                // multi-channel case correctly.
+                                                for channel_id in &new_channels {
+                                                    cb.on_reshare_sender(sender.clone(), (*channel_id).clone());
+                                                }
                                             }
                                             cb.on_keys_received();
+                                        } else {
+                                            warn!("StatusKit: keysharing reshare arrived before callback installed — dropping on_keys_received (peer subscribe will not refresh until next reshare); sender={:?}", upstream_sender);
                                         }
                                     } else {
                                         // Parse the command byte and IDS envelope field presence
@@ -7539,7 +7626,6 @@ pub async fn new_client(
         token_provider,
         cloud_messages_client: tokio::sync::Mutex::new(None),
         cloud_keychain_client: tokio::sync::Mutex::new(None),
-        findmy_client: tokio::sync::Mutex::new(None),
         facetime_client: tokio::sync::Mutex::new(Some(prewarmed_facetime)),
         passwords_client: tokio::sync::Mutex::new(None),
         statuskit_client: tokio::sync::Mutex::new(None),
@@ -7556,7 +7642,7 @@ pub async fn new_client(
 }
 
 impl Client {
-    async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    pub(crate) async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
         // Fast path: return cached client without doing any slow work.
         // IMPORTANT: the lock is released before any network calls so that
         // tokio timeouts can fire and concurrent callers are never blocked by
@@ -7768,60 +7854,6 @@ impl Client {
         }
     }
 
-    async fn get_or_init_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
-        let mut locked = self.findmy_client.lock().await;
-        if let Some(client) = &*locked {
-            return Ok(client.clone());
-        }
-
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
-        let dsid = tp.get_dsid().await?;
-        let keychain = self.get_or_init_cloud_keychain_client().await?;
-        let cloudkit = keychain.client.clone();
-        let account = tp.get_account();
-        let anisette = account.lock().await.anisette.clone();
-
-        let state_path = subsystem_state_path("findmy.state");
-        let state_bytes = match std::fs::read(&state_path) {
-            Ok(data) => data,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => rustpush::findmy::FindMyState::new(dsid).encode()?,
-            Err(err) => {
-                return Err(WrappedError::GenericError {
-                    msg: format!("Failed to read Find My state: {}", err),
-                })
-            }
-        };
-        let state_path_for_closure = state_path.clone();
-        let state_manager = rustpush::findmy::FindMyStateManager::new(
-            &state_bytes,
-            Box::new(move |data| {
-                if let Err(err) = std::fs::write(&state_path_for_closure, data) {
-                    warn!("Failed to persist Find My state to {}: {}", state_path_for_closure, err);
-                }
-            }),
-        );
-
-        let wrapped = Arc::new(WrappedFindMyClient {
-            inner: Arc::new(
-                rustpush::findmy::FindMyClient::new(
-                    self.conn.clone(),
-                    cloudkit,
-                    keychain,
-                    self.os_config.clone(),
-                    state_manager,
-                    tp.inner.clone(),
-                    anisette,
-                    self.client.identity.clone(),
-                )
-                .await?,
-            ),
-        });
-        *locked = Some(wrapped.clone());
-        Ok(wrapped)
-    }
-
     async fn get_or_init_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
         let mut locked = self.facetime_client.lock().await;
         if let Some(client) = &*locked {
@@ -7876,7 +7908,7 @@ impl Client {
         Ok(wrapped)
     }
 
-    async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+    pub(crate) async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
         // Fast path: return cached client without holding the lock during init.
         {
             let locked = self.statuskit_client.lock().await;
@@ -8182,6 +8214,7 @@ impl Client {
         let wrapped = self.get_or_init_statuskit_client().await?;
         *self.shared_statuskit.write().await = Some(wrapped.inner.clone());
         *self.status_callback.write().await = Some(Arc::from(callback));
+        info!("StatusKit: callback registered, recv loop window closed");
         info!("StatusKit initialized — presence system ready");
 
         // Self-visibility diagnostic: query IDS for our own handle's
@@ -8348,37 +8381,71 @@ impl Client {
     /// database — we check each one against the IDS cache for a matching
     /// correlation ID.
     pub async fn resolve_handle(&self, handle: String, known_handles: Vec<String>) -> Result<Vec<String>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
         let my_handles = self.client.identity.get_handles().await;
         let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
             msg: "no handle available".into(),
         })?.clone();
 
-        // Try two IDS services in order:
-        //   1. com.apple.madrid (iMessage) — the normal path
-        //   2. com.apple.private.alloy.status.keysharing (StatusKit) — fallback
+        // Try IDS services in order. Each service's lookup may return zero
+        // keys for a hidden alias (e.g. an Apple-ID-linked mailto: that
+        // isn't registered for iMessage), so we walk down the list until
+        // one returns a correlation_id, then scan known_handles in that
+        // same service for matching ids.
         //
-        // Contacts who use iMessage only via their phone number have zero
-        // Madrid keys for their Apple ID (mailto:) — IDS reports "zero keys".
-        // However, they DO have StatusKit-keysharing keys because their device
-        // sent us a key-sharing message using their Apple ID. The keysharing
-        // service uses the same sender_correlation_identifier as Madrid, so
-        // the same correlation-ID scan works; we just need the right service.
-        //
-        // Each validate_targets call is bounded to 5 s via tokio timeout so
-        // a single-handle IDS query cannot block the goroutine indefinitely.
+        // Only services that are actually registered in the bridge's
+        // IDS service list are valid here — passing a topic that
+        // isn't registered makes IdentityManager::get_main_service
+        // panic via .expect("Topic ... not found!"). The bridge
+        // registers MADRID + MULTIPLEX (which sub_serves status.keysharing
+        // and status.personal); presence.mode.status is APNs-interest
+        // only, not an IDS service, so we cannot validate_targets it.
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
             "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
         ];
 
-        for &service in SERVICES {
+        for (idx, &service) in SERVICES.iter().enumerate() {
+            // Madrid (first service) gets a batched lookup — the unknown
+            // handle plus every known ghost in one query. This matters
+            // for hidden Apple-ID aliases (e.g. mailto:aap724@…) that
+            // return LookupFailed (6001) when queried alone but get their
+            // correlation_id populated alongside successful sibling
+            // lookups in a batch.
+            let (targets, timeout_secs): (Vec<String>, u64) = if idx == 0 {
+                let mut t = Vec::with_capacity(known_handles.len() + 1);
+                t.push(handle.clone());
+                for k in &known_handles {
+                    if k != &handle {
+                        t.push(k.clone());
+                    }
+                }
+                (t, 15)
+            } else {
+                (vec![handle.clone()], 5)
+            };
+
+            // Bypass the EMPTY_REFRESH (1h) freshness filter via refresh=true.
+            // Why: validate_targets uses refresh=false, which keeps stale empty
+            // results "fresh" for an hour — so a handle Apple previously returned
+            // empty for is filtered out of the HTTP fetch and never re-queried.
+            // refresh=true drops the cutoff to REFRESH_MIN (60s). The resolver's
+            // rate gate caps how often this runs, so we don't pound Apple.
             match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.client.identity.validate_targets(&[handle.clone()], service, &my_handle),
+                Duration::from_secs(timeout_secs),
+                self.client.identity.cache_keys(
+                    service,
+                    &targets,
+                    &my_handle,
+                    true,
+                    &QueryOptions::default(),
+                ),
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => info!("resolve_handle: validate_targets({}) failed for {}: {:?}", service, handle, e),
-                Err(_) => info!("resolve_handle: validate_targets({}) timed out after 5s for {}", service, handle),
+                Ok(Err(e)) => info!("resolve_handle: cache_keys({}, n={}) failed: {:?}", service, targets.len(), e),
+                Err(_) => info!("resolve_handle: cache_keys({}, n={}) timed out after {}s", service, targets.len(), timeout_secs),
             }
 
             let cache = self.client.identity.cache.lock().await;
@@ -8391,8 +8458,9 @@ impl Client {
             };
 
             // Scan known handles for matching correlation IDs in this service.
-            // known_handles are pre-populated from message processing (tel:) and
-            // StatusKit invite responses (mailto:), so no extra IDS calls needed.
+            // The Madrid batch above populates correlation_ids for every
+            // known_handle that resolves; later services rely on the cache
+            // from prior message processing / StatusKit invite traffic.
             let mut aliases = vec![];
             for known_handle in &known_handles {
                 if known_handle == &handle {
@@ -8426,9 +8494,11 @@ impl Client {
     /// invite_to_channel runs. Falling through to keysharing lets the
     /// periodic re-invite path find aliases on subsequent ticks.
     pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+        // Mirror resolve_handle's services list — see comment there.
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
             "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
         ];
 
         let my_handles = self.client.identity.get_handles().await;
@@ -8461,6 +8531,154 @@ impl Client {
 
         info!("resolve_handle_cached: {} not in IDS cache", handle);
         vec![]
+    }
+
+    /// Vectorized resolve_handle: takes many unknown handles plus the full set
+    /// of known portal-bearing handles, makes ONE batched IDS call per service
+    /// covering all of them at once, then walks the cache to match each
+    /// unknown's correlation_id against the known handles.
+    ///
+    /// Returns a map of unknown_handle → list of sibling known_handles. Only
+    /// handles that resolved to at least one sibling appear in the map.
+    /// Unknowns Apple has nothing for are silently absent.
+    ///
+    /// Designed to back the per-sync alias-link pass: 12-hour cadence, called
+    /// after the StatusKit-CloudKit pull when state.keys is freshly populated.
+    /// Pays one network round-trip total regardless of how many unknowns —
+    /// the rate gate that protects per-presence resolution doesn't apply
+    /// here because the call is bounded and infrequent by design.
+    pub async fn batch_resolve_handles(
+        &self,
+        unknowns: Vec<String>,
+        known_handles: Vec<String>,
+    ) -> Result<HashMap<String, Vec<String>>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
+        if unknowns.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
+            msg: "no handle available".into(),
+        })?.clone();
+
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
+        ];
+
+        // Dedup unknowns and known siblings into separate vectors so we can
+        // apply different refresh policies. Unknowns get refresh=true (force
+        // Apple to re-query, bypassing EMPTY_REFRESH). Known siblings get
+        // refresh=false (cache-only when warm; only fetched if their entry
+        // is missing or genuinely stale per session_token_refresh_seconds).
+        // This is the difference between ~4 Apple lookups per cycle and ~28.
+        let mut unknown_targets: Vec<String> = Vec::with_capacity(unknowns.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for h in &unknowns {
+            if seen.insert(h.clone()) {
+                unknown_targets.push(h.clone());
+            }
+        }
+        let mut sibling_targets: Vec<String> = Vec::with_capacity(known_handles.len());
+        for h in &known_handles {
+            if seen.insert(h.clone()) {
+                sibling_targets.push(h.clone());
+            }
+        }
+
+        // Timeouts scale with each list's size separately. Unknowns are the
+        // small set (the ones we actually need fresh data for); known siblings
+        // are mostly cache hits, so this call is fast in steady state.
+        let unknown_timeout: u64 = ((unknown_targets.len() as u64 / 18) * 4 + 15).min(90);
+        let sibling_timeout: u64 = ((sibling_targets.len() as u64 / 18) * 4 + 15).min(90);
+
+        let mut results: HashMap<String, Vec<String>> = HashMap::new();
+
+        for &service in SERVICES {
+            // 1. Force-fresh fetch for the unknowns. refresh=true bypasses the
+            //    EMPTY_REFRESH cache filter so Apple is re-queried even if a
+            //    prior empty result is cached within the 1h window.
+            match tokio::time::timeout(
+                Duration::from_secs(unknown_timeout),
+                self.client.identity.cache_keys(
+                    service,
+                    &unknown_targets,
+                    &my_handle,
+                    true,
+                    &QueryOptions::default(),
+                ),
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {:?}", service, unknown_targets.len(), e);
+                    continue;
+                }
+                Err(_) => {
+                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) timed out after {}s", service, unknown_targets.len(), unknown_timeout);
+                    continue;
+                }
+            }
+
+            // 2. Cache-only top-up for known siblings. refresh=false means each
+            //    sibling is filtered out if its cache entry is fresh — typical
+            //    case is cache hit for everyone (siblings have been queried
+            //    during normal message traffic). Only siblings with truly
+            //    missing/stale entries hit Apple.
+            if !sibling_targets.is_empty() {
+                match tokio::time::timeout(
+                    Duration::from_secs(sibling_timeout),
+                    self.client.identity.cache_keys(
+                        service,
+                        &sibling_targets,
+                        &my_handle,
+                        false,
+                        &QueryOptions::default(),
+                    ),
+                ).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {:?}", service, sibling_targets.len(), e);
+                    }
+                    Err(_) => {
+                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) timed out after {}s (continuing with cached entries)", service, sibling_targets.len(), sibling_timeout);
+                    }
+                }
+            }
+
+            let cache = self.client.identity.cache.lock().await;
+            for unknown in &unknowns {
+                if results.contains_key(unknown) {
+                    continue;
+                }
+                let cid = match cache.get_correlation_id(service, &my_handle, unknown) {
+                    Some(c) if !c.is_empty() => c,
+                    _ => continue,
+                };
+                let mut aliases = vec![];
+                for known in &known_handles {
+                    if known == unknown {
+                        continue;
+                    }
+                    if let Some(other_cid) = cache.get_correlation_id(service, &my_handle, known) {
+                        if other_cid == cid {
+                            aliases.push(known.clone());
+                        }
+                    }
+                }
+                if !aliases.is_empty() {
+                    results.insert(unknown.clone(), aliases);
+                }
+            }
+        }
+
+        info!(
+            "batch_resolve_handles: resolved {}/{} unknowns (forced-fresh n={}, sibling cache-top-up n={})",
+            results.len(), unknowns.len(), unknown_targets.len(), sibling_targets.len()
+        );
+        Ok(results)
     }
 
     /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
@@ -8538,15 +8756,37 @@ impl Client {
                 None
             },
         };
-        let record = profiles.get_record(&share_msg).await.map_err(|e| {
-            warn!(
-                "fetch_profile failed (record_key={}…, has_poster={}): {:?}",
-                key_prefix, has_poster, e
-            );
-            WrappedError::GenericError {
-                msg: format!("Failed to fetch profile: {:?}", e),
+        // Upstream cloudkit.rs `FetchedRecords::get_record` does
+        // `.expect("No record found?")` when CloudKit returns a response
+        // with no matching record id. That's a normal outcome when the
+        // peer rotated/deleted their shared-profile record after we cached
+        // its key, but the upstream panics → crosses the FFI boundary →
+        // takes the bridge down (and systemd restarts into the same row,
+        // crashloop). Wrap in catch_unwind so the panic becomes an error
+        // and the Go-side periodic refresh logs+skips the stale row.
+        use futures::FutureExt;
+        let fetch_fut = profiles.get_record(&share_msg);
+        let record = match std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!(
+                    "fetch_profile failed (record_key={}…, has_poster={}): {:?}",
+                    key_prefix, has_poster, e
+                );
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to fetch profile: {:?}", e),
+                });
             }
-        })?;
+            Err(_) => {
+                warn!(
+                    "fetch_profile panicked in upstream CloudKit (record_key={}…, has_poster={}) — likely record rotated/deleted; treating as fetch error",
+                    key_prefix, has_poster
+                );
+                return Err(WrappedError::GenericError {
+                    msg: "Shared profile record not found in CloudKit (rotated/deleted)".to_string(),
+                });
+            }
+        };
         Ok(WrappedProfileRecord {
             display_name: record.name.name,
             first_name: record.name.first,
@@ -8598,10 +8838,6 @@ impl Client {
         }
     }
 
-    pub async fn get_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
-        self.get_or_init_findmy_client().await
-    }
-
     pub async fn get_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
         self.get_or_init_facetime_client().await
     }
@@ -8616,86 +8852,6 @@ impl Client {
 
     pub async fn get_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
         self.get_or_init_sharedstreams_client().await
-    }
-
-    pub async fn findmy_phone_refresh_json(&self) -> Result<String, WrappedError> {
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
-        let dsid = tp.get_dsid().await?;
-        let account = tp.get_account();
-        let anisette = account.lock().await.anisette.clone();
-
-        let mut client = rustpush::findmy::FindMyPhoneClient::new(
-            self.os_config.as_ref(),
-            dsid,
-            self.conn.clone(),
-            anisette,
-            tp.inner.clone(),
-        )
-        .await?;
-        client.refresh(self.os_config.as_ref()).await?;
-
-        serde_json::to_string(&client.devices).map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to encode Find My Phone devices: {}", e),
-        })
-    }
-
-    pub async fn findmy_friends_refresh_json(&self, daemon: bool) -> Result<String, WrappedError> {
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
-        let dsid = tp.get_dsid().await?;
-        let account = tp.get_account();
-        let anisette = account.lock().await.anisette.clone();
-
-        let mut client = rustpush::findmy::FindMyFriendsClient::new(
-            self.os_config.as_ref(),
-            dsid,
-            tp.inner.clone(),
-            self.conn.clone(),
-            anisette,
-            daemon,
-        )
-        .await?;
-        client.refresh(self.os_config.as_ref()).await?;
-
-        #[derive(serde::Serialize)]
-        struct FriendsSnapshot {
-            selected_friend: Option<String>,
-            followers: Vec<rustpush::findmy::Follow>,
-            following: Vec<rustpush::findmy::Follow>,
-        }
-
-        serde_json::to_string(&FriendsSnapshot {
-            selected_friend: client.selected_friend,
-            followers: client.followers,
-            following: client.following,
-        })
-        .map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to encode Find My Friends snapshot: {}", e),
-        })
-    }
-
-    pub async fn findmy_friends_import(&self, daemon: bool, url: String) -> Result<(), WrappedError> {
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
-        let dsid = tp.get_dsid().await?;
-        let account = tp.get_account();
-        let anisette = account.lock().await.anisette.clone();
-
-        let mut client = rustpush::findmy::FindMyFriendsClient::new(
-            self.os_config.as_ref(),
-            dsid,
-            tp.inner.clone(),
-            self.conn.clone(),
-            anisette,
-            daemon,
-        )
-        .await?;
-        client.import(self.os_config.as_ref(), &url).await?;
-        Ok(())
     }
 
     pub async fn validate_targets(

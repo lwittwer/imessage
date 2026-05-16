@@ -170,6 +170,52 @@ def patch_keychain(path: Path) -> None:
     path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
 
 
+def patch_register_body_log(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if "RUSTPUSH_LOG_REGISTER_BODY" in text:
+        return
+    needle = '    let mut request = SignedRequest::new("id-register", Method::POST)\n'
+    if needle not in text:
+        return
+    print("Patching user.rs to add env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports d77b1ac4)...")
+    replacement = (
+        '    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { '
+        'info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); '
+        '} let mut request = SignedRequest::new("id-register", Method::POST)\n'
+    )
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+
+
+def patch_statuskit_missing_channel(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    needle = '            panic!("No saved channel for identifier!")\n'
+    if needle not in text:
+        return
+    print("Softening statuskit.rs:119 panic to warn+default APSChannel (StatusKit reliability)...")
+    replacement = (
+        '            warn!("StatusKit: no saved channel for identifier -- using last_msg_ns=0 (will replay)"); '
+        "return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };\n"
+    )
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+
+
+def patch_statuskit_presence_race(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    needle = (
+        "let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) "
+        'else { panic!("Channel not found!") };'
+    )
+    if needle not in text:
+        return
+    print("Softening statuskit.rs:736 panic to warn+Ok(None) (StatusKit reliability -- presence-before-keysharing race)...")
+    replacement = (
+        "let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) "
+        'else { warn!("StatusKit: presence msg arrived before keysharing for channel={} -- dropping", '
+        "encode_hex(&channel.id)); return Ok(None); };"
+    )
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+
+
 def apply_source_patches(rustpush_dir: Path) -> None:
     replace_line_once(
         rustpush_dir / "src/lib.rs",
@@ -203,6 +249,10 @@ def apply_source_patches(rustpush_dir: Path) -> None:
         "Re-exporting FetchedToken from icloud_auth crate root...",
     )
     patch_keychain(rustpush_dir / "src/icloud/keychain.rs")
+    patch_register_body_log(rustpush_dir / "src/ids/user.rs")
+    statuskit_rs = rustpush_dir / "src/statuskit.rs"
+    patch_statuskit_missing_channel(statuskit_rs)
+    patch_statuskit_presence_race(statuskit_rs)
 
 
 def main() -> None:
