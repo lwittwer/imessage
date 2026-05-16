@@ -129,11 +129,26 @@ func (c *CardDAVConfig) GetUsername() string {
 type umIMConfig IMConfig
 
 func (c *IMConfig) UnmarshalYAML(node *yaml.Node) error {
+	if !yamlMapHasKey(node, "statuskit_share_on_startup") {
+		c.StatusKitShareOnStartup = true
+	}
 	err := node.Decode((*umIMConfig)(c))
 	if err != nil {
 		return err
 	}
 	return c.PostProcess()
+}
+
+func yamlMapHasKey(node *yaml.Node, key string) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *IMConfig) PostProcess() error {
