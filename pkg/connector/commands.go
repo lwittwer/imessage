@@ -33,17 +33,79 @@ import (
 	"github.com/lrhodin/imessage/imessage"
 )
 
+// Help sections for Apple-service commands added by this bridge. Orders slot
+// in after bridgev2's built-in sections (General=0, Auth=10, Chats=20,
+// Admin=50), so `!im help` renders each service as its own heading at the
+// bottom instead of lumping everything under "General".
+var (
+	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
+	HelpSectionFindMy        = commands.HelpSection{Name: "Find My", Order: 70}
+	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
+	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
+)
+
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
+// Pass disableFaceTime=true to skip every !facetime* handler — used by
+// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
+// keep the bridge's FT wrapper out of their chat.
+//
 // Register these in main.go's PostInit hook:
 //
-//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands()...)
-func BridgeCommands() []*commands.FullHandler {
-	return []*commands.FullHandler{
+//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
+func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
+	cmds := []*commands.FullHandler{
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
 	}
+	if !disableFaceTime {
+		cmds = append(cmds,
+			cmdFaceTime,
+			cmdFaceTimeSend,
+			cmdFaceTimeClear,
+			cmdFaceTimeInvalidatePeer,
+			cmdFaceTimeRotateIdentity,
+			cmdFaceTimeState,
+			cmdFaceTimeSessionLink,
+			cmdFaceTimeUseLink,
+			cmdFaceTimeDeleteLink,
+			cmdFaceTimeLetMeIn,
+			cmdFaceTimeLetMeInApprove,
+			cmdFaceTimeLetMeInDeny,
+			cmdFaceTimeCreateSession,
+			cmdFaceTimeRing,
+			cmdFaceTimeAddMembers,
+			cmdFaceTimeRemoveMembers,
+		)
+	}
+	cmds = append(cmds,
+		cmdFindMy,
+		cmdFindMyAcceptShare,
+		cmdFindMyDeleteItem,
+		cmdFindMyRenameBeacon,
+		cmdFindMyStateJSON,
+		cmdFindMyDevices,
+		cmdFindMyFriends,
+		cmdFindMyFriendsImport,
+		cmdSharedAlbums,
+		cmdSharedSubscribe,
+		cmdSharedSubscribeToken,
+		cmdSharedUnsubscribe,
+		cmdSharedState,
+		cmdSharedAssetsJSON,
+		cmdSharedDeleteAssets,
+		cmdDeleteRoom,
+		cmdStatuskitState,
+		cmdStatuskitShare,
+		cmdStatuskitResetKeys,
+		cmdStatuskitRollKeys,
+		cmdStatuskitRequestHandles,
+		cmdStatuskitClearInterest,
+		cmdStatuskitInviteToChannel,
+		cmdStatuskitInviteAll,
+	)
+	return cmds
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with
@@ -189,13 +251,14 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 
 // restoreChatCandidate represents a chat that can be restored.
 type restoreChatCandidate struct {
-	portalID       string
-	displayName    string
-	participants   []string // normalized participants from recycle bin (may be nil)
-	groupID        string   // CloudKit group UUID (for groups)
-	chatID         string   // CloudKit chat_identifier
-	groupPhotoGuid string   // CloudKit group photo GUID (for group avatar)
-	source         string   // debug: which source produced this candidate
+	portalID        string
+	displayName     string
+	seedDisplayName string
+	participants    []string // normalized participants from recycle bin (may be nil)
+	groupID         string   // CloudKit group UUID (for groups)
+	chatID          string   // CloudKit chat_identifier
+	groupPhotoGuid  string   // CloudKit group photo GUID (for group avatar)
+	source          string   // debug: which source produced this candidate
 }
 
 // fnRestoreChatFromCloudKit finds deleted chats from CloudKit recycle-bin
@@ -235,8 +298,10 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 				// friendlyPortalName falls back to member names which prevents
 				// the old portalID-equality check from triggering.
 				name := ""
-				if chat.DisplayName != nil && *chat.DisplayName != "" {
+				seedDisplayName := ""
+				if chat.DisplayName != nil && *chat.DisplayName != "" && !isPlaceholderGroupName(*chat.DisplayName) {
 					name = *chat.DisplayName
+					seedDisplayName = *chat.DisplayName
 				}
 				if name == "" {
 					name = friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
@@ -253,7 +318,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 						}
 					}
 					if len(normalized) > 0 {
-						if built := client.buildGroupName(normalized); built != "" && built != "Group Chat" {
+						if built := client.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 							name = built
 						}
 					}
@@ -270,13 +335,14 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 					photoGuid = *chat.GroupPhotoGuid
 				}
 				candidates = append(candidates, restoreChatCandidate{
-					portalID:       portalID,
-					displayName:    name,
-					participants:   normParts,
-					groupID:        chat.GroupId,
-					chatID:         chat.CloudChatId,
-					groupPhotoGuid: photoGuid,
-					source:         "S1:recycle",
+					portalID:        portalID,
+					displayName:     name,
+					seedDisplayName: seedDisplayName,
+					participants:    normParts,
+					groupID:         chat.GroupId,
+					chatID:          chat.CloudChatId,
+					groupPhotoGuid:  photoGuid,
+					source:          "S1:recycle",
 				})
 				seenPortalIDs[portalID] = true
 			}
@@ -560,15 +626,16 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 			chosen := candidates[n-1]
 			portalKey := networkid.PortalKey{ID: networkid.PortalID(chosen.portalID), Receiver: login.ID}
 			if err := client.startRestoreBackfillPipeline(restorePipelineOptions{
-				PortalID:       chosen.portalID,
-				PortalKey:      portalKey,
-				Source:         "restore_chat_cmd",
-				DisplayName:    chosen.displayName,
-				Participants:   chosen.participants,
-				ChatID:         chosen.chatID,
-				GroupID:        chosen.groupID,
-				GroupPhotoGuid: chosen.groupPhotoGuid,
-				RecoverOnApple: true,
+				PortalID:        chosen.portalID,
+				PortalKey:       portalKey,
+				Source:          "restore_chat_cmd",
+				DisplayName:     chosen.displayName,
+				SeedDisplayName: chosen.seedDisplayName,
+				Participants:    chosen.participants,
+				ChatID:          chosen.chatID,
+				GroupID:         chosen.groupID,
+				GroupPhotoGuid:  chosen.groupPhotoGuid,
+				RecoverOnApple:  true,
 				Notify: func(format string, args ...any) {
 					ce.Reply(format, args...)
 				},
@@ -586,13 +653,18 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 // then falls back to formatting the portal_id.
 func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IMClient, key networkid.PortalKey, portalID string) string {
 	if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
-		return portal.Name
+		if !isRefreshableGroupName(portal.Name) {
+			return portal.Name
+		}
 	}
 	// For group chats, resolve from cloud store (display_name / contact names).
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 	if isGroup && client != nil {
-		if name, _ := client.resolveGroupName(ctx, portalID); name != "" && name != "Group Chat" {
+		if name, authoritative := client.resolveGroupName(ctx, portalID); name != "" && (authoritative || !isPlaceholderGroupName(name)) {
 			return name
+		}
+		if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
+			return portal.Name
 		}
 	}
 	// For DM portals, try to resolve a contact name.

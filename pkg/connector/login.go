@@ -11,6 +11,8 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,6 +20,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
@@ -334,11 +337,16 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		apsState := getExistingAPSState(session, extLog)
 		l.conn = rustpushgo.Connect(cfg, apsState)
 
+		nacNote := "Registration uses the hardware key for NAC validation (no Mac needed at runtime)."
+		if cfg.RequiresNacRelay() {
+			nacNote = "Apple Silicon hardware key detected.\n" +
+				"The NAC relay server must be running on the Mac that provided this key during registration.\n" +
+				"Start it with: go run tools/nac-relay/main.go"
+		}
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
 			StepID: LoginStepAppleIDPassword,
-			Instructions: "Enter your Apple ID credentials.\n" +
-				"Registration uses the hardware key for NAC validation (no Mac needed at runtime).",
+			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
 					Type: bridgev2.LoginInputFieldTypeEmail,
@@ -641,10 +649,13 @@ func fetchDevicesAndPrompt(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvi
 		return devicePasscodeStepForDevice(devs, 0), nil
 	}
 
-	// Multiple devices — let the user choose
+	// Multiple devices — let the user choose. Prefix each label with its
+	// 1-based index so the Matrix bot's login flow (which renders Select
+	// options as a plain list in chat, not as an app dropdown) shows a
+	// clearly numbered picker instead of an ambiguous bullet list.
 	options := make([]string, len(devs))
 	for i, d := range devs {
-		options[i] = formatDeviceLabel(d)
+		options[i] = fmt.Sprintf("%d. %s", i+1, formatDeviceLabel(d))
 	}
 
 	return &bridgev2.LoginStep{
@@ -664,11 +675,21 @@ func fetchDevicesAndPrompt(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvi
 	}, nil
 }
 
-// parseDeviceSelection converts the user's device selection (the label string)
-// back to an index into the devices list.
+// parseDeviceSelection converts the user's device selection back to an index
+// into the devices list. Accepts three forms so the bot's numbered-picker
+// flow works regardless of how the user replies:
+//   - the bare 1-based index (e.g. "2")
+//   - the full numbered label we emitted (e.g. "2. iPhone 15 (iPhone15,2)")
+//   - the raw device label without the prefix (e.g. "iPhone 15 (iPhone15,2)")
 func parseDeviceSelection(selected string, devices []rustpushgo.EscrowDeviceInfo) int {
+	trimmed := strings.TrimSpace(selected)
+	if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 && n <= len(devices) {
+		return n - 1
+	}
 	for i, d := range devices {
-		if formatDeviceLabel(d) == selected {
+		label := formatDeviceLabel(d)
+		numbered := fmt.Sprintf("%d. %s", i+1, label)
+		if trimmed == label || trimmed == numbered {
 			return i
 		}
 	}
@@ -832,10 +853,15 @@ func completeLoginWithMeta(
 		contactsReady:           false,
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(main.Bridge.DB.Database, loginID),
+		sharedProfileStore:      newSharedProfileStore(main.Bridge.DB.Database, loginID),
+		pendingAttachments:      newPendingAttachmentStore(main.Bridge.DB.Database, loginID),
+		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
+		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
+		sharedAlbumRooms:        make(map[string]id.RoomID),
 		imGroupNames:            make(map[string]string),
 		imGroupGuids:            make(map[string]string),
 		imGroupParticipants:     make(map[string][]string),

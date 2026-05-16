@@ -54,6 +54,28 @@ type IMConfig struct {
 	// If empty, the handle chosen during login is used.
 	PreferredHandle string `yaml:"preferred_handle"`
 
+	// FaceTimeDisplayName overrides the display name pre-filled on the
+	// FaceTime web join page (the value attached to `#n=…` in the ring-
+	// notice link). If empty, the bridge reads the user's "First Last"
+	// from the cached Apple Account SPD; if that's also unavailable it
+	// falls back to the bare iMessage handle.
+	FaceTimeDisplayName string `yaml:"facetime_display_name"`
+
+	// DisableFaceTime turns off all bridge FaceTime integration: the
+	// !facetime* slash commands aren't registered, inbound ring / missed /
+	// answered-elsewhere notices aren't posted, and inbound peer-invite
+	// notices are suppressed. Intended for users who own an Apple device
+	// and answer FaceTime calls natively — the bridge wrapper adds nothing
+	// in that case and just clutters the chat.
+	DisableFaceTime bool `yaml:"disable_facetime"`
+
+	// StatusKitShareOnStartup publishes share_status(available) once after
+	// StatusKit init completes. Peer iOS reciprocates with a reshare (which
+	// carries the key material needed to decrypt its subsequent presence
+	// updates), so keeping this on dramatically improves the chance of
+	// seeing contacts' Focus state in Matrix. Default true.
+	StatusKitShareOnStartup bool `yaml:"statuskit_share_on_startup"`
+
 	// CardDAV is an external CardDAV server for contact name resolution.
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
@@ -147,6 +169,9 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
 	helper.Copy(up.Str, "preferred_handle")
+	helper.Copy(up.Str, "facetime_display_name")
+	helper.Copy(up.Bool, "disable_facetime")
+	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")

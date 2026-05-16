@@ -593,6 +593,56 @@ if [ -t 0 ]; then
     fi
 fi
 
+# ── Ensure disable_facetime key exists in config ──────────────
+if ! grep -q 'disable_facetime:' "$CONFIG" 2>/dev/null; then
+    sed -i '/video_transcoding:/a\    disable_facetime: false' "$CONFIG"
+fi
+
+# ── Disable FaceTime Bridge (use native Apple FT instead) ────────
+CURRENT_DISABLE_FT=$(grep 'disable_facetime:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*disable_facetime: *//' || true)
+if [ -n "${DISABLE_FACETIME:-}" ]; then
+    case "$DISABLE_FACETIME" in
+        1|true|TRUE|yes|YES)
+            sed -i "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
+            echo "✓ FaceTime Bridge disabled (DISABLE_FACETIME env)"
+            ;;
+        *)
+            sed -i "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
+            echo "✓ FaceTime Bridge enabled (DISABLE_FACETIME env)"
+            ;;
+    esac
+elif [ -t 0 ]; then
+    echo ""
+    echo "FaceTime Bridge:"
+    echo "  If you have an Apple device that already handles FaceTime, the"
+    echo "  bridge's FT wrapper just clutters your chat. Disable it to skip"
+    echo "  !im facetime commands and inbound FT notices."
+    echo ""
+    if [ "$CURRENT_DISABLE_FT" = "true" ]; then
+        read -p "Disable FaceTime Bridge? [Y/n]:" DIS_FT
+        case "$DIS_FT" in
+            [nN]*)
+                sed -i "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
+                echo "✓ FaceTime Bridge enabled"
+                ;;
+            *)
+                echo "✓ FaceTime Bridge disabled"
+                ;;
+        esac
+    else
+        read -p "Disable FaceTime Bridge (use native Apple FT)? [y/N]: " DIS_FT
+        case "$DIS_FT" in
+            [yY]*)
+                sed -i "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
+                echo "✓ FaceTime Bridge disabled"
+                ;;
+            *)
+                echo "✓ FaceTime Bridge enabled"
+                ;;
+        esac
+    fi
+fi
+
 # ── Ensure heic_conversion key exists in config ──────────────
 if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
     sed -i '/video_transcoding:/a\    heic_conversion: false' "$CONFIG"

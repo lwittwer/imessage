@@ -8,8 +8,25 @@ DATA_DIR    ?= $(HOME)/.local/share/mautrix-imessage
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
-RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis rustpush/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard rustpush/open-absinthe/build.rs)
+RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               pkg/rustpushgo/build.rs \
+               $(shell find nac-validation/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               nac-validation/build.rs
+# rustpush source root (default: upstream worktree checkout).
+# Override at invocation time, e.g.:
+#   make RUSTPUSH_DIR=rustpush-master build
+RUSTPUSH_DIR ?= third_party/rustpush-upstream
+FALLBACK_RUSTPUSH_DIR ?= third_party/rustpush-upstream
+# rustpush source strategy:
+#   fork (default): clone cameronaaron/rustpush which has all bridge-compat
+#                   fixes already applied — no runtime patching needed.
+#   upstream:       clone raw OpenBubbles/rustpush (no patches; for testing only).
+# Pinned OpenBubbles/rustpush commit. Edit this file manually to bump, then
+# test locally before committing. The Makefile reads the SHA on build and
+# checks out that exact commit — no auto-bump, no branch drift, no fork refs.
+RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
+RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
+RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
@@ -95,7 +112,62 @@ else
   CARGO_FEATURES := --features hardware-key
 endif
 
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
+UPSTREAM_REPO := https://github.com/OpenBubbles/rustpush.git
+FAIRPLAY_CERTS := 4056631661436364584235346952193 \
+                  4056631661436364584235346952194 \
+                  4056631661436364584235346952195 \
+                  4056631661436364584235346952196 \
+                  4056631661436364584235346952197 \
+                  4056631661436364584235346952198 \
+                  4056631661436364584235346952199 \
+                  4056631661436364584235346952200 \
+                  4056631661436364584235346952201 \
+                  4056631661436364584235346952208
+
+.PHONY: ensure-rustpush-source
+
+# Prepare rustpush sources the same way upstream CI does: checkout with
+# submodules present and fake FairPlay certs available for build-time signing.
+ensure-rustpush-source:
+	@if [ "$(RUSTPUSH_DIR)" = "rustpush-master" ]; then \
+		if [ ! -f rustpush-master/apple-private-apis/icloud-auth/Cargo.toml ]; then \
+			if [ -f $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/icloud-auth/Cargo.toml ]; then \
+				echo "Hydrating rustpush-master/apple-private-apis from $(FALLBACK_RUSTPUSH_DIR)..."; \
+				mkdir -p rustpush-master/apple-private-apis; \
+				rm -rf rustpush-master/apple-private-apis/icloud-auth rustpush-master/apple-private-apis/omnisette; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/icloud-auth rustpush-master/apple-private-apis/; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/omnisette rustpush-master/apple-private-apis/; \
+			else \
+				echo "error: rustpush-master is missing apple-private-apis and fallback $(FALLBACK_RUSTPUSH_DIR) copy is unavailable" >&2; exit 1; \
+			fi; \
+		fi; \
+		if [ ! -f rustpush-master/open-absinthe/Cargo.toml ]; then \
+			if [ -f $(FALLBACK_RUSTPUSH_DIR)/open-absinthe/Cargo.toml ]; then \
+				echo "Hydrating rustpush-master/open-absinthe from $(FALLBACK_RUSTPUSH_DIR)..."; \
+				rm -rf rustpush-master/open-absinthe; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/open-absinthe rustpush-master/; \
+			else \
+				echo "error: rustpush-master is missing open-absinthe and fallback $(FALLBACK_RUSTPUSH_DIR) copy is unavailable" >&2; exit 1; \
+			fi; \
+		fi; \
+		if [ ! -d rustpush-master/certs/fairplay ]; then \
+			echo "Generating rustpush-master FairPlay cert stubs..."; \
+			mkdir -p rustpush-master/certs/fairplay; \
+			for name in $(FAIRPLAY_CERTS); do \
+				cp rustpush-master/certs/legacy-fairplay/fairplay.crt rustpush-master/certs/fairplay/$$name.crt; \
+				cp rustpush-master/certs/legacy-fairplay/fairplay.pem rustpush-master/certs/fairplay/$$name.pem; \
+			done; \
+		fi; \
+	elif [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
+		python3 scripts/ensure_rustpush_source.py --rustpush-dir "$(RUSTPUSH_DIR)"; \
+	fi
+
+# `ensure-rustpush-source` is an order-only prereq (the `|` separator):
+# it runs before the recipe when needed, but its phony "always-dirty"
+# timestamp doesn't force $(RUST_LIB) to rebuild on every `make` invocation.
+# Only actual Rust source changes / Cargo.toml changes should trigger a
+# rebuild; the pinned SHA + submodule setup is idempotent once done.
+$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
