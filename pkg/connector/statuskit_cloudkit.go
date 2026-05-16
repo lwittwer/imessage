@@ -452,11 +452,14 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			if err := c.cloudStore.setSyncStateSuccess(ctx, statusKitCloudTokenRow, &encoded); err != nil {
 				log.Info().Err(err).Msg("StatusKit-CloudKit pass: failed to persist next continuation token")
 			}
-		} else if page.ResolvedZone == nil && currentToken != nil {
-			// FFI signalled re-discovery. Drop the stale token so the
-			// next pass starts fresh.
+		} else if currentToken != nil {
+			// No continuation token means the page stream is drained. Drop
+			// the previous token so the next 12h pass starts a fresh
+			// incremental fetch instead of replaying the terminal page.
+			// This also handles FFI re-discovery (ResolvedZone=nil), where
+			// the stale token would belong to an old or missing zone.
 			if err := c.cloudStore.clearZoneToken(ctx, statusKitCloudTokenRow); err != nil {
-				log.Info().Err(err).Msg("StatusKit-CloudKit pass: failed to clear stale continuation token")
+				log.Info().Err(err).Msg("StatusKit-CloudKit pass: failed to clear drained continuation token")
 			}
 		}
 
