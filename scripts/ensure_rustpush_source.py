@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -201,11 +202,15 @@ def patch_statuskit_missing_channel(path: Path) -> None:
 
 def patch_statuskit_presence_race(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    needle = (
-        "let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) "
-        'else { panic!("Channel not found!") };'
+    if "presence msg arrived before keysharing" in text:
+        return
+    pattern = re.compile(
+        r"let Some\(referenced_channel\) = "
+        r"state\.keys\.get_mut\(&base64_encode\(&channel\.id\)\)\s*"
+        r"else\s*\{\s*panic!\(\"Channel not found!\"\)\s*\};",
+        re.MULTILINE,
     )
-    if needle not in text:
+    if not pattern.search(text):
         return
     print("Softening statuskit.rs:736 panic to warn+Ok(None) (StatusKit reliability -- presence-before-keysharing race)...")
     replacement = (
@@ -213,7 +218,7 @@ def patch_statuskit_presence_race(path: Path) -> None:
         'else { warn!("StatusKit: presence msg arrived before keysharing for channel={} -- dropping", '
         "encode_hex(&channel.id)); return Ok(None); };"
     )
-    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+    path.write_text(pattern.sub(replacement, text, count=1), encoding="utf-8")
 
 
 def apply_source_patches(rustpush_dir: Path) -> None:
