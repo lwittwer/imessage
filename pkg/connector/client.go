@@ -2269,7 +2269,18 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 
 	if msg.IsDelivered {
-		c.handleDeliveryReceipt(log, msg)
+		// Delivery receipts for our own outgoing sends can arrive while the
+		// rustpush send call is still unwinding. Handle them asynchronously so
+		// bridgev2 can commit the outgoing message row before the receipt lookup
+		// retry loop runs.
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in handleDeliveryReceipt")
+				}
+			}()
+			c.handleDeliveryReceipt(log, msg)
+		}()
 		return
 	}
 
@@ -5792,11 +5803,15 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	})
 	if err != nil {
 		errStr := err.Error()
-		// Suppress non-actionable failures: IDS lookup errors (6001) for
+		// Suppress non-actionable receipt failures: IDS lookup errors (6001) for
 		// urn:biz: business chat portals and edge cases between restart and SMS
-		// state restoration; NoValidTargets for contacts with no reachable handle.
-		// All other errors propagate normally so real network/auth failures surface.
-		if strings.Contains(errStr, "6001") || strings.Contains(errStr, "NoValidTargets") {
+		// state restoration; NoValidTargets for contacts with no reachable handle;
+		// and Apple's generic "could not deliver" response for read receipts. The
+		// latter is actionable for message sends, but read receipts are best-effort
+		// and should not surface as bridge errors.
+		if strings.Contains(errStr, "6001") ||
+			strings.Contains(errStr, "NoValidTargets") ||
+			strings.Contains(errStr, "Failed to send read receipt: Could not deliver message") {
 			zerolog.Ctx(ctx).Warn().Err(err).
 				Str("portal_id", string(receipt.Portal.ID)).
 				Msg("Read receipt failed (non-actionable, suppressed)")
@@ -6922,6 +6937,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// targeting messages in this batch go into BackfillMessage.Reactions
 		// (correct DAG ordering) instead of QueueRemoteEvent (end of DAG).
 		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
+		allMessages = c.filterExistingBackfillMessages(ctx, portalID, allMessages)
 
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
@@ -7090,6 +7106,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						rows[i], rows[j] = rows[j], rows[i]
 					}
 					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					allMessages = c.filterExistingBackfillMessages(ctx, portalID, allMessages)
 					log.Info().
 						Str("portal_id", portalID).
 						Int("db_rows", len(rows)).
@@ -7132,6 +7149,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 
 	convertStart := time.Now()
 	messages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+	messages = c.filterExistingBackfillMessages(ctx, portalID, messages)
 	convertElapsed := time.Since(convertStart)
 
 	var nextCursor networkid.PaginationCursor
@@ -7237,6 +7255,33 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	}
 
 	return messages
+}
+
+func (c *IMClient) filterExistingBackfillMessages(ctx context.Context, portalID string, messages []*bridgev2.BackfillMessage) []*bridgev2.BackfillMessage {
+	if len(messages) == 0 || c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.DB == nil {
+		return messages
+	}
+	filtered := messages[:0]
+	skipped := 0
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		existing, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, c.UserLogin.ID, msg.ID)
+		if err == nil && existing != nil {
+			skipped++
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	if skipped > 0 {
+		c.Main.Bridge.Log.Debug().
+			Str("portal_id", portalID).
+			Int("skipped", skipped).
+			Int("remaining", len(filtered)).
+			Msg("Skipped already-inserted backfill messages")
+	}
+	return filtered
 }
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {

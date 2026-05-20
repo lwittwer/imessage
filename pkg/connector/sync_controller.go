@@ -878,6 +878,13 @@ const statusKitPostInviteShareMinSpacing = 5 * time.Minute
 // invite (cert-stale, ratchet, transient IDS issue).
 const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
 
+// statusKitInviteTerminalFailKeyPrefix marks handles that IDS has told us are
+// not valid StatusKit invite targets. Retrying these on every restart only
+// creates log noise and risks tripping peer-side spam heuristics, but
+// reachability can change if a peer later enables iMessage/StatusKit, so the
+// quiet period is intentionally short.
+const statusKitInviteTerminalFailKeyPrefix = "statuskit.invite_terminal_fail."
+
 // statusKitReshareSeenKeyPrefix marks handles whose StatusKit reshare we have
 // actually observed (proof of reciprocation, written by OnReshareSender).
 // Used by the soft-latch logic to distinguish "invite dispatched and peer
@@ -895,6 +902,50 @@ const statusKitInvitedOkTTL = 7 * 24 * time.Hour
 // invites. Only applies on the periodic tick path to handles that did NOT
 // succeed; successful sends are latched and never retried.
 const statusKitPerHandleMinSpacing = 4 * time.Hour
+
+const statusKitTerminalFailTTL = 7 * 24 * time.Hour
+
+func isTerminalStatusKitInviteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "NoValidTargets") ||
+		strings.Contains(errStr, "DoNotRetry(LookupFailed(IDSError(6001)))")
+}
+
+func (c *IMClient) markTerminalStatusKitInviteFailure(ctx context.Context, handle string, err error, at time.Time) {
+	if handle == "" || !isTerminalStatusKitInviteError(err) {
+		return
+	}
+	value := at.Format(time.RFC3339) + " " + err.Error()
+	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle), value)
+	if normalized := normalizeIdentifierForPortalID(handle); normalized != "" && normalized != handle {
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized), value)
+	}
+}
+
+func (c *IMClient) hasFreshTerminalStatusKitInviteFailure(ctx context.Context, handle string, now time.Time) bool {
+	value := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle))
+	if value == "" {
+		if normalized := normalizeIdentifierForPortalID(handle); normalized != handle {
+			value = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized))
+		}
+	}
+	return statusKitTerminalFailureFresh(value, now)
+}
+
+func statusKitTerminalFailureFresh(value string, now time.Time) bool {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return false
+	}
+	return now.Sub(ts) < statusKitTerminalFailTTL
+}
 
 // inviteContactsToStatusSharing sends our StatusKit key to the peer
 // handles of every 1:1 iMessage portal that has not yet keyed us back,
@@ -1005,10 +1056,14 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 
 	now := time.Now()
 	var pending []string
-	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired int
+	var skippedKnown, skippedSpacing, skippedAlreadySent, skippedTerminal, softExpired int
 	for _, h := range allGhosts {
 		if _, known := knownSet[h]; known {
 			skippedKnown++
+			continue
+		}
+		if !bypassLatch && c.hasFreshTerminalStatusKitInviteFailure(ctx, h, now) {
+			skippedTerminal++
 			continue
 		}
 		// Soft latch: if we've previously dispatched an invite to this handle
@@ -1062,6 +1117,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		Int("total_targets", len(allGhosts)).
 		Int("already_keyed", skippedKnown).
 		Int("already_invited_ok", skippedAlreadySent).
+		Int("terminal_fail_skip", skippedTerminal).
 		Int("soft_expired_retrying", softExpired).
 		Int("spacing_skip", skippedSpacing).
 		Int("pending", len(pending)).
@@ -1118,7 +1174,12 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		case err := <-inviteDone:
 			if err != nil {
 				failCount++
-				log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
+				if isTerminalStatusKitInviteError(err) {
+					c.markTerminalStatusKitInviteFailure(ctx, h, err, now)
+					log.Debug().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: terminal failure for handle")
+				} else {
+					log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
+				}
 			} else {
 				okCount++
 				// Write both keys:
@@ -1252,6 +1313,10 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 
 	now := time.Now()
+	if c.hasFreshTerminalStatusKitInviteFailure(ctx, handle, now) {
+		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): previous terminal failure; skipping")
+		return
+	}
 	latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle))
 	if latchedAt != "" {
 		reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle)) != ""
@@ -1303,7 +1368,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	select {
 	case err := <-inviteDone:
 		if err != nil {
-			log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
+			if isTerminalStatusKitInviteError(err) {
+				c.markTerminalStatusKitInviteFailure(ctx, handle, err, now)
+				log.Debug().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): terminal failure")
+			} else {
+				log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
+			}
 			return
 		}
 		nowStr := now.Format(time.RFC3339)

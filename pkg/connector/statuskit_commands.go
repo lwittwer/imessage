@@ -421,11 +421,13 @@ func fnStatuskitClearLatch(ce *commands.Event) {
 	bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), "")
+	bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle), "")
 	normalized := normalizeIdentifierForPortalID(handle)
 	if normalized != handle {
 		bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+normalized), "")
+		bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized), "")
 	}
 	ce.Reply("Cleared StatusKit latches for %q (and normalized %q). Next invite sweep will retry this handle.", handle, normalized)
 }
