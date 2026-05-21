@@ -2389,17 +2389,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		go c.handleNotifyAnyways(log, msg)
 		return
 	}
-	// Transcript background — someone set or cleared the iMessage chat wallpaper.
 	if msg.IsSetTranscriptBackground {
-		if c.cloudStore != nil {
-			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
-				return
-			}
-			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
-				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist SetTranscriptBackground UUID; duplicates possible on restart")
-			}
-		}
-		go c.handleTranscriptBackground(log, msg)
 		return
 	}
 
@@ -3699,57 +3689,6 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 		return
 	}
 	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
-}
-
-// handleTranscriptBackground posts a silent bot notice when a participant sets
-// or removes the custom iMessage chat wallpaper (transcript background).
-// Stored messages are silently dropped.
-func (c *IMClient) handleTranscriptBackground(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	if msg.IsStoredMessage {
-		log.Debug().Msg("Skipping stored SetTranscriptBackground message")
-		return
-	}
-	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	if err != nil || portal == nil || portal.MXID == "" {
-		log.Debug().Err(err).Msg("SetTranscriptBackground: no portal found, skipping notice")
-		return
-	}
-
-	senderHandle := ptrStringOr(msg.Sender, "")
-	name := senderHandle
-	if senderHandle != "" {
-		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
-		if ghostErr == nil && ghost != nil && ghost.Name != "" {
-			name = ghost.Name
-		}
-	}
-
-	var notice string
-	isRemove := msg.TranscriptBackgroundRemove != nil && *msg.TranscriptBackgroundRemove
-	if isRemove {
-		notice = "🖼️ " + name + " removed the chat background."
-	} else {
-		notice = "🖼️ " + name + " set a new chat background."
-	}
-
-	log.Info().
-		Str("sender", senderHandle).
-		Bool("remove", isRemove).
-		Str("portal_mxid", string(portal.MXID)).
-		Msg("SetTranscriptBackground: posting notice")
-
-	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Parsed: &event.MessageEventContent{
-			MsgType:  event.MsgNotice,
-			Body:     notice,
-			Mentions: &event.Mentions{},
-		},
-	}, nil)
-	if sendErr != nil {
-		log.Warn().Err(sendErr).Msg("SetTranscriptBackground: failed to send notice")
-	}
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
@@ -5736,17 +5675,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
 
-	// Per MSC2530, when FileName is set and differs from Body, Body is the caption.
-	// Some clients duplicate the filename into Body (no real caption) — treating that
-	// as a caption would land in the iMessage subject field and show to iPhone users.
-	var caption *string
-	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
-		caption = &msg.Content.Body
-	}
-
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID — no Go-side retry here (would orphan delivery receipts).
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -5758,12 +5689,106 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		}
 	}
 
+	// If the Matrix event has body text alongside the attachment, send it as a
+	// separate iMessage so the text is editable, reactable, etc. — like every
+	// other chat app. Skip when body duplicates the filename (no real caption).
+	textUUID := ""
+	textMXID := id.EventID("")
+	siblingUUID := ""
+	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
+		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
+		if textErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
+		} else {
+			textUUID = tUUID
+			siblingUUID = uuid
+			if c.cloudStore != nil {
+				if err := c.cloudStore.persistMessageUUID(ctx, tUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", tUUID).Msg("Failed to persist sent text UUID; echo may be delivered as duplicate")
+				}
+			}
+
+			// Surface the caption as a standalone Matrix m.text event (via the
+			// user's double puppet) so the user's Matrix client treats it like
+			// any other text message — editable, reactable, etc. Also edit the
+			// original m.image to drop the caption body so the text doesn't
+			// appear twice in the room.
+			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+				textContent := &event.MessageEventContent{
+					MsgType: event.MsgText,
+					Body:    msg.Content.Body,
+				}
+				resp, err := dp.SendMessage(ctx, msg.Portal.MXID, event.EventMessage, &event.Content{Parsed: textContent}, nil)
+				if err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to bridge caption as standalone Matrix text event")
+				} else if resp != nil {
+					textMXID = resp.EventID
+					// Edit the original m.image to drop the caption body so it doesn't render twice.
+					editContent := &event.MessageEventContent{
+						MsgType:  event.MsgImage,
+						Body:     msg.Content.FileName,
+						FileName: msg.Content.FileName,
+						Info:     msg.Content.Info,
+						URL:      msg.Content.URL,
+						File:     msg.Content.File,
+					}
+					editContent.SetEdit(msg.Event.ID)
+					if _, err := dp.SendMessage(ctx, msg.Portal.MXID, event.EventMessage, &event.Content{Parsed: editContent}, nil); err != nil {
+						zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to clear caption from original m.image event")
+					}
+				}
+			}
+		}
+	}
+
+	// If we bridged the caption as its own m.text Matrix event, the attachment
+	// and the text live on separate Matrix events. Each gets its own DB row so
+	// edits/redacts/reactions on either route to the right iMessage.
+	if textUUID != "" && textMXID != "" {
+		bridgeRef := c.Main.Bridge
+		userLogin := c.UserLogin
+		portalKey := msg.Portal.PortalKey
+		senderID := makeUserID(c.handle)
+		now := time.Now()
+		return &bridgev2.MatrixMessageResponse{
+			DB: &database.Message{
+				ID:        makeMessageID(uuid),
+				SenderID:  senderID,
+				Timestamp: now,
+				Metadata:  &MessageMetadata{HasAttachments: true},
+			},
+			PostSave: func(ctx context.Context, primary *database.Message) {
+				textRow := &database.Message{
+					Room:       portalKey,
+					ID:         makeMessageID(textUUID),
+					MXID:       textMXID,
+					SenderID:   senderID,
+					SenderMXID: userLogin.UserMXID,
+					Timestamp:  now,
+					Metadata:   &MessageMetadata{},
+				}
+				if err := bridgeRef.DB.Message.Insert(ctx, textRow); err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Str("text_uuid", textUUID).Msg("Failed to insert DB row for bridged caption text")
+				}
+			},
+		}, nil
+	}
+
+	// Fallback when the double puppet isn't available: keep the attachment
+	// as the primary Matrix-side event and rely on sibling-UUID metadata so
+	// at least redact unsends both halves on iMessage.
+	finalUUID := uuid
+	hasAttachments := true
+	if textUUID != "" {
+		finalUUID = textUUID
+		hasAttachments = false
+	}
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
-			ID:        makeMessageID(uuid),
+			ID:        makeMessageID(finalUUID),
 			SenderID:  makeUserID(c.handle),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{HasAttachments: true},
+			Metadata:  &MessageMetadata{HasAttachments: hasAttachments, SiblingUUID: siblingUUID},
 		},
 	}, nil
 }
@@ -5853,6 +5878,27 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	}
 
 	targetGUID, _ := extractTapbackTarget(string(msg.TargetMessage.ID))
+
+	// If this Matrix event was bridged as two iMessages (attachment + caption text),
+	// unsend the sibling first. The attachment was sent before the text on the wire,
+	// so unsend it first to keep the same wire ordering - some peers ignore unsends
+	// that arrive out of timeline order for an attachment.
+	var siblingUUID string
+	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
+		siblingUUID = meta.SiblingUUID
+	}
+
+	if siblingUUID != "" {
+		c.trackOutboundUnsend(siblingUUID)
+		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(sibErr).
+				Str("sibling_uuid", siblingUUID).
+				Msg("Failed to unsend sibling iMessage on split image+caption redact")
+		} else if c.cloudStore != nil {
+			c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
+		}
+	}
+
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(targetGUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.

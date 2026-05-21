@@ -6507,6 +6507,7 @@ pub struct SharedAlbumInfo {
     pub name: Option<String>,
     pub fullname: Option<String>,
     pub email: Option<String>,
+    pub subscriptiondate: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -6579,6 +6580,7 @@ impl WrappedSharedStreamsClient {
             name: a.name.clone(),
             fullname: a.fullname.clone(),
             email: a.email.clone(),
+            subscriptiondate: a.subscriptiondate.clone(),
         }).collect()
     }
 
@@ -6772,6 +6774,7 @@ pub async fn new_client(
         let status_cb_for_recv = status_callback_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
+        let identity_for_reregister = client.identity.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -6786,6 +6789,7 @@ pub async fn new_client(
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
+                let identity_for_reregister = identity_for_reregister.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
                     let mut state = conn.resource_state.subscribe();
@@ -6820,6 +6824,28 @@ pub async fn new_client(
                                         .as_millis() as u64;
                                     reconnected_at.store(now, Ordering::Relaxed);
                                     info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+                                }
+                                // APS courier reconnect: refresh IDS registration so the
+                                // madrid push-token binding tracks the (possibly rotated)
+                                // APS token. Upstream's do_connect adopts a new token
+                                // from Apple's ConnectResponse without notifying IDS,
+                                // leaving madrid silently routed to the old token even
+                                // though multiplex1 keeps working on the new connection.
+                                //
+                                // refresh_now() = ResourceManager::refresh — same call
+                                // OpenBubbles' "Reregister" button makes (api.rs
+                                // do_reregister). It has a 15s internal no-op gate so
+                                // network flaps don't spam IDS. Permanent failures
+                                // (6005 et al.) close the ResourceManager — same risk
+                                // as today's schedule_rereg loop, not new exposure.
+                                if matches!(current, ResourceState::Generated) {
+                                    let identity = identity_for_reregister.clone();
+                                    tokio::spawn(async move {
+                                        match identity.refresh_now().await {
+                                            Ok(()) => info!("Refreshed IDS registration after APS reconnect"),
+                                            Err(e) => warn!("IDS refresh_now after APS reconnect failed: {:?}", e),
+                                        }
+                                    });
                                 }
                             }
                             // Message drain: forward APNs messages to process task
