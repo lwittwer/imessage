@@ -33,6 +33,9 @@ Use these as the default verification commands:
 Testing expectations:
 
 - Go tests now exist in targeted packages; run focused `go test` commands for packages you touch.
+- On macOS, plain `go test` may not find libolm headers installed by Homebrew. Match the Makefile environment when running Go tests:
+  `CGO_CFLAGS="-I/opt/homebrew/include" CGO_LDFLAGS="-L/opt/homebrew/lib -L$(pwd)" go test ./pkg/connector`
+  Use `/usr/local` instead of `/opt/homebrew` on Intel Homebrew installs.
 - Rust tests exist; run targeted cargo tests when changing Rust behavior:
   - `cargo test --manifest-path third_party/rustpush-upstream/Cargo.toml`
   - `cargo test --manifest-path third_party/rustpush-upstream/open-absinthe/Cargo.toml`
