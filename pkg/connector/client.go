@@ -2504,11 +2504,19 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// buffer flushes, delayed APNs deliveries can arrive with IsStoredMessage=false
 	// for messages that CloudKit already bridged. Check the Bridge DB for any
 	// message whose UUID is already known to prevent duplicates.
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	if msg.Uuid != "" {
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
+			if portalKey.ID == "unknown" {
+				log.Debug().
+					Str("uuid", msg.Uuid).
+					Bool("is_stored", msg.IsStoredMessage).
+					Str("existing_portal", string(dbMsgs[0].Room.ID)).
+					Msg("Skipping message already in bridge DB with unresolved APNs portal")
+				return
+			}
 			// Only skip if the existing message is in the SAME portal.
 			// Apple's SMS relay can reuse UUIDs across different short-code
 			// conversations, causing false-positive dedup drops.
@@ -2553,7 +2561,42 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+
+	// SMS/RCS group reactions and other messages sometimes arrive from the
+	// iPhone relay with an empty participant list. makePortalKey() then falls
+	// back to [sender, our_number] and computes a DM portal key, which can split
+	// one group chat into spurious DM portals.
+	//
+	// Only redirect DM->group when there is unambiguous evidence that this
+	// payload belongs to a known group. If evidence is ambiguous, keep the DM
+	// portal to avoid misrouting legitimate 1:1 SMS traffic.
+	if msg.IsSms && (portalKey.ID == "unknown" || isComputedDMPortalID(portalKey.ID)) {
+		if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
+			log.Debug().
+				Bool("has_sender", msg.Sender != nil && *msg.Sender != "").
+				Str("sender_guid", ptr.Val(msg.SenderGuid)).
+				Str("dm_portal", string(portalKey.ID)).
+				Str("group_portal", string(groupKey.ID)).
+				Msg("Redirecting SMS message to known group portal")
+			portalKey = groupKey
+		}
+	}
+
+	// Drop messages that couldn't be resolved to a real portal.
+	// makePortalKey returns ID:"unknown" when participants and sender are both
+	// empty/unresolvable. Letting these through creates a junk "unknown" room.
+	if portalKey.ID == "unknown" {
+		log.Warn().
+			Str("msg_uuid", msg.Uuid).
+			Bool("is_sms", msg.IsSms).
+			Bool("has_sender", msg.Sender != nil && *msg.Sender != "").
+			Bool("has_sender_guid", msg.SenderGuid != nil && *msg.SenderGuid != "").
+			Bool("has_group_name", msg.GroupName != nil && !isPlaceholderGroupName(*msg.GroupName)).
+			Strs("participants", msg.Participants).
+			Msg("Dropping message: could not resolve portal key (no participants/sender)")
+		return
+	}
+
 	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	// Eagerly learn sender-handle → portal mapping for StatusKit presence
@@ -2564,39 +2607,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// CardDAV-based resolver often fails for peers missing from contacts. By
 	// stamping the cache on every inbound 1:1 message, we ensure any peer
 	// who's ever messaged bridge has a direct lookup path for presence.
-	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) && portalKey.ID != "unknown" {
+	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) {
 		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID)
-	}
-
-	// Drop messages that couldn't be resolved to a real portal.
-	// makePortalKey returns ID:"unknown" when participants and sender are both
-	// empty/unresolvable. Letting these through creates a junk "unknown" room.
-	if portalKey.ID == "unknown" {
-		log.Warn().
-			Str("msg_uuid", msg.Uuid).
-			Strs("participants", msg.Participants).
-			Msg("Dropping message: could not resolve portal key (no participants/sender)")
-		return
-	}
-
-	// SMS/RCS group reactions and other messages sometimes arrive from the
-	// iPhone relay with an empty participant list. makePortalKey() then falls
-	// back to [sender, our_number] and computes a DM portal key, which can split
-	// one group chat into spurious DM portals.
-	//
-	// Only redirect DM->group when there is unambiguous evidence that this
-	// payload belongs to a known group. If evidence is ambiguous, keep the DM
-	// portal to avoid misrouting legitimate 1:1 SMS traffic.
-	if msg.IsSms && isComputedDMPortalID(portalKey.ID) {
-		if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
-			log.Debug().
-				Str("sender", ptr.Val(msg.Sender)).
-				Str("sender_guid", ptr.Val(msg.SenderGuid)).
-				Str("dm_portal", string(portalKey.ID)).
-				Str("group_portal", string(groupKey.ID)).
-				Msg("Redirecting SMS message from DM portal to known group portal")
-			portalKey = groupKey
-		}
 	}
 
 	// Track SMS portals so outbound replies use the correct service type.
@@ -8966,7 +8978,17 @@ func isComputedDMPortalID(id networkid.PortalID) bool {
 }
 
 func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) (networkid.PortalKey, bool) {
-	if len(msg.Participants) != 0 || msg.Sender == nil || *msg.Sender == "" {
+	return c.resolveSMSGroupRedirectPortalWithExists(msg, func(ctx context.Context, groupKey networkid.PortalKey) bool {
+		existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
+		return existing != nil && existing.MXID != ""
+	})
+}
+
+func (c *IMClient) resolveSMSGroupRedirectPortalWithExists(
+	msg rustpushgo.WrappedMessage,
+	portalExists func(context.Context, networkid.PortalKey) bool,
+) (networkid.PortalKey, bool) {
+	if len(msg.Participants) != 0 {
 		return networkid.PortalKey{}, false
 	}
 
@@ -8997,29 +9019,40 @@ func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) 
 	}
 
 	// Fallback: unique group membership match only (no "last active" heuristic).
-	normalized := normalizeIdentifierForPortalID(*msg.Sender)
-	if normalized != "" {
-		c.ensureGroupPortalIndex()
-		c.groupPortalMu.RLock()
-		portals := c.groupPortalIndex[normalized]
-		c.groupPortalMu.RUnlock()
-		if len(portals) == 1 {
-			for portalID := range portals {
-				addCandidate(portalID)
+	if msg.Sender != nil && *msg.Sender != "" {
+		normalized := normalizeIdentifierForPortalID(*msg.Sender)
+		if normalized != "" {
+			c.ensureGroupPortalIndex()
+			c.groupPortalMu.RLock()
+			portals := c.groupPortalIndex[normalized]
+			c.groupPortalMu.RUnlock()
+			if len(portals) == 1 {
+				for portalID := range portals {
+					addCandidate(portalID)
+				}
 			}
 		}
 	}
 
-	if len(candidates) != 1 {
+	if len(candidates) == 0 {
 		return networkid.PortalKey{}, false
 	}
 
 	ctx := context.Background()
+	var resolved networkid.PortalKey
+	resolvedCount := 0
 	for portalID := range candidates {
 		groupKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
-		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey); existing != nil && existing.MXID != "" {
-			return groupKey, true
+		if portalExists(ctx, groupKey) {
+			resolved = groupKey
+			resolvedCount++
+			if resolvedCount > 1 {
+				return networkid.PortalKey{}, false
+			}
 		}
+	}
+	if resolvedCount == 1 {
+		return resolved, true
 	}
 	return networkid.PortalKey{}, false
 }
@@ -9682,13 +9715,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 				// Last resort: extract from portal ID (lowercase, lossy)
 				guid = strings.TrimPrefix(portalID, "gid:")
 			}
-			// Look up participants from cloud store
-			if c.cloudStore != nil {
-				ctx := context.Background()
-				if parts, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(parts) > 0 {
-					participants = parts
-				}
-			}
+			participants = c.resolveGroupMembers(context.Background(), portalID)
 		} else {
 			participants = strings.Split(portalID, ",")
 		}
@@ -9763,9 +9790,9 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
-// For gid: portals it checks the in-memory cache first (populated synchronously
-// by makePortalKey), then the cloud store DB; for legacy comma-separated
-// portal IDs it splits the ID string.
+// For gid: portals it checks the cloud store DB first, then falls back to the
+// in-memory cache populated synchronously by makePortalKey; for legacy
+// comma-separated portal IDs it splits the ID string.
 func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []string {
 	if strings.HasPrefix(portalID, "gid:") {
 		// 1) Check cloud store DB (persisted from CloudKit sync or previous messages)
