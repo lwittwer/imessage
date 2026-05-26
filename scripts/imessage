@@ -32,38 +32,54 @@ imessage — host-side CLI for the mautrix-imessage-v2 Docker bridge.
 USAGE
     imessage <command> [args...]
 
-DAILY
-    setup           Run the interactive setup wizard inside the container.
-                    Same as `docker exec -it Rustpush-Matrix imessage-setup`.
-    login           Re-run only the iMessage login flow.
-    logs            Tail bridge logs (`docker logs -f Rustpush-Matrix`).
-    status          Show whether the bridge container is running.
-    shell           Open a bash shell inside the container (debugging).
-    bbctl <args>    Run bbctl inside the container with the given args.
-                    e.g. `imessage bbctl whoami`, `imessage bbctl logout`.
+Every subcommand is a thin wrapper around the raw command shown after the
+arrow. Useful when debugging or when you want to run the underlying
+operation manually.
 
-LIFECYCLE
-    start           docker compose up -d
-    stop            docker compose stop Rustpush-Matrix
-    restart         docker compose restart Rustpush-Matrix
-    update          docker compose pull && docker compose up -d
-    pull            docker compose pull   (no restart)
+DAILY (work from any directory — container looked up by name)
+    setup           → docker exec -it Rustpush-Matrix imessage-setup
+                      Interactive setup wizard inside the container.
+    login           → docker exec -it Rustpush-Matrix /entrypoint.sh login
+                      Re-run only the iMessage login flow.
+    logs            → docker logs -f Rustpush-Matrix
+                      Tail bridge logs.
+    status          → docker ps --filter name=^Rustpush-Matrix$
+                      Is the container running?
+    shell           → docker exec -it Rustpush-Matrix bash
+                      Open a debug shell inside the container.
+    bbctl <args>    → docker exec -it Rustpush-Matrix bbctl <args>
+                      Run the Beeper bridge-manager CLI inside the container.
+                      e.g. `imessage bbctl whoami`, `imessage bbctl logout`.
 
-ONE-TIME
-    migrate         Migrate from a bare-Linux install — strip the old
-                    systemd-based shell aliases from your shell rc files,
-                    stop+disable+remove the systemd unit, leave your
-                    state at ~/.local/share/mautrix-imessage in place.
+LIFECYCLE (must run from the directory with docker-compose.yml — or set IMESSAGE_COMPOSE_FILE)
+    start           → docker compose up -d
+    stop            → docker compose stop Rustpush-Matrix
+    restart         → docker compose restart Rustpush-Matrix
+    pull            → docker compose pull
+    update          → docker compose pull && docker compose up -d
+
+ONE-TIME (host-side only — no docker calls)
+    migrate         Migrate from a bare-Linux install:
+                      • strip the bare-Linux managed-alias block from
+                        ~/.bashrc / ~/.zshrc
+                      • stop + disable + remove the mautrix-imessage
+                        systemd unit (user + system scopes)
+                      • leave state at ~/.local/share/mautrix-imessage
+                        in place
                     Then run `imessage start` and `imessage setup`.
+
+OTHER
+    help, -h, --help    Print this message.
 
 ENV
     IMESSAGE_CONTAINER      Container name (default: Rustpush-Matrix).
     IMESSAGE_COMPOSE_FILE   Path to docker-compose.yml for lifecycle commands.
                             Otherwise compose looks in the current dir.
 
-Examples:
+Examples
     imessage setup
     imessage logs
+    imessage bbctl whoami
     IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml imessage update
 EOF
 }

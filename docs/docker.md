@@ -122,6 +122,28 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 | Open a debug shell inside | `imessage shell` |
 | Run `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` |
 
+### What each command does under the hood
+
+The `imessage` CLI is a thin wrapper — every subcommand maps to a small number of raw `docker` / `docker compose` invocations. Useful when debugging, when teaching someone else, or when you want to do the same thing manually:
+
+| `imessage …` | Equivalent raw command |
+|---|---|
+| `setup` | `docker exec -it Rustpush-Matrix imessage-setup` |
+| `login` | `docker exec -it Rustpush-Matrix /entrypoint.sh login` |
+| `logs` | `docker logs -f Rustpush-Matrix` |
+| `status` | `docker ps --filter name=^Rustpush-Matrix$` |
+| `shell` | `docker exec -it Rustpush-Matrix bash` |
+| `bbctl <args>` | `docker exec -it Rustpush-Matrix bbctl <args>` |
+| `start` | `docker compose up -d` |
+| `stop` | `docker compose stop Rustpush-Matrix` |
+| `restart` | `docker compose restart Rustpush-Matrix` |
+| `pull` | `docker compose pull` |
+| `update` | `docker compose pull && docker compose up -d` |
+| `migrate` | Pure host-side script — strips the bare-Linux managed-alias block from `~/.bashrc` / `~/.zshrc` and stops + disables + removes the `mautrix-imessage` systemd unit (user + system scopes). No `docker` calls. |
+| `help` | Prints the subcommand list. |
+
+When `docker compose` is invoked above, the CLI inserts `-f "$IMESSAGE_COMPOSE_FILE"` if that env var is set, otherwise compose uses its default search behavior (current working directory). Container name comes from `${IMESSAGE_CONTAINER:-Rustpush-Matrix}`.
+
 ### Where you need to run these
 
 | Subcommand group | Runs from anywhere? | Why |
