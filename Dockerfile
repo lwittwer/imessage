@@ -95,6 +95,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     python3 \
     sqlite3 \
     openssl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Apple Root CA — same source the bootstrap-linux.sh script fetches.
@@ -141,7 +142,12 @@ WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 29325
 
-USER bridge
-
+# Entrypoint starts as root (no USER directive). It chowns /data to
+# the bridge user when needed — handles the case where Docker
+# auto-created the bind-mount source as root because the host path
+# didn't exist on first `docker compose up` — then drops privileges
+# via gosu. The long-lived bridge process always runs as bridge (UID
+# 1000 by default; override with PUID / PGID env vars in compose for
+# hosts where appdata isn't owned by 1000, e.g. UNRAID, Synology).
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["run"]

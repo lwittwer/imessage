@@ -7,12 +7,16 @@ State lives on a bind mount at `~/.local/share/mautrix-imessage` — the same pa
 ## Quick start (new install)
 
 ```bash
-mkdir -p ~/.local/share/mautrix-imessage
 curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
-# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
+# Edit docker-compose.yml:
+#   - Set BEEPER to "true" (Beeper) or "false" (self-hosted).
+#   - Change the bind mount under volumes: to whatever host path suits
+#     you — see "Host paths" below.
 docker compose up -d
 docker exec -it bridge imessage-setup
 ```
+
+You don't need to `mkdir` the host bind-mount source. If it doesn't exist, Docker creates it on first `docker compose up` and the container chowns it to the bridge user automatically.
 
 `imessage-setup` runs the same install script bare-Linux uses (`scripts/install-beeper-linux.sh` when `BEEPER=true`, `scripts/install-linux.sh` when `BEEPER=false`). Walk through the prompts — same UX as today. When the script finishes the bridge picks up `/data/config.yaml` on its next poll (within ~30s) and starts.
 
@@ -95,11 +99,32 @@ docker exec bridge /entrypoint.sh aliases >> ~/.bashrc  # or ~/.zshrc
 
 `restart-imessage` is not provided — `restart: unless-stopped` in compose makes it redundant, and the right way to restart is `docker compose restart bridge`.
 
-## UID consistency
+## Host paths
 
-The example compose pins `user: "1000:1000"` because that's the typical first Linux user. The bind mount at `~/.local/share/mautrix-imessage` only works cleanly when the container's UID matches the host user's UID — otherwise state files written by one side become unreadable to the other.
+The container only cares about `/data` internally — the host bind-mount source is your choice. Pick whatever makes sense for your platform:
 
-If your host UID is different (check with `id -u && id -g`), update the `user:` line in compose before `docker compose up`.
+| Platform | Typical host path |
+|---|---|
+| Standard Linux | `~/.local/share/mautrix-imessage` (matches bare-Linux install path) |
+| UNRAID | `/mnt/user/appdata/mautrix-imessage` |
+| Synology | `/volume1/docker/mautrix-imessage` |
+| TrueNAS / ZFS | dataset of your choice |
+
+Edit the `volumes:` line in `docker-compose.yml` to point at your path. If the directory doesn't exist on the host, Docker creates it on first `docker compose up`.
+
+## UID / GID
+
+The container starts as root just long enough to `chown /data` to the bridge user, then drops privileges via `gosu`. The long-lived bridge process is never root.
+
+Defaults: UID 1000, GID 1000 (matches the typical first Linux user). Override via `PUID` / `PGID` in the compose `environment:` block when your host appdata directory is owned by a different UID — common on UNRAID (often `99:100`), Synology, or shared-server setups. Example:
+
+```yaml
+environment:
+  PUID: "99"
+  PGID: "100"
+```
+
+Check with `stat -c '%u:%g' /path/to/your/appdata` to see what UID/GID your data dir uses.
 
 ## Apple Silicon NAC relay
 

@@ -190,12 +190,12 @@ When the script finishes you're already logged in and the bridge is up.
 
 > ⚠ **Work in progress.** The Docker image, entrypoint, and migration flow are under active development. Expect rough edges, breaking changes, and no compatibility guarantees yet. Use the bare-Linux install for anything you rely on.
 
-The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount at `~/.local/share/mautrix-imessage` — the same directory the bare-Linux install uses. That means migrating in either direction is a matter of pointing the mount at the existing dir, no state copy.
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform (`/mnt/user/appdata/mautrix-imessage` on UNRAID, `/volume1/docker/mautrix-imessage` on Synology, any ZFS dataset, etc.).
 
 ```bash
-mkdir -p ~/.local/share/mautrix-imessage
 curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
-# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
+# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false"
+# (self-hosted), and change the volumes: line to your preferred host path.
 docker compose up -d
 docker exec -it bridge imessage-setup
 ```

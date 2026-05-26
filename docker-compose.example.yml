@@ -16,12 +16,18 @@ services:
     image: ghcr.io/lrhodin/imessage:latest
     container_name: bridge
     restart: unless-stopped
-    user: "1000:1000"
     stdin_open: true
     tty: true
     volumes:
-      # State directory. Same path bare-Linux uses, so migrating in or out
-      # is just a matter of pointing this at the existing dir — no copy.
+      # State directory. Pick whatever HOST path matches your setup —
+      # the container only cares about /data internally. Examples:
+      #   ~/.local/share/mautrix-imessage   (standard Linux desktop;
+      #                                      matches bare-Linux install
+      #                                      path, makes migration trivial)
+      #   /mnt/user/appdata/mautrix-imessage   (UNRAID)
+      #   /volume1/docker/mautrix-imessage     (Synology)
+      # If the host path doesn't exist, Docker creates it on first
+      # `docker compose up` and the entrypoint chowns it for you.
       - ~/.local/share/mautrix-imessage:/data
       # Uncomment ONLY during migration (MIGRATE=true) so the container
       # can strip the bare-Linux systemd-based shell aliases from your
@@ -46,6 +52,15 @@ services:
       # can append to ~/.bashrc / ~/.zshrc on the host. Default is off
       # because the aliases are a quality-of-life thing, not required.
       EMIT_ALIASES: "true"
+
+      # UID / GID the bridge process runs as. Defaults are 1000:1000
+      # which matches the typical first Linux user. Override when the
+      # host appdata directory is owned by a different UID — common
+      # on UNRAID (often 99:100), Synology, or shared-server setups.
+      # The entrypoint chowns /data to PUID:PGID on startup as root,
+      # then drops to that UID for the bridge process itself.
+      # PUID: "1000"
+      # PGID: "1000"
 
       # Optional toggles — same env vars the bare-Linux install scripts
       # read. Either is fine; the corresponding install-script prompt is

@@ -15,8 +15,47 @@
 #
 # All setup scripts read IN_DOCKER to skip apt-install, systemd, and
 # host-bashrc-aliases sections that don't make sense in the container.
+#
+# Privilege model: the container's CMD is invoked as root so the
+# entrypoint can fix /data ownership when Docker auto-creates the bind
+# mount source as root (happens on first `docker compose up` if the
+# host path didn't exist yet). After chown, we re-exec ourselves via
+# gosu as the bridge user. Every subcommand below runs as bridge — the
+# long-lived bridge process is never root.
 # ============================================================================
 set -euo pipefail
+
+# ── Privilege bootstrap ──────────────────────────────────────────────────────
+# Runs only on the initial root invocation. After gosu re-exec we come back
+# in as the bridge user and skip this block entirely.
+if [ "$(id -u)" = "0" ]; then
+    PUID="${PUID:-1000}"
+    PGID="${PGID:-1000}"
+
+    # Align the bridge user/group to the requested UID/GID if different
+    # from the image default. Cheap; only fires when the user actually
+    # overrides via PUID/PGID in compose.
+    if [ "$(id -u bridge)" != "$PUID" ]; then
+        usermod -o -u "$PUID" bridge >/dev/null 2>&1 || true
+    fi
+    if [ "$(id -g bridge)" != "$PGID" ]; then
+        groupmod -o -g "$PGID" bridge >/dev/null 2>&1 || true
+    fi
+
+    # Make sure /data is writable by the bridge user. Only chown when
+    # ownership doesn't already match — preserves existing UIDs on bind
+    # mounts from bare-Linux installs (migration path stays clean).
+    mkdir -p /data
+    if [ "$(stat -c '%u:%g' /data 2>/dev/null)" != "${PUID}:${PGID}" ]; then
+        chown "${PUID}:${PGID}" /data
+    fi
+
+    # Drop privileges. gosu replaces this shell with the same script
+    # running as the bridge user — no fork, no extra process, signals
+    # propagate cleanly to PID 1.
+    exec gosu bridge "$0" "$@"
+fi
+# ── From here on we are the bridge user. ─────────────────────────────────────
 
 BIN=/usr/local/bin/mautrix-imessage-v2
 DATA_DIR=/data
