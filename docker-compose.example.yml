@@ -1,0 +1,54 @@
+# ============================================================================
+# mautrix-imessage-v2 — example docker-compose.yml
+#
+# Copy this file to `docker-compose.yml` and edit:
+#   - Set BEEPER to "true" (Beeper) or "false" (self-hosted homeserver).
+#   - If you're migrating from a bare-Linux install: set MIGRATE to "true"
+#     and uncomment the two rc-file mounts under volumes for the first run.
+#     After the migration completes, comment them back out and set
+#     MIGRATE back to "false".
+#   - If your host UID isn't 1000:1000, update the `user:` line to match
+#     (run `id -u` and `id -g` on the host to check).
+# ============================================================================
+
+services:
+  bridge:
+    image: ghcr.io/lrhodin/imessage:latest
+    container_name: bridge
+    restart: unless-stopped
+    user: "1000:1000"
+    stdin_open: true
+    tty: true
+    volumes:
+      # State directory. Same path bare-Linux uses, so migrating in or out
+      # is just a matter of pointing this at the existing dir — no copy.
+      - ~/.local/share/mautrix-imessage:/data
+      # Uncomment ONLY during migration (MIGRATE=true) so the container
+      # can strip the bare-Linux systemd-based shell aliases from your
+      # shell rc files. Comment them back out once migration finishes.
+      # - ~/.bashrc:/host/.bashrc
+      # - ~/.zshrc:/host/.zshrc
+    environment:
+      # Required. Picks which install script runs when you invoke
+      # `docker exec -it bridge imessage-setup`. Same scripts the
+      # bare-Linux install uses; `BEEPER` is just the path selector.
+      BEEPER: "true"
+
+      # One-shot migration flag. Set to "true" only when moving from a
+      # bare-Linux install — the container will strip old systemd-based
+      # shell aliases (if the rc files are bind-mounted above) and tell
+      # you the host-side systemd commands to run. After the bridge
+      # starts cleanly once, set this back to "false".
+      MIGRATE: "false"
+
+      # Optional: when "true", `docker exec bridge /entrypoint.sh aliases`
+      # emits a shell alias block (imessage-setup, imessage-logs) you
+      # can append to ~/.bashrc / ~/.zshrc on the host. Default is off
+      # because the aliases are a quality-of-life thing, not required.
+      EMIT_ALIASES: "true"
+
+      # Optional toggles — same env vars the bare-Linux install scripts
+      # read. Either is fine; the corresponding install-script prompt is
+      # skipped when the env var is set. Defaults match the config keys.
+      # DISABLE_FACETIME: "false"
+      # STATUSKIT_NOTIFICATIONS: "true"

@@ -1,0 +1,78 @@
+# ============================================================================
+# docker.yml — build + push the mautrix-imessage-v2 image to GHCR.
+#
+# Manual dispatch ONLY. This workflow does NOT auto-run on push or PR —
+# each run takes ~15-20 min cold and shouldn't fire on every commit.
+# Trigger via Actions → docker → "Run workflow" when you want a new
+# image published.
+#
+# After the first successful push, set the GHCR package visibility to
+# Public via the GitHub UI (one-time): Package settings → Change visibility.
+# ============================================================================
+
+name: docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to apply to the published image (in addition to :sha-<short>). Leave empty for none."
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+  packages: write   # required to push to ghcr.io/lrhodin/*
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          IMAGE=ghcr.io/lrhodin/imessage
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TAGS="$IMAGE:sha-$SHORT_SHA"
+          EXTRA="${{ inputs.tag }}"
+          if [ -n "$EXTRA" ]; then
+            TAGS="$TAGS,$IMAGE:$EXTRA"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Will push: $TAGS"
+
+      - name: Build & push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # linux/amd64 only for now. linux/arm64 builds work but take a
+          # long time (rustpush + open-absinthe + unicorn-engine all
+          # compile from source) — enable when there's demand:
+          # platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Pass the commit hash to the build so the version stamp inside
+          # the binary reflects the source commit even when .git is not
+          # in the build context (it currently is, but this is defensive).
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}

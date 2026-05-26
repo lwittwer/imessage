@@ -186,6 +186,22 @@ When the script finishes you're already logged in and the bridge is up.
 
 **Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the install script, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result.
 
+## Quick Start (Docker) — WIP
+
+> ⚠ **Work in progress.** The Docker image, entrypoint, and migration flow are under active development. Expect rough edges, breaking changes, and no compatibility guarantees yet. Use the bare-Linux install for anything you rely on.
+
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount at `~/.local/share/mautrix-imessage` — the same directory the bare-Linux install uses. That means migrating in either direction is a matter of pointing the mount at the existing dir, no state copy.
+
+```bash
+mkdir -p ~/.local/share/mautrix-imessage
+curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
+# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
+docker compose up -d
+docker exec -it bridge imessage-setup
+```
+
+Updates are `docker compose pull && docker compose up -d`. Full walkthrough, including the migration path from an existing bare-Linux install, lives in [`docs/docker.md`](docs/docker.md). The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
+
 ## Login
 
 There are two ways to log in:

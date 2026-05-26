@@ -1,0 +1,321 @@
+#!/bin/bash
+# ============================================================================
+# docker-entrypoint.sh — dispatcher for the mautrix-imessage-v2 container.
+#
+# Subcommands:
+#   run       (default) — exec the bridge if /data/config.yaml exists,
+#                         otherwise print a hint and exit non-zero.
+#   setup     — interactively ask Beeper vs self-hosted, then exec the
+#               corresponding existing install script with IN_DOCKER=1.
+#               Same as bare-Linux setup, just inside the container.
+#   login     — re-run only the iMessage login flow.
+#   aliases   — when EMIT_ALIASES=true, print a host-side alias block
+#               (imessage-setup, imessage-logs) that the user can append
+#               to ~/.bashrc / ~/.zshrc. No-op otherwise.
+#
+# All setup scripts read IN_DOCKER to skip apt-install, systemd, and
+# host-bashrc-aliases sections that don't make sense in the container.
+# ============================================================================
+set -euo pipefail
+
+BIN=/usr/local/bin/mautrix-imessage-v2
+DATA_DIR=/data
+CONFIG="$DATA_DIR/config.yaml"
+BBCTL=/usr/local/bin/bbctl
+SCRIPTS=/opt/imessage/scripts
+MIGRATION_DONE="$DATA_DIR/.docker-migration-done"
+SETUP_LOCK="$DATA_DIR/.setup-in-progress"
+
+CMD="${1:-run}"
+shift || true
+
+usage() {
+    cat <<'EOF'
+usage: /entrypoint.sh <subcommand>
+
+  run        Start the bridge (requires /data/config.yaml). Default.
+  setup      Run the interactive setup wizard (BEEPER env var picks Beeper vs self-hosted).
+  login      Re-run only the iMessage login flow.
+  migrate    Walk the user through migrating from a bare-Linux install.
+             Auto-runs on first start when MIGRATE=true is set in compose.
+  aliases    Print the host-side alias block (when EMIT_ALIASES=true).
+EOF
+}
+
+require_tty() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "error: '$1' is interactive — re-run with 'docker exec -it' or 'docker compose run' so a TTY is attached." >&2
+        exit 2
+    fi
+}
+
+cmd_run() {
+    # Auto-trigger migration on first start when MIGRATE=true is set in
+    # compose and we've never migrated this data dir before. The user
+    # only sees the migration once — sentinel keeps subsequent restarts
+    # from re-prompting.
+    case "${MIGRATE:-}" in
+        true|TRUE|1|yes|YES)
+            if [ ! -f "$MIGRATION_DONE" ] && [ -f "$CONFIG" ]; then
+                cmd_migrate
+            fi
+            ;;
+    esac
+
+    # Wait for setup. Keeps PID 1 alive so `docker exec -it bridge
+    # imessage-setup` can be run against a "running" container. As soon
+    # as setup writes /data/config.yaml AND finishes (no setup lock),
+    # the next poll picks it up and exec's the bridge.
+    #
+    # The lock check matters because install-beeper-linux.sh writes
+    # config.yaml partway through (during `bbctl config`), then keeps
+    # going with the iMessage login. If we started the bridge as soon as
+    # config appeared, the bridge would grab the DB lock mid-login and
+    # the login step would fail. cmd_setup writes SETUP_LOCK before
+    # invoking the install script and removes it after.
+    local warned=0
+    while [ ! -f "$CONFIG" ] || [ -f "$SETUP_LOCK" ]; do
+        if [ "$warned" -eq 0 ]; then
+            echo "no /data/config.yaml yet — run 'docker exec -it bridge imessage-setup' from the host to configure the bridge."
+            warned=1
+        fi
+        sleep 30
+    done
+    # cd into /data so anisette's relative state/anisette/ lands on the
+    # volume rather than wherever PID 1 happened to start. WORKDIR in
+    # the Dockerfile already does this; the cd is defensive.
+    cd "$DATA_DIR"
+    exec "$BIN" -c "$CONFIG"
+}
+
+# strip_alias_block — remove the managed-alias block from one rc file.
+# Matches the awk pattern the bare-Linux installer already uses, so the
+# remove-aliases path here and the install-script's remove-on-decline
+# path produce identical output. Returns 0 if anything was stripped,
+# 1 otherwise.
+strip_alias_block() {
+    local rc="$1"
+    local marker_start="# >>> mautrix-imessage shortcuts (managed) >>>"
+    local marker_end="# <<< mautrix-imessage shortcuts (managed) <<<"
+    if [ -f "$rc" ] && grep -qF "$marker_start" "$rc"; then
+        awk -v s="$marker_start" -v e="$marker_end" '
+            $0 == s { skip = 1; next }
+            $0 == e { skip = 0; next }
+            !skip   { print }
+        ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+        return 0
+    fi
+    return 1
+}
+
+cmd_migrate() {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo "  Migrating from bare-Linux install"
+    echo "═══════════════════════════════════════════════"
+    echo ""
+    echo "Detected existing state at /data (bind-mounted from your host's"
+    echo "~/.local/share/mautrix-imessage). The bridge will resume against"
+    echo "it — no re-login, no re-setup, no state copy."
+    echo ""
+
+    # ── 1. Bare-Linux shell aliases (systemctl-based) ───────────────────────
+    # If the user bind-mounted their rc files into /host/, we strip the
+    # marker block automatically. Otherwise we print the awk command for
+    # them to run on the host. Detect both shells — bash and zsh — and
+    # handle whichever rc files exist. No HOST_SHELL env var needed:
+    # presence of the rc file in /host/ IS the signal.
+    local stripped=0
+    local rc_unmounted=0
+    for shell_rc in /host/.bashrc /host/.zshrc; do
+        if [ -e "$shell_rc" ]; then
+            if strip_alias_block "$shell_rc"; then
+                echo "✓ Stripped managed-alias block from $(echo "$shell_rc" | sed 's|^/host|~|')"
+                stripped=1
+            fi
+        fi
+    done
+
+    if [ "$stripped" -eq 0 ] && [ ! -e /host/.bashrc ] && [ ! -e /host/.zshrc ]; then
+        rc_unmounted=1
+        cat <<'EOF'
+Note: ~/.bashrc and ~/.zshrc are not bind-mounted into the container.
+To let this script strip the old systemd-based aliases automatically,
+add to your docker-compose.yml volumes (only needed during migration):
+
+    - ~/.bashrc:/host/.bashrc
+    - ~/.zshrc:/host/.zshrc
+
+Otherwise, run this on the host yourself to remove them:
+
+    for rc in ~/.bashrc ~/.zshrc; do
+        [ -f "$rc" ] || continue
+        awk -v s='# >>> mautrix-imessage shortcuts (managed) >>>' \
+            -v e='# <<< mautrix-imessage shortcuts (managed) <<<' '
+            $0 == s { skip = 1; next }
+            $0 == e { skip = 0; next }
+            !skip   { print }
+        ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+    done
+
+EOF
+    fi
+
+    # ── 2. systemd unit teardown (host-side, can't reach from container) ────
+    cat <<'EOF'
+Stop and remove the bare-Linux systemd service on the HOST (the
+container can't reach the host's systemd from inside). Run on the host:
+
+    # systemd --user (most setups)
+    systemctl --user stop mautrix-imessage 2>/dev/null
+    systemctl --user disable mautrix-imessage 2>/dev/null
+    rm -f ~/.config/systemd/user/mautrix-imessage.service
+    systemctl --user daemon-reload
+
+    # systemd system (only if you installed as root)
+    sudo systemctl stop mautrix-imessage 2>/dev/null
+    sudo systemctl disable mautrix-imessage 2>/dev/null
+    sudo rm -f /etc/systemd/system/mautrix-imessage.service
+    sudo systemctl daemon-reload
+
+EOF
+
+    if [ -t 0 ]; then
+        # Interactive — pause so the user can do host-side cleanup before
+        # the bridge starts (otherwise the old systemd unit could race for
+        # the same DB lock + appservice port).
+        read -r -p "Press Enter once host-side cleanup is done (or Ctrl-C to abort): "
+    else
+        echo "(non-interactive run — proceeding without pause; do the host-side cleanup at your earliest convenience)"
+    fi
+
+    # ── 3. Mark migration done so subsequent restarts skip this ─────────────
+    : > "$MIGRATION_DONE"
+    echo ""
+    echo "✓ Migration complete. Starting bridge..."
+    echo ""
+
+    if [ "$rc_unmounted" -eq 1 ]; then
+        echo "Reminder: rc-file mounts can stay commented now that migration's done."
+        echo ""
+    fi
+}
+
+cmd_setup() {
+    require_tty "setup"
+    # Path selection lives in docker-compose.yml as BEEPER=true|false.
+    # `imessage-setup` always re-runs whichever script that env var picks,
+    # so re-config on a Beeper deploy stays on the Beeper script and
+    # re-config on a self-hosted deploy stays on the self-hosted script —
+    # no choose-your-own-adventure inside the container, no state file.
+
+    local script=""
+    local script_args=()
+    case "${BEEPER:-}" in
+        true|TRUE|1|yes|YES)
+            script="$SCRIPTS/install-beeper-linux.sh"
+            script_args=("$BIN" "$DATA_DIR" "$BBCTL")
+            ;;
+        false|FALSE|0|no|NO)
+            script="$SCRIPTS/install-linux.sh"
+            script_args=("$BIN" "$DATA_DIR")
+            ;;
+        "")
+            cat >&2 <<EOF
+error: BEEPER env var is not set.
+
+Set BEEPER in your docker-compose.yml under the bridge service:
+
+  environment:
+    BEEPER: "true"     # for Beeper deploys
+    BEEPER: "false"    # for self-hosted homeservers
+
+Then 'docker compose up -d' and re-run 'docker exec -it bridge imessage-setup'.
+EOF
+            exit 2
+            ;;
+        *)
+            echo "error: BEEPER must be 'true' or 'false' (got: '${BEEPER}')" >&2
+            exit 2
+            ;;
+    esac
+
+    # Take the setup lock so cmd_run (PID 1) doesn't race-start the bridge
+    # when bbctl writes config.yaml partway through the script. The trap
+    # clears the lock no matter how we exit (clean, error, or signal).
+    : > "$SETUP_LOCK"
+    trap 'rm -f "$SETUP_LOCK"' EXIT
+
+    export IN_DOCKER=1
+    cd "$DATA_DIR"
+    # `if` form so `set -e` doesn't kill us before we can capture rc.
+    local rc=0
+    if ! "$script" "${script_args[@]}"; then
+        rc=$?
+    fi
+
+    # On clean completion, also mark migration as "done" so that a stray
+    # MIGRATE=true left in compose on a Docker-native install doesn't
+    # trigger a spurious migration prompt on next restart. Migration is
+    # only meaningful when state existed before Docker owned this volume.
+    if [ "$rc" -eq 0 ]; then
+        : > "$MIGRATION_DONE"
+    fi
+
+    exit "$rc"
+}
+
+cmd_login() {
+    require_tty "login"
+    if [ ! -f "$CONFIG" ]; then
+        echo "error: no /data/config.yaml found. Run setup first." >&2
+        exit 1
+    fi
+    cd "$DATA_DIR"
+    exec "$BIN" login -c "$CONFIG"
+}
+
+cmd_aliases() {
+    # Source of truth for whether to emit is EMIT_ALIASES in compose. When
+    # unset/false, this subcommand stays silent — caller's `>> ~/.bashrc`
+    # is then a no-op. The user opts in explicitly by flipping the env var.
+    case "${EMIT_ALIASES:-}" in
+        1|true|TRUE|yes|YES)
+            cat <<'EOF'
+# >>> mautrix-imessage shortcuts (docker, managed) >>>
+alias imessage-setup='docker exec -it bridge imessage-setup'
+alias imessage-logs='docker logs -f bridge'
+# <<< mautrix-imessage shortcuts (docker, managed) <<<
+EOF
+            ;;
+        *)
+            cat >&2 <<EOF
+EMIT_ALIASES is not set to true — no aliases emitted.
+
+To enable, set EMIT_ALIASES=true in your docker-compose.yml under the
+bridge service's environment block, then re-run:
+
+  docker exec bridge /entrypoint.sh aliases >> ~/.bashrc
+
+Open a new terminal (or source ~/.bashrc) to pick up the aliases.
+EOF
+            exit 0
+            ;;
+    esac
+}
+
+case "$CMD" in
+    run)      cmd_run "$@" ;;
+    setup)    cmd_setup "$@" ;;
+    login)    cmd_login "$@" ;;
+    migrate)  cmd_migrate "$@" ;;
+    aliases)  cmd_aliases "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+        # Fall through: allow `docker run image <arbitrary command>` to work
+        # for diagnostics (e.g. `docker run --rm image bash`). This is
+        # standard entrypoint behavior — bypass the dispatcher when the
+        # first arg isn't one of our subcommands.
+        exec "$CMD" "$@"
+        ;;
+esac
