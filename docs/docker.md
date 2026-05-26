@@ -75,9 +75,10 @@ If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:10
 
 ### Step 4 — Start the container
 
-From the directory containing `docker-compose.yml`:
+**`imessage start` must be run from the directory that contains your `docker-compose.yml`.** Same rule as raw `docker compose up` — compose-driven subcommands (`start`, `stop`, `restart`, `pull`, `update`) need to find the file, and they look in the current directory by default.
 
 ```bash
+cd /path/to/the/dir/with/your/docker-compose.yml
 imessage start
 ```
 
@@ -87,6 +88,8 @@ The container pulls the image (first time only, ~250 MB), comes up, and sits idl
 imessage status
 imessage logs       # Ctrl-C to detach
 ```
+
+If you'd rather run lifecycle commands from anywhere, set `IMESSAGE_COMPOSE_FILE` to the absolute path of your compose file — see [Day-to-day operations](#day-to-day-operations) below.
 
 The logs should show `no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge.` every 30 seconds — that's the entrypoint waiting on step 5.
 
@@ -119,11 +122,19 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 | Open a debug shell inside | `imessage shell` |
 | Run `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` |
 
-If you keep your compose file somewhere other than the current directory, set `IMESSAGE_COMPOSE_FILE`:
+### Where you need to run these
+
+| Subcommand group | Runs from anywhere? | Why |
+|---|---|---|
+| `setup`, `login`, `logs`, `status`, `shell`, `bbctl` | ✓ yes | Found by container name (`Rustpush-Matrix`, unique per host) |
+| `start`, `stop`, `restart`, `pull`, `update` | ✗ only from the `docker-compose.yml` dir (or set `IMESSAGE_COMPOSE_FILE`) | Lifecycle commands invoke `docker compose`, which needs to find the file |
+
+If you'd rather run lifecycle commands from anywhere, point at the compose file once in your shell rc:
 
 ```bash
-export IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml
-imessage update
+echo 'export IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml' >> ~/.bashrc
+# or ~/.zshrc — open a new terminal to pick it up
+imessage update                                # now works from anywhere
 ```
 
 ---
