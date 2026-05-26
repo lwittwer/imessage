@@ -4,9 +4,9 @@
 #
 # Subcommands:
 #   run     (default) — wait for /data/config.yaml, then exec the bridge.
-#                       Polls every 30s so `docker exec -it bridge
-#                       imessage-setup` can populate config against a
-#                       running container.
+#                       Polls every 30s so `docker exec -it
+#                       Rustpush-Matrix imessage-setup` can populate
+#                       config against a running container.
 #   setup   — invoke the existing install-beeper-linux.sh (or
 #             install-linux.sh) inside the container. `BEEPER` env var
 #             in compose selects which.
@@ -79,8 +79,9 @@ require_tty() {
 }
 
 cmd_run() {
-    # Wait for setup. Keeps PID 1 alive so `docker exec -it bridge
-    # imessage-setup` works against a "running" container. The lock
+    # Wait for setup. Keeps PID 1 alive so `docker exec -it
+    # Rustpush-Matrix imessage-setup` works against a "running"
+    # container. The lock
     # check prevents the bridge from grabbing the DB mid-login —
     # install-beeper-linux.sh writes config.yaml partway through (during
     # `bbctl config`) and then continues with the iMessage login.
@@ -117,7 +118,7 @@ cmd_setup() {
             cat >&2 <<EOF
 error: BEEPER env var is not set.
 
-Set BEEPER in your docker-compose.yml under the bridge service:
+Set BEEPER in your docker-compose.yml under the Rustpush-Matrix service:
 
   environment:
     BEEPER: "true"     # for Beeper deploys

@@ -71,8 +71,3 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Pass the commit hash to the build so the version stamp inside
-          # the binary reflects the source commit even when .git is not
-          # in the build context (it currently is, but this is defensive).
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}

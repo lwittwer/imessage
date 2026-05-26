@@ -16,7 +16,7 @@
 # ============================================================================
 set -euo pipefail
 
-CONTAINER="${IMESSAGE_CONTAINER:-bridge}"
+CONTAINER="${IMESSAGE_CONTAINER:-Rustpush-Matrix}"
 COMPOSE_FILE="${IMESSAGE_COMPOSE_FILE:-}"
 
 # Marker block format matches the bare-Linux install scripts so migrating
@@ -34,16 +34,16 @@ USAGE
 
 DAILY
     setup           Run the interactive setup wizard inside the container.
-                    Same as `docker exec -it bridge imessage-setup`.
+                    Same as `docker exec -it Rustpush-Matrix imessage-setup`.
     login           Re-run only the iMessage login flow.
-    logs            Tail bridge logs (`docker logs -f bridge`).
+    logs            Tail bridge logs (`docker logs -f Rustpush-Matrix`).
     status          Show whether the bridge container is running.
     shell           Open a bash shell inside the container (debugging).
 
 LIFECYCLE
     start           docker compose up -d
-    stop            docker compose stop bridge
-    restart         docker compose restart bridge
+    stop            docker compose stop Rustpush-Matrix
+    restart         docker compose restart Rustpush-Matrix
     update          docker compose pull && docker compose up -d
     pull            docker compose pull   (no restart)
 
@@ -60,7 +60,7 @@ ONE-TIME
     uninstall-aliases  Remove the alias block written by install-aliases.
 
 ENV
-    IMESSAGE_CONTAINER      Container name (default: bridge).
+    IMESSAGE_CONTAINER      Container name (default: Rustpush-Matrix).
     IMESSAGE_COMPOSE_FILE   Path to docker-compose.yml for lifecycle commands.
                             Otherwise compose looks in the current dir.
 

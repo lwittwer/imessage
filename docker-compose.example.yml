@@ -1,53 +1,51 @@
 # ============================================================================
-# mautrix-imessage-v2 — example docker-compose.yml
+# Rustpush-Matrix — Docker compose example.
 #
-# Copy this file to `docker-compose.yml` and edit:
-#   - Set BEEPER to "true" (Beeper) or "false" (self-hosted homeserver).
-#   - Adjust the bind mount under volumes: to whatever HOST path suits
-#     you (see "Host paths" in docs/docker.md).
-#   - Set PUID/PGID if your host appdata dir isn't owned by UID 1000
-#     (typical first user). UNRAID is often 99:100.
+# Edit the three values below for your host:
+#   - The bind mount (volumes)  — pick your appdata path
+#   - PUID / PGID               — match the user that owns the bind mount
+#   - BEEPER                    — "true" for Beeper, "false" for self-hosted
 #
-# Then start the bridge with the `imessage` host CLI:
-#   imessage start
-#   imessage setup
+# Everything else (CardDAV, FaceTime toggle, StatusKit, HEIC conversion,
+# video transcoding, preferred handle, …) is configured through the
+# interactive `imessage setup` wizard and persisted in config.yaml on
+# the bind mount. Compose env vars stay minimal on purpose.
 # ============================================================================
 
 services:
-  bridge:
+  Rustpush-Matrix:
     image: ghcr.io/lrhodin/imessage:latest
-    container_name: bridge
+    container_name: Rustpush-Matrix
     restart: unless-stopped
     stdin_open: true
     tty: true
+
     volumes:
-      # State directory. Pick whatever HOST path matches your setup —
-      # the container only cares about /data internally. Examples:
-      #   ~/.local/share/mautrix-imessage   (standard Linux desktop;
-      #                                      matches bare-Linux install
-      #                                      path, makes migration trivial)
-      #   /mnt/user/appdata/mautrix-imessage   (UNRAID)
-      #   /volume1/docker/mautrix-imessage     (Synology)
-      # If the host path doesn't exist, Docker creates it on first
-      # `imessage start` and the entrypoint chowns it for you.
+      # HOST path is your choice — the container only cares about /data.
+      # Standard Linux desktop:  ~/.local/share/mautrix-imessage
+      # UNRAID:                  /mnt/user/appdata/Rustpush-Matrix
+      # Synology:                /volume1/docker/Rustpush-Matrix
+      # TrueNAS Scale:           a dataset of your choice
+      # If the path doesn't exist on the host, Docker creates it on
+      # first start and the entrypoint chowns it to PUID:PGID.
       - ~/.local/share/mautrix-imessage:/data
+
     environment:
-      # Required. Picks which install script runs when you invoke
-      # `imessage setup`. Same scripts the bare-Linux install uses;
-      # `BEEPER` is just the path selector.
+      # Which homeserver are you connecting to?
+      #   "true"  — Beeper
+      #   "false" — self-hosted Synapse / Dendrite / Conduit
       BEEPER: "true"
 
-      # UID / GID the bridge process runs as. Defaults are 1000:1000
-      # which matches the typical first Linux user. Override when the
-      # host appdata directory is owned by a different UID — common on
-      # UNRAID (often 99:100), Synology, or shared-server setups. The
-      # entrypoint chowns /data to PUID:PGID on startup as root, then
-      # drops to that UID for the bridge process itself.
-      # PUID: "1000"
-      # PGID: "1000"
-
-      # Optional toggles — same env vars the bare-Linux install scripts
-      # read. The corresponding install-script prompt is skipped when
-      # the env var is set. Defaults match the config keys.
-      # DISABLE_FACETIME: "false"
-      # STATUSKIT_NOTIFICATIONS: "true"
+      # UID and GID the bridge runs as. MUST match whoever owns the
+      # bind-mount directory above, or the container won't be able to
+      # read/write your state files.
+      #
+      # Look up your values on the HOST:
+      #     id -u                                       # your UID
+      #     id -g                                       # your GID
+      #     stat -c '%u:%g' /your/appdata/path          # what owns the dir
+      #
+      # Typical values: 1000:1000 (first Linux user), 99:100 (UNRAID).
+      # See docs/docker.md → "Finding your UID and GID" for more.
+      PUID: "1000"
+      PGID: "1000"
