@@ -28,6 +28,8 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     curl \
     wget \
     ca-certificates \
+    openssl \
+    sqlite3 \
     libolm-dev \
     libclang-dev \
     libssl-dev \
@@ -40,6 +42,16 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH
+
+# Apple Root CA — bootstrap-linux.sh (invoked by `make check-deps`) tries to
+# install this via `sudo`, which doesn't exist in this builder. Install it
+# here ahead of time so bootstrap-linux.sh's openssl check passes and it
+# skips the sudo path. Same source/destination the runtime stage uses.
+RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCertificate.cer \
+    && openssl x509 -inform DER -in /tmp/AppleRootCA.cer \
+        -out /usr/local/share/ca-certificates/AppleRootCA.crt \
+    && update-ca-certificates --fresh >/dev/null 2>&1 \
+    && rm -f /tmp/AppleRootCA.cer
 
 WORKDIR /src
 COPY . /src
