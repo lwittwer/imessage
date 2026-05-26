@@ -42,8 +42,10 @@ DAILY (work from any directory — container looked up by name)
     login           → docker exec -it Rustpush-Matrix /entrypoint.sh login
                       Re-run only the iMessage login flow.
     logs            → docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log
-                      Live-watch the bridge's full log file (not just
-                      the slice surfaced through docker logs).
+                      Live-watch the bridge's full log file when the
+                      container is healthy. Falls back to `docker logs
+                      -f Rustpush-Matrix` if the container is exited or
+                      restart-looping (so you can see WHY it crashed).
     status          → docker ps --filter name=^Rustpush-Matrix$
                       Is the container running?
     shell           → docker exec -it Rustpush-Matrix bash
@@ -133,11 +135,27 @@ strip_marker_block() {
 cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
 cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
 cmd_logs()    {
-    # Live-tail the bridge's own log file — the full zerolog stream,
-    # not just what's surfaced through docker logs. `tail -F` follows
-    # log rotation and waits for the file to appear, so it works on a
-    # fresh install before the bridge has ever written anything too.
-    exec docker exec -it "$CONTAINER" tail -F /data/logs/bridge.log
+    # Live-tail the bridge's own log file when the container is healthy
+    # (the full zerolog stream, not just what surfaces through docker
+    # logs). When it isn't — restart-looping, exited, missing — fall
+    # back to `docker logs` so the user can see startup/crash output.
+    # `docker exec` can't run on a non-running container, so the inspect
+    # check decides up front.
+    local state
+    state=$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)
+    case "$state" in
+        running)
+            exec docker exec -it "$CONTAINER" tail -F /data/logs/bridge.log
+            ;;
+        missing)
+            echo "error: container '$CONTAINER' doesn't exist. Did you 'imessage start' yet?" >&2
+            exit 1
+            ;;
+        *)
+            echo "(container is $state — tailing 'docker logs' instead of /data/logs/bridge.log)" >&2
+            exec docker logs -f "$CONTAINER"
+            ;;
+    esac
 }
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
