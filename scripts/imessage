@@ -41,8 +41,9 @@ DAILY (work from any directory — container looked up by name)
                       Interactive setup wizard inside the container.
     login           → docker exec -it Rustpush-Matrix /entrypoint.sh login
                       Re-run only the iMessage login flow.
-    logs            → docker logs -f Rustpush-Matrix
-                      Tail bridge logs.
+    logs            → docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log
+                      Live-watch the bridge's full log file (not just
+                      the slice surfaced through docker logs).
     status          → docker ps --filter name=^Rustpush-Matrix$
                       Is the container running?
     shell           → docker exec -it Rustpush-Matrix bash
@@ -131,7 +132,13 @@ strip_marker_block() {
 
 cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
 cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
-cmd_logs()    { exec docker logs -f "$CONTAINER"; }
+cmd_logs()    {
+    # Live-tail the bridge's own log file — the full zerolog stream,
+    # not just what's surfaced through docker logs. `tail -F` follows
+    # log rotation and waits for the file to appear, so it works on a
+    # fresh install before the bridge has ever written anything too.
+    exec docker exec -it "$CONTAINER" tail -F /data/logs/bridge.log
+}
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
 cmd_bbctl()   { exec docker exec -it "$CONTAINER" bbctl "$@"; }
