@@ -98,6 +98,53 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
     make build
 
+# Verify every rustpush patch landed in the cloned source tree. Mirrors
+# the `verify-rustpush-patches` job in .github/workflows/ci.yml exactly
+# so the Docker image can't ship a binary that's missing one of these
+# patches (which would happen silently if upstream reworded a guarded
+# line and the sed in ensure-rustpush-source quietly skipped it).
+#
+# Prints a one-line-per-patch status + a summary line at the end. Fails
+# the build if ANY patch marker is missing — the only safe failure mode
+# for a binary that depends on every one of these.
+RUN set -e; \
+    BASE=third_party/rustpush-upstream; \
+    PASS=0; FAIL=0; TOTAL=0; \
+    check() { \
+        local desc="$1" file="$2" marker="$3"; \
+        TOTAL=$((TOTAL+1)); \
+        if grep -Fq "$marker" "$file" 2>/dev/null; then \
+            echo "  ✓ $desc"; \
+            PASS=$((PASS+1)); \
+        else \
+            echo "  ✗ $desc — marker not found in $file"; \
+            FAIL=$((FAIL+1)); \
+        fi; \
+    }; \
+    echo ""; \
+    echo "═══════════════════════════════════════════════════════════"; \
+    echo "  Verifying rustpush patches are applied to built binary"; \
+    echo "═══════════════════════════════════════════════════════════"; \
+    check "activation pub"                       "$BASE/src/lib.rs"                                   "pub mod activation;"; \
+    check "ids pub"                              "$BASE/src/lib.rs"                                   "pub mod ids;"; \
+    check "FetchedToken.token pub"               "$BASE/apple-private-apis/icloud-auth/src/client.rs" "pub token: String,"; \
+    check "FetchedToken.expiration pub"          "$BASE/apple-private-apis/icloud-auth/src/client.rs" "pub expiration: SystemTime,"; \
+    check "FetchedToken re-export"               "$BASE/apple-private-apis/icloud-auth/src/lib.rs"    "pub use client::{AppleAccount, FetchedToken,"; \
+    check "keychain self-exclusion fix"          "$BASE/src/icloud/keychain.rs"                       "Ignoring exclusion of ourselves"; \
+    check "register XML dump env-gate"           "$BASE/src/ids/user.rs"                              "RUSTPUSH_LOG_REGISTER_BODY"; \
+    check "statuskit no-saved-channel softened"  "$BASE/src/statuskit.rs"                             "no saved channel for identifier"; \
+    check "statuskit channel-not-found softened" "$BASE/src/statuskit.rs"                             "presence msg arrived before keysharing"; \
+    echo "═══════════════════════════════════════════════════════════"; \
+    echo "  Patch status: $PASS / $TOTAL applied"; \
+    if [ "$FAIL" -ne 0 ]; then \
+        echo "  ✗ FAIL — $FAIL patch(es) missing. Image will NOT be pushed."; \
+        echo "═══════════════════════════════════════════════════════════"; \
+        exit 1; \
+    fi; \
+    echo "  ✓ OK — all rustpush patches applied to the shipped binary."; \
+    echo "═══════════════════════════════════════════════════════════"; \
+    echo ""
+
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
