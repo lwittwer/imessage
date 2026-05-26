@@ -25,12 +25,21 @@ services:
     tty: true
 
     volumes:
-      # HOST path is your choice — the container only cares about /data.
-      # Standard Linux desktop:  ~/.local/share/mautrix-imessage
-      # UNRAID:                  /mnt/user/appdata/Rustpush-Matrix
-      # Synology:                /volume1/docker/Rustpush-Matrix
-      # TrueNAS Scale:           a dataset of your choice
+      # Bridge state (config.yaml, mautrix-imessage.db, session.json,
+      # trustedpeers.plist, ...). HOST path is your choice; the
+      # container only cares about /data internally. Examples:
+      #   Standard Linux desktop:  ~/.local/share/mautrix-imessage
+      #   UNRAID:                  /mnt/user/appdata/Rustpush-Matrix
+      #   Synology:                /volume1/docker/Rustpush-Matrix
+      #   TrueNAS Scale:           a dataset of your choice
       - ~/.local/share/mautrix-imessage:/data
+
+      # bbctl Beeper auth — kept in its own host directory (same path
+      # bare-Linux uses), separate from bridge state. Lets you migrate
+      # an existing bare-Linux ~/.config/bridge-manager/ into the
+      # container with no copy, and lets bbctl auth survive any
+      # rm-rf of the bridge state dir.
+      - ~/.config/bridge-manager:/home/bridge/.config/bridge-manager
 
     environment:
       # Which homeserver are you connecting to?

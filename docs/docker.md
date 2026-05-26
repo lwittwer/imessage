@@ -60,16 +60,27 @@ curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose
 Open it in your editor:
 
 1. **`BEEPER` env var** — set to `"true"` for a Beeper deploy or `"false"` for a self-hosted homeserver.
-2. **The bind mount** under `volumes:`. The default is `~/.local/share/mautrix-imessage:/data`, which matches the bare-Linux install path so migrating to or from Docker is trivial. Change the left side to whatever fits your platform:
+2. **The bind mounts** under `volumes:`. There are two by default:
 
-   | Platform | Typical host path |
-   |---|---|
-   | Standard Linux | `~/.local/share/mautrix-imessage` |
-   | UNRAID | `/mnt/user/appdata/mautrix-imessage` |
-   | Synology | `/volume1/docker/mautrix-imessage` |
-   | TrueNAS / ZFS | dataset of your choice |
+   ```yaml
+   volumes:
+     - ~/.local/share/mautrix-imessage:/data
+     - ~/.config/bridge-manager:/home/bridge/.config/bridge-manager
+   ```
 
-   You don't need to `mkdir` the path yourself — Docker creates it on first start and the entrypoint chowns it for you.
+   - `/data` holds bridge state (`config.yaml`, `mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …). Path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migrating in either direction is a no-copy operation.
+   - `/home/bridge/.config/bridge-manager` holds `bbctl`'s Beeper auth — same path bare-Linux puts it at (`~/.config/bridge-manager/`). Kept separate from bridge state on purpose: a bare-Linux user migrating their existing `~/.config/bridge-manager/` keeps their Beeper login, and `imessage bbctl logout` doesn't touch bridge state.
+
+   For non-default platforms, change the left side of each line:
+
+   | Platform | Bridge state path | bbctl path |
+   |---|---|---|
+   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bridge-manager` |
+   | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
+   | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
+   | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
+
+   Run `imessage fix-perms` after editing to chown both paths to the container's UID/GID in one step.
 
 If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set `PUID` / `PGID` to match. See [Finding your UID and GID](#finding-your-uid-and-gid) below for how to look them up.
 

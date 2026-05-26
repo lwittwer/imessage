@@ -205,65 +205,65 @@ EOF
         exit 1
     fi
 
-    # Pull the /data bind source and the container user out of the
-    # rendered compose JSON. Service name defaults to Rustpush-Matrix;
-    # falls back to the first service if the user renamed it.
+    # Pull ALL bind-mount sources and the container user out of the
+    # rendered compose JSON. The compose example has two: /data
+    # (bridge state) and /home/bridge/.config/bridge-manager (bbctl
+    # auth). Both need to be writable by the container's UID:GID.
     local parsed
     parsed=$(compose config --format json | python3 -c '
 import sys, json
 cfg = json.load(sys.stdin)
 services = cfg.get("services", {})
 svc = services.get("Rustpush-Matrix") or next(iter(services.values()), {})
-src = ""
-for v in svc.get("volumes", []) or []:
-    if isinstance(v, dict) and v.get("target") == "/data":
-        src = v.get("source", "")
-        break
 user = svc.get("user") or "1000:1000"
 user = str(user)
 if ":" not in user:
     user = f"{user}:{user}"
-print(src)
-print(user)
+print("USER", user)
+for v in svc.get("volumes", []) or []:
+    if isinstance(v, dict) and v.get("type") == "bind":
+        src = v.get("source", "")
+        dst = v.get("target", "")
+        if src:
+            print("BIND", src, dst)
 ') || { echo "error: failed to parse compose config" >&2; exit 1; }
 
-    local bind_source user_dir
-    bind_source=$(printf '%s\n' "$parsed" | sed -n '1p')
-    user_dir=$(printf '%s\n' "$parsed" | sed -n '2p')
-
-    if [ -z "$bind_source" ]; then
-        echo "error: no bind mount with target '/data' found in compose." >&2
-        echo "  Make sure your docker-compose.yml has a volumes: entry like" >&2
-        echo "  '- ~/.local/share/mautrix-imessage:/data'." >&2
-        exit 1
-    fi
-
+    local user_dir
+    user_dir=$(printf '%s\n' "$parsed" | awk '$1=="USER"{print $2}')
     if ! printf '%s' "$user_dir" | grep -qE '^[0-9]+:[0-9]+$'; then
         echo "error: 'user: $user_dir' in compose isn't numeric UID:GID." >&2
         echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
         exit 1
     fi
 
-    if [ ! -d "$bind_source" ]; then
-        echo "Note: '$bind_source' doesn't exist yet — will create it."
-        if [ "$(id -u)" = "0" ]; then
-            mkdir -p "$bind_source"
-        else
-            sudo mkdir -p "$bind_source"
-        fi
+    # Collect each bind mount source + its container destination.
+    local binds
+    binds=$(printf '%s\n' "$parsed" | awk '$1=="BIND"{print $2" "$3}')
+    if [ -z "$binds" ]; then
+        echo "error: no bind mounts found in compose." >&2
+        exit 1
     fi
 
     echo ""
     echo "Read from your compose project:"
-    echo "    bind mount    : $bind_source → /data"
     echo "    container user: $user_dir"
+    echo "    bind mounts:"
+    while IFS=' ' read -r src dst; do
+        [ -z "$src" ] && continue
+        printf '        %-50s → %s\n' "$src" "$dst"
+    done <<<"$binds"
+
     echo ""
-    echo "About to run:"
-    if [ "$(id -u)" = "0" ]; then
-        echo "    chown -R $user_dir $bind_source"
-    else
-        echo "    sudo chown -R $user_dir $bind_source"
-    fi
+    echo "About to chown each bind-mount source to $user_dir (recursively):"
+    while IFS=' ' read -r src dst; do
+        [ -z "$src" ] && continue
+        if [ "$(id -u)" = "0" ]; then
+            echo "    chown -R $user_dir $src"
+        else
+            echo "    sudo chown -R $user_dir $src"
+        fi
+    done <<<"$binds"
+
     local yn
     read -r -p "Proceed? [y/N]: " yn
     case "$yn" in
@@ -271,11 +271,25 @@ print(user)
         *) echo "Aborted."; exit 0 ;;
     esac
 
-    if [ "$(id -u)" = "0" ]; then
-        chown -R "$user_dir" "$bind_source"
-    else
-        sudo chown -R "$user_dir" "$bind_source"
-    fi
+    while IFS=' ' read -r src dst; do
+        [ -z "$src" ] && continue
+        if [ ! -d "$src" ]; then
+            echo "  → creating $src"
+            if [ "$(id -u)" = "0" ]; then
+                mkdir -p "$src"
+            else
+                sudo mkdir -p "$src"
+            fi
+        fi
+        if [ "$(id -u)" = "0" ]; then
+            chown -R "$user_dir" "$src"
+        else
+            sudo chown -R "$user_dir" "$src"
+        fi
+        echo "  ✓ $src"
+    done <<<"$binds"
+
+    echo ""
     echo "✓ Done. You can now run 'imessage start' (or 'imessage restart' if already up)."
 }
 

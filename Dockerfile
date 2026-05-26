@@ -180,25 +180,25 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
     && rm -f /tmp/AppleRootCA.cer
 
 # Non-root user with a stable UID/GID. Matches the typical first Linux
-# user (1000:1000), so a bind mount to ~/.local/share/mautrix-imessage
-# on the host works without chown gymnastics WHEN the host directory
-# is also owned by 1000:1000.
+# user (1000:1000), so bind mounts on hosts where appdata is also
+# 1000:1000 work without chown gymnastics.
 #
-# Home directory layout mirrors bare-Linux exactly so install scripts
-# that build $HOME/.local/share/mautrix-imessage/... paths land on the
-# bind mount the same way they land on the bare-Linux data dir:
+# Home-directory layout mirrors bare-Linux exactly so install scripts
+# that build $HOME/.local/share/mautrix-imessage/... paths land in
+# the same on-disk locations they would on bare-Linux:
 #
-#   $HOME = /home/bridge
-#   /home/bridge/.local/share/mautrix-imessage → symlink to /data
+#   $HOME                                       = /home/bridge
+#   /home/bridge/.local/share/mautrix-imessage  → symlink to /data
+#   /home/bridge/.config/bridge-manager         ← compose bind mount
+#                                                  for bbctl Beeper auth
 #
-# Result: $HOME/.local/share/mautrix-imessage/bbctl/ resolves to
-# /data/bbctl/ via the symlink, which is the top of the bind mount —
-# the exact same on-disk location bare-Linux puts bbctl in. Migrations
-# from bare-Linux Just Work; no nested duplicate directories appear on
-# the host volume.
+# bbctl writes auth credentials to $HOME/.config/bridge-manager — same
+# path as bare-Linux. The compose example bind-mounts the host's
+# ~/.config/bridge-manager directly there, so existing bare-Linux auth
+# migrates without copy, and Docker auth persists across restarts.
 RUN groupadd --system --gid 1000 bridge \
     && useradd --system --uid 1000 --gid 1000 --create-home --shell /bin/bash bridge \
-    && mkdir -p /home/bridge/.local/share \
+    && mkdir -p /home/bridge/.local/share /home/bridge/.config/bridge-manager \
     && ln -sf /data /home/bridge/.local/share/mautrix-imessage \
     && chown -R bridge:bridge /home/bridge \
     && mkdir -p /data \
@@ -229,14 +229,9 @@ WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 29325
 
-# Pin XDG_CONFIG_HOME to a subdir of /data so $HOME-relative tools
-# (notably bbctl, which keeps Beeper auth at $XDG_CONFIG_HOME/bridge-
-# manager/) land their state on the bind-mounted volume. Without this
-# bbctl would write to /home/bridge/.config — fine for the running
-# container, lost on every restart.
-ENV XDG_CONFIG_HOME=/data/.config
-ENV XDG_DATA_HOME=/data/.xdg-data
-ENV XDG_CACHE_HOME=/data/.xdg-cache
+# XDG env vars left unset on purpose — bbctl uses its default of
+# $HOME/.config/bridge-manager, which is bind-mounted from the host
+# via compose. Same path as bare-Linux, so auth migrates cleanly.
 
 # Container runs as the bridge user (UID:GID 1000:1000) from PID 1.
 # No privilege transitions, no gosu — what Docker starts is what runs.
