@@ -223,6 +223,33 @@ id beepuser
 | Synology DSM (`admin`) | `1024:100` (varies; verify with `id`) |
 | TrueNAS Scale (`apps`) | `568:568` |
 
+### Running Docker as root (common on VPS / dedicated servers)
+
+If you're logged into the host as `root` (`id -u` returns `0`), you have two clean options. Pick one:
+
+**Option A — chown appdata to 1000:1000 once, use defaults (recommended)**
+
+The image's bundled non-root `bridge` user is UID 1000, which is what `PUID` / `PGID` default to. Make the appdata directory match:
+
+```bash
+mkdir -p ~/.local/share/mautrix-imessage     # or your chosen host path
+sudo chown -R 1000:1000 ~/.local/share/mautrix-imessage
+```
+
+Leave `PUID` / `PGID` at `"1000"` in compose. The bridge process inside the container then runs as a real non-root user — the whole point of the `gosu` privilege drop in the entrypoint.
+
+**Option B — set PUID/PGID to 0**
+
+```yaml
+environment:
+  PUID: "0"
+  PGID: "0"
+```
+
+The entrypoint re-aliases the in-container `bridge` user to UID 0, and `gosu` then drops to it — which means the bridge process inside the container also runs as root. Functionally fine (Apple's servers don't care), but the container's privilege model collapses to root. Use Option A unless you specifically can't.
+
+The host CLI (`imessage`) calls `docker` directly and works the same either way — no extra config.
+
 ---
 
 ## Apple Silicon NAC relay
