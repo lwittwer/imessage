@@ -169,7 +169,6 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     python3 \
     sqlite3 \
     openssl \
-    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Apple Root CA — same source the bootstrap-linux.sh script fetches.
@@ -181,17 +180,19 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
     && rm -f /tmp/AppleRootCA.cer
 
 # Non-root user with a stable UID/GID. Matches the typical first Linux
-# user (1000:1000), so a bind mount to ~/.local/share/mautrix-imessage on
-# the host works without chown gymnastics. Users on hosts with a
-# different UID can override via `user:` in compose.
+# user (1000:1000), so a bind mount to ~/.local/share/mautrix-imessage
+# on the host works without chown gymnastics WHEN the host directory
+# is also owned by 1000:1000.
 #
 # HOME is /data on purpose — bbctl persists its Beeper auth state under
 # $HOME, and the bridge user's "home" needs to be on the bind-mounted
-# volume so credentials survive container restarts. This is the same
-# directory the bare-Linux install puts state in
-# (~/.local/share/mautrix-imessage), so paths match cross-runtime.
+# volume so credentials survive container restarts. Same directory the
+# bare-Linux install puts state in (~/.local/share/mautrix-imessage),
+# so paths match cross-runtime.
 RUN groupadd --system --gid 1000 bridge \
-    && useradd --system --uid 1000 --gid 1000 --home-dir /data --shell /bin/bash bridge
+    && useradd --system --uid 1000 --gid 1000 --home-dir /data --shell /bin/bash bridge \
+    && mkdir -p /data \
+    && chown bridge:bridge /data
 
 # Copy the built binaries and the existing install scripts. The scripts
 # stay as-is; the entrypoint dispatches to them. Three sections inside
@@ -218,12 +219,16 @@ WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 29325
 
-# Entrypoint starts as root (no USER directive). It chowns /data to
-# the bridge user when needed — handles the case where Docker
-# auto-created the bind-mount source as root because the host path
-# didn't exist on first `docker compose up` — then drops privileges
-# via gosu. The long-lived bridge process always runs as bridge (UID
-# 1000 by default; override with PUID / PGID env vars in compose for
-# hosts where appdata isn't owned by 1000, e.g. UNRAID, Synology).
+# Container runs as the bridge user (UID:GID 1000:1000) from PID 1.
+# No privilege transitions, no gosu — what Docker starts is what runs.
+#
+# Override via `user:` in docker-compose.yml for hosts where the
+# appdata directory is owned by a different UID:
+#   user: "99:100"    # UNRAID
+#   user: "0:0"       # root
+# Whichever you pick, the host data directory must be chowned to
+# match (sudo chown -R <uid>:<gid> /path/to/data/dir).
+USER bridge
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["run"]

@@ -60,6 +60,11 @@ LIFECYCLE (must run from the directory with docker-compose.yml — or set IMESSA
     restart         → docker compose restart Rustpush-Matrix
     pull            → docker compose pull
     update          → docker compose pull && docker compose up -d
+    fix-perms       Read the bind mount + user: from your compose file
+                    and chown the host data dir to match. Run before
+                    'imessage start' (especially on first install — the
+                    bridge can't open /data until its host owner matches
+                    the UID compose declares).
 
 ONE-TIME (host-side only — no docker calls)
     migrate         Migrate from a bare-Linux install:
@@ -67,9 +72,11 @@ ONE-TIME (host-side only — no docker calls)
                         ~/.bashrc / ~/.zshrc
                       • stop + disable + remove the mautrix-imessage
                         systemd unit (user + system scopes)
+                      • rewrite absolute paths in config.yaml to /data
                       • leave state at ~/.local/share/mautrix-imessage
                         in place
-                    Then run `imessage start` and `imessage setup`.
+                    Then run `imessage fix-perms`, `imessage start`,
+                    and `imessage setup`.
 
 OTHER
     help, -h, --help    Print this message.
@@ -156,6 +163,109 @@ cmd_logs()    {
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
 cmd_bbctl()   { exec docker exec -it "$CONTAINER" bbctl "$@"; }
+
+cmd_fix_perms() {
+    # Read the bind-mount source and target UID:GID directly from the
+    # compose file (NOT from a running container — fix-perms has to work
+    # before the first `imessage start`). Same compose-dir rule as
+    # start/stop/restart: must run from the directory with your
+    # docker-compose.yml or set IMESSAGE_COMPOSE_FILE.
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "error: fix-perms is interactive; run from a real terminal." >&2
+        exit 2
+    fi
+
+    # Verify we can render the compose file from here.
+    if ! compose config --format json >/dev/null 2>&1; then
+        cat >&2 <<EOF
+error: docker compose can't render a compose file from here.
+
+fix-perms reads the bind mount + user from your compose project —
+same CWD rule as 'imessage start'. cd to the directory containing
+docker-compose.yml, or set IMESSAGE_COMPOSE_FILE to its absolute path.
+EOF
+        exit 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "error: python3 is required to parse the compose file." >&2
+        echo "  Install it: apt install python3   (or your distro's equivalent)" >&2
+        exit 1
+    fi
+
+    # Pull the /data bind source and the container user out of the
+    # rendered compose JSON. Service name defaults to Rustpush-Matrix;
+    # falls back to the first service if the user renamed it.
+    local parsed
+    parsed=$(compose config --format json | python3 -c '
+import sys, json
+cfg = json.load(sys.stdin)
+services = cfg.get("services", {})
+svc = services.get("Rustpush-Matrix") or next(iter(services.values()), {})
+src = ""
+for v in svc.get("volumes", []) or []:
+    if isinstance(v, dict) and v.get("target") == "/data":
+        src = v.get("source", "")
+        break
+user = svc.get("user") or "1000:1000"
+user = str(user)
+if ":" not in user:
+    user = f"{user}:{user}"
+print(src)
+print(user)
+') || { echo "error: failed to parse compose config" >&2; exit 1; }
+
+    local bind_source user_dir
+    bind_source=$(printf '%s\n' "$parsed" | sed -n '1p')
+    user_dir=$(printf '%s\n' "$parsed" | sed -n '2p')
+
+    if [ -z "$bind_source" ]; then
+        echo "error: no bind mount with target '/data' found in compose." >&2
+        echo "  Make sure your docker-compose.yml has a volumes: entry like" >&2
+        echo "  '- ~/.local/share/mautrix-imessage:/data'." >&2
+        exit 1
+    fi
+
+    if ! printf '%s' "$user_dir" | grep -qE '^[0-9]+:[0-9]+$'; then
+        echo "error: 'user: $user_dir' in compose isn't numeric UID:GID." >&2
+        echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
+        exit 1
+    fi
+
+    if [ ! -d "$bind_source" ]; then
+        echo "Note: '$bind_source' doesn't exist yet — will create it."
+        if [ "$(id -u)" = "0" ]; then
+            mkdir -p "$bind_source"
+        else
+            sudo mkdir -p "$bind_source"
+        fi
+    fi
+
+    echo ""
+    echo "Read from your compose project:"
+    echo "    bind mount    : $bind_source → /data"
+    echo "    container user: $user_dir"
+    echo ""
+    echo "About to run:"
+    if [ "$(id -u)" = "0" ]; then
+        echo "    chown -R $user_dir $bind_source"
+    else
+        echo "    sudo chown -R $user_dir $bind_source"
+    fi
+    local yn
+    read -r -p "Proceed? [y/N]: " yn
+    case "$yn" in
+        [yY]|[yY][eE][sS]) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+
+    if [ "$(id -u)" = "0" ]; then
+        chown -R "$user_dir" "$bind_source"
+    else
+        sudo chown -R "$user_dir" "$bind_source"
+    fi
+    echo "✓ Done. You can now run 'imessage start' (or 'imessage restart' if already up)."
+}
 
 cmd_start()   { compose up -d; }
 cmd_stop()    { compose stop "$CONTAINER"; }
@@ -256,6 +366,7 @@ case "$cmd" in
     pull)               cmd_pull "$@" ;;
     update)             cmd_update "$@" ;;
     migrate)            cmd_migrate "$@" ;;
+    fix-perms)          cmd_fix_perms "$@" ;;
     ""|help|-h|--help)  usage ;;
     *)                  echo "error: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
 esac

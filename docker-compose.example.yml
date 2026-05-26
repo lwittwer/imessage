@@ -1,15 +1,19 @@
 # ============================================================================
 # Rustpush-Matrix — Docker compose example.
 #
-# Edit the three values below for your host:
+# Edit the two values below for your host:
 #   - The bind mount (volumes)  — pick your appdata path
-#   - PUID / PGID               — match the user that owns the bind mount
 #   - BEEPER                    — "true" for Beeper, "false" for self-hosted
 #
-# Everything else (CardDAV, FaceTime toggle, StatusKit, HEIC conversion,
-# video transcoding, preferred handle, …) is configured through the
+# The host data directory MUST be owned by the UID:GID the container
+# runs as. By default that's 1000:1000 (the typical first Linux user).
+# Run `imessage fix-perms` once after creating the dir if you're not
+# sure — it walks you through the chown.
+#
+# Everything else (CardDAV, FaceTime toggle, StatusKit, HEIC, video
+# transcoding, preferred handle, …) is configured through the
 # interactive `imessage setup` wizard and persisted in config.yaml on
-# the bind mount. Compose env vars stay minimal on purpose.
+# the bind mount. Compose stays minimal on purpose.
 # ============================================================================
 
 services:
@@ -26,8 +30,6 @@ services:
       # UNRAID:                  /mnt/user/appdata/Rustpush-Matrix
       # Synology:                /volume1/docker/Rustpush-Matrix
       # TrueNAS Scale:           a dataset of your choice
-      # If the path doesn't exist on the host, Docker creates it on
-      # first start and the entrypoint chowns it to PUID:PGID.
       - ~/.local/share/mautrix-imessage:/data
 
     environment:
@@ -36,16 +38,15 @@ services:
       #   "false" — self-hosted Synapse / Dendrite / Conduit
       BEEPER: "true"
 
-      # UID and GID the bridge runs as. MUST match whoever owns the
-      # bind-mount directory above, or the container won't be able to
-      # read/write your state files.
-      #
-      # Look up your values on the HOST:
-      #     id -u                                       # your UID
-      #     id -g                                       # your GID
-      #     stat -c '%u:%g' /your/appdata/path          # what owns the dir
-      #
-      # Typical values: 1000:1000 (first Linux user), 99:100 (UNRAID).
-      # See docs/docker.md → "Finding your UID and GID" for more.
-      PUID: "1000"
-      PGID: "1000"
+    # UID:GID the container runs as. Default 1000:1000 (the bundled
+    # bridge user in the image). Uncomment + edit ONLY if your host
+    # appdata directory is owned by something else.
+    #
+    # Common overrides:
+    #   user: "99:100"     # UNRAID (nobody:users)
+    #   user: "568:568"    # TrueNAS Scale (apps)
+    #   user: "0:0"        # root (discouraged; only if you must)
+    #
+    # Whatever UID:GID you pick, the host data directory above must be
+    # chowned to match. `imessage fix-perms` does that interactively.
+    # user: "1000:1000"

@@ -139,7 +139,8 @@ The `imessage` CLI is a thin wrapper — every subcommand maps to a small number
 | `restart` | `docker compose restart Rustpush-Matrix` |
 | `pull` | `docker compose pull` |
 | `update` | `docker compose pull && docker compose up -d` |
-| `migrate` | Pure host-side script — strips the bare-Linux managed-alias block from `~/.bashrc` / `~/.zshrc` and stops + disables + removes the `mautrix-imessage` systemd unit (user + system scopes). No `docker` calls. |
+| `migrate` | Pure host-side script — strips the bare-Linux managed-alias block from `~/.bashrc` / `~/.zshrc`, stops + disables + removes the `mautrix-imessage` systemd unit, rewrites absolute DB paths in config.yaml to `/data`. No `docker` calls. |
+| `fix-perms` | Reads bind-mount source + `user:` from your compose file (via `docker compose config`), then `chown -R <uid>:<gid> <bind source>`. Compose-driven, so it works before the container is ever created. Same CWD rule as `start`. |
 | `help` | Prints the subcommand list. |
 
 When `docker compose` is invoked above, the CLI inserts `-f "$IMESSAGE_COMPOSE_FILE"` if that env var is set, otherwise compose uses its default search behavior (current working directory). Container name comes from `${IMESSAGE_CONTAINER:-Rustpush-Matrix}`.

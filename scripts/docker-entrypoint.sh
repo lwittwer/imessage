@@ -12,40 +12,16 @@
 #             in compose selects which.
 #   login   — re-run only the iMessage login flow.
 #
-# Host-side concerns (shell aliases, bare-Linux migration) live in the
-# `imessage` host CLI script in this repo (scripts/imessage). The
-# container only does container things.
+# Host-side concerns (shell aliases, bare-Linux migration, fixing data
+# dir permissions) live in the `imessage` host CLI script in this repo
+# (scripts/imessage). The container only does container things.
 #
-# Privilege model: the CMD is invoked as root so the entrypoint can fix
-# /data ownership when Docker auto-creates the bind-mount source as
-# root (happens on first `docker compose up` if the host path didn't
-# exist yet). After chown, we re-exec via gosu as the bridge user. The
-# long-lived bridge process is never root.
+# The container runs as the `bridge` user (UID:GID 1000:1000) from PID
+# 1, set via USER in the Dockerfile. No privilege transitions. Users
+# who need a different UID/GID override via `user:` in compose AND
+# chown their data dir to match (`imessage fix-perms` automates this).
 # ============================================================================
 set -euo pipefail
-
-# ── Privilege bootstrap ──────────────────────────────────────────────────────
-# Runs only on the initial root invocation. After gosu re-exec we come
-# back in as the bridge user and skip this block.
-if [ "$(id -u)" = "0" ]; then
-    PUID="${PUID:-1000}"
-    PGID="${PGID:-1000}"
-
-    if [ "$(id -u bridge)" != "$PUID" ]; then
-        usermod -o -u "$PUID" bridge >/dev/null 2>&1 || true
-    fi
-    if [ "$(id -g bridge)" != "$PGID" ]; then
-        groupmod -o -g "$PGID" bridge >/dev/null 2>&1 || true
-    fi
-
-    mkdir -p /data
-    if [ "$(stat -c '%u:%g' /data 2>/dev/null)" != "${PUID}:${PGID}" ]; then
-        chown "${PUID}:${PGID}" /data
-    fi
-
-    exec gosu bridge "$0" "$@"
-fi
-# ── From here on we are the bridge user. ─────────────────────────────────────
 
 BIN=/usr/local/bin/mautrix-imessage-v2
 DATA_DIR=/data
