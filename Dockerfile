@@ -35,6 +35,8 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     libssl-dev \
     libunicorn-dev \
     libheif-dev \
+    libsqlite3-dev \
+    zlib1g-dev \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
