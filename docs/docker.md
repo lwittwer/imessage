@@ -223,7 +223,7 @@ id beepuser
 | Synology DSM (`admin`) | `1024:100` (varies; verify with `id`) |
 | TrueNAS Scale (`apps`) | `568:568` |
 
-### Running Docker as root (common on VPS / dedicated servers)
+### Running Docker as root
 
 If you're logged into the host as `root` (`id -u` returns `0`), you have two clean options. Pick one:
 
