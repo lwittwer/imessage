@@ -186,10 +186,8 @@ When the script finishes you're already logged in and the bridge is up.
 
 **Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the install script, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result.
 
-## Quick Start (Docker, Linux only) — WIP
+## Quick Start (Docker, Linux only)
 
-> ⚠ **Work in progress.** The Docker image, entrypoint, and migration flow are under active development. Expect rough edges, breaking changes, and no compatibility guarantees yet. Use the bare-Linux install for anything you rely on.
->
 > **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
 
 The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform (`/mnt/user/appdata/mautrix-imessage` on UNRAID, `/volume1/docker/mautrix-imessage` on Synology, any ZFS dataset, etc.).
@@ -207,7 +205,16 @@ imessage start
 imessage setup
 ```
 
-Updates are `imessage update`. Full walkthrough, the migration path from an existing bare-Linux install (`imessage migrate`), and the full subcommand list live in [`docs/docker.md`](docs/docker.md). The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
+Updates are `imessage update`. The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
+
+### Migrating between bare-Linux and Docker
+
+The bind-mount layout matches the bare-Linux paths (`~/.local/share/mautrix-imessage` and `~/.config/bbctl/`), so migration in either direction is a no-copy operation — stop one runtime, start the other against the same files.
+
+- **Bare-Linux → Docker:** `systemctl --user stop mautrix-imessage`, follow the Docker setup above keeping the default bind-mount source, then `imessage start`. The container's entrypoint chowns the existing files to `PUID:PGID`, symlinks the absolute host path inside the container to `/data` (so the DB URI in `config.yaml` resolves unchanged), and opens up traversal on the ancestors. No config edits, no re-login.
+- **Docker → bare-Linux:** `imessage stop && docker compose down`, then `make install` (or `make install-beeper`) as the user that owns the bind-mount files. The installer detects the existing `config.yaml` and DB and skips the iMessage login step.
+
+Full walkthrough including non-default platform paths, the privilege model, and edge cases live in [`docs/docker.md`](docs/docker.md).
 
 ## Login
 

@@ -116,5 +116,3 @@ echo "       curl -fsSL $REPO_RAW/docker-compose.example.yml -o docker-compose.y
 echo "  3. Edit it (BEEPER + bind-mount path), then start:"
 echo "       imessage start"
 echo "       imessage setup"
-echo ""
-echo "Full guide: https://github.com/lrhodin/imessage/blob/master/docs/docker.md"

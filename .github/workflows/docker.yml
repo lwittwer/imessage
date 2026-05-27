@@ -58,16 +58,22 @@ jobs:
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
           echo "Will push: $TAGS"
 
-      - name: Build & push (linux/amd64)
+      - name: Set up QEMU (cross-arch emulation for arm64 build)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build & push (linux/amd64, linux/arm64)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # linux/amd64 only for now. linux/arm64 builds work but take a
-          # long time (rustpush + open-absinthe + unicorn-engine all
-          # compile from source) — enable when there's demand:
-          # platforms: linux/amd64,linux/arm64
-          platforms: linux/amd64
+          # rustpush + open-absinthe + unicorn-engine all compile from
+          # source, so cold arm64 builds take a while (~25-30 min via
+          # QEMU). The GHA cache (cache-to: type=gha,mode=max) brings
+          # warm runs back in line with amd64. Manual-dispatch only, so
+          # this only fires when you ask for it.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

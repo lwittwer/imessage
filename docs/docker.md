@@ -111,7 +111,8 @@ imessage start
 
 1. Chowns each bind-mount target to `PUID:PGID` — but only if `find` spots a file that doesn't already match. Steady state is a single `find -quit` and a no-op.
 2. Reads `/proc/self/mountinfo` to discover the host path of the `/data` bind mount and creates a symlink at that path inside the container pointing to `/data`. Lets absolute paths baked into `config.yaml` by the bare-Linux installer (e.g. `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db`) resolve unchanged. Skipped if the symlink already points where it should.
-3. `setpriv`s to `PUID:PGID` and re-execs the entrypoint to run the bridge.
+3. Adds `o+x` to each ancestor of the symlink so `PUID` can traverse them (`/root` ships at `0700` in the base image, so without this the kernel denies the path walk before SQLite ever opens the file).
+4. `setpriv`s to `PUID:PGID` and re-execs the entrypoint to run the bridge.
 
 The container pulls the image (first time only, ~250 MB), comes up, and sits idle waiting for setup. You can confirm with:
 
@@ -135,6 +136,57 @@ This invokes the same install script the bare-Linux path uses, inside the contai
 Then you'll be asked about CardDAV (if applicable), preferred handle, and the optional toggles for FaceTime, StatusKit, HEIC conversion, video transcoding.
 
 When the wizard finishes, the container detects the new `config.yaml` and starts the bridge automatically. `imessage logs` should now show the bridge running. Go send yourself an iMessage to confirm the round trip.
+
+---
+
+## Migrating between bare-Linux and Docker
+
+The Docker image uses the **same on-disk layout** as the bare-Linux install: `/data` inside the container is bind-mounted from `~/.local/share/mautrix-imessage`, and `bbctl` auth from `~/.config/bbctl/`. Migrating in either direction is a no-copy operation — stop one runtime and start the other against the same files.
+
+### Bare-Linux → Docker
+
+1. Stop the bare-Linux bridge:
+   ```bash
+   systemctl --user stop mautrix-imessage
+   systemctl --user disable mautrix-imessage    # optional: don't restart on reboot
+   ```
+2. Run [Fresh install](#fresh-install) above. Keep the bind-mount source at the default `${HOME}/.local/share/mautrix-imessage` so it lines up with where your bare-Linux state already lives. **Skip `imessage setup`** — your existing `config.yaml` is already in place.
+3. `imessage start`. The container's root prelude:
+   - Chowns the existing files to `PUID:PGID` if they don't already match.
+   - Creates a symlink inside the container at the host bind-mount path → `/data`, so the absolute database paths the bare-Linux installer baked into `config.yaml` (e.g. `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db`) resolve unchanged.
+   - Adds `o+x` to each ancestor of that path so `PUID` can traverse them.
+
+   You do **not** need to edit `config.yaml`, copy files, or re-run the iMessage login — the existing config + DB are picked up as-is.
+
+### Docker → Bare-Linux
+
+1. Stop and remove the container:
+   ```bash
+   imessage stop
+   docker compose down
+   ```
+2. Build and install the bare-Linux bridge **as the user that owns the bind-mount files**. If you ran the container with `PUID:PGID = 1000:1000` (the default), that's typically your normal Linux user; if you ran with `PUID: "0"`, run the install as root.
+   ```bash
+   git clone https://github.com/lrhodin/imessage.git
+   cd imessage
+   make install              # self-hosted homeserver
+   # or:
+   make install-beeper       # Beeper
+   ```
+3. The installer detects the existing `config.yaml` and DB in `~/.local/share/mautrix-imessage`, skips the iMessage login step, writes the systemd unit, and starts the bridge against the same state Docker was using.
+
+If the bare-Linux user's `$HOME` differs from the one Docker was running under (e.g. you ran Docker as `root` with `${HOME}=/root`, and you're now installing bare-Linux under your own account), the absolute paths in `config.yaml` point at the wrong location. Two ways to fix:
+
+- **Move the state dir to match the new `$HOME`:**
+  ```bash
+  sudo mv /root/.local/share/mautrix-imessage ~/.local/share/
+  sudo chown -R $(id -u):$(id -g) ~/.local/share/mautrix-imessage
+  ```
+- **Or rewrite the DB `uri:` lines to relative paths** so they resolve against the data dir regardless of host:
+  ```bash
+  sed -i 's|file:/root/.local/share/mautrix-imessage/|file:|g; s|sqlite:/root/.local/share/mautrix-imessage/|sqlite:|g' \
+      ~/.local/share/mautrix-imessage/config.yaml
+  ```
 
 ---
 
