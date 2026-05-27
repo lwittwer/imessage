@@ -232,7 +232,7 @@ If those don't match what `PUID:PGID` is set to in compose, you have two options
 **For another user** (e.g. you'll run Docker as a separate service account):
 
 ```bash
-id beepuser
+id bridge
 ```
 
 **Platform quick reference** (a starting point; `id` / `stat` are still authoritative):
