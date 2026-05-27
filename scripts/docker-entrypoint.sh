@@ -91,6 +91,16 @@ if [ "$(id -u)" = "0" ]; then
                         ln -sfn /data "$host_src"
                     fi
                 fi
+
+                # Open up search (o+x) on each ancestor dir of the symlink so
+                # PUID can traverse them. /root ships at mode 0700 in the base
+                # image, so without this chmod the kernel denies the path walk
+                # before SQLite ever calls open() on the DB. Idempotent.
+                parent="$(dirname "$host_src")"
+                while [ -n "$parent" ] && [ "$parent" != "/" ]; do
+                    chmod o+x "$parent" 2>/dev/null || true
+                    parent="$(dirname "$parent")"
+                done
                 ;;
         esac
     fi
