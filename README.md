@@ -190,31 +190,137 @@ When the script finishes you're already logged in and the bridge is up.
 
 > **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
 
-The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform (`/mnt/user/appdata/mautrix-imessage` on UNRAID, `/volume1/docker/mautrix-imessage` on Synology, any ZFS dataset, etc.).
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/imessage` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts like Oracle Cloud's free-tier Ampere VMs (4 OCPU + 24 GB RAM, free forever — the ideal place to park this bridge if you don't have a Linux box at home) and Raspberry Pi 4/5. Images are published manually via the `docker` GitHub Actions workflow, not auto-built per commit. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+, `docker compose` v2 (`docker compose version`, not `docker-compose`), a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
 
-Two one-liners to install — the image lives in GHCR, and a small `imessage` host CLI ships alongside it:
+### Install
 
 ```bash
-# Install the host CLI — one line, drops `imessage` at /usr/local/bin (on PATH by default).
+# 1. Install the host CLI (drops `imessage` at /usr/local/bin, on PATH by default).
 curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
 
-# Drop in a compose file, then start + run setup.
+# 2. Pick a directory you'll keep docker-compose.yml in (~/docker/imessage/, /srv/imessage/, etc.).
+#    From inside it, drop in the example compose file:
 curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
-# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
+
+# 3. Edit it (see "Configuring docker-compose.yml" below).
+
+# 4. Bring it up and run the setup wizard. `imessage start` must be run from the directory
+#    containing docker-compose.yml — or set IMESSAGE_COMPOSE_FILE to its absolute path.
 imessage start
 imessage setup
 ```
 
-Updates are `imessage update`. The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
+`imessage setup` is the same install script the bare-Linux path uses, running inside the container. For Beeper that's: bbctl login → bbctl config → iMessage login (paste hardware key + Apple ID + password + 2FA). For self-hosted: homeserver URL → domain → Matrix ID → DB choice → iMessage login. Then optional CardDAV, preferred handle, FaceTime/StatusKit/HEIC/video toggles.
+
+When the wizard finishes, the container detects the new `config.yaml` and starts the bridge. `imessage logs` shows it running. Send yourself an iMessage to confirm the round trip.
+
+> **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` to the URL.
+
+### Configuring `docker-compose.yml`
+
+One required edit, one platform-dependent, one optional:
+
+1. **`BEEPER` env var** *(required)* — `"true"` for Beeper, `"false"` for self-hosted.
+2. **The bind mounts under `volumes:`** *(only if you're not on standard Linux)*. Defaults to `${HOME}/.local/share/mautrix-imessage` → `/data` (bridge state — `config.yaml`, DB, session, trustedpeers) and `${HOME}/.config/bbctl` → `/home/bridge/.config/bbctl` (bbctl Beeper auth). The bridge-state path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migration is no-copy.
+
+   | Platform | Bridge state path | bbctl path |
+   |---|---|---|
+   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bbctl` |
+   | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
+   | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
+   | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
+
+3. **`PUID` / `PGID`** *(optional, defaults `1000:1000`)* — the UID/GID the bridge runs as. Edit if you want the bridge to write as a different user: UNRAID `99:100` (`nobody:users`), TrueNAS Scale `568:568`, root `0:0` (discouraged). Numeric only — names don't translate. You don't need to chown your bind mounts to match; the entrypoint does that on first start.
+
+To look up your own: `id -u` / `id -g`, or `stat -c '%u:%g' <path>` for an existing directory.
+
+### Day-to-day commands
+
+| Want to… | Run |
+|---|---|
+| Tail bridge logs | `imessage logs` |
+| Check if it's running | `imessage status` |
+| Restart the bridge | `imessage restart` |
+| Stop / start it | `imessage stop` / `imessage start` |
+| Pull a new image + restart | `imessage update` |
+| Re-run iMessage login | `imessage login` |
+| Re-run setup (flip a toggle) | `imessage setup` |
+| Debug shell inside | `imessage shell` |
+| `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` |
+
+`setup` / `login` / `logs` / `status` / `shell` / `bbctl` work from anywhere (found by container name). Lifecycle commands (`start` / `stop` / `restart` / `pull` / `update`) need to be in the `docker-compose.yml` directory, or set `IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml` in your shell rc to run them from anywhere.
+
+### How the privilege model works
+
+The image's `USER` is unset — PID 1 enters the entrypoint as root. A small root prelude runs, all steps conditional on detection (so subsequent starts are no-ops):
+
+1. **Chowns bind-mount targets to `PUID:PGID`** — only if `find -quit` spots a mismatched file.
+2. **Creates a host-path symlink** from the bind mount's host source path inside the container → `/data`. Lets absolute paths from a bare-Linux install (e.g. `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db` baked into `config.yaml`) resolve when running in Docker. Skipped if the symlink already points where it should.
+3. **Adds `o+x` to each ancestor of the symlink** so `PUID` can traverse them — `/root` ships at `0700` in the base image, so without this the kernel denies the path walk before SQLite ever opens the file.
+4. **`setpriv`s to `PUID:PGID`** and re-execs itself. From there, the bridge runs as the configured non-root user.
+
+Host-side `docker exec` calls (`imessage setup` / `bbctl` / `shell` / `login`) go through `/usr/local/bin/as-bridge` inside the container, which re-applies the same setpriv drop so they don't end up running as root.
 
 ### Migrating between bare-Linux and Docker
 
-The bind-mount layout matches the bare-Linux paths (`~/.local/share/mautrix-imessage` and `~/.config/bbctl/`), so migration in either direction is a no-copy operation — stop one runtime, start the other against the same files.
+The bind-mount layout matches the bare-Linux paths, so migration in either direction is a no-copy operation — stop one runtime, start the other against the same files.
 
-- **Bare-Linux → Docker:** `systemctl --user stop mautrix-imessage`, follow the Docker setup above keeping the default bind-mount source, then `imessage start`. The container's entrypoint chowns the existing files to `PUID:PGID`, symlinks the absolute host path inside the container to `/data` (so the DB URI in `config.yaml` resolves unchanged), and opens up traversal on the ancestors. No config edits, no re-login.
-- **Docker → bare-Linux:** `imessage stop && docker compose down`, then `make install` (or `make install-beeper`) as the user that owns the bind-mount files. The installer detects the existing `config.yaml` and DB and skips the iMessage login step.
+**Bare-Linux → Docker:**
 
-Full walkthrough including non-default platform paths, the privilege model, and edge cases live in [`docs/docker.md`](docs/docker.md).
+```bash
+systemctl --user stop mautrix-imessage
+systemctl --user disable mautrix-imessage    # optional: don't restart on reboot
+```
+
+Then follow the Docker setup above keeping the default bind-mount source. **Skip `imessage setup`** — your existing `config.yaml` is already in place. `imessage start` is enough: the entrypoint chowns the existing files, symlinks the host path to `/data` so the absolute DB URI in `config.yaml` resolves unchanged, and opens traversal on the ancestors. No config edits, no re-login.
+
+**Docker → bare-Linux:**
+
+```bash
+imessage stop
+docker compose down
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
+make install          # or make install-beeper
+```
+
+Run the install **as the user that owns the bind-mount files**. The installer detects the existing `config.yaml` + DB, skips the iMessage login step, writes the systemd unit, and starts the bridge against the same state.
+
+If the bare-Linux user's `$HOME` differs from the one Docker ran under (e.g. Docker as `root` with `${HOME}=/root`, now installing as your own account), the absolute paths in `config.yaml` point at the wrong location. Either:
+
+```bash
+# Move the state dir to match the new $HOME:
+sudo mv /root/.local/share/mautrix-imessage ~/.local/share/
+sudo chown -R $(id -u):$(id -g) ~/.local/share/mautrix-imessage
+```
+
+…or rewrite the DB `uri:` lines to relative paths so they resolve against the data dir regardless of host:
+
+```bash
+sed -i 's|file:/root/.local/share/mautrix-imessage/|file:|g; s|sqlite:/root/.local/share/mautrix-imessage/|sqlite:|g' \
+    ~/.local/share/mautrix-imessage/config.yaml
+```
+
+### Apple Silicon NAC relay (Docker)
+
+If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches NAC validation data from a relay running on that Mac (see [Step 1 → Apple Silicon Mac](#apple-silicon-mac)). The relay URL, bearer token, and TLS fingerprint are all embedded in the base64 key — nothing to configure in compose. The Mac needs to be reachable from the Docker host (LAN, VPN, or port-forwarded WAN). Intel keys don't need a relay — the x86_64 unicorn emulator runs entirely in-process inside the container.
+
+### Troubleshooting (Docker)
+
+- **`imessage start` says "Cannot connect to the Docker daemon"** — Docker isn't running, or your user isn't in the `docker` group. Log out and back in after adding yourself.
+- **`imessage logs` keeps showing `no /data/config.yaml yet`** — `imessage setup` never finished, or exited mid-flow. Re-run; it's safe.
+- **Container restarts in a loop** — `imessage logs` shows the actual error. The entrypoint chowns and symlinks on every start where they're not already right, so persistent permission errors usually mean either (a) the bind mount itself isn't writable by root (read-only fs, immutable bits, SELinux/AppArmor) or (b) the bridge is failing for unrelated reasons.
+- **`unable to open database file: permission denied`** — config.yaml URI path doesn't match your bind-mount source. The entrypoint handles the common case (host bind source = path baked into config). You only need to edit `config.yaml` if you copied state from another machine. The fix is to make each `uri:` line relative:
+  ```yaml
+  uri: file:mautrix-imessage.db
+  ```
+  The bridge resolves relative paths against its working directory (`/data`). Stop the container, edit, start again — state files don't need to move.
+- **Bridge starts but doesn't show up in your homeserver** — `imessage logs` should show the appservice connecting. If it doesn't: on Beeper, re-run `imessage setup`. Self-hosted, confirm the bridge's `as_token`/`hs_token` and namespace from `<bind-mount>/registration.yaml` are loaded by your homeserver and that the homeserver URL in `config.yaml` is reachable from inside the container.
+- **Need a shell inside** — `imessage shell` drops you into bash as the bridge user.
+
+### Out of scope for Docker
+
+`backfill_source: chatdb` doesn't work (macOS-only, needs Full Disk Access). macOS Contacts framework — same reason; use external CardDAV. `extract-key` / NAC relay GUIs — those run on the user's Mac, not inside the container.
 
 ## Login
 

@@ -68,11 +68,14 @@ jobs:
         with:
           context: .
           push: true
-          # rustpush + open-absinthe + unicorn-engine all compile from
-          # source, so cold arm64 builds take a while (~25-30 min via
-          # QEMU). The GHA cache (cache-to: type=gha,mode=max) brings
-          # warm runs back in line with amd64. Manual-dispatch only, so
-          # this only fires when you ask for it.
+          # arm64 exists so the image runs on Oracle Cloud's free-tier
+          # Ampere VMs (4 OCPU + 24 GB RAM, perpetually free — the natural
+          # place to park this bridge if you don't have a Linux box at
+          # home) and Raspberry Pi 4/5. rustpush + open-absinthe +
+          # unicorn-engine all compile from source, so cold arm64 builds
+          # via QEMU take ~25-30 min. The GHA cache (cache-to:
+          # type=gha,mode=max) brings warm runs back in line with amd64.
+          # Manual-dispatch only, so this only fires when you ask for it.
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
