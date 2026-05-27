@@ -318,10 +318,6 @@ If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches
 - **Bridge starts but doesn't show up in your homeserver** — `imessage logs` should show the appservice connecting. If it doesn't: on Beeper, re-run `imessage setup`. Self-hosted, confirm the bridge's `as_token`/`hs_token` and namespace from `<bind-mount>/registration.yaml` are loaded by your homeserver and that the homeserver URL in `config.yaml` is reachable from inside the container.
 - **Need a shell inside** — `imessage shell` drops you into bash as the bridge user.
 
-### Out of scope for Docker
-
-`backfill_source: chatdb` doesn't work (macOS-only, needs Full Disk Access). macOS Contacts framework — same reason; use external CardDAV. `extract-key` / NAC relay GUIs — those run on the user's Mac, not inside the container.
-
 ## Login
 
 There are two ways to log in:
