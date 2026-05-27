@@ -12,6 +12,12 @@
 *.db*
 *.log
 
+# Docker (per-host compose + env, never commit). Dockerfile and
+# docker-compose.example.yml stay tracked.
+docker-compose.yml
+docker-compose.override.yml
+.env
+
 # Built binaries
 /mautrix-imessage
 /mautrix-imessage-v2
