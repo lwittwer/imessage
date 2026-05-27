@@ -29,6 +29,19 @@ curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/ins
 
 The installer downloads the `imessage` script, drops it at `/usr/local/bin/imessage` (on `$PATH` by default on every standard Linux distro), verifies it's actually executable, and prints the next step. Safe to re-run any time to update to the latest version.
 
+> **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append a `?nocache=$(date +%s)` query string. Forces a fresh edge fetch:
+> ```bash
+> # The installer (this Step 1 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh?nocache=$(date +%s)" | bash
+>
+> # The imessage wrapper directly, skipping install-imessage.sh (drop into /usr/local/bin/ by hand):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage?nocache=$(date +%s)" -o /usr/local/bin/imessage && chmod +x /usr/local/bin/imessage
+>
+> # The compose example (this Step 2 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml?nocache=$(date +%s)" -o docker-compose.yml
+> ```
+> Same trick works for any `raw.githubusercontent.com` URL: append `?nocache=$(date +%s)`.
+
 Verify:
 
 ```bash
