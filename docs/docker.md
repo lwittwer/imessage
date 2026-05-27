@@ -183,12 +183,12 @@ The container runs as the `bridge` user (UID:GID `1000:1000`) from PID 1 — set
 To run as a different UID/GID, override with Docker's `user:` directive in `docker-compose.yml`:
 
 ```yaml
-user: "99:100"     # UNRAID
+user: "99:100"     # UNRAID (nobody:users)
 user: "568:568"    # TrueNAS Scale
 user: "0:0"        # root (discouraged — loses the non-root containment)
 ```
 
-Whichever UID:GID you pick, the host bind-mount source paths must be chowned to match. `imessage fix-perms` reads compose, finds every bind-mount source, and chowns each to the right UID:GID in one step.
+Whichever UID:GID you pick, the host bind-mount source paths must be chowned to match. `imessage start` and `imessage fix-perms` read compose, find every bind-mount source, and chown each to the right UID:GID. Use numeric IDs, not names like `nobody:users`, because numeric IDs work consistently across the host and container boundary.
 
 ---
 

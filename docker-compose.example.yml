@@ -30,7 +30,7 @@ services:
 
     # Must match ownership of the bind-mount sources. Default 1000:1000 is
     # the typical first Linux user. Common alternatives:
-    #   UNRAID:        "99:100"
+    #   UNRAID:        "99:100"    # nobody:users
     #   TrueNAS Scale: "568:568"
     #   root:          "0:0"    # discouraged unless required
     user: "1000:1000"
