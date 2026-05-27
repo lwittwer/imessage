@@ -19,12 +19,6 @@ set -euo pipefail
 CONTAINER="${IMESSAGE_CONTAINER:-Rustpush-Matrix}"
 COMPOSE_FILE="${IMESSAGE_COMPOSE_FILE:-}"
 
-# Marker block format matches the bare-Linux install scripts so migrating
-# in either direction never produces duplicates. Keep this string in sync
-# with scripts/install-beeper-linux.sh and scripts/install-linux.sh.
-MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-
 usage() {
     cat <<'EOF'
 imessage — host-side CLI for the mautrix-imessage-v2 Docker bridge.
@@ -89,38 +83,6 @@ compose() {
     else
         docker compose "$@"
     fi
-}
-
-# detect_rc_files() — print paths to host shell rc files that exist.
-# Same heuristic the bare-Linux installer uses (case "$SHELL"), but we
-# return all matching files because users may have both.
-detect_rc_files() {
-    local files=()
-    case "${SHELL:-}" in
-        */zsh)  [ -f "$HOME/.zshrc" ] && files+=("$HOME/.zshrc") ;;
-        */bash) [ -f "$HOME/.bashrc" ] && files+=("$HOME/.bashrc") ;;
-        *)
-            # Unknown shell — fall back to whichever rc files exist.
-            [ -f "$HOME/.bashrc" ] && files+=("$HOME/.bashrc")
-            [ -f "$HOME/.zshrc" ] && files+=("$HOME/.zshrc")
-            ;;
-    esac
-    printf '%s\n' "${files[@]}"
-}
-
-# strip_marker_block <rc-file>
-# Safe to re-run: returns 0 if anything was stripped, 1 otherwise.
-strip_marker_block() {
-    local rc="$1"
-    if [ -f "$rc" ] && grep -qF "$MARKER_START" "$rc"; then
-        awk -v s="$MARKER_START" -v e="$MARKER_END" '
-            $0 == s { skip = 1; next }
-            $0 == e { skip = 0; next }
-            !skip   { print }
-        ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
-        return 0
-    fi
-    return 1
 }
 
 # ── commands ────────────────────────────────────────────────────────────────
