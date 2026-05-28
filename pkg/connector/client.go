@@ -1489,10 +1489,22 @@ func statusKitModeLabel(mode *string) string {
 // call back into Rust (e.g. ResolveHandle), would block the receive loop and
 // can deadlock on a single-threaded tokio runtime. All non-trivial work is
 // therefore dispatched to a goroutine immediately after the fast dedup check.
+// logSafeHandle returns a stable, opaque UUID-form token derived from a user
+// handle (phone number or email) so logs can correlate a user across lines
+// without recording the PII itself. Deterministic per handle and not reversible
+// (SHA-256, first 16 bytes formatted as a UUID).
+func logSafeHandle(handle string) string {
+	if handle == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(handle))
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
+}
+
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
-		Str("user", user).
+		Str("user", logSafeHandle(user)).
 		Logger()
 
 	if !c.Main.Config.StatusKitNotifications {
