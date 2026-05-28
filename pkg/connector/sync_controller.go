@@ -1531,12 +1531,17 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
-			cancel()
 			if err != nil {
 				log.Warn().Err(err).Msg("Body scrub failed")
 			} else if scrubbed > 0 {
 				log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
 			}
+			if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
+				log.Warn().Err(rerr).Msg("Reaction-text scrub failed")
+			} else if rscrubbed > 0 {
+				log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
+			}
+			cancel()
 		}
 	}
 }
@@ -1793,6 +1798,14 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
 	} else if scrubbed > 0 {
 		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+	}
+
+	// Privacy: reaction rows store the quoted-body descriptor but nothing reads
+	// it (reactions render from tapback metadata), so clear it unconditionally.
+	if scrubbed, err := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); err != nil {
+		log.Warn().Err(err).Msg("Failed to scrub reaction text")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
 	}
 
 	// Privacy: scrub plaintext from the un-backfillable tail (rows older than

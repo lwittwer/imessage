@@ -3378,6 +3378,52 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	return total, nil
 }
 
+// scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),
+// which store the SMS-style "Loved 'original message'" descriptor — leaking the
+// quoted body. cloudTapbackToBackfill renders reactions purely from
+// tapback_type, tapback_emoji, tapback_target_guid, and sender (it never reads
+// text/subject), so dropping the text leaves a fully functional reaction —
+// simple metadata only, like other bridges keep. No bridged/EXISTS gate is
+// needed: bridged reactions live in bridgev2's `reaction` table (not `message`,
+// so scrubBridgedBodies can't see them), and since nothing consumes the text,
+// clearing it past the grace window is safe whether or not it was delivered.
+// sender and tapback_emoji are preserved so re-backfill still attributes and
+// renders the reaction (including custom emoji).
+func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	const chunkSize = 1000
+	var total int64
+	for {
+		result, err := s.db.Exec(ctx, `
+			UPDATE cloud_message
+			SET text=NULL, subject=NULL, body_scrubbed=TRUE
+			WHERE login_id=$1 AND tapback_type >= 2000
+			  AND body_scrubbed=FALSE AND updated_ts < $2
+			  AND guid IN (
+			    SELECT guid FROM cloud_message
+			    WHERE login_id=$1 AND tapback_type >= 2000
+			      AND body_scrubbed=FALSE AND updated_ts < $2
+			      AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
+			    LIMIT $3
+			  )
+		`, s.loginID, cutoff, chunkSize)
+		if err != nil {
+			return total, fmt.Errorf("failed to scrub reaction text: %w", err)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+		if n < chunkSize {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return total, nil
+}
+
 // scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE
 // the newest keepPerPortal messages of their portal — the tail that backfill
 // can never reach. scrubBridgedBodies only clears rows already delivered to
