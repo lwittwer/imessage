@@ -117,7 +117,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
 		log.Warn().Err(sanitizeURLError(err, c.baseURL+"/")).Msg("CardDAV: failed to discover principal URL")
-		return err
+		return sanitizeURLError(err, c.baseURL+"/")
 	}
 	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("CardDAV: discovered principal URL")
 
@@ -125,7 +125,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
 		log.Warn().Err(sanitizeURLError(err, principalURL)).Msg("CardDAV: failed to discover address book home")
-		return err
+		return sanitizeURLError(err, principalURL)
 	}
 	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("CardDAV: discovered address book home")
 
@@ -133,7 +133,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
 		log.Warn().Err(sanitizeURLError(err, homeSetURL)).Msg("CardDAV: failed to list address books")
-		return err
+		return sanitizeURLError(err, homeSetURL)
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("CardDAV: found address books")
 

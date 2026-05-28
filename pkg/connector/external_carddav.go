@@ -96,21 +96,21 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	// Step 1: Discover principal
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
-		return fmt.Errorf("discover principal: %w", err)
+		return fmt.Errorf("discover principal: %w", sanitizeURLError(err, c.baseURL+"/"))
 	}
 	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("External CardDAV: discovered principal")
 
 	// Step 2: Get address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
-		return fmt.Errorf("discover address book home: %w", err)
+		return fmt.Errorf("discover address book home: %w", sanitizeURLError(err, principalURL))
 	}
 	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("External CardDAV: discovered address book home")
 
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
-		return fmt.Errorf("list address books: %w", err)
+		return fmt.Errorf("list address books: %w", sanitizeURLError(err, homeSetURL))
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("External CardDAV: found address books")
 
