@@ -48,6 +48,11 @@ type cloudMessageRow struct {
 	// Regular user messages always have this; system messages (group renames,
 	// participant changes) do not.
 	HasBody bool
+
+	// True once the body has been scrubbed because the message was bridged
+	// to Matrix. Identifiers (guid, timestamps, record_name) are kept for
+	// echo dedup and routing; text/subject/sender/attachments_json are NULL.
+	BodyScrubbed bool
 }
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
@@ -177,6 +182,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"date_read_ms", "BIGINT NOT NULL DEFAULT 0"},
 		{"record_name", "TEXT NOT NULL DEFAULT ''"},
 		{"has_body", "BOOLEAN NOT NULL DEFAULT TRUE"},
+		// Privacy: TRUE once the body has been scrubbed because the message
+		// was bridged to Matrix. Set by scrubBridgedBodies and preserved
+		// across CloudKit re-syncs by the upsert ON CONFLICT clause.
+		{"body_scrubbed", "BOOLEAN NOT NULL DEFAULT FALSE"},
 	} {
 		var exists int
 		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
@@ -499,15 +508,15 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			chat_id=excluded.chat_id,
 			portal_id=excluded.portal_id,
 			timestamp_ms=excluded.timestamp_ms,
-			sender=excluded.sender,
+			sender=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.sender ELSE excluded.sender END,
 			is_from_me=excluded.is_from_me,
-			text=excluded.text,
-			subject=excluded.subject,
+			text=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.text ELSE excluded.text END,
+			subject=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.subject ELSE excluded.subject END,
 			service=excluded.service,
 			deleted=CASE WHEN cloud_message.deleted THEN cloud_message.deleted ELSE excluded.deleted END,
 			tapback_type=excluded.tapback_type,
 			tapback_target_guid=excluded.tapback_target_guid,
-			tapback_emoji=excluded.tapback_emoji,
+			tapback_emoji=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.tapback_emoji ELSE excluded.tapback_emoji END,
 			attachments_json=excluded.attachments_json,
 			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
 			has_body=excluded.has_body,
@@ -584,7 +593,13 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 		}
 
 		query := fmt.Sprintf(
-			`UPDATE cloud_message SET deleted=TRUE, updated_ts=$2 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE,
+			     updated_ts=$2
+			 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
@@ -1759,7 +1774,12 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 // be re-bridged on backfill, while preserving the UUID for echo detection.
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) {
 	_, _ = s.db.Exec(ctx,
-		`UPDATE cloud_message SET deleted=TRUE WHERE login_id=$1 AND guid=$2`,
+		`UPDATE cloud_message
+		 SET deleted=TRUE,
+		     text=NULL, subject=NULL, sender='',
+		     tapback_emoji=NULL,
+		     body_scrubbed=TRUE
+		 WHERE login_id=$1 AND guid=$2`,
 		s.loginID, guid,
 	)
 }
@@ -1880,7 +1900,13 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 		return fmt.Errorf("failed to soft-delete cloud_chat records for portal %s: %w", portalID, err)
 	}
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
+		`UPDATE cloud_message
+		 SET deleted=TRUE,
+		     text=NULL, subject=NULL, sender='',
+		     tapback_emoji=NULL,
+		     body_scrubbed=TRUE,
+		     updated_ts=$3
+		 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
 		s.loginID, portalID, nowMS,
 	); err != nil {
 		return fmt.Errorf("failed to soft-delete cloud_message records for portal %s: %w", portalID, err)
@@ -2213,7 +2239,12 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')"
+		// body_scrubbed rows had content at bridge time; treat them as contentful
+		// so a fully-bridged-then-scrubbed portal's newest timestamp survives
+		// (used by queueRecoveredPortalResync to gate ChatResync events).
+		// tapback_type IS NULL excludes scrubbed reactions, which aren't
+		// "content" in the same sense.
+		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))"
 	}
 	var ts sql.NullInt64
 	err := s.db.QueryRow(ctx, baseQuery, s.loginID, portalID).Scan(&ts)
@@ -2313,7 +2344,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 		SELECT COUNT(*)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')
+		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
@@ -2331,7 +2362,7 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')"
+		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))"
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count); err != nil {
@@ -2343,7 +2374,8 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
-	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE)`
+	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
+	COALESCE(body_scrubbed, FALSE)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -2456,6 +2488,7 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.AttachmentsJSON,
 			&row.DateReadMS,
 			&row.HasBody,
+			&row.BodyScrubbed,
 		); err != nil {
 			return nil, err
 		}
@@ -2857,6 +2890,29 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	return int(n), nil
 }
 
+// clearBodyScrubByPortalID drops the body_scrubbed flag for every row in a
+// portal so the next CloudKit upsert can repopulate text/subject/sender/
+// tapback_emoji from Apple's source of truth. Called from the restore-chat
+// pipeline before re-fetching messages: scrub protection in the upsert ON
+// CONFLICT clause keeps NULL bodies sticky, which is correct for normal
+// re-syncs but blocks user-triggered restore. Returns the number of rows
+// updated.
+//
+// After restore completes and the messages are re-bridged, the periodic
+// scrubBridgedBodies tick re-scrubs them (within bodyScrubInterval).
+func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, portalID string) (int, error) {
+	result, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET body_scrubbed=FALSE
+		 WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=TRUE`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 // seedChatFromRecycleBin inserts or updates a cloud_chat row with data from
 // Apple's recycle bin. This ensures GetChatInfo can resolve group name,
 // participants, and style even when the local cloud_chat table was wiped.
@@ -3109,6 +3165,88 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
+}
+
+// scrubBridgedBodies nulls plaintext message content (text, subject, sender,
+// tapback_emoji) on cloud_message rows whose corresponding Matrix event has
+// been successfully delivered (an entry exists in bridgev2's `message` table)
+// and which were ingested at least graceWindow ago. The grace window is a
+// buffer against bridgev2 racing the scrubber on freshly-ingested messages.
+//
+// SMS reaction quoting (HandleMatrixReaction for IsSms portals needs the
+// original body to format "Loved 'x'") goes through getReactionTargetBody
+// which falls back to fetching the body from the Matrix room via
+// Bot.GetEvent — the body still exists where the bridge posted it.
+//
+// Intentionally NOT scrubbed: attachments_json. It contains CloudKit
+// record_names that AttachmentRetrier needs to repull files from Apple when
+// a Matrix upload fails post-bridge, and that pruneOrphanedAttachmentCache
+// uses to keep the mxc-URI cache in sync. The actual attachment bytes live
+// in CloudKit; the JSON here is metadata pointing back to that source.
+//
+// Identifiers and routing columns (guid, record_name, timestamp_ms,
+// is_from_me, portal_id, chat_id, service, tapback_type, tapback_target_guid,
+// has_body, created_ts, date_read_ms, deleted, attachments_json) are retained.
+//
+// The body_scrubbed flag is preserved across CloudKit re-syncs by the
+// upsert ON CONFLICT clause in upsertMessageBatch, so a re-sync of a
+// previously-scrubbed message cannot re-populate the body. User-triggered
+// restore-chat calls clearBodyScrubByPortalID first to bypass that gate
+// so the fresh CloudKit fetch can repopulate text for re-bridging.
+//
+// Note on the grace window: `created_ts` is the bridge-ingest time (set on
+// first INSERT, not bumped on UPSERT). For live messages, that's seconds
+// before the Matrix event is created. For history backfilled from CloudKit,
+// every row's `created_ts` is already past the grace window — the EXISTS
+// gate against bridgev2's `message` table is the load-bearing safety check.
+//
+// Chunked to avoid long-running DB locks on the first post-deploy run, which
+// may scrub the entire backlog of already-delivered messages at once.
+func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	var total int64
+	// Small chunks + a brief yield between chunks so the scrubber doesn't
+	// contend with live upsertMessageBatch / APNs ingestion when the
+	// first-boot backlog is large.
+	const chunkSize = 1000
+	for {
+		result, err := s.db.Exec(ctx, `
+			UPDATE cloud_message
+			SET text=NULL,
+			    subject=NULL,
+			    sender='',
+			    tapback_emoji=NULL,
+			    body_scrubbed=TRUE
+			WHERE login_id=$1
+			  AND guid IN (
+			    SELECT guid FROM cloud_message
+			    WHERE login_id=$1
+			      AND body_scrubbed=FALSE
+			      AND created_ts < $2
+			      AND EXISTS (
+			        SELECT 1 FROM message
+			        WHERE bridge_id=$3
+			          AND id=cloud_message.guid
+			          AND (room_receiver=$1 OR room_receiver='')
+			      )
+			    LIMIT $4
+			  )
+		`, s.loginID, cutoff, bridgeID, chunkSize)
+		if err != nil {
+			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+		if n < chunkSize {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return total, nil
 }
 
 // deleteOrphanedMessages hard-deletes cloud_message rows that are already

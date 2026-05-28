@@ -1504,6 +1504,43 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 // fails, so recovery happens quickly.
 const cloudSyncRetryInterval = 1 * time.Minute
 
+// bodyScrubInterval and bodyScrubGracePeriod control how aggressively the
+// privacy scrubber clears plaintext from cloud_message rows whose Matrix
+// event has been delivered. The grace period is a buffer against bridgev2
+// racing the scrubber on freshly-ingested messages; the interval is the
+// steady-state sweep cadence.
+const (
+	bodyScrubInterval    = 5 * time.Minute
+	bodyScrubGracePeriod = 5 * time.Minute
+)
+
+// runBodyScrubLoop runs the privacy scrubber on a fixed interval for the
+// lifetime of the IMClient. Bootstrap-time scrubbing is handled by
+// runPostSyncHousekeeping; this loop covers steady-state ongoing operation
+// (the bridge runs for days at a time).
+func (c *IMClient) runBodyScrubLoop(log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	ticker := time.NewTicker(bodyScrubInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod)
+			cancel()
+			if err != nil {
+				log.Warn().Err(err).Msg("Body scrub failed")
+			} else if scrubbed > 0 {
+				log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+			}
+		}
+	}
+}
+
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// NOTE: no defer recover() here intentionally. A panic in this goroutine
 	// must crash the process so the bridge restarts and re-runs CloudKit sync.
@@ -1746,6 +1783,16 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Warn().Err(err).Msg("Failed to prune orphaned attachment cache")
 	} else if pruned > 0 {
 		log.Info().Int64("pruned", pruned).Msg("Pruned orphaned attachment cache entries")
+	}
+
+	// Privacy: scrub plaintext from cloud_message rows that have been
+	// successfully bridged to Matrix. Runs both here (post-bootstrap, so
+	// existing rows migrate on first boot of this version) and on a
+	// dedicated ticker (see runBodyScrubLoop).
+	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod); err != nil {
+		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
 	}
 
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.

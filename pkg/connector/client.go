@@ -1335,6 +1335,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
 		c.startCloudSyncController(log)
+		go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger())
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -4053,6 +4054,14 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	} else {
 		log.Info().Int("undeleted", undeleted).Msg("Undeleted cloud_message rows for restore")
 	}
+	// Clear body_scrubbed so the upsert from the upcoming CloudKit re-fetch
+	// can repopulate text/subject/sender — privacy scrubbing will re-apply
+	// on the next periodic tick after the restored messages are re-bridged.
+	if cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		log.Warn().Err(err).Msg("Failed to clear body_scrubbed flag for restore")
+	} else if cleared > 0 {
+		log.Info().Int("cleared", cleared).Msg("Cleared body_scrubbed flag for restore (will re-scrub after re-bridge)")
+	}
 	needsRecoverMessages := false
 	if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err != nil {
 		log.Warn().Err(err).Msg("Failed to check portal messages during restore")
@@ -5872,10 +5881,8 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		// suffixed ID would fail lookups and relay routing.
 		targetGUID, _ := extractTapbackTarget(string(msg.TargetMessage.ID))
 		reactionText := formatSMSReactionText(reaction, emoji, false)
-		if c.cloudStore != nil {
-			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
-				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
-			}
+		if origText := c.getReactionTargetBody(ctx, targetGUID); origText != "" {
+			reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
 		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
@@ -5921,10 +5928,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 		// suffixed ID would fail lookups and relay routing.
 		targetGUID, _ := extractTapbackTarget(string(msg.TargetReaction.MessageID))
 		reactionText := formatSMSReactionText(reaction, emoji, true)
-		if c.cloudStore != nil {
-			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
-				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
-			}
+		if origText := c.getReactionTargetBody(ctx, targetGUID); origText != "" {
+			reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
 		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
@@ -10246,6 +10251,61 @@ func parseBalloonPart(s, format string) int {
 	var bp int
 	fmt.Sscanf(s, format, &bp)
 	return bp
+}
+
+// getReactionTargetBody returns the original message body of a reaction's
+// target. SMS reactions sent from Matrix are rendered on the recipient's
+// device by quoting the original text (e.g. "Loved 'hey'"); the receiving
+// iPhone parses that exact format to render a tap on the message bubble.
+//
+// Lookup order:
+//  1. cloud_message.text — fast, works for unscrubbed rows.
+//  2. The bridged Matrix event — the body the bridge originally posted to
+//     Matrix is still there even after the privacy scrubber clears it from
+//     cloud_message. Bot.GetEvent is the bridgev2 MatrixAPI primitive (it
+//     also handles decryption for E2EE rooms).
+//
+// Returns "" if neither path finds a body — callers fall back to the
+// non-quoted SMS reaction text.
+func (c *IMClient) getReactionTargetBody(ctx context.Context, targetGUID string) string {
+	if c.cloudStore != nil {
+		if t, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && t != "" {
+			return t
+		}
+	}
+	if c.Main == nil || c.Main.Bridge == nil {
+		return ""
+	}
+	dbMsg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, c.UserLogin.ID, makeMessageID(targetGUID))
+	if err != nil || dbMsg == nil {
+		return ""
+	}
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, dbMsg.Room)
+	if err != nil || portal == nil || portal.MXID == "" {
+		return ""
+	}
+	evt, err := c.Main.Bridge.Bot.GetEvent(ctx, portal.MXID, dbMsg.MXID)
+	if err != nil || evt == nil {
+		return ""
+	}
+	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
+	if !ok {
+		return ""
+	}
+	body := content.Body
+	// cloudRowToBackfillMessages prepends "**Subject**\n" to the body for
+	// MMS messages that carry a subject header. The iPhone tapback parser
+	// matches against the original bubble text (no subject prefix), so
+	// strip a leading bold-Markdown line before returning. False-positive
+	// risk is bounded — user-typed bodies that happen to start with
+	// "**X**\n" would already mismatch the original SMS text and not
+	// render as a tap anyway.
+	if strings.HasPrefix(body, "**") {
+		if idx := strings.Index(body, "**\n"); idx > 2 {
+			body = body[idx+3:]
+		}
+	}
+	return body
 }
 
 // extractTapbackTarget splits a message ID that may contain an _attN suffix into
