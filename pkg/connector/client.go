@@ -3748,6 +3748,23 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 			Str("portal_id", string(portalKey.ID)).
 			Msg("Sending redaction for deleted message")
 
+		// Scrub-before-emit: once we QueueRemoteEvent MessageRemove, bridgev2
+		// will (asynchronously) delete its own message row, and once that's
+		// gone the periodic scrubber's EXISTS check against bridgev2 message
+		// is permanently FALSE for this guid — meaning a scrub failure here
+		// would leave plaintext in cloud_message until next bridge restart.
+		// Scrub first so a DB error is observable while the row still has a
+		// bridgev2 counterpart to retry against.
+		if c.cloudStore != nil {
+			scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+			cancel()
+			if err != nil {
+				log.Warn().Err(err).Str("target_uuid", targetUUID).
+					Msg("Failed to scrub plaintext for deleted message — periodic scrubber will retry while bridgev2 row exists")
+			}
+		}
+
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
 			EventMeta: simplevent.EventMeta{
 				Type:      bridgev2.RemoteEventMessageRemove,
@@ -3757,15 +3774,6 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 			},
 			TargetMessage: makeMessageID(targetUUID),
 		})
-
-		// Scrub plaintext from cloud_message inline. bridgev2 will delete its
-		// own message row in response to the MessageRemove above; after that
-		// the periodic scrubber's EXISTS check against bridgev2 message is
-		// permanently FALSE for this guid, so the row's text/subject/sender
-		// would otherwise persist until next bridge restart.
-		if c.cloudStore != nil {
-			c.cloudStore.softDeleteMessageByGUID(context.Background(), targetUUID)
-		}
 	}
 }
 
@@ -5840,7 +5848,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
-			c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
+				zerolog.Ctx(ctx).Warn().Err(scrubErr).Str("sibling_uuid", siblingUUID).
+					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
+			}
 		}
 	}
 
@@ -5852,7 +5863,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
 	if c.cloudStore != nil {
-		c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID))
+		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
+				Msg("Failed to soft-delete cloud_message after outbound unsend")
+		}
 	}
 
 	return err
@@ -7194,6 +7208,19 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 }
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
+	// Privacy: a body_scrubbed row was already bridged to Matrix (the
+	// scrubber's EXISTS predicate requires a bridgev2 `message` row for the
+	// same GUID before clearing text/subject/sender/tapback_emoji). Emitting
+	// here would produce empty-body events. Skip — bridgev2 already has the
+	// message and would dedup anyway under aggressive-dedup, plus this avoids
+	// the empty-body cliff for any backfill path that lands on a scrubbed row
+	// whose bridgev2 counterpart got purged. Restore-chat clears
+	// body_scrubbed before re-fetching from CloudKit, so the user-initiated
+	// restore path is unaffected.
+	if row.BodyScrubbed {
+		return nil
+	}
+
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
 

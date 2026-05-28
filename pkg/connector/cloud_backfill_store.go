@@ -1772,8 +1772,8 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
 // be re-bridged on backfill, while preserving the UUID for echo detection.
-func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) {
-	_, _ = s.db.Exec(ctx,
+func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
+	_, err := s.db.Exec(ctx,
 		`UPDATE cloud_message
 		 SET deleted=TRUE,
 		     text=NULL, subject=NULL, sender='',
@@ -1782,6 +1782,10 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 		 WHERE login_id=$1 AND guid=$2`,
 		s.loginID, guid,
 	)
+	if err != nil {
+		return fmt.Errorf("soft-delete message %s: %w", guid, err)
+	}
+	return nil
 }
 
 // getGroupPhotoByPortalID returns the group_photo_guid and record_name for
@@ -3194,11 +3198,13 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 // restore-chat calls clearBodyScrubByPortalID first to bypass that gate
 // so the fresh CloudKit fetch can repopulate text for re-bridging.
 //
-// Note on the grace window: `created_ts` is the bridge-ingest time (set on
-// first INSERT, not bumped on UPSERT). For live messages, that's seconds
-// before the Matrix event is created. For history backfilled from CloudKit,
-// every row's `created_ts` is already past the grace window — the EXISTS
-// gate against bridgev2's `message` table is the load-bearing safety check.
+// Note on the grace window: `updated_ts` is the most-recent ingest time
+// (bumped on every UPSERT, so restore-chat's CloudKit re-fetch resets it).
+// Using updated_ts (not created_ts) gives the bridgev2 backfill pipeline a
+// fresh 5-min window to read the re-populated text before the next
+// scrubber tick wipes it again — the restore-chat race documented in the
+// privacy audit. The EXISTS gate against bridgev2's `message` table is the
+// load-bearing safety check; the timestamp window just buys backfill time.
 //
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
 // may scrub the entire backlog of already-delivered messages at once.
@@ -3222,7 +3228,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 			    SELECT guid FROM cloud_message
 			    WHERE login_id=$1
 			      AND body_scrubbed=FALSE
-			      AND created_ts < $2
+			      AND updated_ts < $2
 			      AND EXISTS (
 			        SELECT 1 FROM message
 			        WHERE bridge_id=$3
