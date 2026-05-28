@@ -337,8 +337,7 @@ func (c *cloudContactsClient) listAddressBooks(log zerolog.Logger, homeSetURL st
 	}
 
 	log.Debug().
-		Int("response_bytes", len(data)).
-		Str("body_preview", string(data[:min(len(data), 3000)])).
+		Int("body_bytes", len(data)).
 		Msg("CardDAV: listAddressBooks PROPFIND response")
 	return c.parseAddressBookList(data, homeSetURL, log), nil
 }
@@ -370,8 +369,8 @@ func (c *cloudContactsClient) fetchAllVCards(log zerolog.Logger, addressBookURL 
 	}
 
 	log.Debug().
-		Int("response_bytes", len(data)).
-		Str("address_book", addressBookURL).
+		Int("body_bytes", len(data)).
+		Str("address_book_host", logSafeURL(addressBookURL)).
 		Msg("CardDAV: REPORT response received")
 
 	return c.parseVCardMultistatus(data, log), nil

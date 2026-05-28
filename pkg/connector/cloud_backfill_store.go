@@ -78,18 +78,18 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
-	// Privacy: secure_delete = ON forces SQLite to zero out freed pages
-	// during DELETE/UPDATE rather than leave the prior content readable in
-	// unallocated space. Persistent in the DB header — set once, applies
-	// to every subsequent write. Without this, NULLing text/subject/sender
-	// in scrubBridgedBodies leaves the original strings recoverable by file
-	// inspection until VACUUM (which we don't run automatically because it
-	// rewrites the entire DB and would block writes for the duration on a
-	// large backlog). Self-hosters who want immediate page reclamation can
-	// run `sqlite3 bridge.db "VACUUM;"` manually after first-boot scrub.
-	// Non-fatal: older SQLite versions or non-SQLite backends (if ever added)
-	// may not support it; the schema setup must still proceed.
-	_, _ = s.db.Exec(ctx, `PRAGMA secure_delete = ON`)
+	// Privacy: secure_delete forces SQLite to zero out freed pages during
+	// DELETE/UPDATE so NULLing text/subject/sender in scrubBridgedBodies does
+	// not leave the original strings recoverable by file inspection until
+	// VACUUM (which we don't run automatically because it rewrites the entire
+	// DB and would block writes for the duration on a large backlog).
+	// secure_delete is a PER-CONNECTION setting that is NOT persisted in the
+	// DB file, so it is set via the _secure_delete DSN param in
+	// ensureSecureDeleteDSN (cmd/mautrix-imessage/main.go) — that applies it
+	// on every pooled connection, which a one-shot PRAGMA here could not do
+	// (the pool hands scrub writes to arbitrary connections). Self-hosters who
+	// want immediate page reclamation can run `sqlite3 bridge.db "VACUUM;"`
+	// manually after first-boot scrub.
 
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
@@ -1805,45 +1805,55 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
 // be re-bridged on backfill, while preserving the UUID for echo detection.
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
-	// UPPER() on both sides: APNs delivers UUIDs uppercase while CloudKit
-	// can store them lower/mixed; a case-sensitive = miss would silently
-	// no-op and let the fail-closed delete path proceed thinking it scrubbed.
-	// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
-	res, err := s.db.Exec(ctx,
-		`UPDATE cloud_message
-		 SET deleted=TRUE,
-		     text=NULL, subject=NULL, sender='',
-		     tapback_emoji=NULL,
-		     body_scrubbed=TRUE
-		 WHERE login_id=$1 AND UPPER(guid)=UPPER($2)`,
-		s.loginID, guid,
-	)
-	if err != nil {
-		return fmt.Errorf("soft-delete message %s: %w", guid, err)
-	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
+	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
+	// 0 rows and the INSERT OR IGNORE running, a concurrent CloudKit upsert
+	// could land a live (deleted=FALSE) row for this guid. INSERT OR IGNORE
+	// would then no-op against it and the body would bridge undeleted. Wrap
+	// both in a single txn so the upsert serializes either fully before
+	// (UPDATE scrubs it) or fully after (its ON CONFLICT CASE preserves the
+	// stub's deleted=TRUE). DoTxn reuses an outer txn if ctx already carries
+	// one, so this stays correct when called inside a larger transaction.
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		// UPPER() on both sides: APNs delivers UUIDs uppercase while CloudKit
+		// can store them lower/mixed; a case-sensitive = miss would silently
+		// no-op and let the fail-closed delete path proceed thinking it scrubbed.
+		// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
+		res, err := s.db.Exec(ctx,
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE
+			 WHERE login_id=$1 AND UPPER(guid)=UPPER($2)`,
+			s.loginID, guid,
+		)
+		if err != nil {
+			return fmt.Errorf("soft-delete message %s: %w", guid, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			return nil
+		}
+		// Stub-insert path: Apple-side delete can arrive before CloudKit sync
+		// ever populates cloud_message (typical for messages sent and quickly
+		// retracted on the iPhone, or for portals still pending creation that
+		// hold the original in pendingPortalMsgs). Drop a deleted=TRUE stub
+		// so the future CloudKit upsert's ON CONFLICT CASE preserves the
+		// deletion (excluded.deleted ignored when cloud_message.deleted=TRUE).
+		// Without this stub the row would arrive live and bridge the body
+		// Apple already deleted on the user's devices.
+		nowMS := time.Now().UnixMilli()
+		_, err = s.db.Exec(ctx,
+			`INSERT OR IGNORE INTO cloud_message
+				(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
+			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)`,
+			s.loginID, guid, nowMS, nowMS,
+		)
+		if err != nil {
+			return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)
+		}
 		return nil
-	}
-	// Stub-insert path: Apple-side delete can arrive before CloudKit sync
-	// ever populates cloud_message (typical for messages sent and quickly
-	// retracted on the iPhone, or for portals still pending creation that
-	// hold the original in pendingPortalMsgs). Drop a deleted=TRUE stub
-	// so the future CloudKit upsert's ON CONFLICT CASE preserves the
-	// deletion (excluded.deleted ignored when cloud_message.deleted=TRUE).
-	// Without this stub the row would arrive live and bridge the body
-	// Apple already deleted on the user's devices.
-	nowMS := time.Now().UnixMilli()
-	_, err = s.db.Exec(ctx,
-		`INSERT OR IGNORE INTO cloud_message
-			(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
-		 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)`,
-		s.loginID, guid, nowMS, nowMS,
-	)
-	if err != nil {
-		return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)
-	}
-	return nil
+	})
 }
 
 // getGroupPhotoByPortalID returns the group_photo_guid and record_name for
