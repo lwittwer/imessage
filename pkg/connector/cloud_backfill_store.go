@@ -3306,6 +3306,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		    SELECT guid FROM cloud_message
 		    WHERE login_id=$1
 		      AND body_scrubbed=FALSE
+		      AND tapback_type IS NULL
 		      AND updated_ts < $2
 		      AND (
 		        deleted=TRUE

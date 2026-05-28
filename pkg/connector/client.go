@@ -3837,14 +3837,20 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	// ChatDelete emit. Once bridgev2 wipes its message rows via
 	// Message.DeleteInChunks, the scrubber's EXISTS predicate is forever
 	// FALSE for those guids — a scrub failure here would leak the entire
-	// chat's plaintext until next restart.
+	// chat's plaintext until next restart. Each DB op gets its own 5s
+	// budget so a slow clearRestoreOverride can't starve the load-bearing
+	// deleteLocalChatByPortalID into a spurious DeadlineExceeded.
 	if c.cloudStore != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := c.cloudStore.clearRestoreOverride(ctx, portalID); err != nil {
+		overrideCtx, overrideCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := c.cloudStore.clearRestoreOverride(overrideCtx, portalID); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear restore override for Apple-deleted chat")
 		}
-		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+		overrideCancel()
+
+		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c.cloudStore.deleteLocalChatByPortalID(deleteCtx, portalID)
+		deleteCancel()
+		if err != nil {
 			log.Error().Err(err).Str("portal_id", portalID).
 				Msg("Skipping ChatDelete emit because cloud_message scrub failed — preserving privacy at the cost of a stale Beeper portal")
 			return
@@ -5892,6 +5898,12 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		siblingUUID = meta.SiblingUUID
 	}
 
+	// Track scrub failures so we can fail-closed at the end after both
+	// Apple-side unsends have been attempted. We can't bail mid-flight
+	// because we've already committed to one Apple-side unsend by the
+	// time we get to the second.
+	var scrubErrs []error
+
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
 		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
@@ -5900,8 +5912,9 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
 			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
-				zerolog.Ctx(ctx).Warn().Err(scrubErr).Str("sibling_uuid", siblingUUID).
+				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
 					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
+				scrubErrs = append(scrubErrs, scrubErr)
 			}
 		}
 	}
@@ -5915,12 +5928,25 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// while preserving the UUID for echo detection.
 	if c.cloudStore != nil {
 		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
-			zerolog.Ctx(ctx).Warn().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
+			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
 				Msg("Failed to soft-delete cloud_message after outbound unsend")
+			scrubErrs = append(scrubErrs, scrubErr)
 		}
 	}
 
-	return err
+	// Fail-closed: report scrub failure to bridgev2 so it doesn't proceed
+	// with future row deletion (currently a `// TODO delete msg/reaction
+	// db row` in bridgev2/portal.go:2442 — not implemented today but
+	// forward-compatible). When bridgev2 does start deleting on success,
+	// the EXISTS gate in scrubBridgedBodies goes permanently FALSE for
+	// scrubbed-fail rows, stranding plaintext.
+	if err != nil {
+		return err
+	}
+	if len(scrubErrs) > 0 {
+		return fmt.Errorf("cloud_message scrub failed after Matrix-initiated unsend (privacy fail-closed): %v", scrubErrs[0])
+	}
+	return nil
 }
 
 func (c *IMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
@@ -7272,7 +7298,16 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	// whose bridgev2 counterpart got purged. Restore-chat clears
 	// body_scrubbed before re-fetching from CloudKit, so the user-initiated
 	// restore path is unaffected.
-	if row.BodyScrubbed {
+	//
+	// Exception: scrubbed tapbacks (tapback_type set) — fall through to
+	// cloudTapbackToBackfill which derives the emoji from tapback_type
+	// alone for the standard reactions (heart/like/dislike/laugh/excl/q).
+	// Custom-emoji (type 6) degrades to thumbs-up if tapback_emoji was
+	// scrubbed, but the reaction still lands in Matrix. The scrubber's
+	// `AND tapback_type IS NULL` predicate means this path is only reached
+	// via inline soft-delete (which also sets deleted=TRUE, filtered out
+	// of backfill queries), so it's defense-in-depth.
+	if row.BodyScrubbed && row.TapbackType == nil {
 		return nil
 	}
 
