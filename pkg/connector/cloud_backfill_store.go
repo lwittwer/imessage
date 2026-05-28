@@ -209,6 +209,25 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	// Privacy migration: pre-existing soft-deleted rows from before the
+	// privacy branch never went through softDeleteMessageByGUID's inline
+	// scrub. They sit with deleted=TRUE and original text/subject/sender,
+	// and the periodic scrubber can't catch them because bridgev2 likely
+	// purged its message row long ago (so the EXISTS predicate fails).
+	// One-shot UPDATE on startup to scrub them in place. Idempotent: only
+	// matches rows still holding plaintext that haven't been scrubbed.
+	if _, err := s.db.Exec(ctx, `
+		UPDATE cloud_message
+		SET text=NULL, subject=NULL, sender='',
+		    tapback_emoji=NULL,
+		    body_scrubbed=TRUE
+		WHERE login_id=$1
+		  AND deleted=TRUE
+		  AND body_scrubbed=FALSE
+	`, s.loginID); err != nil {
+		return fmt.Errorf("failed to scrub pre-existing soft-deleted rows: %w", err)
+	}
+
 	// Cleanup: permanently delete system/rename message rows that slipped into
 	// the DB before the MsgType==0 ingest filter was added.  Two conditions
 	// catch different eras of the DB:
@@ -3288,14 +3307,17 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		    WHERE login_id=$1
 		      AND body_scrubbed=FALSE
 		      AND updated_ts < $2
-		      AND EXISTS (
-		        SELECT 1 FROM message
-		        WHERE bridge_id=$3
-		          AND (
-		            id=cloud_message.guid
-		            OR id LIKE cloud_message.guid || '\_%' ESCAPE '\'
-		          )
-		          AND (room_receiver=$1 OR room_receiver='')
+		      AND (
+		        deleted=TRUE
+		        OR EXISTS (
+		          SELECT 1 FROM message
+		          WHERE bridge_id=$3
+		            AND (
+		              UPPER(id)=UPPER(cloud_message.guid)
+		              OR UPPER(id) LIKE UPPER(cloud_message.guid) || '\_%' ESCAPE '\'
+		            )
+		            AND (room_receiver=$1 OR room_receiver='')
+		        )
 		      )` + exclusionSQL + `
 		    LIMIT ` + limitPlaceholder + `
 		  )

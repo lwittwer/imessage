@@ -7276,6 +7276,21 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		return nil
 	}
 
+	// Defense in depth for the restore-chat orphan case: a previously-
+	// scrubbed row whose flag got cleared (clearBodyScrubByPortalID) but
+	// whose CloudKit re-fetch returned no data (purged from CloudKit,
+	// network failure) is now body_scrubbed=FALSE with text/attachments
+	// still NULL. Without this skip cloudRowToBackfillMessages would
+	// silently emit no events for it, bridgev2 would treat the empty
+	// result as "no more history" and mark forward backfill done — losing
+	// the row permanently from Matrix. Detected as: real-message shape
+	// (HasBody=TRUE, not tapback) but empty body+attachments after a
+	// supposed restore re-population.
+	if row.HasBody && row.TapbackType == nil &&
+		strings.TrimSpace(row.Text) == "" && row.Subject == "" && row.AttachmentsJSON == "" {
+		return nil
+	}
+
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
 
