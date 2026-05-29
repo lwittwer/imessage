@@ -749,6 +749,8 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── command_contacts.go                   #   `contacts` command — search + iMessage validation
   ├── facetime.go                           #   FaceTime web-join + call control
   ├── statuskit_commands.go                 #   StatusKit (Focus / DND) commands
+  ├── statuskit_cloudkit.go                 #   StatusKit CloudKit pull — fetches + injects peer presence records (bridge-side orchestration of the Rust FFI)
+  ├── statuskit_alias_resolver.go           #   StatusKit alias-cluster resolver — maps a presence `from` alias (e.g. an unregistered mailto:) to the right portal via persisted channel↔alias clustering
   ├── sharedstreams.go                      #   iCloud Shared Albums commands + sync
   ├── shared_profile.go                     #   Name & Photo Sharing fallback
   ├── external_carddav.go                   #   external CardDAV contact resolution
@@ -780,8 +782,8 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── config.go                             #   bridge config schema (YAML + `upgradeConfig` helper)
   ├── example-config.yaml                   #   default config template
   └── *_test.go                             #   unit tests (audioconvert, capabilities, carddav_crypto,
-                                            #   cloud_backfill_store, config, dbmeta, external_carddav,
-                                            #   ford_cache, ids, util)
+                                            #   cloud_backfill_store, config, config_upgrade, dbmeta,
+                                            #   external_carddav, ford_cache, ids, util)
 
 pkg/rustpushgo/                             # Rust FFI wrapper (uniffi → cgo)
   ├── src/lib.rs                            #   FFI surface — login / send / receive / CloudKit / Ford
