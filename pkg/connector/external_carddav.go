@@ -58,11 +58,11 @@ func newExternalCardDAVClient(cfg CardDAVConfig, log zerolog.Logger) *externalCa
 	if url == "" {
 		discovered, err := DiscoverCardDAVURL(cfg.Email, username, password, log)
 		if err != nil {
-			log.Warn().Err(err).Str("email", cfg.Email).Msg("CardDAV auto-discovery failed")
+			log.Warn().Err(err).Str("email", logSafeHandle(cfg.Email)).Msg("CardDAV auto-discovery failed")
 			return nil
 		}
 		url = discovered
-		log.Info().Str("url", url).Msg("CardDAV URL auto-discovered")
+		log.Info().Str("url_host", logSafeURL(url)).Msg("CardDAV URL auto-discovered")
 	}
 
 	return &externalCardDAVClient{
@@ -96,21 +96,21 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	// Step 1: Discover principal
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
-		return fmt.Errorf("discover principal: %w", err)
+		return fmt.Errorf("discover principal: %w", sanitizeURLError(err, c.baseURL+"/"))
 	}
-	log.Debug().Str("principal", principalURL).Msg("External CardDAV: discovered principal")
+	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("External CardDAV: discovered principal")
 
 	// Step 2: Get address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
-		return fmt.Errorf("discover address book home: %w", err)
+		return fmt.Errorf("discover address book home: %w", sanitizeURLError(err, principalURL))
 	}
-	log.Debug().Str("home_set", homeSetURL).Msg("External CardDAV: discovered address book home")
+	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("External CardDAV: discovered address book home")
 
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
-		return fmt.Errorf("list address books: %w", err)
+		return fmt.Errorf("list address books: %w", sanitizeURLError(err, homeSetURL))
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("External CardDAV: found address books")
 
@@ -119,7 +119,7 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("External CardDAV: failed to fetch vCards")
+			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("External CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -147,19 +147,6 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 		}
 	}
 	c.lastSync = time.Now()
-
-	// Debug logging
-	for _, contact := range allContacts {
-		if contact.HasName() {
-			log.Debug().
-				Str("first", contact.FirstName).
-				Str("last", contact.LastName).
-				Strs("phones", contact.Phones).
-				Strs("emails", contact.Emails).
-				Bool("has_photo", contact.Avatar != nil).
-				Msg("External CardDAV contact loaded")
-		}
-	}
 
 	log.Info().
 		Int("contacts", len(allContacts)).
@@ -231,7 +218,7 @@ func (c *externalCardDAVClient) discoverPrincipal(log zerolog.Logger) (string, e
 
 	href := extractPropValue(data, "current-user-principal")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("External CardDAV: PROPFIND response (no principal)")
+		log.Debug().Int("body_bytes", len(data)).Msg("External CardDAV: PROPFIND response (no principal)")
 		return "", fmt.Errorf("no current-user-principal in response")
 	}
 
@@ -328,7 +315,7 @@ func (c *externalCardDAVClient) fetchAllVCards(log zerolog.Logger, addressBookUR
 
 	log.Debug().
 		Int("response_bytes", len(data)).
-		Str("address_book", addressBookURL).
+		Str("address_book_host", logSafeURL(addressBookURL)).
 		Msg("External CardDAV: REPORT response received")
 
 	return parseVCardMultistatusStandalone(data, log), nil
@@ -370,7 +357,7 @@ func (c *externalCardDAVClient) parseAddressBookList(data []byte, homeSetURL str
 			}
 			if ps.Prop.ResourceType.AddressBook != nil {
 				log.Debug().
-					Str("href", href).
+					Str("address_book_host", logSafeURL(href)).
 					Str("name", ps.Prop.DisplayName).
 					Msg("External CardDAV: found address book")
 				addressBooks = append(addressBooks, href)
@@ -475,7 +462,7 @@ func DiscoverCardDAVURL(email, username, password string, log zerolog.Logger) (s
 
 	// Try known providers first
 	if url := ResolveProviderURL(email); url != "" {
-		log.Info().Str("url", url).Msg("CardDAV URL resolved from known provider")
+		log.Info().Str("url_host", logSafeURL(url)).Msg("CardDAV URL resolved from known provider")
 		return url, nil
 	}
 
@@ -523,7 +510,7 @@ func tryWellKnown(wellKnownURL, username, password string, log zerolog.Logger) (
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Debug().Err(err).Str("method", method).Str("url", wellKnownURL).Msg("CardDAV .well-known request failed")
+			log.Debug().Err(sanitizeURLError(err, wellKnownURL)).Str("method", method).Str("url_host", logSafeURL(wellKnownURL)).Msg("CardDAV .well-known request failed")
 			continue
 		}
 		resp.Body.Close()
@@ -532,7 +519,7 @@ func tryWellKnown(wellKnownURL, username, password string, log zerolog.Logger) (
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			location := resp.Header.Get("Location")
 			if location != "" {
-				log.Debug().Str("location", location).Str("method", method).Msg("CardDAV .well-known redirected")
+				log.Debug().Str("location_host", logSafeURL(location)).Str("method", method).Msg("CardDAV .well-known redirected")
 				return resolveRedirect(wellKnownURL, location), nil
 			}
 		}
@@ -543,7 +530,7 @@ func tryWellKnown(wellKnownURL, username, password string, log zerolog.Logger) (
 		}
 	}
 
-	return "", fmt.Errorf(".well-known not available at %s", wellKnownURL)
+	return "", fmt.Errorf(".well-known not available at %s", logSafeURL(wellKnownURL))
 }
 
 // resolveRedirect resolves a potentially relative redirect Location.
@@ -570,7 +557,7 @@ func trySRVDiscovery(domain string, log zerolog.Logger) (string, error) {
 		target := strings.TrimRight(addrs[0].Target, ".")
 		port := addrs[0].Port
 		url := fmt.Sprintf("https://%s:%d", target, port)
-		log.Debug().Str("url", url).Msg("CardDAV SRV record found (_carddavs._tcp)")
+		log.Debug().Str("url_host", logSafeURL(url)).Msg("CardDAV SRV record found (_carddavs._tcp)")
 		return url, nil
 	}
 
@@ -580,7 +567,7 @@ func trySRVDiscovery(domain string, log zerolog.Logger) (string, error) {
 		target := strings.TrimRight(addrs[0].Target, ".")
 		port := addrs[0].Port
 		url := fmt.Sprintf("http://%s:%d", target, port)
-		log.Debug().Str("url", url).Msg("CardDAV SRV record found (_carddav._tcp)")
+		log.Debug().Str("url_host", logSafeURL(url)).Msg("CardDAV SRV record found (_carddav._tcp)")
 		return url, nil
 	}
 

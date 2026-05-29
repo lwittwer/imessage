@@ -1017,11 +1017,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if c.handle != "" {
 		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.handle {
 			meta.PreferredHandle = c.handle
-			log.Info().Str("handle", c.handle).Msg("Persisted selected handle to metadata")
+			log.Info().Str("handle", logSafeHandle(c.handle)).Msg("Persisted selected handle to metadata")
 		}
 	}
 
-	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
+	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
 	// for outbound, "nextincomingcall" for inbound). Done in the
@@ -1038,7 +1038,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 				return
 			}
 			premintFaceTimeLinks(ft, handle)
-			log.Info().Str("handle", handle).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
+			log.Info().Str("handle", logSafeHandle(handle)).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
 		}(c.handle)
 	}
 
@@ -1279,7 +1279,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
 		if extContacts != nil {
 			c.contacts = extContacts
-			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			log.Info().Str("email", logSafeHandle(c.Main.Config.CardDAV.Email)).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {
@@ -1305,7 +1305,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {
 			c.contacts = cloudContacts
-			log.Info().Str("url", cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
 			} else {
@@ -1335,6 +1335,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
 		c.startCloudSyncController(log)
+		// Pass c.stopChan by value so the goroutine captures the current
+		// channel at launch — Disconnect closes that channel and the loop
+		// exits deterministically. The next Connect launches a fresh
+		// goroutine against the new stopChan; an idempotent scrubber UPDATE
+		// means overlapping ticks during transient reconnect are harmless.
+		// sync.Once is wrong here because it never re-fires post-Disconnect.
+		// Skip the scrubber entirely when privacy is disabled for debugging —
+		// the scrub functions already no-op in that mode, but not launching the
+		// loop avoids pointless 5-minute ticks.
+		if !debugDisablePrivacy {
+			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
+		}
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -1482,10 +1494,43 @@ func statusKitModeLabel(mode *string) string {
 // call back into Rust (e.g. ResolveHandle), would block the receive loop and
 // can deadlock on a single-threaded tokio runtime. All non-trivial work is
 // therefore dispatched to a goroutine immediately after the fast dedup check.
+// debugDisablePrivacy is a process-global DEVELOPMENT-ONLY switch mirroring
+// IMConfig.DebugDisablePrivacy. It lives at package scope (rather than being
+// threaded through every call site) so the free log helpers below — which have
+// no access to config — can honor it. Set once in IMConnector.Start() before
+// any login connects; read-only afterward, so no synchronization is needed.
+// When true the log anonymizers below pass values through verbatim.
+var debugDisablePrivacy bool
+
+// logSafeHandle returns a stable, opaque UUID-form token derived from a user
+// handle (phone number or email) so logs can correlate a user across lines
+// without recording the PII itself. Deterministic per handle and not reversible
+// (SHA-256, first 16 bytes formatted as a UUID).
+func logSafeHandle(handle string) string {
+	if handle == "" {
+		return ""
+	}
+	if debugDisablePrivacy {
+		return handle
+	}
+	sum := sha256.Sum256([]byte(handle))
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
+}
+
+// logSafeHandles maps logSafeHandle over a slice for logging handle lists
+// (e.g. a portal's participants) without recording the raw PII.
+func logSafeHandles(handles []string) []string {
+	out := make([]string, len(handles))
+	for i, h := range handles {
+		out[i] = logSafeHandle(h)
+	}
+	return out
+}
+
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
-		Str("user", user).
+		Str("user", logSafeHandle(user)).
 		Logger()
 
 	if !c.Main.Config.StatusKitNotifications {
@@ -1603,7 +1648,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			if cached, ok := c.statusKitPortalCache.Load(key); ok {
 				if p := findPortal(cached.(networkid.PortalID)); p != nil {
 					portal = p
-					log.Info().Str("user", user).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
+					log.Info().Str("user", logSafeHandle(user)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
 					break
 				}
 			}
@@ -1632,7 +1677,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// previously-resolved handles.
 			if portal == nil {
 				if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, user); altPortal != nil {
-					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+					log.Info().Str("user", logSafeHandle(user)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
 					portal = altPortal
 				}
 			}
@@ -2008,7 +2053,7 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 	// already cached (common when the contact has sent messages before),
 	// this resolves instantly and we skip the slow validate_targets call.
 	if aliases := c.client.ResolveHandleCached(user, knownHandles); len(aliases) > 0 {
-		log.Info().Str("user", user).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
+		log.Info().Str("user", logSafeHandle(user)).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
 		if portal := c.findPortalForAliases(ctx, log, user, aliases); portal != nil {
 			return portal
 		}
@@ -2018,7 +2063,7 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 	// caller is responsible for applying a timeout.
 	aliases, err := c.client.ResolveHandle(user, knownHandles)
 	if err != nil {
-		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
+		log.Warn().Err(err).Str("user", logSafeHandle(user)).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
 	return c.findPortalForAliases(ctx, log, user, aliases)
@@ -3004,6 +3049,26 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	}
 
+	// Scrub-before-emit, fail-closed: same pattern as handleMessageDelete.
+	// QueueRemoteEvent will (eventually) cause bridgev2 to delete its message
+	// row; once gone, the periodic scrubber's EXISTS predicate is permanently
+	// FALSE for this guid. Skip the emit on scrub error so the Matrix event
+	// stays visible rather than leaking plaintext.
+	if c.cloudStore != nil {
+		// 10s (> the SQLite busy_timeout of 5s) so a one-off lock contention
+		// with the first-boot chunked scrubber doesn't cancel the write early
+		// and strand this Apple-side unsend as a stale, still-visible Matrix
+		// event (APNs won't replay it).
+		scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Str("target_uuid", targetGUID).
+				Msg("Skipping unsend MessageRemove emit because cloud_message scrub failed — preserving privacy at the cost of a stale Matrix event")
+			return
+		}
+	}
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessageRemove,
@@ -3591,7 +3656,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 	}
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
+			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
 			return
 		}
 	}
@@ -3604,7 +3669,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
+	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
 }
 
 func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -3625,7 +3690,7 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 	senderHandle := ptrStringOr(msg.Sender, "")
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
+			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
 			return
 		}
 	}
@@ -3638,7 +3703,7 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
+	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
@@ -3751,11 +3816,38 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 		Msg("Processing per-message delete")
 
 	for _, targetUUID := range msg.DeleteMessageUuids {
+		// Scrub-before-portal-resolve: Apple-side delete can arrive while
+		// the targeted message is still sitting in pendingPortalMsgs for a
+		// not-yet-created portal (CloudKit sync hadn't finished when APNs
+		// delivered it), or before any cloud_message ingest has happened
+		// at all. If we waited for portal resolution we'd skip the scrub
+		// and the message would later bridge to Matrix with the body Apple
+		// has already deleted on the user's devices. softDeleteMessageByGUID
+		// also stub-inserts a deleted=TRUE row for guids not yet in
+		// cloud_message so the future CloudKit upsert preserves the
+		// deletion via its ON CONFLICT CASE.
+		//
+		// Fail-closed: skip the MessageRemove emit on scrub error so we
+		// don't strand plaintext post-bridgev2-row-deletion.
+		if c.cloudStore != nil {
+			// 10s (> the SQLite busy_timeout of 5s) so a one-off lock
+			// contention with the first-boot chunked scrubber doesn't cancel
+			// the write early and strand this Apple-side delete unscrubbed.
+			scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+			cancel()
+			if err != nil {
+				log.Error().Err(err).Str("target_uuid", targetUUID).
+					Msg("Skipping MessageRemove emit because cloud_message scrub failed — preserving privacy at the cost of a stale Matrix event")
+				continue
+			}
+		}
+
 		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
 		if portalKey.ID == "" {
 			log.Debug().
 				Str("target_uuid", targetUUID).
-				Msg("Message UUID not found in bridge DB, skipping")
+				Msg("Message UUID not found in bridge DB, scrub applied; skipping Matrix MessageRemove emit")
 			continue
 		}
 
@@ -3808,12 +3900,27 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	c.trackDeletedChat(portalID)
 
 	// Soft-delete local DB records (preserves UUIDs for echo detection).
+	// Fail-closed: if soft-delete (which scrubs plaintext) fails, skip the
+	// ChatDelete emit. Once bridgev2 wipes its message rows via
+	// Message.DeleteInChunks, the scrubber's EXISTS predicate is forever
+	// FALSE for those guids — a scrub failure here would leak the entire
+	// chat's plaintext until next restart. Each DB op gets its own 5s
+	// budget so a slow clearRestoreOverride can't starve the load-bearing
+	// deleteLocalChatByPortalID into a spurious DeadlineExceeded.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.clearRestoreOverride(context.Background(), portalID); err != nil {
+		overrideCtx, overrideCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := c.cloudStore.clearRestoreOverride(overrideCtx, portalID); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear restore override for Apple-deleted chat")
 		}
-		if err := c.cloudStore.deleteLocalChatByPortalID(context.Background(), portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local records for Apple-deleted chat")
+		overrideCancel()
+
+		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c.cloudStore.deleteLocalChatByPortalID(deleteCtx, portalID)
+		deleteCancel()
+		if err != nil {
+			log.Error().Err(err).Str("portal_id", portalID).
+				Msg("Skipping ChatDelete emit because cloud_message scrub failed — preserving privacy at the cost of a stale Beeper portal")
+			return
 		}
 	}
 
@@ -3985,6 +4092,54 @@ func (c *IMClient) finishRestoreBackfillPipeline(portalID string) {
 	c.restorePipelinesMu.Unlock()
 }
 
+// activeRestorePortalIDs returns a snapshot of portal IDs with an active
+// restore pipeline. The privacy scrubber excludes these so a long backfill
+// (large portal, many thousands of messages) can't be re-scrubbed mid-flight,
+// which would interact with cloudRowToBackfillMessages' BodyScrubbed skip to
+// silently drop the un-backfilled tail.
+func (c *IMClient) activeRestorePortalIDs() []string {
+	c.restorePipelinesMu.Lock()
+	defer c.restorePipelinesMu.Unlock()
+	if len(c.restorePipelines) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.restorePipelines))
+	for pid := range c.restorePipelines {
+		out = append(out, pid)
+	}
+	return out
+}
+
+// runUnbridgedTailScrub clears plaintext from cloud_message rows older than the
+// newest MaxInitialMessages of each portal — the history beyond the per-chat
+// backfill cap that backward backfill can never deliver (FetchMessages
+// short-circuits backward requests when the cap is set). Gated on a configured
+// cap: with backfill uncapped (MaxInitialMessages == math.MaxInt32) backward
+// backfill is live, so the tail is still reachable and must NOT be scrubbed.
+//
+// Runs both from post-sync housekeeping (to catch a freshly-synced backlog) and
+// on the periodic scrub ticker. The ticker pass is essential, not redundant:
+// rows synced just before the post-sync pass are still inside the grace window
+// and get skipped there, so without a later periodic pass they would never be
+// scrubbed. The per-portal indexed query is cheap and scrubs nothing once a
+// portal has converged.
+func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	keepN := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+	if keepN <= 0 || keepN >= math.MaxInt32 {
+		return
+	}
+	scrubbed, err := c.cloudStore.scrubUnbridgedTail(ctx, keepN, bodyScrubGracePeriod, c.activeRestorePortalIDs())
+	if err != nil {
+		log.Warn().Err(err).Msg("Unbridged-tail scrub failed")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Int("keep_per_portal", keepN).
+			Msg("Scrubbed plaintext from unreachable backfill tail")
+	}
+}
+
 func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
 	if opts.Notify == nil {
 		return
@@ -4069,6 +4224,14 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		log.Warn().Err(err).Msg("Failed to undelete cloud_message rows")
 	} else {
 		log.Info().Int("undeleted", undeleted).Msg("Undeleted cloud_message rows for restore")
+	}
+	// Clear body_scrubbed so the upsert from the upcoming CloudKit re-fetch
+	// can repopulate text/subject/sender — privacy scrubbing will re-apply
+	// on the next periodic tick after the restored messages are re-bridged.
+	if cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		log.Warn().Err(err).Msg("Failed to clear body_scrubbed flag for restore")
+	} else if cleared > 0 {
+		log.Info().Int("cleared", cleared).Msg("Cleared body_scrubbed flag for restore (will re-scrub after re-bridge)")
 	}
 	needsRecoverMessages := false
 	if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err != nil {
@@ -5353,9 +5516,9 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 			canonical = lp.MatchedURL
 		}
 		log.Debug().
-			Str("matched_url", lp.MatchedURL).
-			Str("canonical_url", canonical).
-			Str("title", lp.Title).
+			Str("matched_url_host", logSafeURL(lp.MatchedURL)).
+			Str("canonical_url_host", logSafeURL(canonical)).
+			Bool("has_title", lp.Title != "").
 			Msg("Encoding Beeper link preview for iMessage")
 		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
@@ -5363,16 +5526,16 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
 	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
-		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
+		log.Debug().Str("detected_url_host", logSafeURL(detectedURL)).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
 		// Try homeserver preview first
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
 				title = lp.Title
 				desc = lp.Description
-				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
+				log.Debug().Bool("has_title", title != "").Bool("has_description", desc != "").Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
-				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+				log.Debug().Err(sanitizeURLError(err, fetchURL, detectedURL)).Msg("Failed to fetch URL preview from homeserver for outbound")
 			}
 		}
 		// Fall back to our own og: scraping if homeserver didn't provide metadata
@@ -5381,7 +5544,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 			title = ogData["title"]
 			desc = ogData["description"]
 			if title != "" || desc != "" {
-				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
+				log.Debug().Bool("has_title", title != "").Bool("has_description", desc != "").Msg("Got URL preview from og: scraping for outbound")
 			}
 		}
 		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
@@ -5471,7 +5634,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 	log := c.UserLogin.Log.With().
 		Str("component", "url_preview").
 		Stringer("event_id", eventID).
-		Str("detected_url", detectedURL).
+		Str("detected_url_host", logSafeURL(detectedURL)).
 		Logger()
 	ctx := log.WithContext(context.Background())
 
@@ -5495,7 +5658,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to send outbound URL preview edit")
 	} else {
-		log.Debug().Str("title", preview.Title).Msg("Sent outbound URL preview edit")
+		log.Debug().Bool("has_title", preview.Title != "").Msg("Sent outbound URL preview edit")
 	}
 }
 
@@ -5832,6 +5995,12 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		siblingUUID = meta.SiblingUUID
 	}
 
+	// Track scrub failures so we can fail-closed at the end after both
+	// Apple-side unsends have been attempted. We can't bail mid-flight
+	// because we've already committed to one Apple-side unsend by the
+	// time we get to the second.
+	var scrubErrs []error
+
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
 		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
@@ -5839,7 +6008,11 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
-			c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
+				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
+					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
+				scrubErrs = append(scrubErrs, scrubErr)
+			}
 		}
 	}
 
@@ -5851,10 +6024,26 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
 	if c.cloudStore != nil {
-		c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID))
+		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
+			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
+				Msg("Failed to soft-delete cloud_message after outbound unsend")
+			scrubErrs = append(scrubErrs, scrubErr)
+		}
 	}
 
-	return err
+	// Fail-closed: report scrub failure to bridgev2 so it doesn't proceed
+	// with future row deletion (currently a `// TODO delete msg/reaction
+	// db row` in bridgev2/portal.go:2442 — not implemented today but
+	// forward-compatible). When bridgev2 does start deleting on success,
+	// the EXISTS gate in scrubBridgedBodies goes permanently FALSE for
+	// scrubbed-fail rows, stranding plaintext.
+	if err != nil {
+		return err
+	}
+	if len(scrubErrs) > 0 {
+		return fmt.Errorf("cloud_message scrub failed after Matrix-initiated unsend (privacy fail-closed): %v", scrubErrs[0])
+	}
+	return nil
 }
 
 func (c *IMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
@@ -6007,11 +6196,15 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		// Soft-delete local records for both portal_id and group_id.
+		// Fail-closed: same pattern as handleChatDelete — scrub failure must
+		// not be followed by Matrix-side deletion that would forever strand
+		// the cloud_message plaintext via the EXISTS predicate going FALSE.
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local cloud records")
-		} else {
-			log.Info().Str("portal_id", portalID).Msg("Soft-deleted local cloud_chat and cloud_message records")
+			log.Error().Err(err).Str("portal_id", portalID).
+				Msg("Aborting Matrix-initiated chat delete because cloud_message scrub failed — preserving privacy")
+			return fmt.Errorf("failed to scrub cloud_message for chat delete: %w", err)
 		}
+		log.Info().Str("portal_id", portalID).Msg("Soft-deleted local cloud_chat and cloud_message records")
 		if groupID != "" {
 			if err := c.cloudStore.deleteLocalChatByGroupID(ctx, groupID); err != nil {
 				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to soft-delete local cloud records by group_id")
@@ -6233,6 +6426,207 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 	}
 }
 
+const (
+	// plLockLevel is the power level required for destructive or bridge-owned
+	// room actions. It sits just below the bridge bot's 9001 so the bot can
+	// still perform them, but no human-reachable level (Matrix tops out at 100
+	// in practice) can. The homeserver enforces this, so a user's attempt to
+	// tombstone the room, toggle encryption, set server ACLs, invite/kick/ban,
+	// or redact someone else's message is rejected outright. Power-level edits
+	// themselves are intentionally NOT locked here — they're allowed through and
+	// then rubberbanded by HandleMatrixPowerLevels.
+	plLockLevel = 9000
+
+	// botPowerLevel mirrors the level bridgev2 assigns the bridge bot in every
+	// portal at creation. It must stay above plLockLevel so the bot can always
+	// re-assert the hardened power levels.
+	botPowerLevel = 9001
+)
+
+// hardenedPowerLevels returns the power-level overrides applied to every portal
+// — DMs and group chats, on both the CloudKit (GetChatInfo) and chat.db
+// (chatDBInfoToBridgev2) paths — so Matrix users can't clobber bridge-managed
+// room state. See docs/postmortem-style notes: a user raising their power level
+// can otherwise tombstone the room, silently kill incoming messages by raising
+// events_default, pull unbridged users into a group, or redact other people's
+// messages.
+//
+// Two layers of defense:
+//
+//  1. Homeserver-enforced lock. The destructive/bridge-owned actions are pinned
+//     to plLockLevel, so the homeserver itself rejects any human user trying
+//     them. Everyday messaging is deliberately left alone: events_default stays
+//     0 so both ghosts and the user can always send, and a user can still
+//     redact (unsend) their OWN messages because self-redaction is gated by
+//     events_default, not the redact level.
+//
+//  2. Reset on apply (+ notice). The Custom hook (resetEscalatedUsers) runs on
+//     every power-level apply — room creation, every member resync, and the
+//     HandleMatrixPowerLevels rubberband. If a non-bot user sits above the room
+//     baseline (users_default) it resets them and posts a single rate-limited
+//     m.notice. Running on resync (not just on user-sent edits) is what catches
+//     the escalation vectors that don't arrive as a user event — `set-pl` and
+//     the homeserver admin API both write power levels as the bot, which the
+//     framework filters out before HandleMatrixPowerLevels would ever see them.
+//     This is safe against notice spam because the bridge never grants normal
+//     users an explicit entry above users_default, so the reset only fires on a
+//     genuine escalation, not on every resync.
+//
+// ctx/portal may be nil (the chat.db path has neither in scope); the reset still
+// happens, only the m.notice is skipped.
+func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Portal) *bridgev2.PowerLevelOverrides {
+	return &bridgev2.PowerLevelOverrides{
+		EventsDefault: ptr.Ptr(0), // ghosts + users can always send messages
+		Events: map[event.Type]int{
+			// NOTE: m.room.power_levels is deliberately NOT locked. On homeservers
+			// where a user can edit it, we let the change land (so it's visible in
+			// the room), then snap it back. On platforms where the user can't (e.g.
+			// Beeper users sit at 0 and power_levels needs 100), the escalation can
+			// only come via set-pl/admin-API, which the resync reset below catches.
+			event.StateTombstone:  plLockLevel, // no user may upgrade/replace the room
+			event.StateEncryption: plLockLevel, // encryption is bridge-managed
+			event.StateServerACL:  plLockLevel,
+		},
+		Invite: ptr.Ptr(plLockLevel), // membership is bridge-managed
+		Kick:   ptr.Ptr(plLockLevel),
+		Ban:    ptr.Ptr(plLockLevel),
+		Redact: ptr.Ptr(plLockLevel), // can't redact others; self-unsend still works
+		Custom: func(pl *event.PowerLevelsEventContent) bool {
+			return c.resetEscalatedUsers(ctx, portal, pl)
+		},
+	}
+}
+
+// resetEscalatedUsers is the Custom power-level hook from hardenedPowerLevels.
+// It demotes any non-bot user whose level was raised above the room baseline
+// (users_default) back down to that baseline, and — when a room is known and the
+// per-room+user rate limit allows — posts one m.notice. The baseline is also
+// exactly the level the user had before they escalated, since the bridge never
+// grants normal users an explicit power-level entry. Returns true if it modified
+// the power-level content, so the framework re-sends the event.
+func (c *IMClient) resetEscalatedUsers(ctx context.Context, portal *bridgev2.Portal, pl *event.PowerLevelsEventContent) bool {
+	if pl == nil {
+		return false
+	}
+	botMXID := c.Main.Bridge.Bot.GetMXID()
+	baseline := pl.UsersDefault
+
+	// Snapshot the user IDs so we don't mutate the map mid-range.
+	var userIDs []id.UserID
+	for userID := range pl.Users {
+		userIDs = append(userIDs, userID)
+	}
+
+	var demoted []id.UserID
+	for _, userID := range userIDs {
+		if userID == botMXID {
+			continue
+		}
+		if pl.GetUserLevel(userID) <= baseline {
+			continue
+		}
+		// The bot sits at 9001, so this reset always succeeds against a user.
+		if pl.EnsureUserLevelAs(botMXID, userID, baseline) {
+			demoted = append(demoted, userID)
+		}
+	}
+	if len(demoted) == 0 {
+		return false
+	}
+
+	if portal != nil && portal.MXID != "" {
+		roomID := portal.MXID
+		notifyCtx := context.Background()
+		if ctx != nil {
+			notifyCtx = context.WithoutCancel(ctx)
+		}
+		body := fmt.Sprintf("⚠️ Power-level changes are disabled in bridge chats. Your power level remains at %d.", baseline)
+		for _, userID := range demoted {
+			c.UserLogin.Log.Info().
+				Stringer("user_id", userID).
+				Stringer("room_id", roomID).
+				Int("baseline", baseline).
+				Msg("Reset escalated Matrix power level back to room default")
+			go func() {
+				if _, err := c.Main.Bridge.Bot.SendMessage(notifyCtx, roomID, event.EventMessage, &event.Content{
+					Parsed: &event.MessageEventContent{MsgType: event.MsgNotice, Body: body},
+				}, nil); err != nil {
+					c.UserLogin.Log.Warn().Err(err).Stringer("room_id", roomID).Msg("Failed to post power-level reset notice")
+				}
+			}()
+		}
+	}
+	return true
+}
+
+// rubberbandSetPowerLevel is the instant path for the `set-pl` command. The
+// framework sends set-pl's change as the bot and filters bot-sent events before
+// HandleMatrixPowerLevels would see them, so the connector's own set-pl command
+// (cmdSetPowerLevel) calls this directly: apply the requested level just long
+// enough to be visible, then snap the room back to the hardened policy —
+// resetting the just-granted level and posting the m.notice via the Custom hook.
+func (c *IMClient) rubberbandSetPowerLevel(ctx context.Context, portal *bridgev2.Portal, target id.UserID, level int) error {
+	if portal == nil || portal.MXID == "" {
+		return fmt.Errorf("no portal room")
+	}
+	pl, err := c.Main.Bridge.Matrix.GetPowerLevels(ctx, portal.MXID)
+	if err != nil {
+		return fmt.Errorf("failed to get power levels: %w", err)
+	}
+	botMXID := c.Main.Bridge.Bot.GetMXID()
+	pl.EnsureUserLevel(botMXID, botPowerLevel)
+
+	// Apply the requested level first so the change is briefly visible.
+	if pl.EnsureUserLevelAs(botMXID, target, level) {
+		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+			return fmt.Errorf("failed to set power level: %w", err)
+		}
+	}
+	// Snap back to the hardened policy (Custom hook resets + posts the notice).
+	if c.hardenedPowerLevels(ctx, portal).Apply(botMXID, pl) {
+		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+			return fmt.Errorf("failed to re-assert hardened power levels: %w", err)
+		}
+	}
+	return nil
+}
+
+// HandleMatrixPowerLevels implements bridgev2.PowerLevelHandlingNetworkAPI.
+// iMessage has no power-level concept, so the change is never bridged to the
+// network. Instead this callback is the immediate "rubberband" for homeservers
+// where a user CAN edit power levels: the instant they do, re-apply the hardened
+// overrides — reset any escalation back to the room default, re-assert
+// events_default=0 and the destructive-action locks — and, if that changed
+// anything, re-send the corrected power-levels event as the bot. The user's edit
+// lands first (so it's visible in the timeline), then snaps back. The m.notice
+// is posted by resetEscalatedUsers (the Custom hook inside Apply), which also
+// covers the set-pl/admin-API vectors that never reach this callback.
+func (c *IMClient) HandleMatrixPowerLevels(ctx context.Context, msg *bridgev2.MatrixPowerLevelChange) (bool, error) {
+	portal := msg.Portal
+	pl := msg.Content
+	if portal == nil || portal.MXID == "" || pl == nil {
+		return false, nil
+	}
+	// The homeserver already guarantees the bot's entry survives (a user can't
+	// modify a level above their own), but assert it defensively so the bot is
+	// always a high-enough actor to apply the overrides below.
+	botMXID := c.Main.Bridge.Bot.GetMXID()
+	pl.EnsureUserLevel(botMXID, botPowerLevel)
+
+	// Apply runs the Custom hook (resetEscalatedUsers), which resets escalations
+	// and posts the notice. If it changed nothing, the edit was already within
+	// policy — leave it alone.
+	if !c.hardenedPowerLevels(ctx, portal).Apply(botMXID, pl) {
+		return false, nil
+	}
+	// Re-send the corrected power levels as the bot (the snap-back).
+	if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+		return false, fmt.Errorf("failed to re-assert hardened power levels: %w", err)
+	}
+	// Return false: nothing was bridged to the iMessage network.
+	return false, nil
+}
+
 // ============================================================================
 // Chat & user info
 // ============================================================================
@@ -6310,11 +6704,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			}
 		}
 		chatInfo.Members = &bridgev2.ChatMemberList{
-			IsFull:    true,
-			MemberMap: memberMap,
-			PowerLevels: &bridgev2.PowerLevelOverrides{
-				Invite: ptr.Ptr(95), // Prevent Matrix users from inviting — the bridge manages membership
-			},
+			IsFull:      true,
+			MemberMap:   memberMap,
+			PowerLevels: c.hardenedPowerLevels(ctx, portal),
 		}
 
 		// Only set the group name for NEW portals (no Matrix room yet).
@@ -6429,6 +6821,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			IsFull:      true,
 			OtherUserID: otherUser,
 			MemberMap:   memberMap,
+			PowerLevels: c.hardenedPowerLevels(ctx, portal),
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
@@ -7196,7 +7589,54 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	return messages
 }
 
+// cloudReactionMinType is the lowest tapback_type that denotes a real reaction.
+// Regular messages are stored with tapback_type NULL or 0; reactions occupy
+// 2000-2006 (add) and 3000-3006 (remove). Every "is this a reaction?" decision
+// goes through isCloudReactionRow so the NULL-vs-0 representation can't be
+// mistaken for a reaction (which previously let the privacy scrubber skip every
+// type-0 message — i.e. nearly all of them).
+const cloudReactionMinType uint32 = 2000
+
+func isCloudReactionRow(tapbackType *uint32) bool {
+	return tapbackType != nil && *tapbackType >= cloudReactionMinType
+}
+
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
+	// Privacy: a body_scrubbed regular message was already bridged to Matrix
+	// (the scrubber requires a bridgev2 `message` row for the same GUID before
+	// clearing text/subject/sender). Emitting here would produce empty-body
+	// events. Skip — bridgev2 already has the message and would dedup anyway
+	// under aggressive-dedup, plus this avoids the empty-body cliff for any
+	// backfill path that lands on a scrubbed row whose bridgev2 counterpart got
+	// purged. Restore-chat clears body_scrubbed before re-fetching from
+	// CloudKit, so the user-initiated restore path is unaffected.
+	//
+	// Exception: scrubbed reactions (tapback_type >= 2000) fall through to
+	// cloudTapbackToBackfill and render identically to master. scrubReactionText
+	// (the only scrub touching a live reaction) clears text/subject only — it
+	// preserves tapback_emoji — so custom-emoji reactions (type 6) keep their
+	// emoji. The paths that DO null tapback_emoji all also set deleted=TRUE, and
+	// every backfill reader filters deleted=FALSE, so an emoji-nulled reaction is
+	// never re-rendered. Net: reaction rendering is unchanged from master.
+	if row.BodyScrubbed && !isCloudReactionRow(row.TapbackType) {
+		return nil
+	}
+
+	// Defense in depth for the restore-chat orphan case: a previously-
+	// scrubbed row whose flag got cleared (clearBodyScrubByPortalID) but
+	// whose CloudKit re-fetch returned no data (purged from CloudKit,
+	// network failure) is now body_scrubbed=FALSE with text/attachments
+	// still NULL. Without this skip cloudRowToBackfillMessages would
+	// silently emit no events for it, bridgev2 would treat the empty
+	// result as "no more history" and mark forward backfill done — losing
+	// the row permanently from Matrix. Detected as: real-message shape
+	// (HasBody=TRUE, not a reaction) but empty body+attachments after a
+	// supposed restore re-population.
+	if row.HasBody && !isCloudReactionRow(row.TapbackType) &&
+		strings.TrimSpace(row.Text) == "" && row.Subject == "" && row.AttachmentsJSON == "" {
+		return nil
+	}
+
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
 
@@ -9910,10 +10350,10 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 		}
 
 		log.Debug().
-			Str("original_url", originalURL).
-			Str("canonical_url", canonicalURL).
-			Str("title", title).
-			Str("description", description).
+			Str("original_url_host", logSafeURL(originalURL)).
+			Str("canonical_url_host", logSafeURL(canonicalURL)).
+			Bool("has_title", title != "").
+			Bool("has_description", description != "").
 			Str("image_mime", imageMime).
 			Msg("Parsed rich link sideband data from iMessage")
 
@@ -9954,13 +10394,13 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 			}
 		}
 
-		log.Debug().Str("matched_url", matchedURL).Str("title", title).Msg("Inbound rich link preview ready")
+		log.Debug().Str("matched_url_host", logSafeURL(matchedURL)).Bool("has_title", title != "").Msg("Inbound rich link preview ready")
 		return []*event.BeeperLinkPreview{preview}
 	}
 
 	// No rich link from iMessage — auto-detect URL and fetch og: metadata + image
 	if detectedURL := urlRegex.FindString(bodyText); detectedURL != "" {
-		log.Debug().Str("detected_url", detectedURL).Msg("No iMessage rich link, fetching URL preview")
+		log.Debug().Str("detected_url_host", logSafeURL(detectedURL)).Msg("No iMessage rich link, fetching URL preview")
 		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL)}
 	}
 
@@ -11028,6 +11468,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		members := &bridgev2.ChatMemberList{
 			IsFull:    true,
 			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
+			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
 		}
 		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
@@ -11074,6 +11515,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			IsFull:      true,
 			OtherUserID: otherUser,
 			MemberMap:   memberMap,
+			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
