@@ -519,6 +519,16 @@ func convertHEICToJPEG(data []byte, mimeType, fileName string, quality int, log 
 	return jpegBytes, "image/jpeg", newName, goImg, nil
 }
 
+// heicConvertSem serializes HEIC decoding process-wide. Decoding a HEIC
+// allocates a full RGBA bitmap (width*height*4) in C plus a copy in the Go
+// image — ~100-250 MB for a typical 12 MP iPhone photo. The backfill fan-out
+// would otherwise run many decodes at once and peg memory: the concurrent
+// high-water mark is retained by the Go heap and glibc's allocator long after
+// the decodes finish, so it looks like a leak even though every C resource is
+// freed. Capping concurrency to one decode bounds peak image memory, the same
+// way transcodeSem bounds ffmpeg. The slot is held only for the decode/convert.
+var heicConvertSem = make(chan struct{}, 1)
+
 // maybeConvertHEIC handles HEIC/HEIF images. When conversion is enabled, it
 // converts to JPEG and returns the updated data, MIME type, filename, and the
 // decoded image. When conversion is disabled but the MIME type is HEIC/HEIF,
@@ -529,6 +539,12 @@ func maybeConvertHEIC(log *zerolog.Logger, data []byte, mimeType, fileName strin
 	if !isHEIC(mimeType) || len(data) == 0 {
 		return data, mimeType, fileName, nil
 	}
+
+	// One HEIC decode at a time across the whole process — bounds peak image
+	// memory so a backfill of many photos can't pile up bitmaps and OOM a
+	// small host. Acquired only for actual HEIC work (non-HEIC returned above).
+	heicConvertSem <- struct{}{}
+	defer func() { <-heicConvertSem }()
 
 	if !enabled {
 		// Decode for dimensions/thumbnail only, keep original HEIC data
