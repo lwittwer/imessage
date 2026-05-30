@@ -407,21 +407,10 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	if videoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
-		method := "remux"
-		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-			[]string{"-c", "copy", "-movflags", "+faststart"},
-			mimeType)
-		if convertErr != nil {
-			// Remux failed — try full re-encode
-			method = "re-encode"
-			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-					"-c:a", "aac", "-movflags", "+faststart"},
-				mimeType)
-		}
+		converted, method, convertErr := transcodeToMP4(ctx, log, data, mimeType)
 		if convertErr != nil {
 			log.Warn().Err(convertErr).Str("guid", msg.GUID).Str("original_mime", origMime).
-				Msg("FFmpeg video conversion failed, uploading original")
+				Msg("FFmpeg video conversion failed after retries, uploading original")
 		} else {
 			log.Info().Str("guid", msg.GUID).Str("original_mime", origMime).
 				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).

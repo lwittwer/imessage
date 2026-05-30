@@ -10503,6 +10503,62 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 	}
 }
 
+const (
+	// videoTranscodeMaxAttempts caps how many times we retry an ffmpeg
+	// conversion before falling back to the original file.
+	videoTranscodeMaxAttempts = 6
+	// videoTranscodeInitialBackoff is the first inter-attempt wait; it doubles
+	// each retry (5s, 10s, 20s, 40s, 80s ...).
+	videoTranscodeInitialBackoff = 5 * time.Second
+)
+
+// transcodeToMP4 remuxes (cheap) or, failing that, re-encodes data to MP4.
+//
+// On a low-memory host (Raspberry Pi, small VPS, low-memory Mac) ffmpeg can
+// fail transiently when the box is briefly out of memory — the OS kills the
+// ffmpeg subprocess. Instead of giving up and shipping the original, we retry
+// the whole conversion with exponential backoff: by the time we try again,
+// other work has usually freed enough memory for it to complete. We detach the
+// ffmpeg run from the parent context's deadline/cancellation so a short inbound
+// deadline can't abort it mid-encode, but still honor true bridge shutdown by
+// watching the original ctx during the backoff wait.
+//
+// Returns the converted bytes + the method used, or the last error once all
+// attempts are exhausted (the caller then falls back to the original file).
+func transcodeToMP4(ctx context.Context, log *zerolog.Logger, data []byte, mimeType string) (converted []byte, method string, err error) {
+	base := context.WithoutCancel(ctx)
+	backoff := videoTranscodeInitialBackoff
+	for attempt := 1; attempt <= videoTranscodeMaxAttempts; attempt++ {
+		method = "remux"
+		converted, err = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
+			[]string{"-c", "copy", "-movflags", "+faststart"},
+			mimeType)
+		if err != nil {
+			// Remux failed (often an incompatible codec) — try a full re-encode.
+			method = "re-encode"
+			converted, err = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
+				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+					"-c:a", "aac", "-movflags", "+faststart"},
+				mimeType)
+		}
+		if err == nil {
+			return converted, method, nil
+		}
+		if attempt < videoTranscodeMaxAttempts {
+			log.Warn().Err(err).Int("attempt", attempt).Int("max_attempts", videoTranscodeMaxAttempts).
+				Dur("backoff", backoff).Int("bytes", len(data)).
+				Msg("Video transcode failed (likely transient memory pressure), backing off before retry")
+			select {
+			case <-ctx.Done():
+				return nil, method, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+	}
+	return nil, method, err
+}
+
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
@@ -10554,21 +10610,10 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		log := zerolog.Ctx(ctx)
 		origMime := mimeType
 		origSize := len(inlineData)
-		method := "remux"
-		converted, convertErr := ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
-			[]string{"-c", "copy", "-movflags", "+faststart"},
-			mimeType)
-		if convertErr != nil {
-			// Remux failed — try full re-encode
-			method = "re-encode"
-			converted, convertErr = ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
-				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-					"-c:a", "aac", "-movflags", "+faststart"},
-				mimeType)
-		}
+		converted, method, convertErr := transcodeToMP4(ctx, log, inlineData, mimeType)
 		if convertErr != nil {
 			log.Warn().Err(convertErr).Str("original_mime", origMime).
-				Msg("FFmpeg video conversion failed, uploading original")
+				Msg("FFmpeg video conversion failed after retries, uploading original")
 		} else {
 			log.Info().Str("original_mime", origMime).
 				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
@@ -11466,8 +11511,8 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 	if parsed.IsGroup {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
 		members := &bridgev2.ChatMemberList{
-			IsFull:    true,
-			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
+			IsFull:      true,
+			MemberMap:   make(map[networkid.UserID]bridgev2.ChatMember),
 			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
 		}
 		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
