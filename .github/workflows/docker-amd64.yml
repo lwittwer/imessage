@@ -63,13 +63,15 @@ jobs:
         with:
           context: .
           push: true
-          # amd64 only — no QEMU, no arm64. Shares the `linux-amd64` GHA
-          # cache scope with the multi-arch `docker` workflow's amd64
-          # matrix leg so warm builds reuse the rustpush + cargo + go
-          # layers either way.
+          # amd64 only — no QEMU, no arm64. Shares the `linux-amd64-v2` GHA
+          # cache scope with the multi-arch `docker` workflow's amd64 matrix
+          # leg so warm builds reuse the rustpush + cargo + go layers either
+          # way. The -v2 suffix busts the poisoned pre-existing cache that was
+          # restoring a bad Unicorn (NAC emulator) build — keep both workflows'
+          # scopes in lockstep so neither repoisons the other.
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
-          cache-from: type=gha,scope=linux-amd64
-          cache-to: type=gha,mode=max,scope=linux-amd64
+          cache-from: type=gha,scope=linux-amd64-v2
+          cache-to: type=gha,mode=max,scope=linux-amd64-v2

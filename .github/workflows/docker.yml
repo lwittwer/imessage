@@ -43,10 +43,16 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-            scope: linux-amd64
+            # scope bumped to -v2 to bust a poisoned gha layer cache: a bad
+            # Unicorn (NAC emulator) build got committed to the cached compile
+            # layer and was being restored on every layered build ("Could not
+            # allocate dynamic translator buffer" at NAC start). The bump forces
+            # one fresh compile so a known-good librustpushgo.a re-populates the
+            # cache. Bump again if the unicorn/rustpush build is ever poisoned.
+            scope: linux-amd64-v2
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-            scope: linux-arm64
+            scope: linux-arm64-v2
     steps:
       - uses: actions/checkout@v4
 
