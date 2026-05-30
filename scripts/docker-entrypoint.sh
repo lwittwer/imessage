@@ -76,6 +76,15 @@ if [ "$(id -u)" = "0" ] && [ -z "${ENTRYPOINT_PRIV_DROPPED:-}" ]; then
         fi
     done
 
+    # Pre-create the log dir/file owned by PUID. The Docker HEALTHCHECK runs as
+    # root and appends here whenever config exists but the bridge isn't PID 1
+    # (e.g. during `imessage setup`). If it CREATES a root-owned bridge.log
+    # first, the PUID bridge/init-db can't rotate it on startup (rename ->
+    # EACCES) and setup fails until a retry happens to win the race.
+    mkdir -p /data/logs
+    [ -e /data/logs/bridge.log ] || : > /data/logs/bridge.log
+    chown "$PUID:$PGID" /data/logs /data/logs/bridge.log 2>/dev/null || true
+
     # Mirror the host bind-mount source path inside the container, pointing
     # at /data. Lets absolute paths from a bare-Linux install (e.g. config
     # has `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db`)
@@ -125,6 +134,10 @@ CONFIG="$DATA_DIR/config.yaml"
 BBCTL=/usr/local/bin/bbctl
 SCRIPTS=/opt/imessage/scripts
 SETUP_LOCK="$DATA_DIR/.setup-in-progress"
+# session.json (the iMessage identity/APNs state, written by every successful
+# login) marks that setup has actually completed a login. /home/bridge/.local/
+# share/mautrix-imessage is symlinked to /data, so the bridge writes it here.
+SESSION_FILE="$DATA_DIR/session.json"
 
 CMD="${1:-run}"
 shift || true
@@ -151,16 +164,29 @@ require_tty() {
 }
 
 cmd_run() {
-    # Wait for setup. Keeps PID 1 alive so `docker exec -it
-    # Rustpush-Matrix imessage-setup` works against a "running"
-    # container. The lock
-    # check prevents the bridge from grabbing the DB mid-login —
-    # install-beeper-linux.sh writes config.yaml partway through (during
-    # `bbctl config`) and then continues with the iMessage login.
+    # Wait for setup to FINISH before starting the bridge. Keeps PID 1 alive so
+    # `docker exec -it Rustpush-Matrix imessage-setup` works against a "running"
+    # container.
+    #
+    # Three gates, all required:
+    #   * config.yaml exists          — the bridge has something to run against.
+    #   * no .setup-in-progress lock   — an active setup run isn't mid-write
+    #                                    (install-beeper-linux.sh writes config
+    #                                    partway through, then does the login).
+    #   * session.json exists          — a login has actually completed.
+    #
+    # The session.json gate is load-bearing: /data persists across container
+    # rebuilds, so config.yaml is usually already present at boot. Without this
+    # gate, PID 1 would exec a login-less bridge the instant the container
+    # starts — before `imessage setup` runs — and that idle bridge never picks
+    # up the session.json that setup writes later, so the bridge "doesn't start"
+    # until a manual `docker restart`. Waiting for session.json means setup
+    # completes, drops the lock, writes the session, and cmd_run starts the
+    # bridge on its own.
     local warned=0
-    while [ ! -f "$CONFIG" ] || [ -f "$SETUP_LOCK" ]; do
+    while [ ! -f "$CONFIG" ] || [ -f "$SETUP_LOCK" ] || [ ! -f "$SESSION_FILE" ]; do
         if [ "$warned" -eq 0 ]; then
-            echo "no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge."
+            echo "waiting for setup — run 'imessage setup' from the host (no config.yaml or no completed iMessage login yet)."
             warned=1
         fi
         sleep 30
