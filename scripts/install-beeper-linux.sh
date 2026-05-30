@@ -1331,12 +1331,12 @@ echo ""
 echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo ""
-if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
+if [ "${SYSTEMD_MODE:-none}" = "user" ] && [ -f "${USER_SERVICE_FILE:-}" ]; then
     echo "  Status:  systemctl --user status mautrix-imessage"
     echo "  Logs:    journalctl --user -u mautrix-imessage -f"
     echo "  Stop:    systemctl --user stop mautrix-imessage"
     echo "  Restart: systemctl --user restart mautrix-imessage"
-elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
+elif [ "${SYSTEMD_MODE:-none}" = "system" ] && [ -f "${SYSTEM_SERVICE_FILE:-}" ]; then
     echo "  Status:  systemctl status mautrix-imessage"
     echo "  Logs:    journalctl -u mautrix-imessage -f"
     echo "  Stop:    systemctl stop mautrix-imessage"
