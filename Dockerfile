@@ -218,7 +218,8 @@ COPY --from=builder /src/scripts/install-beeper-linux.sh /opt/imessage/scripts/i
 COPY scripts/docker-entrypoint.sh /entrypoint.sh
 COPY scripts/imessage-setup.sh    /usr/local/bin/imessage-setup
 COPY scripts/as-bridge.sh         /usr/local/bin/as-bridge
-RUN chmod +x /entrypoint.sh /usr/local/bin/imessage-setup /usr/local/bin/as-bridge /opt/imessage/scripts/*.sh
+COPY scripts/healthcheck.sh       /usr/local/bin/healthcheck
+RUN chmod +x /entrypoint.sh /usr/local/bin/imessage-setup /usr/local/bin/as-bridge /usr/local/bin/healthcheck /opt/imessage/scripts/*.sh
 
 # State directory. WORKDIR /data is load-bearing: Rust hardcodes
 # `state/anisette/` as a relative path (pkg/rustpushgo/src/lib.rs).
@@ -229,6 +230,13 @@ RUN mkdir -p /data
 WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 29325
+
+# Liveness probe (see scripts/healthcheck.sh). Reports unhealthy whenever the
+# bridge binary isn't PID 1 — e.g. the wedged privilege-drop loop with PUID=0 —
+# and, once config exists, writes the failure into /data/logs/bridge.log so
+# `imessage logs` shows it instead of a silent tail behind an "Up" container.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD healthcheck
 
 # XDG env vars left unset on purpose. User config persistence is defined by
 # docker-compose.yml bind mounts, not by image-level path overrides.
