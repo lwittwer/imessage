@@ -10504,31 +10504,44 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 }
 
 const (
-	// videoTranscodeMaxAttempts caps how many times we retry an ffmpeg
-	// conversion before falling back to the original file.
-	videoTranscodeMaxAttempts = 6
-	// videoTranscodeInitialBackoff is the first inter-attempt wait; it doubles
-	// each retry (5s, 10s, 20s, 40s, 80s ...).
-	videoTranscodeInitialBackoff = 5 * time.Second
+	// transcodeBackoffInitial is the first wait between transcode retries; it
+	// doubles after each failure.
+	transcodeBackoffInitial = 3 * time.Second
+	// transcodeRetryCadence caps the INTERVAL between retries — not the number
+	// of retries. Transcoding never gives up (no man left behind), so the wait
+	// must settle at a steady cadence: an uncapped interval would double to
+	// hours/days and effectively stop retrying, which is the opposite of what
+	// we want. Retries continue at this cadence until the conversion succeeds.
+	transcodeRetryCadence = 60 * time.Second
 )
 
-// transcodeToMP4 remuxes (cheap) or, failing that, re-encodes data to MP4.
-//
-// On a low-memory host (Raspberry Pi, small VPS, low-memory Mac) ffmpeg can
-// fail transiently when the box is briefly out of memory — the OS kills the
-// ffmpeg subprocess. Instead of giving up and shipping the original, we retry
-// the whole conversion with exponential backoff: by the time we try again,
-// other work has usually freed enough memory for it to complete. We detach the
-// ffmpeg run from the parent context's deadline/cancellation so a short inbound
-// deadline can't abort it mid-encode, but still honor true bridge shutdown by
-// watching the original ctx during the backoff wait.
-//
-// Returns the converted bytes + the method used, or the last error once all
-// attempts are exhausted (the caller then falls back to the original file).
+// transcodeSem serializes ffmpeg conversions process-wide. The dominant cause
+// of OOM on low-memory hosts (Raspberry Pi, small VPS, low-memory Mac) is many
+// backfill attachments transcoding at once; capping concurrency to a single
+// ffmpeg run bounds peak memory. The slot is held only for the duration of each
+// ffmpeg invocation and released during the backoff wait, so a struggling job
+// never starves the others.
+var transcodeSem = make(chan struct{}, 1)
+
+// transcodeToMP4 remuxes (cheap) or, failing that, re-encodes data to MP4. It
+// is serialized against other transcodes (one ffmpeg at a time → bounded peak
+// memory) and retries with exponential backoff that NEVER gives up: on a
+// low-memory host the conversion may be OOM-killed repeatedly, so we keep
+// retrying — backing off to a steady cadence — until it completes. No man left
+// behind. The ffmpeg run is detached from the parent context's deadline so a
+// short inbound deadline can't abort it mid-encode; the only way out without a
+// successful conversion is true bridge shutdown (ctx cancelled), in which case
+// the caller ships the original.
 func transcodeToMP4(ctx context.Context, log *zerolog.Logger, data []byte, mimeType string) (converted []byte, method string, err error) {
 	base := context.WithoutCancel(ctx)
-	backoff := videoTranscodeInitialBackoff
-	for attempt := 1; attempt <= videoTranscodeMaxAttempts; attempt++ {
+	backoff := transcodeBackoffInitial
+	for attempt := 1; ; attempt++ {
+		// One ffmpeg at a time across the whole process — bounds peak memory.
+		select {
+		case transcodeSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
 		method = "remux"
 		converted, err = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -10541,22 +10554,21 @@ func transcodeToMP4(ctx context.Context, log *zerolog.Logger, data []byte, mimeT
 					"-c:a", "aac", "-movflags", "+faststart"},
 				mimeType)
 		}
+		<-transcodeSem // release before backing off so other transcodes can run
 		if err == nil {
 			return converted, method, nil
 		}
-		if attempt < videoTranscodeMaxAttempts {
-			log.Warn().Err(err).Int("attempt", attempt).Int("max_attempts", videoTranscodeMaxAttempts).
-				Dur("backoff", backoff).Int("bytes", len(data)).
-				Msg("Video transcode failed (likely transient memory pressure), backing off before retry")
-			select {
-			case <-ctx.Done():
-				return nil, method, ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff *= 2
+		log.Warn().Err(err).Int("attempt", attempt).Dur("backoff", backoff).Int("bytes", len(data)).
+			Msg("Video transcode failed (likely transient memory pressure); will keep retrying until it completes")
+		select {
+		case <-ctx.Done():
+			return nil, method, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > transcodeRetryCadence {
+			backoff = transcodeRetryCadence
 		}
 	}
-	return nil, method, err
 }
 
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
