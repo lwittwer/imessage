@@ -55,6 +55,33 @@ fix_permissions() {
     return 1
 }
 
+# ── Appservice-token validity check (Docker only) ─────────────
+# Returns 0 (true) when the homeserver actively REJECTS the config's as_token
+# (HTTP 401/403), 1 otherwise (accepted, or undeterminable — never disrupt a
+# working setup on a transient error). After a `bbctl delete` + re-register the
+# local config can stay pinned to the deleted registration's token while the
+# server holds a new one; the bridge then log.Fatals on M_UNKNOWN_TOKEN every
+# start. bbctl whoami still lists the (new) registration, so the "not
+# registered" path below can't catch it — we ask the homeserver directly.
+config_token_rejected() {
+    local cfg="$1" as_token hs_addr bot_user domain code
+    [ -f "$cfg" ] || return 1
+    as_token=$(grep -E '^[[:space:]]*as_token:' "$cfg" | head -1 | sed -E 's/.*as_token:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    hs_addr=$(grep -E '^[[:space:]]*address:' "$cfg" | head -1 | sed -E 's/.*address:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    bot_user=$(grep -E '^[[:space:]]*username:' "$cfg" | head -1 | sed -E 's/.*username:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    domain=$(grep -E '^[[:space:]]*domain:' "$cfg" | head -1 | sed -E 's/.*domain:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    [ -n "$as_token" ] && [ -n "$hs_addr" ] && [ -n "$bot_user" ] && [ -n "$domain" ] || return 1
+    # Mirror the bridge's own whoami probe; curl url-encodes the @ and : for us.
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -G \
+        -H "Authorization: Bearer ${as_token}" \
+        --data-urlencode "user_id=@${bot_user}:${domain}" \
+        "${hs_addr}/_matrix/client/v3/account/whoami") || code=000
+    case "$code" in
+        401|403) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 
@@ -183,6 +210,26 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
+fi
+# ── Docker: regenerate a config whose appservice token the server rejects ──
+# In Docker config.yaml lives on the persistent /data volume, so a `bbctl
+# delete` + re-register cycle leaves it pinned to the deleted registration's
+# as_token while the server holds a new one. bbctl whoami still lists the (new)
+# registration, so the "not registered" path above keeps the stale config and
+# the bridge log.Fatals on M_UNKNOWN_TOKEN every start. Ask the homeserver
+# directly; if it rejects the token, drop the registration + config + DB so a
+# fresh, matching config is generated below. A still-accepted token is kept, so
+# re-running setup to change knobs leaves the working config in place.
+# (Bare metal never hits this: `make reset` wipes the whole state dir first.)
+if [ -n "${IN_DOCKER:-}" ] && [ -f "$CONFIG" ] && config_token_rejected "$CONFIG"; then
+    echo "⚠  Existing config's appservice token is no longer accepted by the homeserver (M_UNKNOWN_TOKEN)."
+    echo "   Regenerating config to match the current registration..."
+    if [ -n "$EXISTING_BRIDGE" ]; then
+        "$BBCTL" delete "$BRIDGE_NAME" >/dev/null 2>&1 || true
+        sleep 3
+    fi
+    rm -f "$CONFIG"
+    rm -f "$DATA_DIR"/mautrix-imessage.db*
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"

@@ -194,6 +194,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     ca-certificates \
     ffmpeg \
     wget \
+    curl \
     bash \
     coreutils \
     sed \
