@@ -34,11 +34,21 @@ if pgrep -f mautrix-imessage-v2 >/dev/null 2>&1; then
 fi
 
 # ── Delete server-side registration (cleans up Matrix rooms) ──
+# Check whoami first: a registration that the server has already dropped can
+# linger in bbctl whoami, and `bbctl delete` then fails with M_NOT_FOUND
+# (HTTP 404). Under set -e that aborts the reset with a confusing error, even
+# though there's nothing left to delete. Skip the delete when nothing is
+# registered, and don't let a not-found delete abort the local wipe.
 echo ""
-echo "Deleting bridge registration from Beeper..."
-echo "(Answer the confirmation prompt below)"
-echo ""
-"$BBCTL" delete "$BRIDGE_NAME"
+if "$BBCTL" whoami 2>/dev/null | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
+    echo "Deleting bridge registration from Beeper..."
+    echo "(Answer the confirmation prompt below)"
+    echo ""
+    "$BBCTL" delete "$BRIDGE_NAME" || \
+        echo "⚠  Registration already absent on server — continuing with local wipe."
+else
+    echo "✓ No '$BRIDGE_NAME' registration on server — skipping delete."
+fi
 
 # ── Clear journal logs ───────────────────────────────────────
 echo ""
