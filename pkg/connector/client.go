@@ -6500,6 +6500,36 @@ func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Por
 	}
 }
 
+// powerLevelsForMemberSync returns the power-level overrides to attach to a
+// member list, choosing by whether the Matrix room already exists.
+//
+// On room CREATION (portal.MXID == ""), bridgev2 bakes these overrides into the
+// CreateRoom request's PowerLevelOverride, and on Beeper (auto_join_invites) the
+// server adds the initial roster via that same create — silently — only if the
+// create's power levels don't get in the way. Baking the full hardened lockdown
+// (Invite/Kick/Ban/Redact = plLockLevel, EventsDefault, the destructive-event
+// locks and the Custom reset hook) into the CREATE request breaks that silent
+// initial-member add, so the whole roster re-surfaces as "<name> joined the
+// chat" on a fresh-DB backfill. Pre-d78e666 we created groups with only a light
+// Invite=95 and DMs with no override, and creation was silent.
+//
+// So: at creation use those pre-lockdown levels; on every later resync
+// (portal.MXID != "") apply the full hardened lockdown. The room therefore ends
+// up — and stays — locked, because the immediate post-creation ChatResync runs
+// this with portal.MXID set. Steady-state protection is unchanged; only the
+// one create event is permissive.
+func (c *IMClient) powerLevelsForMemberSync(ctx context.Context, portal *bridgev2.Portal, isGroup bool) *bridgev2.PowerLevelOverrides {
+	if portal == nil || portal.MXID == "" {
+		if isGroup {
+			// Bridge still owns membership for groups, just at a human-reachable
+			// lock so the silent initial-member add isn't rejected at creation.
+			return &bridgev2.PowerLevelOverrides{Invite: ptr.Ptr(95)}
+		}
+		return nil
+	}
+	return c.hardenedPowerLevels(ctx, portal)
+}
+
 // resetEscalatedUsers is the Custom power-level hook from hardenedPowerLevels.
 // It demotes any non-bot user whose level was raised above the room baseline
 // (users_default) back down to that baseline, and — when a room is known and the
@@ -6709,7 +6739,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		chatInfo.Members = &bridgev2.ChatMemberList{
 			IsFull:      true,
 			MemberMap:   memberMap,
-			PowerLevels: c.hardenedPowerLevels(ctx, portal),
+			// Permissive at creation (silent initial-member add), full lockdown
+			// on resync. See powerLevelsForMemberSync.
+			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, true),
 		}
 
 		// Only set the group name for NEW portals (no Matrix room yet).
@@ -6824,7 +6856,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			IsFull:      true,
 			OtherUserID: otherUser,
 			MemberMap:   memberMap,
-			PowerLevels: c.hardenedPowerLevels(ctx, portal),
+			// Permissive at creation (silent initial-member add), full lockdown
+			// on resync. See powerLevelsForMemberSync.
+			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, false),
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
