@@ -122,6 +122,13 @@ func main() {
 		return
 	}
 
+	// Backfill any network config keys this build knows about but that are
+	// missing from the on-disk config (e.g. configs generated before a key was
+	// added). Runs before PreInit loads the config so the file is complete for
+	// this run too. Append-only and parser-safe — it never overwrites existing
+	// keys and never touches a config that doesn't parse. See ensure_config.go.
+	ensureNetworkConfigKeys(configPathFromArgs())
+
 	// Instead of m.Run(), manually call PreInit/Init/Start so we can
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
