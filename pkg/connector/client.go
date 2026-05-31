@@ -1463,6 +1463,16 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 		modified := *base
 		modified.ReadReceipts = c.Main.Config.ReadReceipts
 		modified.TypingNotifications = c.Main.Config.TypingNotifications
+		// Vary the capability ID so bridgev2's UpdateCapabilities re-advertises
+		// the reduced feature set. It short-circuits when caps.GetID() matches
+		// the stored CapState.ID, so reusing base.ID would leave clients showing
+		// stale support after the flag is toggled. Mirrors the "+dm" convention.
+		if !c.Main.Config.ReadReceipts {
+			modified.ID += "+nordr"
+		}
+		if !c.Main.Config.TypingNotifications {
+			modified.ID += "+notyp"
+		}
 		return &modified
 	}
 	return base
