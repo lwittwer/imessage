@@ -1,9 +1,9 @@
 # Consolidate contributor identities for `git shortlog` and GitHub's
 # Contributors graph. Maps each historical identity to its canonical form.
+# Canonical uses david@mackid1993.com — a domain identity already verified on
+# GitHub — rather than a personal email address.
 # Format: Canonical Name <canonical@email> Commit Name <commit@email>
 
-# David (mackid1993) — earlier commits used a hostname-derived (.local) email,
-# or david@mackid1993.com, before the canonical identity was configured.
-mackid1993 <david@brustein.net> David <david@mackid1993.com>
-mackid1993 <david@brustein.net> David Brustein <david@Artemis.local>
-mackid1993 <david@brustein.net> David Brustein <david@Davids-MacBook-Pro.local>
+mackid1993 <david@mackid1993.com> David <david@mackid1993.com>
+mackid1993 <david@mackid1993.com> David Brustein <david@Artemis.local>
+mackid1993 <david@mackid1993.com> David Brustein <david@Davids-MacBook-Pro.local>
