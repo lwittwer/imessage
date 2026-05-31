@@ -3312,6 +3312,47 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
             }
         }
     };
+    // DIAGNOSTIC: resolve the callee on facetime.multi the same way ft.ring
+    // will, immediately before ringing, and report how many FaceTime push
+    // endpoints IDS currently returns for them. If this logs 0 endpoints (or
+    // cache_keys_ok=false), the Invitation has nowhere to land — "rang 1
+    // target" is meaningless and the callee cannot ring. That would pin the
+    // break on the shared IDS layer (StatusKit's concurrent refresh=true churn
+    // / throttling) leaving the callee unresolved at ring time. If it logs a
+    // non-zero count, resolution is fine and the failure is downstream of the
+    // ring (delivery/validity), not the IDS layer.
+    {
+        let diag_topic = "com.apple.private.alloy.facetime.multi";
+        let diag_my_handle = session.my_handles.first().cloned().unwrap_or_default();
+        let diag_ck = ft
+            .identity
+            .cache_keys(
+                diag_topic,
+                &targets,
+                &diag_my_handle,
+                true,
+                &rustpush::ids::user::QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await;
+        let diag_targets = ft
+            .identity
+            .cache
+            .lock()
+            .await
+            .get_participants_targets(diag_topic, &diag_my_handle, &targets);
+        info!(
+            "FACETIME_RING_DIAG: session={} callee_targets={:?} resolved_ft_endpoints={} cache_keys_ok={} cache_keys_err={:?}",
+            guid,
+            targets,
+            diag_targets.len(),
+            diag_ck.is_ok(),
+            diag_ck.as_ref().err()
+        );
+    }
+
     let rang = match ft.ring(&session, &targets, false).await {
         Ok(_) => {
             info!(
