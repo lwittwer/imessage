@@ -74,6 +74,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
+		cmdClearIdentityCache,
 	}
 	if !disableFaceTime {
 		cmds = append(cmds,
@@ -82,7 +83,6 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 			cmdFaceTimeClear,
 			cmdFaceTimeInvalidatePeer,
 			cmdFaceTimeRotateIdentity,
-			cmdFaceTimeClearIdentityCache,
 			cmdFaceTimeState,
 			cmdFaceTimeSessionLink,
 			cmdFaceTimeUseLink,
@@ -117,6 +117,46 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdStatuskitClearLatch,
 	)
 	return cmds
+}
+
+// cmdClearIdentityCache drops the bridge's cached IDS identity/key data for ALL
+// Apple services (iMessage, FaceTime, StatusKit) and re-registers, so the cache
+// rebuilds against Apple's current state. This is OpenBubbles' "clear identity
+// cache" recovery: invalidate the local IDS key cache, then re-register the
+// identity bundle so the bridge isn't left cache-wiped/unregistered. Use when
+// the bridge's identity has gone stale or smeared — e.g. peers can't resolve a
+// clean identity (calls ring a UUID / don't connect, inbound routing is wrong).
+// Not FaceTime-specific; stays available even with disable_facetime set.
+var cmdClearIdentityCache = &commands.FullHandler{
+	Name: "clear-identity-cache",
+	Func: fnClearIdentityCache,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Clear the bridge's cached IDS identity/key data for all Apple services (iMessage, FaceTime, StatusKit) and re-register. Recovers from a stale or smeared registration.",
+	},
+	RequiresLogin: true,
+}
+
+func fnClearIdentityCache(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("You're not signed in to iMessage. Run `$cmdprefix login` first.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil || client.client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	count, err := client.client.ClearIdentityCache()
+	if err != nil {
+		ce.Reply("Failed to clear the identity cache: %v", err)
+		return
+	}
+	ce.Reply(
+		"Cleared the cached IDS identity/key data for all Apple services and re-registered (services in registration: %d). Give Apple a minute to settle, then retry.",
+		count,
+	)
 }
 
 // cmdStartChat opens an iMessage DM with a phone number or email. Replaces
