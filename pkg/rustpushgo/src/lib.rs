@@ -3396,40 +3396,97 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
 // send_message, KeyCache::get_participants_targets, ConversationMessage
 // proto). No upstream patching.
 async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
-    // DISABLED — this emitter breaks every bridged FaceTime call.
-    //
-    // It was meant to tell the user's *other* Apple devices to stop ringing
-    // when the bridge places or answers a call, by sending a RespondedElsewhere
-    // to get_participants_targets(own_handle) on facetime.multi. But a bridge
-    // user has no separate Apple device, so every target under the own handle
-    // (e.g. tel:+1...) is the bridge's OWN FaceTime registration / call-carrying
-    // leg — including stale tokens left behind by repeated re-registration.
-    // A RespondedElsewhere(disconnected_reason=4) sent there tears the bridge's
-    // own leg out of the LIVE session: outbound the callee's ring is cancelled,
-    // inbound the just-answered call hangs up on the caller. iMessage is
-    // unaffected (separate path), which is why only FaceTime broke.
-    //
-    // Token-filtering the live conn token (prior attempt) didn't help — the
-    // harmful targets are stale/rotated registrations whose tokens don't match
-    // ft.conn.get_token(). The correct behavior is to never tell our own handle
-    // "responded elsewhere" for a call we are bridging, so we send nothing.
-    //
-    // NOTE: the same RespondedElsewhere can also be emitted by UPSTREAM
-    // prop_up_conv (facetime.rs:708) via respond_letmein's needs_prop branch
-    // (facetime.rs:1078). That's a separate emitter we can't disable from here;
-    // if calls still tear down after this lands, that one is next.
+    use prost::Message as _;
+    use rustpush::facetime::facetimep::{ConversationMessage, ConversationMessageType};
+    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
+    use rustpush::ids::user::QueryOptions;
+
     let handle = {
         let state = ft.state.read().await;
-        state
-            .sessions
-            .get(guid)
-            .and_then(|s| s.my_handles.first().cloned())
-            .unwrap_or_default()
+        let Some(session) = state.sessions.get(guid) else {
+            warn!("suppress_own_device_ring: session {} not found", guid);
+            return;
+        };
+        match session.my_handles.first().cloned() {
+            Some(h) => h,
+            None => {
+                warn!("suppress_own_device_ring: session {} has no my_handles", guid);
+                return;
+            }
+        }
     };
-    info!(
-        "suppress_own_device_ring: SKIPPED (disabled) for own handle {} session {} — sending RespondedElsewhere here tears the bridge's own call leg out",
-        handle, guid
-    );
+
+    let mut message = ConversationMessage::default();
+    message.set_type(ConversationMessageType::RespondedElsewhere);
+    message.conversation_group_uuid_string = guid.to_string();
+    message.disconnected_reason = 4;
+
+    let relevant_people = vec![handle.clone()];
+    let topic = "com.apple.private.alloy.facetime.multi";
+
+    if let Err(e) = ft
+        .identity
+        .cache_keys(
+            topic,
+            &relevant_people,
+            &handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true },
+        )
+        .await
+    {
+        warn!(
+            "suppress_own_device_ring: cache_keys failed for session {}: {:?}",
+            guid, e
+        );
+        return;
+    }
+
+    // Suppress the user's OTHER Apple devices (e.g. a MacBook in the same
+    // Apple ID) from ringing when the bridge places/answers a call — but never
+    // the bridge's OWN call-carrying leg. Upstream identifies the bridge's own
+    // participant by base64(conn.get_token()) (facetime.rs:730-748); excluding
+    // that token here keeps the RespondedElsewhere off the live leg (which
+    // would tear the call down) while still reaching genuine sibling devices.
+    let my_token = ft.conn.get_token().await;
+    let targets: Vec<_> = ft
+        .identity
+        .cache
+        .lock()
+        .await
+        .get_participants_targets(topic, &handle, &relevant_people)
+        .into_iter()
+        .filter(|t| t.delivery_data.push_token != my_token)
+        .collect();
+    if targets.is_empty() {
+        // Only the bridge's own leg was registered — nothing to suppress.
+        return;
+    }
+    let target_count = targets.len();
+
+    let ids_send = IDSSendMessage {
+        sender: handle.clone(),
+        raw: Raw::Body(message.encode_to_vec()),
+        send_delivered: false,
+        command: 242,
+        no_response: false,
+        id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+        scheduled_ms: None,
+        queue_id: None,
+        relay: None,
+        extras: Default::default(),
+    };
+
+    match ft.identity.send_message(topic, ids_send, targets).await {
+        Ok(_) => info!(
+            "suppress_own_device_ring: sent RespondedElsewhere to own handle {} for session {} ({} sibling target(s), bridge's own leg excluded)",
+            handle, guid, target_count
+        ),
+        Err(e) => warn!(
+            "suppress_own_device_ring: send_message failed for session {}: {:?}",
+            guid, e
+        ),
+    }
 }
 
 // Wrapper-side replacement for upstream's prop_up_conv on the inbound
