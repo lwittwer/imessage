@@ -975,7 +975,7 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 //     contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.handle == "" {
-		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -984,7 +984,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	// this gate, a bootstrap burst of fresh DM portals would race the sweep
 	// and spawn unpaced concurrent invites.
 	c.statusKitSweepRunning.Store(true)
-	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
+	log.Info().Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: starting")
 	defer func() {
 		c.statusKitSweepRunning.Store(false)
 		if r := recover(); r != nil {
@@ -1151,7 +1151,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		// callers both miss the latch and double-invoke. Peer iOS treats
 		// repeat invites as spam.
 		if _, loaded := c.inviteInFlight.LoadOrStore(h, struct{}{}); loaded {
-			log.Debug().Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: skipping — already in flight")
+			log.Debug().Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: skipping — already in flight")
 			continue
 		}
 		inviteDone := make(chan error, 1)
@@ -1176,9 +1176,9 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 				failCount++
 				if isTerminalStatusKitInviteError(err) {
 					c.markTerminalStatusKitInviteFailure(ctx, h, err, now)
-					log.Debug().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: terminal failure for handle")
+					log.Debug().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: terminal failure for handle")
 				} else {
-					log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
+					log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
 				}
 			} else {
 				okCount++
@@ -1189,12 +1189,12 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 				//   useful for debug timelines)
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+h), nowStr)
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
-				log.Info().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
-				log.Info().Str("handle", h).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
+				log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
+				log.Info().Str("handle", logSafeHandle(h)).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
 			}
 		case <-time.After(perInviteTimeout):
 			timeoutCount++
-			log.Warn().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite: timed out for handle — abandoning this handle, continuing sweep")
+			log.Warn().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite: timed out for handle — abandoning this handle, continuing sweep")
 		case <-c.stopChan:
 			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
 			return
@@ -1210,7 +1210,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			}
 		}
 	}
-	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", sender).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
+	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", logSafeHandle(sender)).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 	if okCount > 0 {
 		c.publishStatusKitAvailableAfterInvite(log, "invite sweep")
 	}
@@ -1297,7 +1297,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	// emit unpaced FFI calls. The next sweep (or the soft-expired
 	// re-invite path) will pick this peer up if needed.
 	if c.statusKitSweepRunning.Load() {
-		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): sweep in progress; skipping")
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): sweep in progress; skipping")
 		return
 	}
 
@@ -1306,7 +1306,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
 		for _, known := range sk.GetKnownHandles() {
 			if known == handle {
-				log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): peer already keyed; skipping")
+				log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): peer already keyed; skipping")
 				return
 			}
 		}
@@ -1326,11 +1326,11 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			}
 		}
 		if reshareSeen {
-			log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): reshare already seen; skipping")
+			log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): reshare already seen; skipping")
 			return
 		}
 		if ts, parseErr := time.Parse(time.RFC3339, latchedAt); parseErr == nil && now.Sub(ts) < statusKitInvitedOkTTL {
-			log.Debug().Str("handle", handle).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
+			log.Debug().Str("handle", logSafeHandle(handle)).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
 			return
 		}
 	}
@@ -1344,12 +1344,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	// parent select can return on its 30s timeout while the FFI is still
 	// running, and we must not free the slot until the FFI itself ends.
 	if _, loaded := c.inviteInFlight.LoadOrStore(handle, struct{}{}); loaded {
-		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): already in flight; skipping")
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): already in flight; skipping")
 		return
 	}
 
 	sender := c.handle
-	log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): dispatching")
+	log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): dispatching")
 
 	const perInviteTimeout = 30 * time.Second
 	inviteDone := make(chan error, 1)
@@ -1370,19 +1370,19 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 		if err != nil {
 			if isTerminalStatusKitInviteError(err) {
 				c.markTerminalStatusKitInviteFailure(ctx, handle, err, now)
-				log.Debug().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): terminal failure")
+				log.Debug().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): terminal failure")
 			} else {
-				log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
+				log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): failed")
 			}
 			return
 		}
 		nowStr := now.Format(time.RFC3339)
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), nowStr)
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), nowStr)
-		log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): ok")
+		log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): ok")
 		c.publishStatusKitAvailableAfterInvite(log, "new portal invite")
 	case <-time.After(perInviteTimeout):
-		log.Warn().Str("sender", sender).Str("handle", handle).Dur("timeout", perInviteTimeout).Msg("StatusKit invite (new portal): timed out — abandoning")
+		log.Warn().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite (new portal): timed out — abandoning")
 	case <-c.stopChan:
 		return
 	}
@@ -1596,6 +1596,52 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 // cloudSyncRetryInterval is the interval used when a bootstrap sync attempt
 // fails, so recovery happens quickly.
 const cloudSyncRetryInterval = 1 * time.Minute
+
+// bodyScrubInterval and bodyScrubGracePeriod control how aggressively the
+// privacy scrubber clears plaintext from cloud_message rows whose Matrix
+// event has been delivered. The grace period is a buffer against bridgev2
+// racing the scrubber on freshly-ingested messages; the interval is the
+// steady-state sweep cadence.
+const (
+	bodyScrubInterval    = 5 * time.Minute
+	bodyScrubGracePeriod = 5 * time.Minute
+)
+
+// runBodyScrubLoop runs the privacy scrubber on a fixed interval for the
+// lifetime of the IMClient. Bootstrap-time scrubbing is handled by
+// runPostSyncHousekeeping; this loop covers steady-state ongoing operation
+// (the bridge runs for days at a time).
+func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}) {
+	if c.cloudStore == nil {
+		return
+	}
+	ticker := time.NewTicker(bodyScrubInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
+			if err != nil {
+				log.Warn().Err(err).Msg("Body scrub failed")
+			} else if scrubbed > 0 {
+				log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+			}
+			if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
+				log.Warn().Err(rerr).Msg("Reaction-text scrub failed")
+			} else if rscrubbed > 0 {
+				log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
+			}
+			// Tail scrub must run here too, not just post-sync: rows synced just
+			// before a post-sync pass are still inside the grace window and get
+			// skipped, so without a later periodic pass they'd never be scrubbed.
+			c.runUnbridgedTailScrub(ctx, log)
+			cancel()
+		}
+	}
+}
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// NOTE: no defer recover() here intentionally. A panic in this goroutine
@@ -1841,6 +1887,31 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Info().Int64("pruned", pruned).Msg("Pruned orphaned attachment cache entries")
 	}
 
+	// Privacy: scrub plaintext from cloud_message rows that have been
+	// successfully bridged to Matrix. Runs both here (post-bootstrap, so
+	// existing rows migrate on first boot of this version) and on a
+	// dedicated ticker (see runBodyScrubLoop).
+	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs()); err != nil {
+		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+	}
+
+	// Privacy: reaction rows store the quoted-body descriptor but nothing reads
+	// it (reactions render from tapback metadata), so clear it unconditionally.
+	if scrubbed, err := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); err != nil {
+		log.Warn().Err(err).Msg("Failed to scrub reaction text")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
+	}
+
+	// Privacy: scrub plaintext from the un-backfillable tail (rows older than
+	// the newest MaxInitialMessages per portal, which backward backfill can
+	// never reach when a cap is set). No-op when backfill is uncapped. Also
+	// runs on the periodic ticker (runBodyScrubLoop) to catch rows that were
+	// inside the grace window during this pass.
+	c.runUnbridgedTailScrub(ctx, log)
+
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.
 	if deleted, err := c.cloudStore.deleteOrphanedMessages(ctx); err != nil {
 		log.Warn().Err(err).Msg("Failed to delete orphaned cloud messages")
@@ -1861,6 +1932,31 @@ func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.L
 // continuation tokens mean CloudKit only returns changes since last sync.
 func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
 	if isBootstrap {
+		// DEVELOPMENT-ONLY re-fill: when privacy is disabled, undo the scrubber's
+		// NULLing so plaintext returns to the local cache. clearAllBodyScrub flips
+		// body_scrubbed off (non-deleted rows only — deletes stay purged); the
+		// upsert's ON CONFLICT clause then writes Apple's text back instead of
+		// preserving the NULL. That only takes effect once CloudKit re-delivers
+		// the records, so we also reset the continuation tokens to force a full
+		// re-page. Self-limiting: once every row is re-filled (scrubber stays off
+		// in this mode) clearAllBodyScrub reports 0 and we leave sync incremental,
+		// so this full re-download happens at most once per flip, not every boot.
+		// Caveat: if the re-page is interrupted mid-sync, some rows are left
+		// body_scrubbed=FALSE with text still NULL; the next boot's n=0 short-
+		// circuit then skips the token reset, so those rows stay empty until the
+		// next full sync (e.g. a sync-version bump). Acceptable for a debug knob.
+		if debugDisablePrivacy {
+			if n, err := c.cloudStore.clearAllBodyScrub(ctx); err != nil {
+				log.Warn().Err(err).Msg("debug_disable_privacy: failed to clear body-scrub flags for re-fill")
+			} else if n > 0 {
+				if err := c.cloudStore.clearSyncTokens(ctx); err != nil {
+					log.Warn().Err(err).Msg("debug_disable_privacy: cleared scrub flags but failed to reset sync tokens")
+				} else {
+					log.Warn().Int64("rows", n).Msg("debug_disable_privacy: cleared body-scrub flags and reset CloudKit sync tokens — forcing a full re-page to re-fill plaintext")
+				}
+			}
+		}
+
 		isFresh := false
 		hasOwnPortal := false
 		if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {
@@ -2646,8 +2742,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		// for cloud_chat, but catches cloud_message rows too). UUIDs are preserved
 		// so hasMessageUUID can still detect stale APNs echoes.
 		for recordName, portalID := range portalMap {
+			// Fail-closed: if scrub fails we skip the in-memory tombstone +
+			// ChatDelete emit so plaintext isn't stranded after bridgev2 wipes
+			// its message rows. The next housekeeping pass will retry.
 			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete messages for tombstoned chat")
+				log.Error().Err(err).Str("portal_id", portalID).Str("record_name", recordName).
+					Msg("Skipping CloudKit tombstone ChatDelete because cloud_message scrub failed — will retry next sync")
+				continue
 			}
 
 			// Mark as deleted in memory so createPortalsFromCloudSync skips

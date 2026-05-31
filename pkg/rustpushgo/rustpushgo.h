@@ -80,6 +80,11 @@ void* uniffi_rustpushgo_fn_method_client_batch_resolve_handles(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_clear_identity_cache(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_diag_full_count(
 	void* ptr,
 	RustCallStatus* out_status
@@ -756,6 +761,12 @@ void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_ring(
 	RustBuffer session_id,
 	RustBuffer targets,
 	int8_t letmein,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
+	void* ptr,
+	RustBuffer name,
 	RustCallStatus* out_status
 );
 
@@ -1541,6 +1552,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_batch_resolve_handles(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_clear_identity_cache(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(
 	RustCallStatus* out_status
 );
@@ -1910,6 +1925,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_respond_delegat
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_ring(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name(
 	RustCallStatus* out_status
 );
 

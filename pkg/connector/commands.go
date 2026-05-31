@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/provisionutil"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/imessage"
 )
@@ -73,6 +74,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
+		cmdClearIdentityCache,
 	}
 	if !disableFaceTime {
 		cmds = append(cmds,
@@ -95,6 +97,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		)
 	}
 	cmds = append(cmds,
+		cmdSetPowerLevel,
 		cmdSharedAlbums,
 		cmdSharedSubscribe,
 		cmdSharedSubscribeToken,
@@ -116,6 +119,46 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 	return cmds
 }
 
+// cmdClearIdentityCache drops the bridge's cached IDS identity/key data for ALL
+// Apple services (iMessage, FaceTime, StatusKit) and re-registers, so the cache
+// rebuilds against Apple's current state. This is OpenBubbles' "clear identity
+// cache" recovery: invalidate the local IDS key cache, then re-register the
+// identity bundle so the bridge isn't left cache-wiped/unregistered. Use when
+// the bridge's identity has gone stale or smeared — e.g. peers can't resolve a
+// clean identity (calls ring a UUID / don't connect, inbound routing is wrong).
+// Not FaceTime-specific; stays available even with disable_facetime set.
+var cmdClearIdentityCache = &commands.FullHandler{
+	Name: "clear-identity-cache",
+	Func: fnClearIdentityCache,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Clear the bridge's cached IDS identity/key data for all Apple services (iMessage, FaceTime, StatusKit) and re-register. Recovers from a stale or smeared registration.",
+	},
+	RequiresLogin: true,
+}
+
+func fnClearIdentityCache(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("You're not signed in to iMessage. Run `$cmdprefix login` first.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil || client.client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	count, err := client.client.ClearIdentityCache()
+	if err != nil {
+		ce.Reply("Failed to clear the identity cache: %v", err)
+		return
+	}
+	ce.Reply(
+		"Cleared the cached IDS identity/key data for all Apple services and re-registered (services in registration: %d). Give Apple a minute to settle, then retry.",
+		count,
+	)
+}
+
 // cmdStartChat opens an iMessage DM with a phone number or email. Replaces
 // bridgev2's built-in `start-chat` (registered first by the Processor, then
 // overwritten by us in PostInit) so users get an interactive picker that
@@ -130,6 +173,68 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 //
 // No aliases — `start-chat` is the single canonical command name. Synonyms
 // just teach users multiple ways to do the same thing and clutter help.
+// cmdSetPowerLevel shadows bridgev2's built-in `set-pl` (registered first by
+// the Processor, then overwritten by us in PostInit — same pattern as
+// cmdStartChat). The built-in sets the level as the bot, whose event the
+// framework filters out before the connector's HandleMatrixPowerLevels could
+// react — so set-pl would only get rubberbanded on the next resync. This
+// version sets the level then immediately snaps it back to the hardened policy
+// (reset + m.notice), so it happens the instant the command runs.
+var cmdSetPowerLevel = &commands.FullHandler{
+	Func:    fnSetPowerLevel,
+	Name:    "set-pl",
+	Aliases: []string{"set-power-level"},
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Change a power level. Bridge-managed rooms snap it back to the default.",
+		Args:        "[_user ID_] <_power level_>",
+	},
+	RequiresAdmin:  true,
+	RequiresPortal: true,
+}
+
+func fnSetPowerLevel(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	if ce.Portal == nil {
+		ce.Reply("That command can only be run in portal rooms.")
+		return
+	}
+	var target id.UserID
+	var level int
+	var err error
+	switch len(ce.Args) {
+	case 1:
+		target = ce.User.MXID
+		level, err = strconv.Atoi(ce.Args[0])
+	case 2:
+		target = id.UserID(ce.Args[0])
+		if _, _, perr := target.Parse(); perr != nil {
+			ce.Reply("Invalid user ID %q", ce.Args[0])
+			return
+		}
+		level, err = strconv.Atoi(ce.Args[1])
+	default:
+		ce.Reply("**Usage:** `set-pl [user] <level>`")
+		return
+	}
+	if err != nil {
+		ce.Reply("Invalid power level.")
+		return
+	}
+	if rbErr := client.rubberbandSetPowerLevel(ce.Ctx, ce.Portal, target, level); rbErr != nil {
+		ce.Reply("Failed to set power level: %v", rbErr)
+	}
+}
+
 var cmdStartChat = &commands.FullHandler{
 	Name: "start-chat",
 	Func: fnStartChat,

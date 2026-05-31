@@ -49,6 +49,16 @@ type IMConfig struct {
 	// converting HEIC/HEIF images. Default is 95.
 	HEICJPEGQuality int `yaml:"heic_jpeg_quality"`
 
+	// URLPreviewsInBackfill controls whether the bridge fetches link-preview
+	// metadata (og:/twitter: tags + thumbnail image) for messages that
+	// contain a URL during backfill. Each URL-bearing message triggers up to
+	// three HTTP round-trips (homeserver preview, page metadata, image
+	// download + re-upload) inline with conversion, which on a slow uplink
+	// dominates backfill wall-clock time. Setting this to false skips
+	// preview generation for backfilled history only; live inbound messages
+	// and outbound edits still build previews normally. Default true.
+	URLPreviewsInBackfill bool `yaml:"url_previews_in_backfill"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -89,9 +99,46 @@ type IMConfig struct {
 	// other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
 
+	// ReadReceipts controls whether the bridge sends read receipts to iMessage
+	// contacts when you mark a message as read in Matrix. When false, iMessage
+	// contacts will not see the "Read" indicator for your messages. Incoming
+	// read receipts from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	ReadReceipts bool `yaml:"read_receipts"`
+
+	// TypingNotifications controls whether the bridge sends typing indicators
+	// to iMessage contacts while you compose a reply in Matrix. When false,
+	// iMessage contacts will not see the typing bubble. Incoming typing
+	// indicators from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	TypingNotifications bool `yaml:"typing_notifications"`
+
 	// CardDAV is an external CardDAV server for contact name resolution.
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
+
+	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the
+	// bridge's privacy protections so plaintext is observable for debugging.
+	// MUST be false in any real deployment. Default false. When true:
+	//
+	//   1. Logs are no longer anonymized — raw iMessage handles
+	//      (phone numbers / emails) and full URLs appear verbatim in logs
+	//      instead of opaque tokens / scheme+host forms.
+	//   2. The periodic body scrubber is disabled — plaintext message
+	//      bodies (text/subject/sender) downloaded into the local
+	//      cloud_message side-cache are NOT cleared after Matrix delivery,
+	//      so they persist in mautrix-imessage.db.
+	//   3. On the next CloudKit sync the bridge re-fills already-scrubbed
+	//      rows: it clears the body_scrubbed flags and resets the CloudKit
+	//      continuation tokens, forcing a full re-page that re-downloads the
+	//      plaintext that was previously cleared. This is a one-shot per flip
+	//      (once no scrubbed rows remain, sync goes back to incremental).
+	//
+	// Notes: only the CloudKit backfill source caches plaintext locally, so
+	// effects 2 and 3 are CloudKit-specific (the chatdb source never stores
+	// message bodies in our DB). This does NOT undo deletes/unsends — content
+	// you delete or retract is still purged. Re-deletes nothing from Matrix.
+	DebugDisablePrivacy bool `yaml:"debug_disable_privacy"`
 }
 
 // CardDAVConfig configures an external CardDAV server for contact name resolution.
@@ -199,15 +246,19 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
+	helper.Copy(up.Bool, "url_previews_in_backfill")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "facetime_display_name")
 	helper.Copy(up.Bool, "disable_facetime")
 	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Bool, "statuskit_notifications")
+	helper.Copy(up.Bool, "read_receipts")
+	helper.Copy(up.Bool, "typing_notifications")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")
 	helper.Copy(up.Str, "carddav", "password_encrypted")
+	helper.Copy(up.Bool, "debug_disable_privacy")
 }
 
 func (c *IMConnector) GetConfig() (string, any, up.Upgrader) {

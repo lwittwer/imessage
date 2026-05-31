@@ -100,6 +100,7 @@ func main() {
 			// setup questions, without connecting to Matrix or APNs.
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			m.PreInit()
+			ensureSecureDeleteDSN(&m)
 			repairPermissions(&m)
 			m.Init()
 			fmt.Fprintln(os.Stderr, "Database initialized successfully")
@@ -124,12 +125,39 @@ func main() {
 	// Instead of m.Run(), manually call PreInit/Init/Start so we can
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
+	ensureSecureDeleteDSN(&m)
 	repairPermissions(&m)
 	m.Init()
 	m.Start()
 	exitCode := m.WaitForInterrupt()
 	m.Stop()
 	os.Exit(exitCode)
+}
+
+// ensureSecureDeleteDSN forces SQLite's secure_delete pragma on for every
+// pooled connection by injecting it into the database DSN before the bridge
+// opens the pool. secure_delete is a per-connection setting that is NOT
+// persisted in the database file, so running `PRAGMA secure_delete=ON` once
+// only affects whichever pooled connection executed it — other connections'
+// writes would still leave freed plaintext pages readable on disk. The
+// mattn/go-sqlite3 driver applies the _secure_delete DSN param on every
+// connect, which is the only way to guarantee the privacy scrubber's NULLed
+// plaintext is actually zeroed out of freed pages across the whole pool.
+// In-memory only (not persisted to config.yaml). No-op for non-SQLite
+// backends and when the operator already set the param.
+func ensureSecureDeleteDSN(br *mxmain.BridgeMain) {
+	if br.Config == nil || !strings.HasPrefix(br.Config.Database.Type, "sqlite") {
+		return
+	}
+	uri := br.Config.Database.URI
+	if uri == "" || strings.Contains(uri, "_secure_delete") {
+		return
+	}
+	sep := "?"
+	if strings.Contains(uri, "?") {
+		sep = "&"
+	}
+	br.Config.Database.URI = uri + sep + "_secure_delete=on"
 }
 
 // repairPermissions detects and fixes broken bridge.permissions before the

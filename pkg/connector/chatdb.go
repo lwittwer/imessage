@@ -272,7 +272,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 		// Only create a text part if there's actual text content
 		if msg.Text != "" || msg.Subject != "" {
-			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
+			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg, c.Main.Config.URLPreviewsInBackfill)
 			if err == nil {
 				backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
 					ConvertedMessage: cm,
@@ -389,7 +389,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 }
 
-func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message) (*bridgev2.ConvertedMessage, error) {
+func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, urlPreviewsInBackfill bool) (*bridgev2.ConvertedMessage, error) {
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    msg.Text,
@@ -408,9 +408,11 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 	}
 
 	// URL preview: detect URL and fetch og: metadata + image
-	if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
-		content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-			fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL),
+	if urlPreviewsInBackfill {
+		if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
+			content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL),
+			}
 		}
 	}
 
@@ -446,21 +448,10 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	if videoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
-		method := "remux"
-		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-			[]string{"-c", "copy", "-movflags", "+faststart"},
-			mimeType)
-		if convertErr != nil {
-			// Remux failed — try full re-encode
-			method = "re-encode"
-			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-					"-c:a", "aac", "-movflags", "+faststart"},
-				mimeType)
-		}
+		converted, method, convertErr := transcodeToMP4(ctx, log, data, mimeType)
 		if convertErr != nil {
 			log.Warn().Err(convertErr).Str("guid", msg.GUID).Str("original_mime", origMime).
-				Msg("FFmpeg video conversion failed, uploading original")
+				Msg("FFmpeg video conversion failed after retries, uploading original")
 		} else {
 			log.Info().Str("guid", msg.GUID).Str("original_mime", origMime).
 				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).

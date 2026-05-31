@@ -25,6 +25,14 @@ heic_conversion: false
 # JPEG output quality for HEIC/HEIF conversion (1–100). Default is 95.
 heic_jpeg_quality: 95
 
+# Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing
+# messages during backfill. Each URL triggers up to three HTTP round-trips
+# (homeserver preview, page fetch, image download + re-upload) inline with
+# conversion — on a slow uplink this dominates backfill time. Set to false
+# to skip previews during backfill only; live inbound messages and outbound
+# edits still build previews normally.
+url_previews_in_backfill: true
+
 # Override the outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 # Leave empty to use the handle chosen during login.
@@ -59,6 +67,32 @@ statuskit_share_on_startup: true
 # StatusKit registration / key exchange running normally (the IDS-layer
 # 4-service identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
+
+# DEVELOPMENT ONLY — leave this false in any real deployment.
+# Reverts the bridge's privacy protections so plaintext is observable for
+# debugging. When true:
+#   1. Logs are NOT anonymized — raw iMessage handles (phone/email) and full
+#      URLs appear verbatim instead of opaque tokens / scheme+host forms.
+#   2. The periodic body scrubber is disabled — plaintext message bodies
+#      cached locally (in the cloud_message table of mautrix-imessage.db)
+#      are no longer cleared after delivery to Matrix, so they persist.
+#   3. On the next CloudKit sync, rows that were already scrubbed are
+#      re-filled: the scrub flags are cleared and the CloudKit sync tokens
+#      are reset, forcing a full re-page that re-downloads the plaintext.
+# Only the CloudKit backfill source caches plaintext locally, so effects 2
+# and 3 are CloudKit-specific. Does NOT undo deletes/unsends, and does NOT
+# re-deliver anything to Matrix.
+debug_disable_privacy: false
+
+# Send read receipts to iMessage contacts when you read their messages in
+# Matrix. Set to false to stop iMessage contacts seeing when you have read
+# their messages. Incoming read receipts from iMessage contacts are unaffected.
+read_receipts: true
+
+# Send typing indicators to iMessage contacts while you compose a reply in
+# Matrix. Set to false to hide your typing from iMessage contacts. Incoming
+# typing indicators from iMessage contacts are unaffected.
+typing_notifications: true
 
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.

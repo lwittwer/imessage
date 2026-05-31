@@ -225,3 +225,24 @@ statuskit_notifications: false
 		t.Error("StatusKitNotifications should preserve explicit false")
 	}
 }
+
+func TestIMConfig_URLPreviewsInBackfill(t *testing.T) {
+	t.Run("explicit true", func(t *testing.T) {
+		var c IMConfig
+		if err := yaml.Unmarshal([]byte("url_previews_in_backfill: true\n"), &c); err != nil {
+			t.Fatalf("UnmarshalYAML error: %v", err)
+		}
+		if !c.URLPreviewsInBackfill {
+			t.Error("URLPreviewsInBackfill should be true")
+		}
+	})
+	t.Run("explicit false", func(t *testing.T) {
+		var c IMConfig
+		if err := yaml.Unmarshal([]byte("url_previews_in_backfill: false\n"), &c); err != nil {
+			t.Fatalf("UnmarshalYAML error: %v", err)
+		}
+		if c.URLPreviewsInBackfill {
+			t.Error("URLPreviewsInBackfill should be false")
+		}
+	})
+}

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -17,6 +18,50 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
+
+// sanitizeURLError returns err with every occurrence of the given URLs in
+// the error message replaced by their scheme+host form. Go's net/http wraps
+// transport failures in *url.Error whose Error() embeds the full URL
+// (e.g. `Get "https://x.com/secret/path": dial tcp …`), so .Err(err) re-leaks
+// the path/query that logSafeURL was meant to strip from the same log line.
+func sanitizeURLError(err error, urls ...string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	original := msg
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, u, logSafeURL(u))
+	}
+	if msg == original {
+		return err
+	}
+	return errors.New(msg)
+}
+
+// logSafeURL returns a scheme+host representation of a URL for log fields, so
+// the path and query (which carry user-content references like article slugs
+// or search terms) don't end up in logs. Falls back to "url:redacted" when
+// the URL is unparseable.
+func logSafeURL(u string) string {
+	if u == "" {
+		return ""
+	}
+	if debugDisablePrivacy {
+		return u
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" {
+		return "url:redacted"
+	}
+	if parsed.Scheme == "" {
+		return parsed.Host
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
 
 // metaTagRegex generically matches all <meta> tags with property/name and content
 // attributes, in either attribute order. Captures the full attribute name (including
@@ -53,7 +98,7 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 	if mc, ok := bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 		lp, err := mc.GetURLPreview(ctx, fetchURL)
 		if err != nil {
-			log.Debug().Err(err).Str("url", fetchURL).Msg("Homeserver URL preview failed, falling back to meta scraping")
+			log.Debug().Err(sanitizeURLError(err, fetchURL, targetURL)).Str("url_host", logSafeURL(fetchURL)).Msg("Homeserver URL preview failed, falling back to meta scraping")
 		}
 		if err == nil && lp != nil {
 			preview.LinkPreview = *lp
@@ -105,12 +150,12 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 				}
 				preview.ImageType = mime
 				preview.ImageSize = event.IntOrString(len(data))
-				log.Debug().Str("image_url", imageURL).Msg("Uploaded URL preview image")
+				log.Debug().Str("image_url_host", logSafeURL(imageURL)).Msg("Uploaded URL preview image")
 			} else {
 				log.Debug().Err(err).Msg("Failed to upload URL preview image")
 			}
 		} else if err != nil {
-			log.Debug().Err(err).Str("image_url", imageURL).Msg("Failed to download URL preview image")
+			log.Debug().Err(sanitizeURLError(err, imageURL)).Str("image_url_host", logSafeURL(imageURL)).Msg("Failed to download URL preview image")
 		}
 	}
 
@@ -145,11 +190,12 @@ func fetchPageMetadata(ctx context.Context, targetURL string) map[string]string 
 	for _, ua := range userAgents {
 		result := fetchPageMetadataWithUA(ctx, targetURL, ua)
 		if result["image"] != "" || result["title"] != "" {
-			log.Debug().Str("ua", ua).Str("url", targetURL).Str("title", result["title"]).
+			log.Debug().Str("ua", ua).Str("url_host", logSafeURL(targetURL)).
+				Bool("has_title", result["title"] != "").
 				Bool("has_image", result["image"] != "").Msg("Found page metadata")
 			return result
 		}
-		log.Debug().Str("ua", ua).Str("url", targetURL).Msg("No metadata found with this UA, trying next")
+		log.Debug().Str("ua", ua).Str("url_host", logSafeURL(targetURL)).Msg("No metadata found with this UA, trying next")
 	}
 
 	return make(map[string]string)
@@ -192,13 +238,13 @@ func fetchPageMetadataWithUA(ctx context.Context, targetURL string, ua string) m
 
 	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
-		log.Debug().Err(err).Str("url", targetURL).Str("ua", ua).Msg("HTTP request failed for meta scraping")
+		log.Debug().Err(sanitizeURLError(err, targetURL)).Str("url_host", logSafeURL(targetURL)).Str("ua", ua).Msg("HTTP request failed for meta scraping")
 		return result
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		log.Debug().Int("status", resp.StatusCode).Str("url", targetURL).Str("ua", ua).Msg("HTTP error for meta scraping")
+		log.Debug().Int("status", resp.StatusCode).Str("url_host", logSafeURL(targetURL)).Str("ua", ua).Msg("HTTP error for meta scraping")
 		return result
 	}
 
@@ -208,7 +254,7 @@ func fetchPageMetadataWithUA(ctx context.Context, targetURL string, ua string) m
 	if len(data) == 0 {
 		return result
 	}
-	log.Debug().Int("status", resp.StatusCode).Int("body_bytes", len(data)).Str("url", targetURL).Str("ua", ua).Msg("Fetched page for meta scraping")
+	log.Debug().Int("status", resp.StatusCode).Int("body_bytes", len(data)).Str("url_host", logSafeURL(targetURL)).Str("ua", ua).Msg("Fetched page for meta scraping")
 	htmlStr := string(data)
 
 	// Parse ALL <meta> tags generically into namespaced buckets.
@@ -313,7 +359,7 @@ func downloadURL(ctx context.Context, targetURL string) ([]byte, string, error) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, "", fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, targetURL)
+		return nil, "", fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, logSafeURL(targetURL))
 	}
 
 	// Limit to 5MB

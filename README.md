@@ -186,6 +186,160 @@ When the script finishes you're already logged in and the bridge is up.
 
 **Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the install script, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result.
 
+## Quick Start (Docker, Linux only)
+
+> **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
+
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/imessage` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`) — install via Docker's official docs at <https://get.docker.com> if you don't have it yet. Plus a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
+
+### Install
+
+```bash
+# 1. Install the host CLI (drops `imessage` at /usr/local/bin, on PATH by default).
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
+
+# 2. Pick a directory you'll keep docker-compose.yml in (~/docker/imessage/, /srv/imessage/, etc.).
+#    From inside it, drop in the example compose file:
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
+
+# 3. Edit it (see "Configuring docker-compose.yml" below).
+
+# 4. Bring it up and run the setup wizard. `imessage start` must be run from the directory
+#    containing docker-compose.yml — or set IMESSAGE_COMPOSE_FILE to its absolute path.
+imessage start
+imessage setup
+```
+
+`imessage setup` is the same install script the bare-Linux path uses, running inside the container. For Beeper that's: bbctl login → bbctl config → iMessage login (paste hardware key + Apple ID + password + 2FA). For self-hosted: homeserver URL → domain → Matrix ID → DB choice → iMessage login. Then optional CardDAV, preferred handle, FaceTime/StatusKit/HEIC/video toggles.
+
+When the wizard finishes, the container detects the new `config.yaml` and starts the bridge. `imessage logs` shows it running. Send yourself an iMessage to confirm the round trip.
+
+> **Want to read the installer before running it?** Sensible — `curl | bash` is a trust call. Download and inspect first:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh -o install-imessage.sh
+> less install-imessage.sh
+> sudo bash install-imessage.sh
+> ```
+
+> **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` — forces a fresh edge fetch:
+> ```bash
+> # The installer (Step 1 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh?nocache=$(date +%s)" | bash
+>
+> # The imessage wrapper directly, skipping install-imessage.sh:
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage?nocache=$(date +%s)" -o /usr/local/bin/imessage && chmod +x /usr/local/bin/imessage
+>
+> # The compose example (Step 2 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml?nocache=$(date +%s)" -o docker-compose.yml
+> ```
+> Same trick works for any `raw.githubusercontent.com` URL: append `?nocache=$(date +%s)`.
+
+### Configuring `docker-compose.yml`
+
+One required edit, one platform-dependent, one optional:
+
+1. **`BEEPER` env var** *(required)* — `"true"` for Beeper, `"false"` for self-hosted.
+2. **The bind mounts under `volumes:`** *(only if you're not on standard Linux)*. Defaults to `${HOME}/.local/share/mautrix-imessage` → `/data` (bridge state — `config.yaml`, DB, session, trustedpeers) and `${HOME}/.config/bbctl` → `/home/bridge/.config/bbctl` (bbctl Beeper auth). The bridge-state path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migration is no-copy.
+
+   | Platform | Bridge state path | bbctl path |
+   |---|---|---|
+   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bbctl` |
+   | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
+   | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
+   | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
+
+3. **`PUID` / `PGID`** *(optional, defaults `1000:1000`)* — the UID/GID the bridge runs as. Edit if you want the bridge to write as a different user: UNRAID `99:100` (`nobody:users`), TrueNAS Scale `568:568`, root `0:0` (discouraged). Numeric only — names don't translate. You don't need to chown your bind mounts to match; the entrypoint does that on first start.
+
+To look up your own: `id -u` / `id -g`, or `stat -c '%u:%g' <path>` for an existing directory.
+
+### Commands
+
+The `imessage` CLI is a thin wrapper — every subcommand maps to a small `docker` / `docker compose` invocation. Useful when debugging, when teaching someone else, or when you want to do the same thing manually:
+
+| Want to… | Run | Equivalent raw command |
+|---|---|---|
+| Tail bridge logs | `imessage logs` | When the container is running: `docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log` (inotify across bind mounts is unreliable, so we tail from inside). When stopped or restart-looping: `tail -F <host bind-mount>/logs/bridge.log` from the host. |
+| Check if it's running | `imessage status` | `docker ps --filter name=^Rustpush-Matrix$` |
+| Restart the bridge | `imessage restart` | `docker compose restart Rustpush-Matrix` |
+| Stop / start it | `imessage stop` / `imessage start` | `docker compose stop Rustpush-Matrix` / `docker compose up -d` (the container's root prelude handles bind-mount perms + host-path symlinks at startup) |
+| Pull a new image + restart | `imessage update` | `docker compose pull && docker compose up -d` |
+| Re-run iMessage login | `imessage login` | `docker exec -it Rustpush-Matrix as-bridge /entrypoint.sh login` |
+| Re-run setup (flip a toggle) | `imessage setup` | `docker exec -it Rustpush-Matrix as-bridge imessage-setup` |
+| Debug shell inside | `imessage shell` | `docker exec -it Rustpush-Matrix as-bridge bash` |
+| `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` | `docker exec -it Rustpush-Matrix as-bridge bbctl <args>` |
+
+`as-bridge` is a tiny in-container wrapper that re-applies the entrypoint's setpriv drop to `PUID:PGID` — `docker exec` inherits the container's USER (root, so the entrypoint can chown bind mounts at PID 1), so without `as-bridge` every host-side `imessage bbctl …` would run as root inside the container. When the wrapper invokes `docker compose`, it inserts `-f "$IMESSAGE_COMPOSE_FILE"` if that env var is set, otherwise compose looks in the current directory.
+
+`setup` / `login` / `logs` / `status` / `shell` / `bbctl` work from anywhere (found by container name). Lifecycle commands (`start` / `stop` / `restart` / `pull` / `update`) need to be in the `docker-compose.yml` directory, or set `IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml` in your shell rc to run them from anywhere.
+
+### How the privilege model works
+
+The image's `USER` is unset — PID 1 enters the entrypoint as root. A small root prelude runs, all steps conditional on detection (so subsequent starts are no-ops):
+
+1. **Chowns bind-mount targets to `PUID:PGID`** — only if `find -quit` spots a mismatched file.
+2. **Creates a host-path symlink** from the bind mount's host source path inside the container → `/data`. Lets absolute paths from a bare-Linux install (e.g. `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db` baked into `config.yaml`) resolve when running in Docker. Skipped if the symlink already points where it should.
+3. **Adds `o+x` to each ancestor of the symlink** so `PUID` can traverse them — `/root` ships at `0700` in the base image, so without this the kernel denies the path walk before SQLite ever opens the file.
+4. **`setpriv`s to `PUID:PGID`** and re-execs itself. From there, the bridge runs as the configured non-root user.
+
+Host-side `docker exec` calls (`imessage setup` / `bbctl` / `shell` / `login`) go through `/usr/local/bin/as-bridge` inside the container, which re-applies the same setpriv drop so they don't end up running as root.
+
+### Migrating between bare-Linux and Docker
+
+The bind-mount layout matches the bare-Linux paths, so migration in either direction is a no-copy operation — stop one runtime, start the other against the same files.
+
+**Bare-Linux → Docker:**
+
+```bash
+systemctl --user stop mautrix-imessage
+systemctl --user disable mautrix-imessage    # optional: don't restart on reboot
+```
+
+Then follow the Docker setup above keeping the default bind-mount source. **Skip `imessage setup`** — your existing `config.yaml` is already in place. `imessage start` is enough: the entrypoint chowns the existing files, symlinks the host path to `/data` so the absolute DB URI in `config.yaml` resolves unchanged, and opens traversal on the ancestors. No config edits, no re-login.
+
+**Docker → bare-Linux:**
+
+```bash
+imessage stop
+docker compose down
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
+make install          # or make install-beeper
+```
+
+Run the install **as the user that owns the bind-mount files**. The installer detects the existing `config.yaml` + DB, skips the iMessage login step, writes the systemd unit, and starts the bridge against the same state.
+
+If the bare-Linux user's `$HOME` differs from the one Docker ran under (e.g. Docker as `root` with `${HOME}=/root`, now installing as your own account), the absolute paths in `config.yaml` point at the wrong location. Either:
+
+```bash
+# Move the state dir to match the new $HOME:
+sudo mv /root/.local/share/mautrix-imessage ~/.local/share/
+sudo chown -R $(id -u):$(id -g) ~/.local/share/mautrix-imessage
+```
+
+…or rewrite the DB `uri:` lines to relative paths so they resolve against the data dir regardless of host:
+
+```bash
+sed -i 's|file:/root/.local/share/mautrix-imessage/|file:|g; s|sqlite:/root/.local/share/mautrix-imessage/|sqlite:|g' \
+    ~/.local/share/mautrix-imessage/config.yaml
+```
+
+### Apple Silicon NAC relay (Docker)
+
+If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches NAC validation data from a relay running on that Mac (see [Step 1 → Apple Silicon Mac](#apple-silicon-mac)). The relay URL, bearer token, and TLS fingerprint are all embedded in the base64 key — nothing to configure in compose. The Mac needs to be reachable from the Docker host (LAN, VPN, or port-forwarded WAN). Intel keys don't need a relay — the x86_64 unicorn emulator runs entirely in-process inside the container.
+
+### Troubleshooting (Docker)
+
+- **`imessage start` says "Cannot connect to the Docker daemon"** — Docker isn't running, or your user isn't in the `docker` group. Log out and back in after adding yourself.
+- **`imessage logs` keeps showing `no /data/config.yaml yet`** — `imessage setup` never finished, or exited mid-flow. Re-run; it's safe.
+- **Container restarts in a loop** — `imessage logs` shows the actual error. The entrypoint chowns and symlinks on every start where they're not already right, so persistent permission errors usually mean either (a) the bind mount itself isn't writable by root (read-only fs, immutable bits, SELinux/AppArmor) or (b) the bridge is failing for unrelated reasons.
+- **`unable to open database file: permission denied`** — config.yaml URI path doesn't match your bind-mount source. The entrypoint handles the common case (host bind source = path baked into config). You only need to edit `config.yaml` if you copied state from another machine. The fix is to make each `uri:` line relative:
+  ```yaml
+  uri: file:mautrix-imessage.db
+  ```
+  The bridge resolves relative paths against its working directory (`/data`). Stop the container, edit, start again — state files don't need to move.
+- **Bridge starts but doesn't show up in your homeserver** — `imessage logs` should show the appservice connecting. If it doesn't: on Beeper, re-run `imessage setup`. Self-hosted, confirm the bridge's `as_token`/`hs_token` and namespace from `<bind-mount>/registration.yaml` are loaded by your homeserver and that the homeserver URL in `config.yaml` is reachable from inside the container.
+- **Need a shell inside** — `imessage shell` drops you into bash as the bridge user.
+
 ## Login
 
 There are two ways to log in:
@@ -294,6 +448,16 @@ A full list lives under `!im help` in the **FaceTime** section.
 
 The name pre-filled on the FaceTime web join page comes from your Apple Account. To override it, set `facetime_display_name` in `~/.local/share/mautrix-imessage/config.yaml`.
 
+### Caller identity on the recipient's screen (the `temp:` UUID)
+
+When you place a call, the person you're calling sees **your name** — but you may also notice a `temp:<uuid>` identity shown alongside it (most visibly in the call-detail card or call history). This is expected. Here's the reasoning:
+
+A bridge FaceTime call is carried by **Apple's FaceTime web client running in your browser**, not by the bridge process itself. When your browser opens the join link, Apple's web client generates a throwaway pseudonym for that session — a `temp:<uuid>` handle — and that pseudonym *is* the browser participant's identity on the call. The bridge never creates it and has no way to rename it.
+
+To make your name appear, the bridge stamps your display name (`facetime_display_name` → Apple Account name → your handle) onto that participant's **nickname** on the wire, so FaceTime renders your name on top. But FaceTime also shows a participant's underlying *identity* beneath the nickname, and for the web client that identity is the `temp:<uuid>`. So you'll typically see your name **twice** — once for your real IDS handle, once for the browser participant — plus that lingering pseudonym line under the latter.
+
+Removing the `temp:<uuid>` entirely would mean replacing or pruning the browser participant from the call — but that participant is the one actually carrying your audio and video, so removing it **drops the call**. (OpenBubbles' native Android app sidesteps this by injecting the name directly into its own embedded webview; a browser-based Matrix link can't reach into Apple's page to do that.) The bridge therefore leaves the pseudonym in place: showing your name is the safe, meaningful improvement, and suppressing the last identity line isn't possible without breaking calling.
+
 ### Opting out
 
 If you have a Mac or iPhone signed into the same Apple ID, FaceTime rings there natively — the bridge's web-join wrapper adds nothing, so you should disable it. The `make install` / `make install-beeper` scripts ask "Disable FaceTime Bridge?" both on first install and on every subsequent re-run, so you can flip this at any time without editing YAML by hand. (You can also set `disable_facetime: true` in `~/.local/share/mautrix-imessage/config.yaml` directly.) Disabling skips every `facetime-*` command and suppresses all inbound FaceTime notices in your Matrix portals.
@@ -400,6 +564,40 @@ On the **first** install (before the bridge database exists), the install script
 
 The cap can't be changed on later re-runs once the database is in place — edit `~/.local/share/mautrix-imessage/config.yaml` directly to change it.
 
+## Privacy
+
+The bridge's design goal is the same as every other bridgev2 bridge: **message content lives in Matrix, and the bridge's own database holds only the routing metadata needed to correlate messages, edits, reactions, and deletes.** The bridgev2 `message` table never had a body column to begin with — it stores IDs, timestamps, and sender references, nothing else.
+
+The one place this bridge has to deviate is **CloudKit backfill**. To turn your iCloud message history into Matrix events, the sync pipeline stages pulled messages — with their plaintext bodies — in a local `cloud_message` cache. That cache is the only spot where message bodies touch disk, and the privacy layer exists to clean it back down to metadata after delivery. (The `chatdb` backfill source never stores bodies at all — it reads `~/Library/Messages/chat.db` live at query time. If you don't enable CloudKit backfill, none of the below applies; no bodies are ever cached.)
+
+### How scrubbing works
+
+A periodic scrubber (every 5 minutes) NULLs the plaintext columns — `text`, `subject`, `sender`, `tapback_emoji` — on `cloud_message` rows, gated by two conditions:
+
+- **Already delivered to Matrix.** A row is only scrubbed once its GUID has a corresponding row in bridgev2's `message` table (i.e. the message reached Matrix), *or* it was deleted/unsent. A message that hasn't bridged yet is never scrubbed — bridging always comes first, so the scrubber can never blank a message out from under the backfill pipeline.
+- **Past a 5-minute grace window.** Freshly-ingested rows get a buffer (keyed on last-ingest time) so the backfill pipeline has time to read the body before scrubbing clears it.
+
+Scrubbing the local cache is not data loss: the canonical copy of every message stays in Messages in iCloud on Apple's servers. The `cloud_message` table is only a staging cache for backfill, never the source of truth.
+
+On SQLite, the bridge also sets `_secure_delete=on` for every pooled connection, so the freed pages holding the old plaintext are zeroed rather than left readable on disk. This is SQLite-only; on Postgres the columns are NULLed identically, but scrubbed bytes sit in dead tuples until a routine `VACUUM` reclaims them (the bridge does not run `VACUUM FULL` automatically).
+
+Message **deletes and unsends** scrub the cached body right away — not waiting for the periodic tick — and are fail-closed. For inbound (Apple-side) deletes and unsends, a scrub failure makes the bridge skip emitting the Matrix removal, so the row stays scrub-eligible rather than leaking plaintext. For outbound (Matrix-initiated) redactions, the scrub failure is reported back to the framework so it won't drop its own message row before the body is cleared. The row itself is kept (soft-deleted, body NULLed) for echo detection — it isn't removed from the cache.
+
+### Logs
+
+In the bridge's own connector code, raw iMessage handles (phone numbers, email addresses) and full URLs are not written to logs: handles are replaced with a stable, non-reversible token (SHA-256 → UUID form) so you can still correlate one person across log lines without recording the PII, and URLs are reduced to scheme+host. This is anonymization at the log-write boundary — the values used for routing, handle matching, and StatusKit alias resolution are always the real ones, so functionality is unaffected.
+
+**Caveat:** this covers log lines emitted by this connector (`pkg/connector`). The underlying bridgev2 framework emits its own logs and can still print raw handles/identifiers in its messages — those are outside the connector's control. So "anonymized logs" means the connector's own output, not a guarantee across every line in the file.
+
+### What is *not* scrubbed (by design)
+
+- **Attachment metadata** (`attachments_json`) — filenames, MIME types, sizes, and CloudKit record-names. The record-name is required to re-pull a file from Apple if a Matrix upload fails after bridging. The attachment *bytes* live in CloudKit, not the DB.
+- **Chat metadata** (`cloud_chat`) — group display names and participant handles, kept so a conversation's identity (name, members) survives across re-syncs without a refetch.
+
+### Debugging
+
+Everything above is on by default and has no config toggle. The single escape hatch is `debug_disable_privacy` (see [Key options](#key-options)) — a development-only switch that turns off log anonymization and the scrubber and re-fills previously-scrubbed plaintext on the next sync. Leave it `false` in any real deployment.
+
 ## Management
 
 ### Shell shortcuts
@@ -414,6 +612,24 @@ At the end of every install run, the installer offers to drop four aliases into 
 | `imessage-log` | Tail the live bridge log |
 
 The prompt defaults to **no** — answer `y` to install. The aliases are wrapped in a marker comment block (`# >>> mautrix-imessage shortcuts (managed) >>>` … `# <<< mautrix-imessage shortcuts (managed) <<<`), so re-running an installer and answering `y` replaces (rather than duplicates) the entries. If you skipped them on first install, just re-run and say `y`. To remove them later, delete the marker block from your `~/.zshrc` or `~/.bashrc` by hand — the installer doesn't have an "uninstall aliases" path. Bash and Zsh are auto-detected from `$SHELL`; other shells get a clean skip message. After install, open a new terminal — or `source ~/.zshrc` (or `~/.bashrc`) in your current one — to pick the aliases up.
+
+**Adding them by hand.** The installer auto-detects your shell and the systemd scope, which can misfire in containers — e.g. an LXC / Proxmox guest entered via `pct enter`, where `$SHELL` is unset and there's no per-user systemd session. If the prompt skips you, or the installed aliases don't control the service, paste the lines into your `~/.bashrc` or `~/.zshrc` yourself. Use the `--user` form for a user service, or the `sudo` form when the bridge runs as a **system** service (the usual case in an LXC container, or any install done as root):
+
+```bash
+# User service (systemctl --user) — typical desktop / VM install
+alias start-imessage='systemctl --user start mautrix-imessage'
+alias stop-imessage='systemctl --user stop mautrix-imessage'
+alias restart-imessage='systemctl --user restart mautrix-imessage'
+alias imessage-log='journalctl --user -u mautrix-imessage -f'
+
+# System service — LXC container or root install
+alias start-imessage='sudo systemctl start mautrix-imessage'
+alias stop-imessage='sudo systemctl stop mautrix-imessage'
+alias restart-imessage='sudo systemctl restart mautrix-imessage'
+alias imessage-log='sudo journalctl -u mautrix-imessage -f'
+```
+
+Pick one block (not both). Re-`source` the file or open a new terminal to pick the aliases up.
 
 The raw equivalents (and other knobs) are below if you'd rather wire your own thing.
 
@@ -509,6 +725,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 |-------|---------|-------------|
 | `cloudkit_backfill` | `false` | Master switch for message history backfill. Requires device PIN during login to join the iCloud Keychain. |
 | `backfill_source` | `cloudkit` | `cloudkit` (default) or `chatdb` (legacy macOS fallback only — macOS-only, requires Full Disk Access). For legacy Macs prefer running the bridge on Linux with CloudKit instead. Only relevant when `cloudkit_backfill` is true. |
+| `url_previews_in_backfill` | `true` | Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing messages during backfill. Each URL costs up to three HTTP round-trips inline with conversion — set `false` to skip previews during backfill only (live inbound messages and outbound edits still build them). |
 | `displayname_template` | *(see [example-config.yaml](pkg/connector/example-config.yaml))* | Go template controlling how iMessage contacts appear in Matrix. Falls through `FirstName → LastName → Nickname → Phone → Email → ID`. Variables: `{{.FirstName}}`, `{{.LastName}}`, `{{.Nickname}}`, `{{.Phone}}`, `{{.Email}}`, `{{.ID}}`. |
 | `preferred_handle` | *(from login)* | Outgoing iMessage identity in URI form (`tel:+15551234567` or `mailto:user@example.com`). |
 | `disable_facetime` | `false` | Skip every `facetime-*` command and suppress inbound FaceTime notices. Set true if you have a Mac/iPhone that handles FT natively. |
@@ -522,6 +739,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). The install script writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
 | `database.type` | `postgres` | bridgev2 framework option. `postgres` or `sqlite3-fk-wal`; the install script asks during first run and defaults to `postgres`. |
+| `debug_disable_privacy` | `false` | **Development only — leave `false` in any real deployment.** Turns off log anonymization and the message-body scrubber, and re-fills previously-scrubbed plaintext on the next CloudKit sync. See [Privacy](#privacy). Does not undo deletes/unsends and does not re-deliver anything to Matrix. |
 
 ## Development
 
@@ -559,6 +777,8 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── command_contacts.go                   #   `contacts` command — search + iMessage validation
   ├── facetime.go                           #   FaceTime web-join + call control
   ├── statuskit_commands.go                 #   StatusKit (Focus / DND) commands
+  ├── statuskit_cloudkit.go                 #   StatusKit CloudKit pull — fetches + injects peer presence records (bridge-side orchestration of the Rust FFI)
+  ├── statuskit_alias_resolver.go           #   StatusKit alias-cluster resolver — maps a presence `from` alias (e.g. an unregistered mailto:) to the right portal via persisted channel↔alias clustering
   ├── sharedstreams.go                      #   iCloud Shared Albums commands + sync
   ├── shared_profile.go                     #   Name & Photo Sharing fallback
   ├── external_carddav.go                   #   external CardDAV contact resolution
@@ -590,8 +810,8 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── config.go                             #   bridge config schema (YAML + `upgradeConfig` helper)
   ├── example-config.yaml                   #   default config template
   └── *_test.go                             #   unit tests (audioconvert, capabilities, carddav_crypto,
-                                            #   cloud_backfill_store, config, dbmeta, external_carddav,
-                                            #   ford_cache, ids, util)
+                                            #   cloud_backfill_store, config, config_upgrade, dbmeta,
+                                            #   external_carddav, ford_cache, ids, util)
 
 pkg/rustpushgo/                             # Rust FFI wrapper (uniffi → cgo)
   ├── src/lib.rs                            #   FFI surface — login / send / receive / CloudKit / Ford
@@ -700,7 +920,7 @@ dev/
 
 ## Chat With Us
 
-**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#imessage-rustpush:beeper.com)
+**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#rustpush-matrix:beeper.com)
 
 ## License
 

@@ -55,6 +55,33 @@ fix_permissions() {
     return 1
 }
 
+# ── Appservice-token validity check (Docker only) ─────────────
+# Returns 0 (true) when the homeserver actively REJECTS the config's as_token
+# (HTTP 401/403), 1 otherwise (accepted, or undeterminable — never disrupt a
+# working setup on a transient error). After a `bbctl delete` + re-register the
+# local config can stay pinned to the deleted registration's token while the
+# server holds a new one; the bridge then log.Fatals on M_UNKNOWN_TOKEN every
+# start. bbctl whoami still lists the (new) registration, so the "not
+# registered" path below can't catch it — we ask the homeserver directly.
+config_token_rejected() {
+    local cfg="$1" as_token hs_addr bot_user domain code
+    [ -f "$cfg" ] || return 1
+    as_token=$(grep -E '^[[:space:]]*as_token:' "$cfg" | head -1 | sed -E 's/.*as_token:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    hs_addr=$(grep -E '^[[:space:]]*address:' "$cfg" | head -1 | sed -E 's/.*address:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    bot_user=$(grep -E '^[[:space:]]*username:' "$cfg" | head -1 | sed -E 's/.*username:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    domain=$(grep -E '^[[:space:]]*domain:' "$cfg" | head -1 | sed -E 's/.*domain:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)
+    [ -n "$as_token" ] && [ -n "$hs_addr" ] && [ -n "$bot_user" ] && [ -n "$domain" ] || return 1
+    # Mirror the bridge's own whoami probe; curl url-encodes the @ and : for us.
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -G \
+        -H "Authorization: Bearer ${as_token}" \
+        --data-urlencode "user_id=@${bot_user}:${domain}" \
+        "${hs_addr}/_matrix/client/v3/account/whoami") || code=000
+    case "$code" in
+        401|403) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 
@@ -144,10 +171,22 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
     echo "   Deleting old registration to avoid orphaned rooms..."
-    "$BBCTL" delete "$BRIDGE_NAME"
-    echo "✓ Old registration cleaned up"
-    echo "   Waiting for server-side deletion to complete..."
-    sleep 5
+    # bbctl whoami can list a registration that the server can no longer
+    # delete (404 M_NOT_FOUND) — the appservice record is already gone but
+    # still shows in whoami.  Don't let that abort the install under set -e:
+    # a 404 means it's already deleted, and any other error is non-fatal
+    # because config regeneration re-registers anyway (worst case: a few
+    # orphaned rooms, far better than a failed setup).
+    if DELETE_OUT=$("$BBCTL" delete "$BRIDGE_NAME" 2>&1); then
+        echo "✓ Old registration cleaned up"
+        echo "   Waiting for server-side deletion to complete..."
+        sleep 5
+    elif echo "$DELETE_OUT" | grep -qi "not found\|M_NOT_FOUND\|404"; then
+        echo "✓ Registration already absent on server — continuing"
+    else
+        echo "⚠  Could not delete old registration: $DELETE_OUT"
+        echo "   Continuing anyway — config regeneration will re-register."
+    fi
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -171,6 +210,26 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
+fi
+# ── Docker: regenerate a config whose appservice token the server rejects ──
+# In Docker config.yaml lives on the persistent /data volume, so a `bbctl
+# delete` + re-register cycle leaves it pinned to the deleted registration's
+# as_token while the server holds a new one. bbctl whoami still lists the (new)
+# registration, so the "not registered" path above keeps the stale config and
+# the bridge log.Fatals on M_UNKNOWN_TOKEN every start. Ask the homeserver
+# directly; if it rejects the token, drop the registration + config + DB so a
+# fresh, matching config is generated below. A still-accepted token is kept, so
+# re-running setup to change knobs leaves the working config in place.
+# (Bare metal never hits this: `make reset` wipes the whole state dir first.)
+if [ -n "${IN_DOCKER:-}" ] && [ -f "$CONFIG" ] && config_token_rejected "$CONFIG"; then
+    echo "⚠  Existing config's appservice token is no longer accepted by the homeserver (M_UNKNOWN_TOKEN)."
+    echo "   Regenerating config to match the current registration..."
+    if [ -n "$EXISTING_BRIDGE" ]; then
+        "$BBCTL" delete "$BRIDGE_NAME" >/dev/null 2>&1 || true
+        sleep 3
+    fi
+    rm -f "$CONFIG"
+    rm -f "$DATA_DIR"/mautrix-imessage.db*
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
@@ -300,11 +359,34 @@ if [ -t 0 ]; then
             echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
         fi
     else
-        # Re-run: show current setting without prompting
+        # Re-run: let the user toggle the existing setting. Without this, a
+        # config stuck at cloudkit_backfill: false could never be flipped on
+        # interactively once a DB existed — and in Docker the PID-1 bridge
+        # creates the DB between setup runs, so re-runs always land here.
+        echo ""
+        echo "CloudKit Backfill:"
+        echo "  When enabled, the bridge will sync your iMessage history from iCloud."
+        echo "  This requires entering your device PIN during login to join the iCloud Keychain."
+        echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
+        echo ""
         if [ "$CURRENT_BACKFILL" = "true" ]; then
-            echo "✓ Backfill source: CloudKit (iCloud sync)"
+            read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
+            case "$ENABLE_BACKFILL" in
+                [nN]*) ENABLE_BACKFILL=false ;;
+                *)     ENABLE_BACKFILL=true ;;
+            esac
         else
-            echo "✓ Backfill: disabled (real-time messages only)"
+            read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
+            case "$ENABLE_BACKFILL" in
+                [yY]*) ENABLE_BACKFILL=true ;;
+                *)     ENABLE_BACKFILL=false ;;
+            esac
+        fi
+        sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
+        if [ "$ENABLE_BACKFILL" = "true" ]; then
+            echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+        else
+            echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
         fi
     fi
 fi
@@ -651,7 +733,7 @@ if [ -t 0 ]; then
                 echo "✓ Video transcoding disabled"
                 ;;
             *)
-                if ! command -v ffmpeg >/dev/null 2>&1; then
+                if [ -z "${IN_DOCKER:-}" ] && ! command -v ffmpeg >/dev/null 2>&1; then
                     echo "  ffmpeg not found — installing..."
                     if command -v apt >/dev/null 2>&1; then
                         sudo apt install -y ffmpeg
@@ -675,7 +757,7 @@ if [ -t 0 ]; then
         case "$ENABLE_VT" in
             [yY]*)
                 sed -i "s/video_transcoding: .*/video_transcoding: true/" "$CONFIG"
-                if ! command -v ffmpeg >/dev/null 2>&1; then
+                if [ -z "${IN_DOCKER:-}" ] && ! command -v ffmpeg >/dev/null 2>&1; then
                     echo "  ffmpeg not found — installing..."
                     if command -v apt >/dev/null 2>&1; then
                         sudo apt install -y ffmpeg
@@ -828,7 +910,9 @@ if [ -t 0 ]; then
                 echo "✓ HEIC conversion disabled"
                 ;;
             *)
-                if command -v apt >/dev/null 2>&1; then
+                if [ -n "${IN_DOCKER:-}" ]; then
+                    : # libheif baked into Docker image — skip lazy apt install
+                elif command -v apt >/dev/null 2>&1; then
                     dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
                 elif command -v dnf >/dev/null 2>&1; then
                     rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
@@ -849,7 +933,9 @@ if [ -t 0 ]; then
         case "$ENABLE_HC" in
             [yY]*)
                 sed -i "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
-                if command -v apt >/dev/null 2>&1; then
+                if [ -n "${IN_DOCKER:-}" ]; then
+                    : # libheif baked into Docker image — skip lazy apt install
+                elif command -v apt >/dev/null 2>&1; then
                     dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
                 elif command -v dnf >/dev/null 2>&1; then
                     rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
@@ -1060,6 +1146,7 @@ elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
     sudo systemctl stop mautrix-imessage
 fi
 
+if [ -z "${IN_DOCKER:-}" ]; then
 # ── Optional shell shortcuts (asked before preferred handle so the
 #    handle prompt remains the last interactive step) ─────────────
 # Detect existing systemd scope from installed unit files. If neither
@@ -1136,6 +1223,7 @@ EOF
         ;;
 esac
 echo ""
+fi  # IN_DOCKER gate — shortcuts block
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
@@ -1215,6 +1303,7 @@ if [ -n "${CURRENT_HANDLE:-}" ]; then
     echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
+if [ -z "${IN_DOCKER:-}" ]; then
 # ── Install / update systemd service ─────────────────────────
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
@@ -1314,6 +1403,8 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
     fi
 fi
 
+fi  # IN_DOCKER gate — systemd block
+
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "  Setup Complete"
@@ -1322,12 +1413,12 @@ echo ""
 echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo ""
-if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
+if [ "${SYSTEMD_MODE:-none}" = "user" ] && [ -f "${USER_SERVICE_FILE:-}" ]; then
     echo "  Status:  systemctl --user status mautrix-imessage"
     echo "  Logs:    journalctl --user -u mautrix-imessage -f"
     echo "  Stop:    systemctl --user stop mautrix-imessage"
     echo "  Restart: systemctl --user restart mautrix-imessage"
-elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
+elif [ "${SYSTEMD_MODE:-none}" = "system" ] && [ -f "${SYSTEM_SERVICE_FILE:-}" ]; then
     echo "  Status:  systemctl status mautrix-imessage"
     echo "  Logs:    journalctl -u mautrix-imessage -f"
     echo "  Stop:    systemctl stop mautrix-imessage"

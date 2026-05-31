@@ -48,6 +48,11 @@ type cloudMessageRow struct {
 	// Regular user messages always have this; system messages (group renames,
 	// participant changes) do not.
 	HasBody bool
+
+	// True once the body has been scrubbed because the message was bridged
+	// to Matrix. Identifiers (guid, timestamps, record_name) are kept for
+	// echo dedup and routing; text/subject/sender/attachments_json are NULL.
+	BodyScrubbed bool
 }
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
@@ -73,6 +78,19 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
+	// Privacy: secure_delete forces SQLite to zero out freed pages during
+	// DELETE/UPDATE so NULLing text/subject/sender in scrubBridgedBodies does
+	// not leave the original strings recoverable by file inspection until
+	// VACUUM (which we don't run automatically because it rewrites the entire
+	// DB and would block writes for the duration on a large backlog).
+	// secure_delete is a PER-CONNECTION setting that is NOT persisted in the
+	// DB file, so it is set via the _secure_delete DSN param in
+	// ensureSecureDeleteDSN (cmd/mautrix-imessage/main.go) — that applies it
+	// on every pooled connection, which a one-shot PRAGMA here could not do
+	// (the pool hands scrub writes to arbitrary connections). Self-hosters who
+	// want immediate page reclamation can run `sqlite3 bridge.db "VACUUM;"`
+	// manually after first-boot scrub.
+
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
 			login_id TEXT NOT NULL,
@@ -177,6 +195,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"date_read_ms", "BIGINT NOT NULL DEFAULT 0"},
 		{"record_name", "TEXT NOT NULL DEFAULT ''"},
 		{"has_body", "BOOLEAN NOT NULL DEFAULT TRUE"},
+		// Privacy: TRUE once the body has been scrubbed because the message
+		// was bridged to Matrix. Set by scrubBridgedBodies and preserved
+		// across CloudKit re-syncs by the upsert ON CONFLICT clause.
+		{"body_scrubbed", "BOOLEAN NOT NULL DEFAULT FALSE"},
 	} {
 		var exists int
 		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
@@ -185,6 +207,25 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 				return fmt.Errorf("failed to add %s column to cloud_message: %w", col.name, err)
 			}
 		}
+	}
+
+	// Privacy migration: pre-existing soft-deleted rows from before the
+	// privacy branch never went through softDeleteMessageByGUID's inline
+	// scrub. They sit with deleted=TRUE and original text/subject/sender,
+	// and the periodic scrubber can't catch them because bridgev2 likely
+	// purged its message row long ago (so the EXISTS predicate fails).
+	// One-shot UPDATE on startup to scrub them in place. Idempotent: only
+	// matches rows still holding plaintext that haven't been scrubbed.
+	if _, err := s.db.Exec(ctx, `
+		UPDATE cloud_message
+		SET text=NULL, subject=NULL, sender='',
+		    tapback_emoji=NULL,
+		    body_scrubbed=TRUE
+		WHERE login_id=$1
+		  AND deleted=TRUE
+		  AND body_scrubbed=FALSE
+	`, s.loginID); err != nil {
+		return fmt.Errorf("failed to scrub pre-existing soft-deleted rows: %w", err)
 	}
 
 	// Cleanup: permanently delete system/rename message rows that slipped into
@@ -445,7 +486,11 @@ func (s *cloudBackfillStore) upsertChat(
 				THEN excluded.group_photo_guid
 				ELSE cloud_chat.group_photo_guid
 			END,
-			participants_json=excluded.participants_json,
+			participants_json=CASE
+				WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]')
+				THEN excluded.participants_json
+				ELSE cloud_chat.participants_json
+			END,
 			updated_ts=CASE
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
@@ -499,15 +544,15 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			chat_id=excluded.chat_id,
 			portal_id=excluded.portal_id,
 			timestamp_ms=excluded.timestamp_ms,
-			sender=excluded.sender,
+			sender=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.sender ELSE excluded.sender END,
 			is_from_me=excluded.is_from_me,
-			text=excluded.text,
-			subject=excluded.subject,
+			text=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.text ELSE excluded.text END,
+			subject=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.subject ELSE excluded.subject END,
 			service=excluded.service,
 			deleted=CASE WHEN cloud_message.deleted THEN cloud_message.deleted ELSE excluded.deleted END,
 			tapback_type=excluded.tapback_type,
 			tapback_target_guid=excluded.tapback_target_guid,
-			tapback_emoji=excluded.tapback_emoji,
+			tapback_emoji=CASE WHEN cloud_message.body_scrubbed THEN cloud_message.tapback_emoji ELSE excluded.tapback_emoji END,
 			attachments_json=excluded.attachments_json,
 			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
 			has_body=excluded.has_body,
@@ -584,7 +629,13 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 		}
 
 		query := fmt.Sprintf(
-			`UPDATE cloud_message SET deleted=TRUE, updated_ts=$2 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE,
+			     updated_ts=$2
+			 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
@@ -778,7 +829,11 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 				THEN excluded.group_photo_guid
 				ELSE cloud_chat.group_photo_guid
 			END,
-			participants_json=excluded.participants_json,
+			participants_json=CASE
+				WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]')
+				THEN excluded.participants_json
+				ELSE cloud_chat.participants_json
+			END,
 			updated_ts=CASE
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
@@ -1579,6 +1634,69 @@ func (s *cloudBackfillStore) getSenderHistoryByPortalID(ctx context.Context, por
 	return senders, rows.Err()
 }
 
+// updateChatParticipants overwrites the persisted participant roster for an
+// existing cloud_chat row, touching only participants_json (and updated_ts).
+//
+// Unlike upsertChat it never clobbers record_name / display_name / group_id /
+// service, so it is safe to call from the real-time message path on every
+// membership change. participants_json is the SOLE source of the outbound
+// recipient list for gid: group portals (see portalToConversation), and the
+// real-time persist in makePortalKey is insert-once — so without this a member
+// who leaves is never dropped from the send list and keeps receiving messages.
+//
+// It targets the same row getChatParticipantsByPortalID reads: primary match
+// by portal_id, with a gid:<uuid> fallback to group_id / cloud_chat_id. No row
+// is created if none exists — first-time creation stays owned by makePortalKey.
+func (s *cloudBackfillStore) updateChatParticipants(ctx context.Context, portalID string, participants []string) error {
+	participantsJSON, err := json.Marshal(participants)
+	if err != nil {
+		return err
+	}
+	nowMS := time.Now().UnixMilli()
+	res, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET participants_json=$3, updated_ts=$4 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID, string(participantsJSON), nowMS,
+	)
+	if err != nil {
+		return err
+	}
+	// Fallback for gid: portals whose row is keyed by group_id / cloud_chat_id
+	// rather than portal_id (mirrors getChatParticipantsByPortalID's fallback).
+	if strings.HasPrefix(portalID, "gid:") {
+		if affected, aErr := res.RowsAffected(); aErr == nil && affected == 0 {
+			uuid := strings.TrimPrefix(portalID, "gid:")
+			if _, err = s.db.Exec(ctx,
+				`UPDATE cloud_chat SET participants_json=$3, updated_ts=$4 WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2))`,
+				s.loginID, uuid, string(participantsJSON), nowMS,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// syncStoredGroupRoster is the testable core of the self-heal: it reads the
+// stored roster for portalID and overwrites it with `normalized` (a roster of
+// pre-normalized member IDs) when they differ as sets. It is a no-op — writing
+// nothing and reporting updated=false — when no row exists yet (first-time
+// creation is owned by makePortalKey's insert path) or when the rosters already
+// match (ignoring self-handle representation, via isSelf). Returns the old
+// member count for logging and whether an update was written.
+func syncStoredGroupRoster(ctx context.Context, store *cloudBackfillStore, portalID string, normalized []string, isSelf func(string) bool) (oldCount int, updated bool, err error) {
+	existing, err := store.getChatParticipantsByPortalID(ctx, portalID)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(existing) == 0 || participantSetsMatch(existing, normalized, isSelf) {
+		return len(existing), false, nil
+	}
+	if err := store.updateChatParticipants(ctx, portalID, normalized); err != nil {
+		return len(existing), false, err
+	}
+	return len(existing), true, nil
+}
+
 // getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
 // This is the user-set group name (cv_name from the iMessage protocol), NOT an
 // auto-generated label. Returns empty string if none found or if the group is unnamed.
@@ -1844,11 +1962,56 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
 // be re-bridged on backfill, while preserving the UUID for echo detection.
-func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) {
-	_, _ = s.db.Exec(ctx,
-		`UPDATE cloud_message SET deleted=TRUE WHERE login_id=$1 AND guid=$2`,
-		s.loginID, guid,
-	)
+func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
+	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
+	// 0 rows and the INSERT OR IGNORE running, a concurrent CloudKit upsert
+	// could land a live (deleted=FALSE) row for this guid. INSERT OR IGNORE
+	// would then no-op against it and the body would bridge undeleted. Wrap
+	// both in a single txn so the upsert serializes either fully before
+	// (UPDATE scrubs it) or fully after (its ON CONFLICT CASE preserves the
+	// stub's deleted=TRUE). DoTxn reuses an outer txn if ctx already carries
+	// one, so this stays correct when called inside a larger transaction.
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		// UPPER() on both sides: APNs delivers UUIDs uppercase while CloudKit
+		// can store them lower/mixed; a case-sensitive = miss would silently
+		// no-op and let the fail-closed delete path proceed thinking it scrubbed.
+		// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
+		res, err := s.db.Exec(ctx,
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE
+			 WHERE login_id=$1 AND UPPER(guid)=UPPER($2)`,
+			s.loginID, guid,
+		)
+		if err != nil {
+			return fmt.Errorf("soft-delete message %s: %w", guid, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			return nil
+		}
+		// Stub-insert path: Apple-side delete can arrive before CloudKit sync
+		// ever populates cloud_message (typical for messages sent and quickly
+		// retracted on the iPhone, or for portals still pending creation that
+		// hold the original in pendingPortalMsgs). Drop a deleted=TRUE stub
+		// so the future CloudKit upsert's ON CONFLICT CASE preserves the
+		// deletion (excluded.deleted ignored when cloud_message.deleted=TRUE).
+		// Without this stub the row would arrive live and bridge the body
+		// Apple already deleted on the user's devices.
+		nowMS := time.Now().UnixMilli()
+		_, err = s.db.Exec(ctx,
+			`INSERT OR IGNORE INTO cloud_message
+				(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
+			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)`,
+			s.loginID, guid, nowMS, nowMS,
+		)
+		if err != nil {
+			return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)
+		}
+		return nil
+	})
 }
 
 // getGroupPhotoByPortalID returns the group_photo_guid and record_name for
@@ -1967,7 +2130,13 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 		return fmt.Errorf("failed to soft-delete cloud_chat records for portal %s: %w", portalID, err)
 	}
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
+		`UPDATE cloud_message
+		 SET deleted=TRUE,
+		     text=NULL, subject=NULL, sender='',
+		     tapback_emoji=NULL,
+		     body_scrubbed=TRUE,
+		     updated_ts=$3
+		 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
 		s.loginID, portalID, nowMS,
 	); err != nil {
 		return fmt.Errorf("failed to soft-delete cloud_message records for portal %s: %w", portalID, err)
@@ -1987,7 +2156,12 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 			return fmt.Errorf("failed to soft-delete cloud_chat records by group_id %s: %w", uuid, err)
 		}
 		if _, err := s.db.Exec(ctx,
-			`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE,
+			     updated_ts=$3
 			 WHERE login_id=$1 AND deleted=FALSE
 			   AND portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2)))`,
 			s.loginID, uuid, nowMS,
@@ -2300,7 +2474,12 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')"
+		// body_scrubbed rows had content at bridge time; treat them as contentful
+		// so a fully-bridged-then-scrubbed portal's newest timestamp survives
+		// (used by queueRecoveredPortalResync to gate ChatResync events).
+		// tapback_type < 2000 (or NULL) keeps regular messages and excludes
+		// scrubbed reactions (>= 2000), which aren't "content" in the same sense.
+		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
 	}
 	var ts sql.NullInt64
 	err := s.db.QueryRow(ctx, baseQuery, s.loginID, portalID).Scan(&ts)
@@ -2400,7 +2579,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 		SELECT COUNT(*)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')
+		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
@@ -2418,7 +2597,7 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '')"
+		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count); err != nil {
@@ -2430,7 +2609,8 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
-	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE)`
+	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
+	COALESCE(body_scrubbed, FALSE)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -2543,6 +2723,7 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.AttachmentsJSON,
 			&row.DateReadMS,
 			&row.HasBody,
+			&row.BodyScrubbed,
 		); err != nil {
 			return nil, err
 		}
@@ -2944,6 +3125,61 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	return int(n), nil
 }
 
+// clearBodyScrubByPortalID drops the body_scrubbed flag for every row in a
+// portal so the next CloudKit upsert can repopulate text/subject/sender/
+// tapback_emoji from Apple's source of truth. Called from the restore-chat
+// pipeline before re-fetching messages: scrub protection in the upsert ON
+// CONFLICT clause keeps NULL bodies sticky, which is correct for normal
+// re-syncs but blocks user-triggered restore. Returns the number of rows
+// updated.
+//
+// After restore completes and the messages are re-bridged, the periodic
+// scrubBridgedBodies tick re-scrubs them (within bodyScrubInterval).
+func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, portalID string) (int, error) {
+	// Bump updated_ts alongside the flag clear so the scrubber's grace
+	// window predicate (updated_ts < now-graceWindow) skips these rows on
+	// the next tick. Without this, a scrubber tick that races between
+	// clearBodyScrubByPortalID and the restore's CloudKit upsert would
+	// see body_scrubbed=FALSE + old updated_ts and re-scrub before upsert
+	// could repopulate text.
+	nowMS := time.Now().UnixMilli()
+	result, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$3
+		 WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=TRUE`,
+		s.loginID, portalID, nowMS,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// clearAllBodyScrub drops the body_scrubbed flag from every non-deleted row
+// for this login so the next CloudKit upsert can repopulate plaintext from
+// Apple's source of truth. DEVELOPMENT-ONLY: used by the debug_disable_privacy
+// re-fill path to undo the privacy scrubber's NULLing on a fresh full re-sync.
+// Deleted rows are deliberately excluded so re-filling never resurrects content
+// the user deleted/unsent (their body_scrubbed flag stays set, keeping the NULL
+// sticky through the upsert ON CONFLICT clause). Returns the number of rows
+// updated, which lets the caller skip the (expensive) sync-token reset once
+// there is nothing left to re-fill. Bumps updated_ts so a racing scrubber tick's
+// grace-window predicate skips these rows (the scrubber is disabled in this
+// mode anyway, but this keeps the helper correct in isolation).
+func (s *cloudBackfillStore) clearAllBodyScrub(ctx context.Context) (int64, error) {
+	nowMS := time.Now().UnixMilli()
+	result, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$2
+		 WHERE login_id=$1 AND body_scrubbed=TRUE AND deleted=FALSE`,
+		s.loginID, nowMS,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
 // seedChatFromRecycleBin inserts or updates a cloud_chat row with data from
 // Apple's recycle bin. This ensures GetChatInfo can resolve group name,
 // participants, and style even when the local cloud_chat table was wiped.
@@ -2973,7 +3209,7 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 			portal_id=EXCLUDED.portal_id,
 			display_name=COALESCE(EXCLUDED.display_name, cloud_chat.display_name),
 			group_photo_guid=COALESCE(EXCLUDED.group_photo_guid, cloud_chat.group_photo_guid),
-			participants_json=CASE WHEN EXCLUDED.participants_json <> '[]' THEN EXCLUDED.participants_json ELSE cloud_chat.participants_json END,
+			participants_json=CASE WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]') THEN EXCLUDED.participants_json ELSE cloud_chat.participants_json END,
 			deleted=FALSE,
 			updated_ts=EXCLUDED.updated_ts
 	`, s.loginID, chatID, portalID, groupID, dnPtr, photoPtr, participantsJSON, nowMS)
@@ -3201,20 +3437,338 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	return n, nil
 }
 
+// scrubBridgedBodies nulls plaintext message content (text, subject, sender,
+// tapback_emoji) on cloud_message rows whose corresponding Matrix event has
+// been successfully delivered (an entry exists in bridgev2's `message` table)
+// and which were ingested at least graceWindow ago. The grace window is a
+// buffer against bridgev2 racing the scrubber on freshly-ingested messages.
+//
+// SMS reaction quoting (HandleMatrixReaction for IsSms portals quotes the
+// original body as "Loved 'x'") reads cloud_message.text; once scrubbed it
+// degrades to the unquoted reaction text, matching master's behavior when the
+// body isn't locally available.
+//
+// Intentionally NOT scrubbed: attachments_json. It contains CloudKit
+// record_names that AttachmentRetrier needs to repull files from Apple when
+// a Matrix upload fails post-bridge, and that pruneOrphanedAttachmentCache
+// uses to keep the mxc-URI cache in sync. The actual attachment bytes live
+// in CloudKit; the JSON here is metadata pointing back to that source.
+//
+// Identifiers and routing columns (guid, record_name, timestamp_ms,
+// is_from_me, portal_id, chat_id, service, tapback_type, tapback_target_guid,
+// has_body, created_ts, date_read_ms, deleted, attachments_json) are retained.
+//
+// The body_scrubbed flag is preserved across CloudKit re-syncs by the
+// upsert ON CONFLICT clause in upsertMessageBatch, so a re-sync of a
+// previously-scrubbed message cannot re-populate the body. User-triggered
+// restore-chat calls clearBodyScrubByPortalID first to bypass that gate
+// so the fresh CloudKit fetch can repopulate text for re-bridging.
+//
+// Note on the grace window: `updated_ts` is the most-recent ingest time
+// (bumped on every UPSERT, so restore-chat's CloudKit re-fetch resets it).
+// Using updated_ts (not created_ts) gives the bridgev2 backfill pipeline a
+// fresh 5-min window to read the re-populated text before the next
+// scrubber tick wipes it again — the restore-chat race documented in the
+// privacy audit. The membership check against bridgev2's `message` table is the
+// load-bearing safety check; the timestamp window just buys backfill time.
+//
+// Chunked to avoid long-running DB locks on the first post-deploy run, which
+// may scrub the entire backlog of already-delivered messages at once.
+func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	var total int64
+	// Small chunks + a brief yield between chunks so the scrubber doesn't
+	// contend with live upsertMessageBatch / APNs ingestion when the
+	// first-boot backlog is large.
+	const chunkSize = 1000
+
+	// Build optional NOT IN clause for portals with active restore pipelines.
+	// Large portals (50k+ messages) can take many minutes to backfill, and
+	// the updated_ts grace window only buys ~5 min; without this exclusion
+	// the scrubber would re-scrub partway through, and cloudRowToBackfillMessages'
+	// BodyScrubbed skip would silently drop the un-backfilled tail.
+	exclusionSQL := ""
+	args := []any{s.loginID, cutoff, bridgeID}
+	if len(excludePortals) > 0 {
+		placeholders := make([]string, 0, len(excludePortals))
+		for _, pid := range excludePortals {
+			args = append(args, pid)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	args = append(args, chunkSize)
+	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+
+	// The outer UPDATE re-checks body_scrubbed=FALSE AND updated_ts < cutoff
+	// at write time so concurrent upsert / clearBodyScrubByPortalID between
+	// subquery eval and outer apply can't be silently overwritten. The
+	// subquery picks candidate guids; the outer WHERE confirms the row's
+	// state hasn't changed under us. Required because SQLite's IN-subquery
+	// materializes the guid list once, then applies the UPDATE without
+	// re-evaluating the predicate per row.
+	// Match bridged rows by membership in the set of guids that have a `message`
+	// row, computed ONCE per chunk, instead of a per-row correlated EXISTS with
+	// UPPER()+LIKE (which can't use an index and ran ~25s over a 40k-row backlog,
+	// tripping dbutil's 1s slow-query warning every chunk). bridgev2 stores the
+	// base message id in `id`; part-suffixed ids (`<guid>_<part>`) are normalised
+	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
+	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
+	// CloudKit-mixed-case matching the EXISTS form had.
+	query := `
+		UPDATE cloud_message
+		SET text=NULL,
+		    subject=NULL,
+		    sender='',
+		    tapback_emoji=NULL,
+		    body_scrubbed=TRUE
+		WHERE login_id=$1
+		  AND body_scrubbed=FALSE
+		  AND updated_ts < $2
+		  AND guid IN (
+		    SELECT guid FROM cloud_message
+		    WHERE login_id=$1
+		      AND body_scrubbed=FALSE
+		      AND (tapback_type IS NULL OR tapback_type < 2000)
+		      AND updated_ts < $2
+		      AND (
+		        deleted=TRUE
+		        OR UPPER(guid) IN (
+		          SELECT UPPER(id) FROM message
+		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
+		          UNION
+		          SELECT UPPER(substr(id, 1, instr(id, '_') - 1)) FROM message
+		          WHERE bridge_id=$3 AND instr(id, '_') > 0
+		            AND (room_receiver=$1 OR room_receiver='')
+		        )
+		      )` + exclusionSQL + `
+		    LIMIT ` + limitPlaceholder + `
+		  )
+	`
+	for {
+		result, err := s.db.Exec(ctx, query, args...)
+		if err != nil {
+			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+		if n < chunkSize {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return total, nil
+}
+
+// scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),
+// which store the SMS-style "Loved 'original message'" descriptor — leaking the
+// quoted body. cloudTapbackToBackfill renders reactions purely from
+// tapback_type, tapback_emoji, tapback_target_guid, and sender (it never reads
+// text/subject), so dropping the text leaves a fully functional reaction —
+// simple metadata only, like other bridges keep. No bridged/EXISTS gate is
+// needed: bridged reactions live in bridgev2's `reaction` table (not `message`,
+// so scrubBridgedBodies can't see them), and since nothing consumes the text,
+// clearing it past the grace window is safe whether or not it was delivered.
+// sender and tapback_emoji are preserved so re-backfill still attributes and
+// renders the reaction (including custom emoji).
+func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	const chunkSize = 1000
+	var total int64
+	for {
+		result, err := s.db.Exec(ctx, `
+			UPDATE cloud_message
+			SET text=NULL, subject=NULL, body_scrubbed=TRUE
+			WHERE login_id=$1 AND tapback_type >= 2000
+			  AND body_scrubbed=FALSE AND updated_ts < $2
+			  AND guid IN (
+			    SELECT guid FROM cloud_message
+			    WHERE login_id=$1 AND tapback_type >= 2000
+			      AND body_scrubbed=FALSE AND updated_ts < $2
+			      AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
+			    LIMIT $3
+			  )
+		`, s.loginID, cutoff, chunkSize)
+		if err != nil {
+			return total, fmt.Errorf("failed to scrub reaction text: %w", err)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+		if n < chunkSize {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return total, nil
+}
+
+// scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE
+// the newest keepPerPortal messages of their portal — the tail that backfill
+// can never reach. scrubBridgedBodies only clears rows already delivered to
+// Matrix (its EXISTS gate), which leaves the bulk of a CloudKit-synced history
+// (everything beyond the per-chat backfill cap) sitting in plaintext forever.
+//
+// Safe to call ONLY when the operator capped Backfill.MaxInitialMessages: in
+// that mode FetchMessages short-circuits backward backfill to empty, so the
+// sole reader of cloud_message content is the no-anchor forward path via
+// listLatestMessages, which returns exactly the newest `count` rows ordered by
+// (timestamp_ms DESC, guid DESC) over the non-deleted, contentful population.
+// We mirror that: per portal we find the threshold timestamp (the
+// keepPerPortal-th newest row) and scrub only rows strictly OLDER than it.
+// Rows at the threshold timestamp are kept, so the retained set is always
+// >= keepPerPortal and can never include a row forward backfill would deliver.
+//
+// New messages that arrived while the bridge was down become the NEWEST rows in
+// their portal once CloudKit sync ingests them, so they sit above the threshold
+// and are never scrubbed (their fresh updated_ts also keeps them inside the
+// grace window) — they still backfill normally. Tapbacks are left alone for
+// parity with scrubBridgedBodies; restore re-population still works because
+// runRestoreBackfillPipeline clears body_scrubbed and re-fetches from CloudKit.
+//
+// Per-portal and indexed on (login_id, portal_id, timestamp_ms) so each
+// statement stays well under dbutil's 1s slow-query log threshold — unlike a
+// global window-function scan over the whole table.
+func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPortal int, graceWindow time.Duration, excludePortals []string) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
+	if keepPerPortal <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	exclude := make(map[string]struct{}, len(excludePortals))
+	for _, pid := range excludePortals {
+		exclude[pid] = struct{}{}
+	}
+
+	// Only portals whose contentful row count exceeds the cap have an
+	// unreachable tail; the rest are entirely within the backfill window.
+	rows, err := s.db.Query(ctx, `
+		SELECT portal_id FROM cloud_message
+		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
+		GROUP BY portal_id
+		HAVING COUNT(*) > $2
+	`, s.loginID, keepPerPortal)
+	if err != nil {
+		return 0, fmt.Errorf("list portals for tail scrub: %w", err)
+	}
+	var portals []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		portals = append(portals, pid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	const chunkSize = 1000
+	var total int64
+	for _, pid := range portals {
+		if _, skip := exclude[pid]; skip {
+			continue
+		}
+		// Threshold = timestamp of the keepPerPortal-th newest contentful row.
+		// Walks keepPerPortal index entries; rows strictly older are unreachable.
+		var threshold int64
+		err := s.db.QueryRow(ctx, `
+			SELECT timestamp_ms FROM cloud_message
+			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+			ORDER BY timestamp_ms DESC, guid DESC
+			LIMIT 1 OFFSET $3
+		`, s.loginID, pid, keepPerPortal-1).Scan(&threshold)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // fewer than keepPerPortal rows now (raced a deletion)
+		} else if err != nil {
+			return total, fmt.Errorf("tail-scrub threshold for portal %s: %w", pid, err)
+		}
+		for {
+			result, err := s.db.Exec(ctx, `
+				UPDATE cloud_message
+				SET text=NULL, subject=NULL, sender='', tapback_emoji=NULL, body_scrubbed=TRUE
+				WHERE login_id=$1 AND portal_id=$2
+				  AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
+				  AND updated_ts < $3 AND timestamp_ms < $4
+				  AND guid IN (
+				    SELECT guid FROM cloud_message
+				    WHERE login_id=$1 AND portal_id=$2
+				      AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
+				      AND updated_ts < $3 AND timestamp_ms < $4
+				    LIMIT $5
+				  )
+			`, s.loginID, pid, cutoff, threshold, chunkSize)
+			if err != nil {
+				return total, fmt.Errorf("scrub unbridged tail for portal %s: %w", pid, err)
+			}
+			n, _ := result.RowsAffected()
+			total += n
+			if n < chunkSize {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return total, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	return total, nil
+}
+
+// orphanStubReapAge is how long a NULL-portal soft-delete stub must sit before
+// deleteOrphanedMessages reaps it. softDeleteMessageByGUID stub-inserts a
+// deleted=TRUE row with portal_id NULL when an Apple-side delete arrives for a
+// guid CloudKit hasn't synced yet, so the future upsert preserves the deletion.
+// A real CloudKit row would set portal_id non-NULL via the upsert; a stub still
+// NULL after this window means the row never arrived and (since Apple already
+// deleted the message) never will — only the in-flight sync that raced the
+// delete could repopulate it, and that resolves within one sync cycle. 24h is
+// far past that, so reaping here cannot strand the deletion or re-bridge a body.
+const orphanStubReapAge = 24 * time.Hour
+
 // deleteOrphanedMessages hard-deletes cloud_message rows that are already
 // soft-deleted (deleted=TRUE) AND whose portal_id has no matching cloud_chat
 // entry. This is conservative: DM portals legitimately have messages without
 // cloud_chat rows, so we only clean up rows that are BOTH orphaned AND already
 // marked deleted (from tombstone processing or portal deletion).
+//
+// NULL-portal stubs are a separate case: `portal_id NOT IN (...)` can't catch
+// them because SQL's `NULL NOT IN (...)` is NULL (never TRUE), so they're
+// reaped via the age-gated `portal_id IS NULL` branch instead.
 func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64, error) {
+	stubCutoff := time.Now().Add(-orphanStubReapAge).UnixMilli()
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_message
 		WHERE login_id=$1
 		  AND deleted=TRUE
-		  AND portal_id NOT IN (
-			SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+		  AND (
+		    portal_id NOT IN (
+		      SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+		    )
+		    OR (portal_id IS NULL AND created_ts < $2)
 		  )
-	`, s.loginID)
+	`, s.loginID, stubCutoff)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete orphaned messages: %w", err)
 	}

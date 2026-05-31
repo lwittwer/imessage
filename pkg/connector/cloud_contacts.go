@@ -116,24 +116,24 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	// Step 1: Get the principal URL
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to discover principal URL")
-		return err
+		log.Warn().Err(sanitizeURLError(err, c.baseURL+"/")).Msg("CardDAV: failed to discover principal URL")
+		return sanitizeURLError(err, c.baseURL+"/")
 	}
-	log.Debug().Str("principal", principalURL).Msg("CardDAV: discovered principal URL")
+	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("CardDAV: discovered principal URL")
 
 	// Step 2: Get the address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to discover address book home")
-		return err
+		log.Warn().Err(sanitizeURLError(err, principalURL)).Msg("CardDAV: failed to discover address book home")
+		return sanitizeURLError(err, principalURL)
 	}
-	log.Debug().Str("home_set", homeSetURL).Msg("CardDAV: discovered address book home")
+	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("CardDAV: discovered address book home")
 
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to list address books")
-		return err
+		log.Warn().Err(sanitizeURLError(err, homeSetURL)).Msg("CardDAV: failed to list address books")
+		return sanitizeURLError(err, homeSetURL)
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("CardDAV: found address books")
 
@@ -142,7 +142,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("CardDAV: failed to fetch vCards")
+			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -170,25 +170,6 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		}
 	}
 	c.lastSync = time.Now()
-
-	// Debug: log all email keys and a sample of phone keys
-	emailKeys := make([]string, 0, len(c.byEmail))
-	for k := range c.byEmail {
-		emailKeys = append(emailKeys, k)
-	}
-	log.Debug().Strs("email_keys", emailKeys).Msg("CardDAV email lookup keys")
-
-	// Debug: log contacts with their phone/email for troubleshooting
-	for _, contact := range allContacts {
-		if contact.HasName() {
-			log.Debug().
-				Str("first", contact.FirstName).
-				Str("last", contact.LastName).
-				Strs("phones", contact.Phones).
-				Strs("emails", contact.Emails).
-				Msg("CardDAV contact loaded")
-		}
-	}
 
 	log.Info().
 		Int("contacts", len(allContacts)).
@@ -269,7 +250,7 @@ func (c *cloudContactsClient) discoverPrincipal(log zerolog.Logger) (string, err
 
 	href := extractPropValue(data, "current-user-principal")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("CardDAV: PROPFIND response (no principal found)")
+		log.Debug().Int("body_bytes", len(data)).Msg("CardDAV: PROPFIND response (no principal found)")
 		return "", fmt.Errorf("no current-user-principal in response")
 	}
 
@@ -303,7 +284,7 @@ func (c *cloudContactsClient) discoverAddressBookHome(log zerolog.Logger, princi
 
 	href := extractPropValue(data, "addressbook-home-set")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("CardDAV: PROPFIND response (no home set found)")
+		log.Debug().Int("body_bytes", len(data)).Msg("CardDAV: PROPFIND response (no home set found)")
 		return "", fmt.Errorf("no addressbook-home-set in response")
 	}
 
@@ -337,8 +318,7 @@ func (c *cloudContactsClient) listAddressBooks(log zerolog.Logger, homeSetURL st
 	}
 
 	log.Debug().
-		Int("response_bytes", len(data)).
-		Str("body_preview", string(data[:min(len(data), 3000)])).
+		Int("body_bytes", len(data)).
 		Msg("CardDAV: listAddressBooks PROPFIND response")
 	return c.parseAddressBookList(data, homeSetURL, log), nil
 }
@@ -370,8 +350,8 @@ func (c *cloudContactsClient) fetchAllVCards(log zerolog.Logger, addressBookURL 
 	}
 
 	log.Debug().
-		Int("response_bytes", len(data)).
-		Str("address_book", addressBookURL).
+		Int("body_bytes", len(data)).
+		Str("address_book_host", logSafeURL(addressBookURL)).
 		Msg("CardDAV: REPORT response received")
 
 	return c.parseVCardMultistatus(data, log), nil
@@ -480,7 +460,7 @@ func (c *cloudContactsClient) parseAddressBookList(data []byte, homeSetURL strin
 			}
 			if ps.Prop.ResourceType.AddressBook != nil {
 				log.Debug().
-					Str("href", href).
+					Str("address_book_host", logSafeURL(href)).
 					Str("name", ps.Prop.DisplayName).
 					Msg("CardDAV: found address book")
 				addressBooks = append(addressBooks, href)
@@ -492,7 +472,7 @@ func (c *cloudContactsClient) parseAddressBookList(data []byte, homeSetURL strin
 	// try the default Apple path
 	if len(addressBooks) == 0 {
 		defaultURL := c.baseURL + "/" + c.dsid + "/carddavhome/card/"
-		log.Debug().Str("url", defaultURL).Msg("CardDAV: no address books found via PROPFIND, trying default path")
+		log.Debug().Str("url_host", logSafeURL(defaultURL)).Msg("CardDAV: no address books found via PROPFIND, trying default path")
 		addressBooks = append(addressBooks, defaultURL)
 	}
 
@@ -682,7 +662,7 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, targetURL)
+		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, logSafeURL(targetURL))
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 }
@@ -734,9 +714,9 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				data, _, err = downloadURL(ctx, c.AvatarURL)
 			}
 			if err != nil {
-				log.Debug().Err(err).
+				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
 					Str("name", c.Name()).
-					Str("url", c.AvatarURL).
+					Str("url_host", logSafeURL(c.AvatarURL)).
 					Msg("Failed to download contact photo URL")
 				return
 			}

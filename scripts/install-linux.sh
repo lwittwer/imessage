@@ -452,6 +452,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
 fi
 
+if [ -z "${IN_DOCKER:-}" ]; then
 # ── Optional shell shortcuts (asked before preferred handle so the
 #    handle prompt remains the last interactive step) ─────────────
 # Detect existing systemd scope from installed unit files. If neither
@@ -528,6 +529,7 @@ EOF
         ;;
 esac
 echo ""
+fi  # IN_DOCKER gate — shortcuts block
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
@@ -621,7 +623,7 @@ if [ -t 0 ]; then
                 echo "✓ Video transcoding disabled"
                 ;;
             *)
-                if ! command -v ffmpeg >/dev/null 2>&1; then
+                if [ -z "${IN_DOCKER:-}" ] && ! command -v ffmpeg >/dev/null 2>&1; then
                     echo "  ffmpeg not found — installing..."
                     if command -v apt >/dev/null 2>&1; then
                         sudo apt install -y ffmpeg
@@ -645,7 +647,7 @@ if [ -t 0 ]; then
         case "$ENABLE_VT" in
             [yY]*)
                 sed -i "s/video_transcoding: .*/video_transcoding: true/" "$CONFIG"
-                if ! command -v ffmpeg >/dev/null 2>&1; then
+                if [ -z "${IN_DOCKER:-}" ] && ! command -v ffmpeg >/dev/null 2>&1; then
                     echo "  ffmpeg not found — installing..."
                     if command -v apt >/dev/null 2>&1; then
                         sudo apt install -y ffmpeg
@@ -812,6 +814,21 @@ if [ -t 0 ]; then
                 echo "✓ HEIC conversion disabled"
                 ;;
             *)
+                if [ -n "${IN_DOCKER:-}" ]; then
+                    : # libheif baked into Docker image — skip lazy apt install
+                elif command -v apt >/dev/null 2>&1; then
+                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
+                elif command -v dnf >/dev/null 2>&1; then
+                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
+                elif command -v pacman >/dev/null 2>&1; then
+                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
+                elif command -v zypper >/dev/null 2>&1; then
+                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
+                elif command -v apk >/dev/null 2>&1; then
+                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
+                else
+                    echo "  ⚠ Could not detect package manager — please install libheif manually"
+                fi
                 echo "✓ HEIC conversion enabled"
                 ;;
         esac
@@ -820,6 +837,21 @@ if [ -t 0 ]; then
         case "$ENABLE_HC" in
             [yY]*)
                 sed -i "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
+                if [ -n "${IN_DOCKER:-}" ]; then
+                    : # libheif baked into Docker image — skip lazy apt install
+                elif command -v apt >/dev/null 2>&1; then
+                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
+                elif command -v dnf >/dev/null 2>&1; then
+                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
+                elif command -v pacman >/dev/null 2>&1; then
+                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
+                elif command -v zypper >/dev/null 2>&1; then
+                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
+                elif command -v apk >/dev/null 2>&1; then
+                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
+                else
+                    echo "  ⚠ Could not detect package manager — please install libheif manually"
+                fi
                 echo "✓ HEIC conversion enabled"
                 ;;
             *)
@@ -855,6 +887,7 @@ if [ "$HEIC_ENABLED" = "true" ] && [ -t 0 ]; then
     fi
 fi
 
+if [ -z "${IN_DOCKER:-}" ]; then
 # ── Install systemd service (optional) ────────────────────────
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
@@ -953,6 +986,8 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         esac
     fi
 fi
+
+fi  # IN_DOCKER gate — systemd block
 
 echo ""
 echo "═══════════════════════════════════════════════"

@@ -475,6 +475,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_clear_identity_cache(uniffiStatus)
+		})
+		if checksum != 21945 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_clear_identity_cache: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(uniffiStatus)
 		})
 		if checksum != 27287 {
@@ -1308,6 +1317,15 @@ func uniffiCheckChecksums() {
 		if checksum != 4043 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_ring: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name(uniffiStatus)
+		})
+		if checksum != 6851 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -2187,6 +2205,31 @@ func (_self *Client) BatchResolveHandles(unknowns []string, knownHandles []strin
 		FfiConverterMapStringSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) ClearIdentityCache() (uint32, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_clear_identity_cache(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_u32(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) C.uint32_t {
+			// completeFunc
+			return C.ffi_rustpushgo_rust_future_complete_u32(unsafe.Pointer(handle), status)
+		},
+		FfiConverterUint32INSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_u32(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -4638,6 +4681,16 @@ func (_self *WrappedFaceTimeClient) Ring(sessionId string, targets []string, let
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func (_self *WrappedFaceTimeClient) SetSelfDisplayName(name string) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedFaceTimeClient")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
+			_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(name)), _uniffiStatus)
+		return false
+	})
 }
 
 func (_self *WrappedFaceTimeClient) UseLinkFor(oldUsage string, usage string) error {
