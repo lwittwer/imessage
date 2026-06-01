@@ -34,21 +34,18 @@ import (
 var NetworkExampleConfig string
 
 // WrapNetwork returns NetworkExampleConfig nested under a top-level `network:`
-// key, byte-compatible with the wrapping the bridgev2 framework applies in its
-// own makeFullExampleConfig (a "# Network-specific config options" header,
-// then `network:`, then every content line indented four spaces). cmd/bbctl
-// prepends this to the Beeper base config so a freshly registered Beeper
-// bridge and a self-hosted bridge carry the same, complete network block.
+// key. It is byte-for-byte identical to the wrapping the bridgev2 framework
+// applies in its own makeFullExampleConfig — a "# Network-specific config
+// options" header, then `network:`, then every line (blank lines included)
+// indented four spaces, then a trailing blank line. cmd/bbctl prepends this to
+// the Beeper base config so a freshly registered Beeper (Linux) bridge and a
+// self-hosted (Mac) bridge carry an identical network block, not merely the
+// same keys. Keep this loop in lockstep with mxmain.makeFullExampleConfig.
 func WrapNetwork() string {
 	var buf strings.Builder
 	buf.WriteString("# Network-specific config options\n")
 	buf.WriteString("network:\n")
-	for _, line := range strings.Split(strings.TrimRight(NetworkExampleConfig, "\n"), "\n") {
-		if line == "" {
-			// Preserve blank separator lines without trailing whitespace.
-			buf.WriteByte('\n')
-			continue
-		}
+	for _, line := range strings.Split(NetworkExampleConfig, "\n") {
 		buf.WriteString("    ")
 		buf.WriteString(line)
 		buf.WriteByte('\n')
