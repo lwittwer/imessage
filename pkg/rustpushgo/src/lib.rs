@@ -6759,6 +6759,37 @@ pub async fn new_client(
                         .as_millis() as u64;
                     reconnected_at.store(start_ms, Ordering::Relaxed);
                     info!("Drain task started, marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+
+                    // APNs inbound-liveness watchdog (backstop for silent
+                    // receive-path stalls). A healthy APS connection delivers a
+                    // frame through messages_cont at least every ~60s — at
+                    // minimum the keepalive Pong for upstream's 60s Ping. If we
+                    // see NOTHING for APNS_STALL_TIMEOUT, the receive path has
+                    // silently wedged: e.g. a half-open courier socket where
+                    // read_exact() blocks forever, and the keepalive's own
+                    // do_reload() can't fire because its Ping send() is stuck on
+                    // the dead write half (observed in production: inbound dead
+                    // for 22h+, the process otherwise fully alive — pings, state
+                    // saves, backfill all running — only a manual restart
+                    // recovered). On stall we force a TRANSPORT-ONLY reconnect
+                    // via request_update(): the ResourceManager aborts the
+                    // wedged generation (util.rs select! → current_resource.abort)
+                    // and regenerates (open_socket + do_connect + topic refilter).
+                    // This is the SAME lever the keepalive's do_reload() uses. It
+                    // does NOT re-register IDS — re-registration is only
+                    // force_reregister_identity()/refresh_now(), deliberately NOT
+                    // wired to reconnect (see 1938e1a: re-registering on every APS
+                    // reconnect smeared FaceTime across 38 stale registrations and
+                    // broke calls both ways). Conservative: a 5-minute threshold
+                    // (>= 5 missed keepalive cycles) so it never fires on a
+                    // healthy-but-quiet link, and last_inbound resets after firing
+                    // so forced reconnects are spaced >= APNS_STALL_TIMEOUT apart
+                    // even if the link stays down (repeating request_update is
+                    // harmless — the ResourceManager is already retrying).
+                    const APNS_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+                    let mut last_inbound = tokio::time::Instant::now();
+                    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(30));
+                    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
                             biased;
@@ -6797,6 +6828,10 @@ pub async fn new_client(
                             result = recv.recv() => {
                                 match result {
                                     Ok(msg) => {
+                                        // Any inbound APS frame (real message OR a
+                                        // keepalive Pong) proves the receive path is
+                                        // alive — feed the liveness watchdog.
+                                        last_inbound = tokio::time::Instant::now();
                                         drain_pending.fetch_add(1, Ordering::Relaxed);
                                         let drain_ts = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -6808,6 +6843,9 @@ pub async fn new_client(
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        // Lagged means frames WERE arriving (we fell
+                                        // behind) — the link is alive.
+                                        last_inbound = tokio::time::Instant::now();
                                         error!(
                                             "APS broadcast receiver lagged — {} messages were DROPPED by the \
                                              broadcast channel before we could read them. Real-time messages \
@@ -6821,6 +6859,24 @@ pub async fn new_client(
                                         info!("Broadcast channel closed, stopping drain task");
                                         break;
                                     }
+                                }
+                            }
+                            // APNs inbound-liveness watchdog tick. Lowest priority
+                            // under `biased` — real message draining and reconnect
+                            // detection always win; this arm only gets polled when
+                            // no frame is pending, i.e. exactly the stall case.
+                            _ = watchdog_tick.tick() => {
+                                let idle = last_inbound.elapsed();
+                                if idle >= APNS_STALL_TIMEOUT {
+                                    warn!(
+                                        "APNs receive watchdog: no inbound frames for {}s (a healthy link sees a keepalive Pong every ~60s) — forcing TRANSPORT-ONLY APS reconnect via request_update (no IDS re-registration). If inbound resumes after this line, the receive path had silently wedged.",
+                                        idle.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Space forced reconnects >= APNS_STALL_TIMEOUT apart
+                                    // and give regeneration time to deliver frames before
+                                    // we would consider firing again.
+                                    last_inbound = tokio::time::Instant::now();
                                 }
                             }
                         }
