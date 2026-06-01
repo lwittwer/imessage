@@ -1345,6 +1345,9 @@ WorkingDirectory=$DATA_DIR
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
+# Headroom for busy/heavy-message bridges; the binary also raises this at
+# startup, so this is belt-and-suspenders. systemd default is 1024.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=default.target
@@ -1366,6 +1369,9 @@ WorkingDirectory=$DATA_DIR
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
+# Headroom for busy/heavy-message bridges; the binary also raises this at
+# startup, so this is belt-and-suspenders. systemd default is 1024.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

@@ -1,9 +1,8 @@
-//go:build !darwin
+//go:build !darwin && !linux
 
 package main
 
-// raiseFileLimit is a no-op on non-macOS platforms. The descriptor-exhaustion
-// problem it addresses is specific to launchd's low default RLIMIT_NOFILE (256)
-// on macOS; Linux/systemd installs start with a far higher limit, so the bridge
-// leaves their resource limits untouched.
+// raiseFileLimit is a no-op on platforms without the syscall.Rlimit path used
+// in rlimit_unix.go (e.g. Windows). On macOS and Linux the real implementation
+// raises the open-file soft limit at startup.
 func raiseFileLimit() {}
