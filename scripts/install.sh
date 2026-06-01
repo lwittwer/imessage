@@ -926,6 +926,16 @@ cat > "$PLIST" << PLIST_EOF
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>$LOG_OUT</string>
     <key>StandardErrorPath</key>
