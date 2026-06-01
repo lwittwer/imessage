@@ -911,6 +911,9 @@ WorkingDirectory=$(dirname "$BINARY")
 ExecStart=$BINARY -c $CONFIG
 Restart=always
 RestartSec=5
+# Headroom for busy/heavy-message bridges; the binary also raises this at
+# startup, so this is belt-and-suspenders. systemd default is 1024.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=default.target
@@ -932,6 +935,9 @@ WorkingDirectory=$(dirname "$BINARY")
 ExecStart=$BINARY -c $CONFIG
 Restart=always
 RestartSec=5
+# Headroom for busy/heavy-message bridges; the binary also raises this at
+# startup, so this is belt-and-suspenders. systemd default is 1024.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
