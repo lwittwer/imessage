@@ -735,7 +735,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `video_transcoding` | `false` | Auto-remux non-MP4 videos (e.g. QuickTime `.mov`) to MP4 for broad Matrix client compatibility. Requires `ffmpeg`. |
 | `heic_conversion` | `false` | Auto-convert HEIC/HEIF images to JPEG. Requires `libheif`. |
 | `heic_jpeg_quality` | `95` | JPEG output quality (1–100) when HEIC conversion is enabled. |
-| `carddav.email` / `carddav.url` / `carddav.username` / `carddav.password_encrypted` | *(unset)* | External CardDAV server for contact name resolution (Google with app passwords, Nextcloud, Radicale, Fastmail, etc.). Set up via the install script's CardDAV prompt or the `mautrix-imessage-v2 carddav-setup` subcommand. When configured, used instead of iCloud contacts. |
+| `carddav.email` / `carddav.url` / `carddav.username` / `carddav.password_encrypted` | *(unset)* | External CardDAV server for contact name resolution (Google with app passwords, Nextcloud, Radicale, Fastmail, etc.). Set up via the install script's CardDAV prompt. When configured, used instead of iCloud contacts. |
 | `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). The install script writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
 | `database.type` | `postgres` | bridgev2 framework option. `postgres` or `sqlite3-fk-wal`; the install script asks during first run and defaults to `postgres`. |
@@ -757,7 +757,7 @@ cmd/
   ├── mautrix-imessage/                     # Bridge entrypoint
   │     ├── main.go                         #   process bootstrap, config load, command registration
   │     ├── login_cli.go                    #   interactive iMessage CLI login (stdin → bridgev2 LoginProcess)
-  │     ├── carddav_setup.go                #   `carddav-setup` subcommand — URL discovery + password encryption
+  │     ├── carddav_setup.go                #   install-script helper — CardDAV URL discovery + password encryption
   │     ├── setup_darwin.go                 #   macOS chat.db permission dialogs
   │     └── setup_other.go                  #   non-Darwin stubs (no-ops)
   └── bbctl/                                # Beeper bridge-manager CLI — companion tool that talks to Beeper's
