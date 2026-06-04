@@ -948,6 +948,14 @@ impl WrappedAPSState {
 #[derive(uniffi::Object)]
 pub struct WrappedAPSConnection {
     pub inner: rustpush::APSConnection,
+    /// Epoch-ms of the last inbound APS frame — ANY frame, real message or the
+    /// ~60s keepalive Pong. The drain task stamps this on every frame; the Go
+    /// receive-watchdog reads `seconds_since_last_inbound()` to spot a wedged
+    /// receive path (a reconnect storm never delivers even a Pong) and trigger
+    /// a full client rebuild. It lives on the connection, NOT the Client,
+    /// because `Disconnect` only `close()`s the connection — it never destroys
+    /// this Go object — so the watchdog can poll it without any use-after-free.
+    pub last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -956,6 +964,31 @@ impl WrappedAPSConnection {
         Arc::new(WrappedAPSState {
             inner: Some(self.inner.state.read().await.clone()),
         })
+    }
+
+    /// Seconds since the last inbound APS frame. A healthy link refreshes this
+    /// every ~60s (the keepalive Pong) even when idle, so a value far past that
+    /// means the receive path is wedged — a reconnect storm or half-open socket
+    /// that never delivers a frame. The Go receive-watchdog polls this.
+    pub fn seconds_since_last_inbound(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self
+            .last_inbound_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) / 1000
+    }
+
+    /// Tear down the APNs connection's ResourceManager — stops its reconnect
+    /// loop and frees the courier socket. Called on full client teardown so a
+    /// rebuild never leaves a SECOND live connection on the same device token:
+    /// Apple drops the duplicate ("Failed to read message from APS ... early
+    /// eof"), and rustpush's no-backoff reconnect loop turns that into a
+    /// self-sustaining ~9/sec storm that only a restart clears.
+    pub fn close(&self) {
+        self.inner.close();
     }
 }
 
@@ -5472,7 +5505,17 @@ pub async fn connect(
     if let Some(error) = error {
         error!("APS connection error (non-fatal, will retry): {}", error);
     }
-    Arc::new(WrappedAPSConnection { inner: connection })
+    Arc::new(WrappedAPSConnection {
+        inner: connection,
+        // Seed "now" so a freshly-built connection isn't instantly seen as
+        // wedged; the drain task re-stamps it on the first inbound frame.
+        last_inbound_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        )),
+    })
 }
 
 /// Login session object that holds state between login steps.
@@ -6943,6 +6986,7 @@ pub async fn new_client(
     let receive_handle = tokio::spawn({
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
+        let last_inbound_ms = connection.last_inbound_ms.clone();
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
@@ -6962,6 +7006,7 @@ pub async fn new_client(
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
+                let last_inbound_ms = last_inbound_ms.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
                     let mut state = conn.resource_state.subscribe();
@@ -7055,6 +7100,18 @@ pub async fn new_client(
                                     reconnected_at.store(now, Ordering::Relaxed);
                                     info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
                                 }
+                                if matches!(current, ResourceState::Closed) {
+                                    // Connection closed (e.g. Disconnect → close()). Exit so
+                                    // this DETACHED drain task releases its Arc clone of the
+                                    // connection. Otherwise, in the wedged case it runs
+                                    // forever (it otherwise only breaks when a frame arrives
+                                    // and the process task is gone — and no frame arrives when
+                                    // wedged), pinning the courier socket open until process
+                                    // exit. With this, the socket's last strong ref drops once
+                                    // the (GC-finalized) Go connection handle is also gone.
+                                    info!("APS resource closed, stopping drain task");
+                                    break;
+                                }
                                 // NOTE: previously re-registered the full IDS bundle
                                 // (refresh_now()) on every APS reconnect to rebind the
                                 // madrid push token. REMOVED — re-registering the whole
@@ -7076,6 +7133,17 @@ pub async fn new_client(
                                         // keepalive Pong) proves the TRANSPORT is
                                         // alive — feed the half-open-socket watchdog.
                                         last_inbound = tokio::time::Instant::now();
+                                        // One epoch-ms stamp for this frame, reused below
+                                        // (avoids a second SystemTime::now() per frame):
+                                        // mirrored into the connection-scoped atomic the
+                                        // Go receive-watchdog polls (it can't see the
+                                        // local Instant above, and Pongs never reach Go),
+                                        // and handed to the process task as drain_ts.
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        last_inbound_ms.store(now_ms, Ordering::Relaxed);
                                         // A real IDS Notification (incoming message,
                                         // receipt, typing on madrid) additionally
                                         // proves Apple's push ROUTING to this token is
@@ -7088,11 +7156,7 @@ pub async fn new_client(
                                             last_notification = tokio::time::Instant::now();
                                         }
                                         drain_pending.fetch_add(1, Ordering::Relaxed);
-                                        let drain_ts = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as u64;
-                                        if tx.send((msg, drain_ts)).is_err() {
+                                        if tx.send((msg, now_ms)).is_err() {
                                             info!("Process task gone, stopping drain");
                                             break;
                                         }
@@ -7105,6 +7169,16 @@ pub async fn new_client(
                                         // re-filter during a genuine burst.
                                         last_inbound = tokio::time::Instant::now();
                                         last_notification = tokio::time::Instant::now();
+                                        // Frames were flowing (we lagged) → link is alive;
+                                        // refresh the Go receive-watchdog's signal too, so
+                                        // a burst can never be mistaken for a wedge.
+                                        last_inbound_ms.store(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
                                         error!(
                                             "APS broadcast receiver lagged — {} messages were DROPPED by the \
                                              broadcast channel before we could read them. Real-time messages \
@@ -7138,6 +7212,15 @@ pub async fn new_client(
                                     // the regenerated link starts clean, and we don't
                                     // want the deaf-link branch below to fire on the
                                     // pre-reconnect notification gap.
+                                    //
+                                    // last_inbound_ms (the connection-scoped atomic the Go
+                                    // receive-wedge watchdog reads) is DELIBERATELY NOT
+                                    // reset here — only real liveness (an Ok frame or a
+                                    // Lagged burst) resets it. That divergence is the whole
+                                    // point: it lets the Go watchdog measure TRUE silence
+                                    // and escalate to a full rebuild when this request_update
+                                    // keeps failing (the reconnect-storm case), instead of
+                                    // being masked by our own 300s re-fire spacing.
                                     last_inbound = tokio::time::Instant::now();
                                     last_notification = tokio::time::Instant::now();
                                 } else if last_notification.elapsed() >= APNS_RECEIVE_STALL_TIMEOUT {
