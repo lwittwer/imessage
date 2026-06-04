@@ -5328,12 +5328,229 @@ fn _create_config_from_hardware_key_inner(base64_key: String, _device_id: Option
     })
 }
 
+// ---------------------------------------------------------------------------
+// APNs courier socket hardening (entirely in-crate — does NOT touch rustpush).
+//
+// rustpush's open_socket() (aps.rs) opens the long-lived TLS/TCP connection to
+// the APNs courier (push.apple.com:5223) with ZERO socket options: no TCP
+// keep-alive, no write/user timeout. On a home network (consumer NAT, Wi-Fi
+// power-save on a Pi/Mac), that idle long-lived connection can be silently
+// dropped: the read half goes dead (read_exact blocks forever) and/or a wedged
+// write_all() holds the connection's socket lock. With no kernel timeout the
+// socket can stay wedged for the default TCP retransmission ceiling (~15 min) or
+// effectively forever — the "silent death": inbound iMessages stop while the
+// process stays alive, only a restart recovers.
+//
+// We cannot reach rustpush's internally-created socket through any API, and we
+// neither vendor nor patch rustpush. So we discover the courier socket(s) by
+// scanning our OWN open fds for a TCP peer on port 5223 and set, in place:
+//   - SO_KEEPALIVE + keep-idle/intvl/cnt  -> the kernel probes an idle-but-dead
+//     peer and errors the read within ~2 min (frees the blocked read_exact).
+//   - a write/user timeout (Linux TCP_USER_TIMEOUT / macOS TCP_RXT_CONNDROPTIME)
+//     -> a wedged write_all() errors within ~90s (frees self.socket.lock()).
+// Either path makes rustpush's existing ResourceManager regenerate the socket;
+// the in-crate inbound-liveness watchdog (new_client drain task) is the backstop.
+// Idempotent and best-effort, re-applied on a timer so it covers the initial
+// connect AND every reconnect; failures are logged-and-ignored. Port 5223 is
+// APNs-courier-specific, so we never touch the homeserver/CardDAV/IDS sockets
+// (all :443).
+// ---------------------------------------------------------------------------
+const APNS_COURIER_PORT: u16 = 5223;
+
+static APNS_KEEPALIVE_TASK_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_list_open_fds() -> Vec<i32> {
+    // Linux: exact open-fd set via /proc/self/fd. macOS (no procfs): bounded scan
+    // up to the soft NOFILE limit — getpeername on a closed fd returns EBADF
+    // immediately, so this is just fast syscalls.
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        let mut v = Vec::new();
+        for e in rd.flatten() {
+            if let Ok(n) = e.file_name().to_string_lossy().parse::<i32>() {
+                v.push(n);
+            }
+        }
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let mut cap: i64 = 4096;
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            // Cover the bridge's RAISED NOFILE (65536) — macOS has no /proc to enumerate
+            // exactly, and the very fd-spike conditions this patch targets can allocate the
+            // courier fd high. A getpeername on a closed fd is an immediate EBADF, so even a
+            // full 65536-fd sweep every 45s is cheap; do not clamp below NOFILE or the
+            // courier socket can be silently missed.
+            cap = (lim.rlim_cur as i64).clamp(1024, 65536);
+        }
+    }
+    (0..cap as i32).collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_socket_peer_port(fd: i32) -> Option<u16> {
+    unsafe {
+        let mut sotype: libc::c_int = 0;
+        let mut tlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sotype as *mut _ as *mut libc::c_void,
+            &mut tlen,
+        ) != 0
+        {
+            return None;
+        }
+        if sotype != libc::SOCK_STREAM {
+            return None;
+        }
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        if libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+            return None;
+        }
+        match addr.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let a = &*(&addr as *const _ as *const libc::sockaddr_in);
+                Some(u16::from_be(a.sin_port))
+            }
+            libc::AF_INET6 => {
+                let a = &*(&addr as *const _ as *const libc::sockaddr_in6);
+                Some(u16::from_be(a.sin6_port))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_apply_keepalive(fd: i32) -> bool {
+    unsafe fn setopt(fd: i32, level: libc::c_int, opt: libc::c_int, val: libc::c_int) {
+        let _ = libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    unsafe {
+        // One-shot per socket epoch: a fresh rustpush courier socket has SO_KEEPALIVE
+        // OFF; once we turn it on we skip the socket on later sweeps. This avoids
+        // re-arming the idle timer every 45s (XNU may reset the countdown on a repeat
+        // set, which could keep keepalive probes from ever firing) and keeps the sweep
+        // cheap, while still hardening the NEW socket created after each reconnect.
+        let mut already: libc::c_int = 0;
+        let mut alen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &mut already as *mut _ as *mut libc::c_void,
+            &mut alen,
+        ) == 0
+            && already != 0
+        {
+            return false;
+        }
+        let on: libc::c_int = 1;
+        let ok = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0;
+        let tcp = libc::IPPROTO_TCP;
+        #[cfg(target_os = "linux")]
+        {
+            // stable kernel ABI values (netinet/tcp.h)
+            const TCP_KEEPIDLE: libc::c_int = 4;
+            const TCP_KEEPINTVL: libc::c_int = 5;
+            const TCP_KEEPCNT: libc::c_int = 6;
+            const TCP_USER_TIMEOUT: libc::c_int = 18;
+            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence, so on a
+            // HEALTHY link the app traffic always resets the timer first and the kernel
+            // never emits a probe — we add no traffic to Apple. Probes only fire once the
+            // link is actually dead (which is exactly when we want detection).
+            setopt(fd, tcp, TCP_KEEPIDLE, 90);
+            setopt(fd, tcp, TCP_KEEPINTVL, 15);
+            setopt(fd, tcp, TCP_KEEPCNT, 4);
+            // bound unacked (wedged) writes -> write_all() errors in ~90s, freeing the socket lock
+            setopt(fd, tcp, TCP_USER_TIMEOUT, 90_000);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // stable values from <netinet/tcp.h>
+            const TCP_KEEPALIVE: libc::c_int = 0x10; // idle seconds before first probe
+            const TCP_KEEPINTVL: libc::c_int = 0x101;
+            const TCP_KEEPCNT: libc::c_int = 0x102;
+            const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80; // seconds to drop after retransmit failures
+            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence (see Linux
+            // note above): healthy links never emit an extra probe.
+            setopt(fd, tcp, TCP_KEEPALIVE, 90);
+            setopt(fd, tcp, TCP_KEEPINTVL, 15);
+            setopt(fd, tcp, TCP_KEEPCNT, 4);
+            setopt(fd, tcp, TCP_RXT_CONNDROPTIME, 90);
+        }
+        ok
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_apns_socket_keepalive() {
+    let mut hardened = 0usize;
+    for fd in aps_list_open_fds() {
+        if aps_socket_peer_port(fd) == Some(APNS_COURIER_PORT) && aps_apply_keepalive(fd) {
+            hardened += 1;
+        }
+    }
+    if hardened > 0 {
+        // Fires only when we NEWLY harden a socket (per connect/reconnect) — already
+        // hardened sockets are skipped above — so this is a per-epoch confirmation line,
+        // not 45s log spam.
+        info!(
+            "APNs keepalive: applied TCP keep-alive + write timeout to {} courier socket(s) (:{}); a half-open courier socket now self-recovers in ~90-150s instead of stalling indefinitely",
+            hardened, APNS_COURIER_PORT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_apns_socket_keepalive() {}
+
+/// Spawn (once per process) a background sweep that keeps TCP keep-alive + a
+/// write/user timeout applied to the APNs courier socket(s). Idempotent; covers
+/// the initial connect and every reconnect. No-op if already started.
+fn ensure_apns_keepalive_task() {
+    use std::sync::atomic::Ordering;
+    if APNS_KEEPALIVE_TASK_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            set_apns_socket_keepalive();
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        }
+    });
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn connect(
     config: &WrappedOSConfig,
     state: &WrappedAPSState,
 ) -> Arc<WrappedAPSConnection> {
     ensure_crypto_provider();
+    // Keep TCP keep-alive + a write timeout applied to the APNs courier socket so
+    // a half-open/wedged connection errors out (~90-120s) and rustpush's
+    // ResourceManager (and our inbound-liveness watchdog) can recover — instead
+    // of the read/write blocking for the kernel default (~15 min) or forever.
+    ensure_apns_keepalive_task();
     let config = config.config.clone();
     let state = state.inner.clone();
     let (connection, error) = APSConnectionResource::new(config, state).await;
@@ -6844,6 +7061,64 @@ pub async fn new_client(
                         .as_millis() as u64;
                     reconnected_at.store(start_ms, Ordering::Relaxed);
                     info!("Drain task started, marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+
+                    // APNs inbound-liveness watchdog (backstop for silent
+                    // receive-path stalls). A healthy APS connection delivers a
+                    // frame through messages_cont at least every ~60s — at
+                    // minimum the keepalive Pong for upstream's 60s Ping. If we
+                    // see NOTHING for APNS_STALL_TIMEOUT, the receive path has
+                    // silently wedged: e.g. a half-open courier socket where
+                    // read_exact() blocks forever, and the keepalive's own
+                    // do_reload() can't fire because its Ping send() is stuck on
+                    // the dead write half (observed in production: inbound dead
+                    // for 22h+, the process otherwise fully alive — pings, state
+                    // saves, backfill all running — only a manual restart
+                    // recovered). On stall we force a TRANSPORT-ONLY reconnect
+                    // via request_update(): the ResourceManager aborts the
+                    // wedged generation (util.rs select! → current_resource.abort)
+                    // and regenerates (open_socket + do_connect + topic refilter).
+                    // This is the SAME lever the keepalive's do_reload() uses. It
+                    // does NOT re-register IDS — re-registration is only
+                    // force_reregister_identity()/refresh_now(), deliberately NOT
+                    // wired to reconnect (see 1938e1a: re-registering on every APS
+                    // reconnect smeared FaceTime across 38 stale registrations and
+                    // broke calls both ways). Conservative: a 5-minute threshold
+                    // (>= 5 missed keepalive cycles) so it never fires on a
+                    // healthy-but-quiet link, and last_inbound resets after firing
+                    // so forced reconnects are spaced >= APNS_STALL_TIMEOUT apart
+                    // even if the link stays down (repeating request_update is
+                    // harmless — the ResourceManager is already retrying).
+                    const APNS_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+                    // SECOND failure mode (distinct from the dead socket above):
+                    // the transport stays fully alive — keepalive Pongs flow every
+                    // ~60s and the APS Acks for the user's OWN outgoing messages
+                    // come back fine — but Apple has silently stopped routing
+                    // com.apple.madrid push NOTIFICATIONS (incoming messages /
+                    // receipts) to this connection's token. Symptom: "I can send
+                    // but I stop receiving", restart fixes it (observed across
+                    // multiple users; one Raspberry-Pi bridge sent fine for ~19h
+                    // while receiving nothing). The half-open-socket watchdog above
+                    // CANNOT see this: last_inbound is reset by every messages_cont
+                    // frame, including the Pongs and send-Acks that keep arriving on
+                    // a live-but-deaf socket — so it never trips. We therefore track
+                    // notifications SEPARATELY (reset only on a real Notification
+                    // frame) and, when the transport is provably alive yet no
+                    // notification has arrived for a long window, force a
+                    // TRANSPORT-ONLY reconnect to re-assert the topic filter
+                    // (do_connect re-sends SetState + filter(current_topics); the
+                    // madrid interest is held for the connection's lifetime by
+                    // IMClient's _interest_token, so it survives the reconnect).
+                    // Same request_update() lever as above → no IDS re-registration.
+                    // We can't distinguish "deaf" from "genuinely quiet" without an
+                    // active probe, so the threshold is deliberately long (1h): a
+                    // deaf link self-heals within the hour instead of never, and a
+                    // truly idle link just sees one harmless reconnect per hour
+                    // (well within normal reconnect cadence — not Apple-visible spam).
+                    const APNS_RECEIVE_STALL_TIMEOUT: Duration = Duration::from_secs(3600);
+                    let mut last_inbound = tokio::time::Instant::now();
+                    let mut last_notification = tokio::time::Instant::now();
+                    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(30));
+                    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
                             biased;
@@ -6882,6 +7157,21 @@ pub async fn new_client(
                             result = recv.recv() => {
                                 match result {
                                     Ok(msg) => {
+                                        // Any inbound APS frame (real message OR a
+                                        // keepalive Pong) proves the TRANSPORT is
+                                        // alive — feed the half-open-socket watchdog.
+                                        last_inbound = tokio::time::Instant::now();
+                                        // A real IDS Notification (incoming message,
+                                        // receipt, typing on madrid) additionally
+                                        // proves Apple's push ROUTING to this token is
+                                        // live. Pongs and our own send-Acks do NOT —
+                                        // they are exactly what masks a live-but-deaf
+                                        // socket from the watchdog above. matches! does
+                                        // not move msg (no bindings), so it stays
+                                        // available to forward below.
+                                        if matches!(msg, rustpush::APSMessage::Notification { .. }) {
+                                            last_notification = tokio::time::Instant::now();
+                                        }
                                         drain_pending.fetch_add(1, Ordering::Relaxed);
                                         let drain_ts = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -6893,6 +7183,13 @@ pub async fn new_client(
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        // Lagged means frames WERE arriving fast enough
+                                        // that we fell behind — the link is alive and
+                                        // almost certainly carrying real notifications,
+                                        // so refresh both timers to avoid a spurious
+                                        // re-filter during a genuine burst.
+                                        last_inbound = tokio::time::Instant::now();
+                                        last_notification = tokio::time::Instant::now();
                                         error!(
                                             "APS broadcast receiver lagged — {} messages were DROPPED by the \
                                              broadcast channel before we could read them. Real-time messages \
@@ -6906,6 +7203,51 @@ pub async fn new_client(
                                         info!("Broadcast channel closed, stopping drain task");
                                         break;
                                     }
+                                }
+                            }
+                            // APNs inbound-liveness watchdog tick. Lowest priority
+                            // under `biased` — real message draining and reconnect
+                            // detection always win; this arm only gets polled when
+                            // no frame is pending, i.e. exactly the stall case.
+                            _ = watchdog_tick.tick() => {
+                                let idle = last_inbound.elapsed();
+                                if idle >= APNS_STALL_TIMEOUT {
+                                    warn!(
+                                        "APNs receive watchdog: no inbound frames for {}s (a healthy link sees a keepalive Pong every ~60s) — forcing TRANSPORT-ONLY APS reconnect via request_update (no IDS re-registration). If inbound resumes after this line, the receive path had silently wedged.",
+                                        idle.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Space forced reconnects >= APNS_STALL_TIMEOUT apart
+                                    // and give regeneration time to deliver frames before
+                                    // we would consider firing again. Reset BOTH timers:
+                                    // the regenerated link starts clean, and we don't
+                                    // want the deaf-link branch below to fire on the
+                                    // pre-reconnect notification gap.
+                                    last_inbound = tokio::time::Instant::now();
+                                    last_notification = tokio::time::Instant::now();
+                                } else if last_notification.elapsed() >= APNS_RECEIVE_STALL_TIMEOUT {
+                                    // Transport is alive (a frame arrived within
+                                    // APNS_STALL_TIMEOUT — the `if` above didn't trip)
+                                    // but no real IDS notification has come through for
+                                    // APNS_RECEIVE_STALL_TIMEOUT. Either Apple silently
+                                    // stopped routing madrid pushes to this token, or
+                                    // the link is genuinely idle — we can't tell, so we
+                                    // re-assert the topic filter the cheap way: a
+                                    // transport-only reconnect (re-runs do_connect →
+                                    // SetState + filter(current_topics)). Recovers a
+                                    // lapsed subscription; a no-op-cost reconnect if the
+                                    // link was merely quiet.
+                                    let deaf = last_notification.elapsed();
+                                    warn!(
+                                        "APNs receive-routing watchdog: transport alive (inbound frame within {}s) but ZERO IDS notifications for {}s — Apple's madrid push routing to this token may have silently lapsed (the 'I can send but stopped receiving' failure). Forcing TRANSPORT-ONLY APS reconnect via request_update to re-assert the topic filter (no IDS re-registration). Harmless if the link was simply idle.",
+                                        idle.as_secs(),
+                                        deaf.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Reset only the notification timer so re-filters are
+                                    // spaced >= APNS_RECEIVE_STALL_TIMEOUT apart; the
+                                    // reconnect refreshes last_inbound on its own.
+                                    last_notification = tokio::time::Instant::now();
                                 }
                             }
                         }
