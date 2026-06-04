@@ -237,6 +237,16 @@ type IMClient struct {
 	lastPresenceSubscribe     time.Time
 	lastPresenceSubscribeLock sync.Mutex
 
+	// statusKitInviteMu / statusKitNextInviteAt enforce a GLOBAL minimum
+	// interval between StatusKit invite dispatches, shared across every caller:
+	// the periodic sweep, the new-portal hook, and concurrent reconnect-
+	// triggered sweeps. The sweep's per-loop delay only bounded one sweep; the
+	// new-portal hook fires once per portal during CloudKit backfill and was
+	// otherwise unpaced, so a fresh start could still burst Apple's IDS. Every
+	// invite funnels through this gate so the aggregate rate trickles.
+	statusKitInviteMu     sync.Mutex
+	statusKitNextInviteAt time.Time
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex

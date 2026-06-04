@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -916,6 +917,13 @@ const statusKitPerHandleMinSpacing = 4 * time.Hour
 const statusKitNoKeysKeyPrefix = "statuskit.no_keys."
 const statusKitNoKeysTTL = 7 * 24 * time.Hour
 
+// statusKitNoKeysJitterWindow spreads no-keys re-checks so a wave of peers
+// cached together (fresh start, CloudKit backfill) doesn't all expire and
+// re-query Apple on the same day. Each handle gets a deterministic offset in
+// [0, window) added to the base TTL — derived from the handle so it's stable
+// across restarts.
+const statusKitNoKeysJitterWindow = 48 * time.Hour
+
 // statusKitNoKeysGated reports whether handle was recently confirmed not on the
 // keysharing sub-service (an invite that returned NoValidTargets), so every
 // StatusKit invite path can skip it instead of re-querying Apple's IDS. Shared
@@ -926,7 +934,57 @@ func (c *IMClient) statusKitNoKeysGated(ctx context.Context, handle string, now 
 		return false
 	}
 	ts, err := time.Parse(time.RFC3339, raw)
-	return err == nil && now.Sub(ts) < statusKitNoKeysTTL
+	return err == nil && now.Sub(ts) < statusKitNoKeysEffectiveTTL(handle)
+}
+
+// statusKitNoKeysEffectiveTTL is the base no-keys TTL plus a deterministic
+// per-handle jitter (see statusKitNoKeysJitterWindow) so re-checks stagger
+// instead of all expiring on the same day and re-pounding Apple at once.
+func statusKitNoKeysEffectiveTTL(handle string) time.Duration {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(handle))
+	jitter := time.Duration(h.Sum32()%uint32(statusKitNoKeysJitterWindow/time.Second)) * time.Second
+	return statusKitNoKeysTTL + jitter
+}
+
+// waitStatusKitInviteSlot blocks until the next globally-paced invite slot and
+// reserves it, returning false if the bridge is stopping. Every invite caller
+// funnels through here (or tryStatusKitInviteSlot) so the AGGREGATE dispatch
+// rate to Apple is bounded — not just one sweep's rate. This is what makes a
+// fresh-start backfill or a TTL-expiry wave trickle instead of pound.
+func (c *IMClient) waitStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	now := time.Now()
+	slot := c.statusKitNextInviteAt
+	if slot.Before(now) {
+		slot = now
+	}
+	c.statusKitNextInviteAt = slot.Add(statusKitInterInviteDelay)
+	c.statusKitInviteMu.Unlock()
+	d := time.Until(slot)
+	if d <= 0 {
+		return true
+	}
+	select {
+	case <-time.After(d):
+		return true
+	case <-c.stopChan:
+		return false
+	}
+}
+
+// tryStatusKitInviteSlot reserves the next invite slot only if one is free right
+// now; otherwise returns false so the caller (the new-portal hook) defers to the
+// paced sweep instead of bursting an extra IDS query on top of it.
+func (c *IMClient) tryStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	defer c.statusKitInviteMu.Unlock()
+	now := time.Now()
+	if c.statusKitNextInviteAt.After(now) {
+		return false
+	}
+	c.statusKitNextInviteAt = now.Add(statusKitInterInviteDelay)
+	return true
 }
 
 // markStatusKitNoKeysIfUnreachable caches handle as not-on-StatusKit when an
@@ -1140,6 +1198,14 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	const perInviteTimeout = 30 * time.Second
 
 	for i, h := range pending {
+		// Global pace: wait for the next aggregate invite slot (shared with the
+		// new-portal hook and any concurrent sweep) so the whole bridge trickles
+		// invites to Apple instead of one sweep pacing itself while other callers
+		// pile on. Returns false when the bridge is stopping.
+		if !c.waitStatusKitInviteSlot() {
+			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
+			return
+		}
 		// In-memory single-flight: skip if another path (new-portal hook,
 		// post-backfill hook, prior sweep iteration) already has an FFI
 		// call in flight for this handle. The DB-side dispatch latch is
@@ -1191,16 +1257,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
 			return
 		}
-
-		// Skip the delay after the last handle.
-		if i < len(pending)-1 {
-			select {
-			case <-time.After(statusKitInterInviteDelay):
-			case <-c.stopChan:
-				log.Info().Int("done", i+1).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
-				return
-			}
-		}
+		// Pacing is handled at the top of the loop by waitStatusKitInviteSlot
+		// (global across all invite callers), so there's no per-loop sleep here.
 	}
 	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", logSafeHandle(sender)).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 	if okCount > 0 {
@@ -1327,6 +1385,15 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	// keysharing sub-service must not re-query Apple every time it's recreated.
 	if c.statusKitNoKeysGated(ctx, handle, now) {
 		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): peer not on StatusKit (cached); skipping")
+		return
+	}
+
+	// Global invite pacing: if a slot isn't free right now, defer to the paced
+	// sweep rather than fire an extra IDS query. CloudKit backfill calls this
+	// hook once per portal; without this gate a fresh start bursts Apple. The
+	// peer is a pending 1:1 portal, so the next sweep invites it (paced).
+	if !c.tryStatusKitInviteSlot() {
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): invite slot busy; deferring to paced sweep")
 		return
 	}
 
