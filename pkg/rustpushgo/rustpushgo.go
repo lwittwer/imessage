@@ -7955,6 +7955,7 @@ func (err WrappedError) Unwrap() error {
 
 // Err* are used for checking error type with `errors.Is`
 var ErrWrappedErrorGenericError = fmt.Errorf("WrappedErrorGenericError")
+var ErrWrappedErrorNoStatusKitTargets = fmt.Errorf("WrappedErrorNoStatusKitTargets")
 
 // Variant structs
 type WrappedErrorGenericError struct {
@@ -7984,6 +7985,23 @@ func (self WrappedErrorGenericError) Is(target error) bool {
 	return target == ErrWrappedErrorGenericError
 }
 
+type WrappedErrorNoStatusKitTargets struct {
+}
+
+func NewWrappedErrorNoStatusKitTargets() *WrappedError {
+	return &WrappedError{
+		err: &WrappedErrorNoStatusKitTargets{},
+	}
+}
+
+func (err WrappedErrorNoStatusKitTargets) Error() string {
+	return fmt.Sprint("NoStatusKitTargets")
+}
+
+func (self WrappedErrorNoStatusKitTargets) Is(target error) bool {
+	return target == ErrWrappedErrorNoStatusKitTargets
+}
+
 type FfiConverterTypeWrappedError struct{}
 
 var FfiConverterTypeWrappedErrorINSTANCE = FfiConverterTypeWrappedError{}
@@ -8004,6 +8022,8 @@ func (c FfiConverterTypeWrappedError) Read(reader io.Reader) *WrappedError {
 		return &WrappedError{&WrappedErrorGenericError{
 			Msg: FfiConverterStringINSTANCE.Read(reader),
 		}}
+	case 2:
+		return &WrappedError{&WrappedErrorNoStatusKitTargets{}}
 	default:
 		panic(fmt.Sprintf("Unknown error code %d in FfiConverterTypeWrappedError.Read()", errorID))
 	}
@@ -8014,6 +8034,8 @@ func (c FfiConverterTypeWrappedError) Write(writer io.Writer, value *WrappedErro
 	case *WrappedErrorGenericError:
 		writeInt32(writer, 1)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Msg)
+	case *WrappedErrorNoStatusKitTargets:
+		writeInt32(writer, 2)
 	default:
 		_ = variantValue
 		panic(fmt.Sprintf("invalid error value `%v` in FfiConverterTypeWrappedError.Write", value))

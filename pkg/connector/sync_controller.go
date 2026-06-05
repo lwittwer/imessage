@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"regexp"
@@ -987,13 +988,22 @@ func (c *IMClient) tryStatusKitInviteSlot() bool {
 	return true
 }
 
+// isNoStatusKitTargetsErr reports whether an InviteToStatusSharing failure means
+// the peer simply isn't on the keysharing sub-service, as opposed to a transient
+// error. It matches the TYPED WrappedError::NoStatusKitTargets variant — lib.rs
+// invite_to_status_sharing maps rustpush PushError::NoValidTargets to it — NOT a
+// Debug-formatted error string. So a rustpush rename breaks the Rust match arm
+// at compile time, and a binding change breaks this errors.Is at compile time;
+// the no-keys cache can't silently stop populating.
+func isNoStatusKitTargetsErr(err error) bool {
+	return errors.Is(err, rustpushgo.ErrWrappedErrorNoStatusKitTargets)
+}
+
 // markStatusKitNoKeysIfUnreachable caches handle as not-on-StatusKit when an
-// invite failed with NoValidTargets, so future invites skip it for
-// statusKitNoKeysTTL. Only NoValidTargets is cached — transient errors are left
-// to retry. (invite_to_status_sharing wraps the rustpush PushError, so the
-// variant name surfaces in the error string.)
+// invite failed with NoStatusKitTargets, so future invites skip it for
+// statusKitNoKeysTTL. Only that case is cached — transient errors retry.
 func (c *IMClient) markStatusKitNoKeysIfUnreachable(ctx context.Context, handle string, err error, now time.Time) {
-	if err != nil && strings.Contains(err.Error(), "NoValidTargets") {
+	if isNoStatusKitTargetsErr(err) {
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+handle), now.Format(time.RFC3339))
 	}
 }

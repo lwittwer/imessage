@@ -1119,6 +1119,13 @@ impl WrappedOSConfig {
 pub enum WrappedError {
     #[error("{msg}")]
     GenericError { msg: String },
+    // Typed signal that a StatusKit invite found no valid keysharing targets
+    // (the peer isn't on the keysharing sub-service — Android / non-iPhone /
+    // StatusKit off). The Go no-keys cache keys on THIS variant via errors.Is
+    // rather than string-matching a Debug-formatted error, so neither a rustpush
+    // rename nor a wrapper refactor can silently break the anti-pound cache.
+    #[error("peer not registered for the StatusKit keysharing sub-service")]
+    NoStatusKitTargets,
 }
 
 impl From<rustpush::PushError> for WrappedError {
@@ -9111,12 +9118,16 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
-        statuskitgo::invite_keysharing(&sk, &sender_handle, &handles)
-            .await
-            .map_err(|e| WrappedError::GenericError {
+        match statuskitgo::invite_keysharing(&sk, &sender_handle, &handles).await {
+            Ok(_) => Ok(()),
+            // Peer isn't on the keysharing sub-service. Surface as a TYPED
+            // variant (compile-checked here against the rustpush enum) so the Go
+            // no-keys cache matches it with errors.Is, not a brittle string.
+            Err(rustpush::PushError::NoValidTargets) => Err(WrappedError::NoStatusKitTargets),
+            Err(e) => Err(WrappedError::GenericError {
                 msg: format!("StatusKit invite: {:?}", e),
-            })?;
-        Ok(())
+            }),
+        }
     }
 
 
