@@ -1177,6 +1177,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_close(uniffiStatus)
+		})
+		if checksum != 57053 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedapsconnection_close: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_seconds_since_last_inbound(uniffiStatus)
+		})
+		if checksum != 11948 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedapsconnection_seconds_since_last_inbound: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_state(uniffiStatus)
 		})
 		if checksum != 59967 {
@@ -4197,6 +4215,25 @@ func (_ FfiDestroyerLoginSession) Destroy(value *LoginSession) {
 
 type WrappedApsConnection struct {
 	ffiObject FfiObject
+}
+
+func (_self *WrappedApsConnection) Close() {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedApsConnection")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_method_wrappedapsconnection_close(
+			_pointer, _uniffiStatus)
+		return false
+	})
+}
+
+func (_self *WrappedApsConnection) SecondsSinceLastInbound() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedApsConnection")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_rustpushgo_fn_method_wrappedapsconnection_seconds_since_last_inbound(
+			_pointer, _uniffiStatus)
+	}))
 }
 
 func (_self *WrappedApsConnection) State() *WrappedApsState {
@@ -7918,6 +7955,7 @@ func (err WrappedError) Unwrap() error {
 
 // Err* are used for checking error type with `errors.Is`
 var ErrWrappedErrorGenericError = fmt.Errorf("WrappedErrorGenericError")
+var ErrWrappedErrorNoStatusKitTargets = fmt.Errorf("WrappedErrorNoStatusKitTargets")
 
 // Variant structs
 type WrappedErrorGenericError struct {
@@ -7947,6 +7985,23 @@ func (self WrappedErrorGenericError) Is(target error) bool {
 	return target == ErrWrappedErrorGenericError
 }
 
+type WrappedErrorNoStatusKitTargets struct {
+}
+
+func NewWrappedErrorNoStatusKitTargets() *WrappedError {
+	return &WrappedError{
+		err: &WrappedErrorNoStatusKitTargets{},
+	}
+}
+
+func (err WrappedErrorNoStatusKitTargets) Error() string {
+	return fmt.Sprint("NoStatusKitTargets")
+}
+
+func (self WrappedErrorNoStatusKitTargets) Is(target error) bool {
+	return target == ErrWrappedErrorNoStatusKitTargets
+}
+
 type FfiConverterTypeWrappedError struct{}
 
 var FfiConverterTypeWrappedErrorINSTANCE = FfiConverterTypeWrappedError{}
@@ -7967,6 +8022,8 @@ func (c FfiConverterTypeWrappedError) Read(reader io.Reader) *WrappedError {
 		return &WrappedError{&WrappedErrorGenericError{
 			Msg: FfiConverterStringINSTANCE.Read(reader),
 		}}
+	case 2:
+		return &WrappedError{&WrappedErrorNoStatusKitTargets{}}
 	default:
 		panic(fmt.Sprintf("Unknown error code %d in FfiConverterTypeWrappedError.Read()", errorID))
 	}
@@ -7977,6 +8034,8 @@ func (c FfiConverterTypeWrappedError) Write(writer io.Writer, value *WrappedErro
 	case *WrappedErrorGenericError:
 		writeInt32(writer, 1)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Msg)
+	case *WrappedErrorNoStatusKitTargets:
+		writeInt32(writer, 2)
 	default:
 		_ = variantValue
 		panic(fmt.Sprintf("invalid error value `%v` in FfiConverterTypeWrappedError.Write", value))
