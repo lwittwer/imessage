@@ -2,10 +2,8 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"reflect"
 	"testing"
-	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -206,38 +204,5 @@ func existingPortalSet(portalIDs ...string) func(context.Context, networkid.Port
 	}
 	return func(_ context.Context, key networkid.PortalKey) bool {
 		return existing[key.ID]
-	}
-}
-
-func TestStatusKitInviteTerminalErrorClassification(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "nil", err: nil, want: false},
-		{name: "no valid targets", err: errors.New("WrappedError: GenericError: Msg=StatusKit invite: NoValidTargets"), want: true},
-		{name: "ids lookup 6001", err: errors.New("WrappedError: GenericError: Msg=StatusKit invite: DoNotRetry(LookupFailed(IDSError(6001)))"), want: true},
-		{name: "transient", err: errors.New("temporary network failure"), want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isTerminalStatusKitInviteError(tt.err); got != tt.want {
-				t.Fatalf("isTerminalStatusKitInviteError() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestStatusKitTerminalFailureFresh(t *testing.T) {
-	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
-	if !statusKitTerminalFailureFresh(now.Add(-time.Hour).Format(time.RFC3339)+" NoValidTargets", now) {
-		t.Fatal("expected recent terminal failure to be fresh")
-	}
-	if statusKitTerminalFailureFresh(now.Add(-8*24*time.Hour).Format(time.RFC3339)+" NoValidTargets", now) {
-		t.Fatal("expected terminal failure older than TTL to expire")
-	}
-	if statusKitTerminalFailureFresh("not-a-time NoValidTargets", now) {
-		t.Fatal("expected malformed terminal failure timestamp to be ignored")
 	}
 }

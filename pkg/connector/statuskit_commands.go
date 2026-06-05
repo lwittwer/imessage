@@ -114,22 +114,12 @@ var cmdStatuskitInviteToChannel = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
-var cmdStatuskitInviteAll = &commands.FullHandler{
-	Name: "statuskit-invite-all",
-	Func: fnStatuskitInviteAll,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
-		Description: "Send StatusKit invites to all known ghosts and subscribe to their presence — same as the post-backfill hook.",
-	},
-	RequiresLogin: true,
-}
-
 var cmdStatuskitClearLatch = &commands.FullHandler{
 	Name: "statuskit-clear-latch",
 	Func: fnStatuskitClearLatch,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionStatusKit,
-		Description: "Clear the StatusKit invite latch for one handle so the next sweep re-invites it. Use when a peer's reshare never arrives despite a successful dispatch (for individual recovery without flushing every latch).",
+		Description: "Clear the StatusKit invite/no-keys latches for one handle. Use before a manual retry when a peer's StatusKit key state changed.",
 		Args:        "<handle>",
 	},
 	RequiresLogin: true,
@@ -371,28 +361,6 @@ func fnStatuskitInviteToChannel(ce *commands.Event) {
 	ce.Reply("Invited %d handle(s) to StatusKit channel.", len(invites))
 }
 
-func fnStatuskitInviteAll(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
-	if login == nil {
-		ce.Reply("No active login found.")
-		return
-	}
-	client, ok := login.Client.(*IMClient)
-	if !ok || client == nil {
-		ce.Reply("Bridge client not available.")
-		return
-	}
-	ce.Reply("Sending StatusKit invites to all ghosts and subscribing to presence...")
-	go func() {
-		log := client.UserLogin.Log.With().Str("trigger", "statuskit-invite-all").Logger()
-		client.subscribeToContactPresence(log)
-		// User-invoked retry — bypass the one-shot invited_ok latch so
-		// every 1:1 portal gets re-driven, not just handles without a
-		// prior accepted invite.
-		client.inviteContactsToStatusSharingOpts(log, false, true)
-	}()
-}
-
 func fnStatuskitClearLatch(ce *commands.Event) {
 	if len(ce.Args) < 1 {
 		ce.Reply("Usage: statuskit-clear-latch <handle>")
@@ -421,13 +389,13 @@ func fnStatuskitClearLatch(ce *commands.Event) {
 	bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), "")
-	bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle), "")
+	bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+handle), "")
 	normalized := normalizeIdentifierForPortalID(handle)
 	if normalized != handle {
 		bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+normalized), "")
-		bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized), "")
+		bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+normalized), "")
 	}
-	ce.Reply("Cleared StatusKit latches for %q (and normalized %q). Next invite sweep will retry this handle.", handle, normalized)
+	ce.Reply("Cleared StatusKit invite/no-keys latches for %q (and normalized %q).", handle, normalized)
 }

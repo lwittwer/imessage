@@ -3,7 +3,9 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -850,7 +852,14 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 // paced sweep (startup + periodic), one handle per IDS send, with this
 // delay between sends so we don't recreate the all-at-once batch shape
 // that appears to trigger peer-side filtering / spam heuristics.
-const statusKitInterInviteDelay = 1500 * time.Millisecond
+// Rate-limit the StatusKit invite path: pace one-handle-per-IDS-send invites
+// well apart so a sweep can never burst Apple's IDS endpoint (on top of the
+// no-keys cache, which removes the bulk of the queries entirely). Each invite
+// is 2 IDS queries + 1 send, so 30s spacing keeps the worst-case rate to ~2
+// invites/min — and after the cache populates, a steady-state sweep has only a
+// handful of live targets anyway. StatusKit reshare is not time-critical, so a
+// slow sweep is a safe trade against pounding Apple.
+const statusKitInterInviteDelay = 30 * time.Second
 
 // statusKitLastInviteKeyPrefix is the KV store prefix for per-handle
 // last-ATTEMPT timestamps (RFC3339). Used only on the periodic tick path
@@ -878,13 +887,6 @@ const statusKitPostInviteShareMinSpacing = 5 * time.Minute
 // invite (cert-stale, ratchet, transient IDS issue).
 const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
 
-// statusKitInviteTerminalFailKeyPrefix marks handles that IDS has told us are
-// not valid StatusKit invite targets. Retrying these on every restart only
-// creates log noise and risks tripping peer-side spam heuristics, but
-// reachability can change if a peer later enables iMessage/StatusKit, so the
-// quiet period is intentionally short.
-const statusKitInviteTerminalFailKeyPrefix = "statuskit.invite_terminal_fail."
-
 // statusKitReshareSeenKeyPrefix marks handles whose StatusKit reshare we have
 // actually observed (proof of reciprocation, written by OnReshareSender).
 // Used by the soft-latch logic to distinguish "invite dispatched and peer
@@ -903,48 +905,107 @@ const statusKitInvitedOkTTL = 7 * 24 * time.Hour
 // succeed; successful sends are latched and never retried.
 const statusKitPerHandleMinSpacing = 4 * time.Hour
 
-const statusKitTerminalFailTTL = 7 * 24 * time.Hour
+// statusKitNoKeysKeyPrefix / statusKitNoKeysTTL: once an invite resolves to
+// NoValidTargets (the peer isn't registered for the keysharing sub-service —
+// Android / non-iPhone / StatusKit off), cache that and STOP re-querying
+// Apple's IDS for them. Without this, the periodic sweep re-queries the SAME
+// dead peers every statusKitPerHandleMinSpacing (4h) forever — pure futile
+// Apple IDS pounding (one production bridge re-queried ~27 dead peers ~12k
+// times over its uptime), which contributes to Apple throttling / temporarily
+// disabling the account. The TTL is a week, not forever, so a peer who later
+// enables StatusKit is re-discovered within ~7 days. Only NoValidTargets is
+// cached; transient errors still retry on the normal 4h cadence.
+const statusKitNoKeysKeyPrefix = "statuskit.no_keys."
+const statusKitNoKeysTTL = 7 * 24 * time.Hour
 
-func isTerminalStatusKitInviteError(err error) bool {
-	if err == nil {
+// statusKitNoKeysJitterWindow spreads no-keys re-checks so a wave of peers
+// cached together (fresh start, CloudKit backfill) doesn't all expire and
+// re-query Apple on the same day. Each handle gets a deterministic offset in
+// [0, window) added to the base TTL — derived from the handle so it's stable
+// across restarts.
+const statusKitNoKeysJitterWindow = 48 * time.Hour
+
+// statusKitNoKeysGated reports whether handle was recently confirmed not on the
+// keysharing sub-service (an invite that returned NoValidTargets), so every
+// StatusKit invite path can skip it instead of re-querying Apple's IDS. Shared
+// by the periodic sweep and the new-portal hook so the gate is comprehensive.
+func (c *IMClient) statusKitNoKeysGated(ctx context.Context, handle string, now time.Time) bool {
+	raw := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitNoKeysKeyPrefix+handle))
+	if raw == "" {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "NoValidTargets") ||
-		strings.Contains(errStr, "DoNotRetry(LookupFailed(IDSError(6001)))")
+	ts, err := time.Parse(time.RFC3339, raw)
+	return err == nil && now.Sub(ts) < statusKitNoKeysEffectiveTTL(handle)
 }
 
-func (c *IMClient) markTerminalStatusKitInviteFailure(ctx context.Context, handle string, err error, at time.Time) {
-	if handle == "" || !isTerminalStatusKitInviteError(err) {
-		return
-	}
-	value := at.Format(time.RFC3339) + " " + err.Error()
-	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle), value)
-	if normalized := normalizeIdentifierForPortalID(handle); normalized != "" && normalized != handle {
-		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized), value)
-	}
+// statusKitNoKeysEffectiveTTL is the base no-keys TTL plus a deterministic
+// per-handle jitter (see statusKitNoKeysJitterWindow) so re-checks stagger
+// instead of all expiring on the same day and re-pounding Apple at once.
+func statusKitNoKeysEffectiveTTL(handle string) time.Duration {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(handle))
+	jitter := time.Duration(h.Sum32()%uint32(statusKitNoKeysJitterWindow/time.Second)) * time.Second
+	return statusKitNoKeysTTL + jitter
 }
 
-func (c *IMClient) hasFreshTerminalStatusKitInviteFailure(ctx context.Context, handle string, now time.Time) bool {
-	value := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+handle))
-	if value == "" {
-		if normalized := normalizeIdentifierForPortalID(handle); normalized != handle {
-			value = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInviteTerminalFailKeyPrefix+normalized))
-		}
+// waitStatusKitInviteSlot blocks until the next globally-paced invite slot and
+// reserves it, returning false if the bridge is stopping. Every invite caller
+// funnels through here (or tryStatusKitInviteSlot) so the AGGREGATE dispatch
+// rate to Apple is bounded — not just one sweep's rate. This is what makes a
+// fresh-start backfill or a TTL-expiry wave trickle instead of pound.
+func (c *IMClient) waitStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	now := time.Now()
+	slot := c.statusKitNextInviteAt
+	if slot.Before(now) {
+		slot = now
 	}
-	return statusKitTerminalFailureFresh(value, now)
-}
-
-func statusKitTerminalFailureFresh(value string, now time.Time) bool {
-	fields := strings.Fields(value)
-	if len(fields) == 0 {
+	c.statusKitNextInviteAt = slot.Add(statusKitInterInviteDelay)
+	c.statusKitInviteMu.Unlock()
+	d := time.Until(slot)
+	if d <= 0 {
+		return true
+	}
+	select {
+	case <-time.After(d):
+		return true
+	case <-c.stopChan:
 		return false
 	}
-	ts, err := time.Parse(time.RFC3339, fields[0])
-	if err != nil {
+}
+
+// tryStatusKitInviteSlot reserves the next invite slot only if one is free right
+// now; otherwise returns false so the caller (the new-portal hook) defers to the
+// paced sweep instead of bursting an extra IDS query on top of it.
+func (c *IMClient) tryStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	defer c.statusKitInviteMu.Unlock()
+	now := time.Now()
+	if c.statusKitNextInviteAt.After(now) {
 		return false
 	}
-	return now.Sub(ts) < statusKitTerminalFailTTL
+	c.statusKitNextInviteAt = now.Add(statusKitInterInviteDelay)
+	return true
+}
+
+// isNoStatusKitTargetsErr reports whether an InviteToStatusSharing failure means
+// the peer simply isn't on the keysharing sub-service, as opposed to a transient
+// error. It matches the TYPED WrappedError::NoStatusKitTargets variant — lib.rs
+// invite_to_status_sharing maps rustpush PushError::NoValidTargets to it — NOT a
+// Debug-formatted error string. So a rustpush rename breaks the Rust match arm
+// at compile time, and a binding change breaks this errors.Is at compile time;
+// the no-keys cache can't silently stop populating.
+func isNoStatusKitTargetsErr(err error) bool {
+	return errors.Is(err, rustpushgo.ErrWrappedErrorNoStatusKitTargets)
+}
+
+// markStatusKitNoKeysIfUnreachable caches handle as not-on-StatusKit when an
+// invite failed with NoStatusKitTargets, so future invites skip it for
+// statusKitNoKeysTTL. Only that case is cached — transient errors retry.
+func (c *IMClient) markStatusKitNoKeysIfUnreachable(ctx context.Context, handle string, err error, now time.Time) {
+	if isNoStatusKitTargetsErr(err) {
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+handle), now.Format(time.RFC3339))
+	}
 }
 
 // inviteContactsToStatusSharing sends our StatusKit key to the peer
@@ -963,6 +1024,16 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	c.inviteContactsToStatusSharingOpts(log, false, false)
 }
 
+// statusKitAutoInvite gates the legacy IDS bulk invite sweep. OFF: peers share
+// their StatusKit keys automatically (OB's passive model), those keys land in the
+// user's CloudKit, and the periodic CloudKit pull (syncCloudStatusKitPeers)
+// hydrates whatever we're missing — so the bridge never bulk-invites anyone. This
+// removes the sweep's IDS queries entirely AND unblocks the pull (the sweep used
+// to defer it via statusKitSweepRunning). Per-peer manual invites remain via the
+// !statuskit-invite-channel command (a separate, bounded path). Set true only to
+// re-enable the legacy auto bulk sweep.
+const statusKitAutoInvite = false
+
 // inviteContactsToStatusSharingOpts is the core invite sweep.
 //
 //   - respectSpacing (periodic tick path): skip handles invited within
@@ -970,12 +1041,19 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 //     an unresponsive peer. Startup / post-backfill paths pass false.
 //   - bypassLatch (user-invoked retry): ignore the invited_ok one-shot
 //     latch so every pending 1:1 portal target is re-invited, even peers
-//     that previously got an accepted invite. Use for !statuskit-invite-all;
-//     automatic paths leave it false to preserve the "invite once per peer"
-//     contract with peer iOS.
+//     that previously got an accepted invite. Automatic paths leave it false
+//     to preserve the "invite once per peer" contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.handle == "" {
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
+		return
+	}
+	// Bulk auto-invite is disabled (statusKitAutoInvite): peer keys come from the
+	// periodic CloudKit pull. Return BEFORE setting statusKitSweepRunning so this
+	// can never block syncCloudStatusKitPeers. Per-peer invites use a separate
+	// path (!statuskit-invite-channel).
+	if !statusKitAutoInvite {
+		log.Debug().Msg("StatusKit bulk invite disabled — keys come from the CloudKit pull; skipping sweep")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -1056,14 +1134,17 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 
 	now := time.Now()
 	var pending []string
-	var skippedKnown, skippedSpacing, skippedAlreadySent, skippedTerminal, softExpired int
+	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired, skippedNoKeys int
 	for _, h := range allGhosts {
 		if _, known := knownSet[h]; known {
 			skippedKnown++
 			continue
 		}
-		if !bypassLatch && c.hasFreshTerminalStatusKitInviteFailure(ctx, h, now) {
-			skippedTerminal++
+		// Skip peers recently confirmed NOT on the keysharing sub-service —
+		// see statusKitNoKeysGated. bypassLatch ignores this so a manual retry
+		// forces a look.
+		if !bypassLatch && c.statusKitNoKeysGated(ctx, h, now) {
+			skippedNoKeys++
 			continue
 		}
 		// Soft latch: if we've previously dispatched an invite to this handle
@@ -1117,9 +1198,9 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		Int("total_targets", len(allGhosts)).
 		Int("already_keyed", skippedKnown).
 		Int("already_invited_ok", skippedAlreadySent).
-		Int("terminal_fail_skip", skippedTerminal).
 		Int("soft_expired_retrying", softExpired).
 		Int("spacing_skip", skippedSpacing).
+		Int("no_keys_skip", skippedNoKeys).
 		Int("pending", len(pending)).
 		Bool("respect_spacing", respectSpacing).
 		Msg("StatusKit invite: plan")
@@ -1144,6 +1225,14 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	const perInviteTimeout = 30 * time.Second
 
 	for i, h := range pending {
+		// Global pace: wait for the next aggregate invite slot (shared with the
+		// new-portal hook and any concurrent sweep) so the whole bridge trickles
+		// invites to Apple instead of one sweep pacing itself while other callers
+		// pile on. Returns false when the bridge is stopping.
+		if !c.waitStatusKitInviteSlot() {
+			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
+			return
+		}
 		// In-memory single-flight: skip if another path (new-portal hook,
 		// post-backfill hook, prior sweep iteration) already has an FFI
 		// call in flight for this handle. The DB-side dispatch latch is
@@ -1174,12 +1263,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		case err := <-inviteDone:
 			if err != nil {
 				failCount++
-				if isTerminalStatusKitInviteError(err) {
-					c.markTerminalStatusKitInviteFailure(ctx, h, err, now)
-					log.Debug().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: terminal failure for handle")
-				} else {
-					log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
-				}
+				c.markStatusKitNoKeysIfUnreachable(ctx, h, err, now)
+				log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
 			} else {
 				okCount++
 				// Write both keys:
@@ -1199,16 +1284,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
 			return
 		}
-
-		// Skip the delay after the last handle.
-		if i < len(pending)-1 {
-			select {
-			case <-time.After(statusKitInterInviteDelay):
-			case <-c.stopChan:
-				log.Info().Int("done", i+1).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
-				return
-			}
-		}
+		// Pacing is handled at the top of the loop by waitStatusKitInviteSlot
+		// (global across all invite callers), so there's no per-loop sleep here.
 	}
 	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", logSafeHandle(sender)).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 	if okCount > 0 {
@@ -1276,6 +1353,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 		}
 	}()
 
+	// Bulk auto-invite is disabled — a new portal's peer key arrives via the
+	// periodic CloudKit pull, not an auto-invite (statusKitAutoInvite).
+	if !statusKitAutoInvite {
+		return
+	}
+
 	if c.client == nil || c.handle == "" || c.UserLogin == nil {
 		return
 	}
@@ -1313,10 +1396,6 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 
 	now := time.Now()
-	if c.hasFreshTerminalStatusKitInviteFailure(ctx, handle, now) {
-		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): previous terminal failure; skipping")
-		return
-	}
 	latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle))
 	if latchedAt != "" {
 		reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle)) != ""
@@ -1333,6 +1412,22 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			log.Debug().Str("handle", logSafeHandle(handle)).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
 			return
 		}
+	}
+
+	// Same no-keys gate as the sweep: a new portal for a peer not on the
+	// keysharing sub-service must not re-query Apple every time it's recreated.
+	if c.statusKitNoKeysGated(ctx, handle, now) {
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): peer not on StatusKit (cached); skipping")
+		return
+	}
+
+	// Global invite pacing: if a slot isn't free right now, defer to the paced
+	// sweep rather than fire an extra IDS query. CloudKit backfill calls this
+	// hook once per portal; without this gate a fresh start bursts Apple. The
+	// peer is a pending 1:1 portal, so the next sweep invites it (paced).
+	if !c.tryStatusKitInviteSlot() {
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): invite slot busy; deferring to paced sweep")
+		return
 	}
 
 	// In-memory single-flight: claim the slot after the cheap DB checks
@@ -1368,12 +1463,8 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	select {
 	case err := <-inviteDone:
 		if err != nil {
-			if isTerminalStatusKitInviteError(err) {
-				c.markTerminalStatusKitInviteFailure(ctx, handle, err, now)
-				log.Debug().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): terminal failure")
-			} else {
-				log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): failed")
-			}
+			c.markStatusKitNoKeysIfUnreachable(ctx, handle, err, now)
+			log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): failed")
 			return
 		}
 		nowStr := now.Format(time.RFC3339)
