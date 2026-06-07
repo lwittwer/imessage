@@ -1217,16 +1217,34 @@ func (c *IMClient) Connect(ctx context.Context) {
 						// *absent* token (it only re-logs-in for an expired-but-present
 						// one), so the map can lack sharedchannels.auth → "Auth Missing".
 						// The proactive refresh above is throttle-skipped on a quick
-						// restart, so force a full refresh here (unthrottled: this is a
-						// genuine missing-auth, not a redundant refresh) to rebuild the
-						// map, then retry once. Mirrors the CloudKit TokenMissing
-						// recovery; one prime fixes the whole process.
-						log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
-						if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
-							log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+						// restart, so force a full refresh here to rebuild the map,
+						// then retry once. One prime fixes the whole process.
+						//
+						// This deliberately bypasses the proactive 5-minute throttle
+						// (the warm-restore map is genuinely incomplete EVERY restart,
+						// so the throttle would wrongly leave us silent). To still
+						// protect against a crash-restart loop hammering Apple's GSA
+						// login, honor a short floor: skip the prime if any token
+						// refresh ran in the last 60s. Matches the CloudKit recovery's
+						// 60s min-interval; a normal restart (minutes apart) clears it,
+						// a tight crash loop (seconds) is bounded to ~1 login/60s.
+						const statusKitPrimeFloor = 60 * time.Second
+						recentRefresh := false
+						if raw := c.Main.Bridge.DB.KV.Get(context.Background(), petRefreshKVKey); raw != "" {
+							if ts, perr := strconv.ParseInt(raw, 10, 64); perr == nil && time.Since(time.Unix(ts, 0)) < statusKitPrimeFloor {
+								recentRefresh = true
+							}
+						}
+						if recentRefresh {
+							log.Warn().Msg("StatusKit startup share hit Auth Missing, but a token refresh ran <60s ago — skipping prime to avoid hammering Apple GSA (crash-loop guard)")
 						} else {
-							c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
-							shareErr = sk.ShareStatus(true, nil)
+							log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
+							if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
+								log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+							} else {
+								c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
+								shareErr = sk.ShareStatus(true, nil)
+							}
 						}
 					}
 					if shareErr != nil {
