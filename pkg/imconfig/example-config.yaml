@@ -57,15 +57,14 @@ disable_facetime: false
 # chance of seeing others' Focus state in Matrix. Set to false to opt out.
 statuskit_share_on_startup: true
 
-# StatusKit notifications surface iOS 18 Focus / Do Not Disturb state
-# changes from your contacts inline in the relevant DM portal. When a
-# contact enables DND on their iPhone, a silent m.notice appears in the
-# DM ("🔕 Name has notifications silenced (Do Not Disturb).") plus a
-# Matrix ghost presence update, and clears when they turn it off — the
-# same affordance Apple's Messages app shows in-conversation. Set this
-# to false to suppress the notices and presence updates while leaving
-# StatusKit registration / key exchange running normally (the IDS-layer
-# 4-service identity is unaffected, so peer reshare eligibility is kept).
+# StatusKit surfaces iOS 18 Focus / Do Not Disturb state from your contacts.
+# When a contact turns on a Focus/DND, the bridge appends a 🌙 to their name in
+# the DM's chat title (e.g. "Alice 🌙") and removes it when they turn it off,
+# plus a Matrix ghost presence update. The title is a room-state change updated
+# in place, so it never bumps or unarchives the chat. Set this to false to
+# suppress the 🌙 indicator and presence updates while leaving StatusKit
+# registration / key exchange running normally (the IDS-layer 4-service
+# identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
 
 # DEVELOPMENT ONLY — leave this false in any real deployment.
