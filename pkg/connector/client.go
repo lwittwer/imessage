@@ -1935,7 +1935,12 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// on implicit naming so we never mass-seize NameIsCustom (which would
 		// also freeze ghost avatar updates) across DMs. portal.Name may be
 		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
-		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
+		//
+		// Skip the self-chat (Note to Self): your own Focus status on your own
+		// note is meaningless, and the connector already owns the self-chat name
+		// (so the moon would fight it — "David Brustein 🌙" vs the self-chat's
+		// "David"). The periodic refresh loop already skips self-chats too.
+		if portal.RoomType == database.RoomTypeDM && !c.isMyHandle(string(portal.ID)) && (silenced || portal.NameIsCustom) {
 			nameField := c.dmFocusName(ctx, portal)
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
