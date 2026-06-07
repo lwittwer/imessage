@@ -54,21 +54,20 @@ Pick one extraction option:
 
 **Option A: GUI app (recommended, macOS 10.15+ Catalina)**
 
-Build the SwiftUI extraction app on any Mac (Intel or Apple Silicon), then run it on the Intel Mac:
+Download the pre-built `ExtractKey.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build it yourself on any Mac (Intel or Apple Silicon):
 
 ```bash
 git clone https://github.com/lrhodin/imessage.git
 cd imessage/tools/extract-key-app
 ./build.sh
-# Copy ExtractKey.app to the Intel Mac and double-click it.
 ```
 
-The app reads hardware identifiers, displays them, and lets you copy or save the base64 key. If the Mac is missing encrypted IOKit properties (`_enc` fields), the app offers an **Enrich Key** button to compute them on the spot — no extra steps needed.
+Either way, copy `ExtractKey.app` to the Intel Mac and double-click it. The app reads hardware identifiers, displays them, and lets you copy or save the base64 key. If the Mac is missing encrypted IOKit properties (`_enc` fields), the app offers an **Enrich Key** button to compute them on the spot — no extra steps needed.
 
-> **Gatekeeper**: Because the app is ad-hoc signed (not notarized by Apple), macOS will block it on first launch. To open it:
+> **Gatekeeper**: An app you **build yourself** opens with no prompt — locally-built apps aren't quarantined. A **downloaded** pre-built copy is, though: macOS flags anything downloaded and the app is ad-hoc signed (not notarized — just a fact of macOS), so it's blocked on first launch. To open the downloaded copy:
 >
-> - **macOS 13+ (Ventura)**: Double-click the app. When the warning appears, go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
-> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu. Click **Open** in the dialog that appears.
+> - **macOS 13+ (Ventura)**: Double-click it, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu, then **Open** in the dialog.
 > - **Terminal**: Run `xattr -cr ExtractKey.app` to strip the quarantine flag, then double-click normally.
 
 **Option B: CLI (macOS 13+ with Go)**
@@ -118,7 +117,7 @@ Run the NAC relay — a small HTTP server on the Mac that generates Apple valida
 
 **Option 1: GUI app (recommended)**
 
-Build and run the menubar app — it bundles the relay, key extraction, and status monitoring in one place:
+Download the pre-built `NACRelay.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build the menubar app yourself — it bundles the relay, key extraction, and status monitoring in one place:
 
 ```bash
 cd tools/nac-relay-app
@@ -127,6 +126,8 @@ open NACRelay.app
 ```
 
 The app appears as an antenna icon in the menubar (no dock icon). It auto-starts the relay on launch, shows the relay address and auth info, and lets you extract the hardware key with relay credentials embedded — all from the popover UI. Click **Extract Hardware Key**, then **Copy Key** to get the base64 key.
+
+> **Gatekeeper**: Same as the extractor app above — a copy you build yourself opens with no prompt, but the **downloaded** pre-built `NACRelay.app` is quarantined (ad-hoc signed, not notarized — a fact of macOS). Open it via **right-click → Open** (macOS 10.15–12), **System Settings → Privacy & Security → Open Anyway** (macOS 13+), or `xattr -cr NACRelay.app` in Terminal.
 
 **Option 2: CLI**
 
@@ -464,16 +465,16 @@ If you have a Mac or iPhone signed into the same Apple ID, FaceTime rings there 
 
 ## Focus & Do Not Disturb
 
-When a contact toggles a Focus mode (Do Not Disturb, Sleep, Work, etc.) on iOS 18+, the bridge surfaces it inline in the relevant DM portal:
+When a contact toggles a Focus mode (Do Not Disturb, Sleep, Work, etc.) on iOS 18+, the bridge marks it on the **chat title** — appending a 🌙 to the contact's name (e.g. "Alice 🌙") while their Focus/DND is on, and removing it when they turn it off:
 
-- A quiet `m.notice` ("🔕 Name has notifications silenced (Do Not Disturb).") posts when DND turns on, and clears when it turns off.
-- The contact's Matrix ghost gets a presence update so clients that show presence reflect the same state.
-- This will unarchive a chat in Beeper, if this tradeoff is undesirable please disable the feature. This is an issue external to the bridge.
+- The 🌙 rides on the DM's name (a room-state change, updated in place), not a posted message — so it never bumps or unarchives the chat, and there's no timeline spam.
+- The contact's Matrix ghost also gets a presence update, so clients that render presence reflect the same state.
+- DM-only: a group has a single shared title, so per-member Focus can't ride on it.
 - Focus is a global on/off and not per contact.
-  
-This is the same affordance Apple's Messages app shows in-conversation. The bridge announces itself as "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their subsequent presence updates — leave `statuskit_share_on_startup: true` for the best chance of seeing contacts' Focus state.
 
-If you find the notices noisy or already see Focus state on another Apple device, the install scripts ask "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/mautrix-imessage/config.yaml`.) Disabling suppresses the user-visible notices and presence updates while keeping the underlying StatusKit registration intact.
+This is the closest analog to the moon Apple shows next to a name. The bridge announces itself as "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their subsequent presence updates — leave `statuskit_share_on_startup: true` for the best chance of seeing contacts' Focus state.
+
+If you'd rather not see the indicator (or you already track Focus on another Apple device), the install scripts ask "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/mautrix-imessage/config.yaml`.) Disabling suppresses the 🌙 indicator and presence updates while keeping the underlying StatusKit registration intact.
 
 ## Shared Albums
 
@@ -688,7 +689,7 @@ The install scripts (`make install` and `make install-beeper`) are idempotent �
 - **External CardDAV** — change email / server / app password
 - **CloudKit backfill** — enable or disable, switch between CloudKit and `chat.db` sources
 - **FaceTime Bridge** — enable or disable (`disable_facetime`)
-- **StatusKit notifications** — enable or disable iOS 18 Focus / DND notices (`statuskit_notifications`)
+- **StatusKit notifications** — enable or disable the iOS 18 Focus / DND 🌙 chat-title indicator (`statuskit_notifications`)
 - **HEIC conversion / video transcoding** — toggle on or off
 - **Shell shortcuts** — add the `start-imessage` / `stop-imessage` / `restart-imessage` / `imessage-log` aliases on the next re-run if you skipped them initially (see [Shell shortcuts](#shell-shortcuts))
 
@@ -731,7 +732,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `disable_facetime` | `false` | Skip every `facetime-*` command and suppress inbound FaceTime notices. Set true if you have a Mac/iPhone that handles FT natively. |
 | `facetime_display_name` | *(from Apple Account SPD)* | Override the name pre-filled on FaceTime web join links. Falls back to the bare iMessage handle if the SPD lookup is also blank. |
 | `statuskit_share_on_startup` | `true` | Publish "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their Focus/DND state. |
-| `statuskit_notifications` | `true` | Post inline `m.notice` + ghost presence updates when contacts toggle iOS 18 Focus / DND. The underlying StatusKit registration runs either way. |
+| `statuskit_notifications` | `true` | Append a 🌙 to a contact's chat title (+ ghost presence) when they toggle iOS 18 Focus / DND. The underlying StatusKit registration runs either way. |
 | `video_transcoding` | `false` | Auto-remux non-MP4 videos (e.g. QuickTime `.mov`) to MP4 for broad Matrix client compatibility. Requires `ffmpeg`. |
 | `heic_conversion` | `false` | Auto-convert HEIC/HEIF images to JPEG. Requires `libheif`. |
 | `heic_jpeg_quality` | `95` | JPEG output quality (1–100) when HEIC conversion is enabled. |

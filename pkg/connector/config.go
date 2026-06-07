@@ -89,17 +89,16 @@ type IMConfig struct {
 	// seeing contacts' Focus state in Matrix. Default true.
 	StatusKitShareOnStartup bool `yaml:"statuskit_share_on_startup"`
 
-	// StatusKitNotifications controls whether the bridge posts user-visible
-	// notices when a contact toggles iOS 18 Focus / Do Not Disturb. When
-	// true (the default), enabling DND on a contact's iPhone surfaces a
-	// silent m.notice in the DM portal ("🔕 Name has notifications
-	// silenced (Do Not Disturb).") plus a Matrix ghost presence update,
-	// and clears when they turn it off. When false, OnStatusUpdate is a
-	// no-op — StatusKit init, key exchange, and APNs subscription still
-	// run (so the IDS-layer 4-service identity stays intact for peer
-	// reshare eligibility), but no notices or presence updates reach the
-	// user. Useful for users who find the notices noisy or who rely on
-	// other Apple devices for Focus visibility.
+	// StatusKitNotifications controls whether the bridge surfaces a contact's
+	// iOS 18 Focus / Do Not Disturb state. When true (the default), turning DND
+	// on from a contact's iPhone appends a 🌙 to their name in the DM's chat
+	// title (e.g. "Alice 🌙") — a room-state change updated in place, so it
+	// never bumps or unarchives the chat — plus a Matrix ghost presence update,
+	// and clears when they turn it off. When false, OnStatusUpdate is a no-op —
+	// StatusKit init, key exchange, and APNs subscription still run (so the
+	// IDS-layer 4-service identity stays intact for peer reshare eligibility),
+	// but no 🌙 or presence updates reach the user. Useful for users who don't
+	// want the indicator or who rely on other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
 
 	// ReadReceipts controls whether the bridge sends read receipts to iMessage
