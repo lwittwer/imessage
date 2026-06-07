@@ -8546,16 +8546,24 @@ const (
 var attachmentByteSem = semaphore.NewWeighted(attachmentMaxInFlightBytes)
 
 // clampAttachmentWeight turns an attachment's reported FileSize into a valid
-// weight for the in-flight-bytes semaphore: at least 1 (FileSize may be 0 or
-// unknown) and at most the whole budget. iMessage caps attachments at ~100 MB
-// — below the budget — so the upper clamp is a defensive guard that shouldn't
-// fire in practice; it keeps an unexpectedly oversized item running alone
-// instead of deadlocking on budget it could never acquire.
+// weight for the in-flight-bytes semaphore: at least 1 and at most the whole
+// budget.
+//
+// CRITICAL: an unknown or invalid size (0, or a NEGATIVE value from an
+// overflowed/corrupt CloudKit file_size — real records carry sizes like
+// -1,676,737,818, i.e. a ~2.6 GB blob wrapped past int32) must be treated as
+// WORST CASE, not as free. The old code returned weight 1 for fileSize < 1,
+// which defeated the budget entirely: a multi-GB download with a bogus size
+// cost one byte of budget, so 32 of them ran concurrently and OOM-killed the
+// host (resident set blew past 5 GB before the kernel reaped the process).
+// Charging the full budget makes an unknown-size blob acquire the whole
+// semaphore and run ALONE, bounding peak resident bytes to a single download
+// instead of the fan-out's worth.
+//
+// The upper clamp does the same for a known-oversized item (> budget): it
+// runs alone rather than deadlocking on budget it could never acquire.
 func clampAttachmentWeight(fileSize int64) int64 {
-	if fileSize < 1 {
-		return 1
-	}
-	if fileSize > attachmentMaxInFlightBytes {
+	if fileSize < 1 || fileSize > attachmentMaxInFlightBytes {
 		return attachmentMaxInFlightBytes
 	}
 	return fileSize
