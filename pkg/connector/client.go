@@ -1636,10 +1636,11 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // ============================================================================
 
 // OnStatusUpdate is called by StatusKit when a contact's presence changes.
-// Posts an m.notice in the contact DM and the last active shared group so the
-// user sees status inline where they're actively chatting, similar to Apple's
-// in-conversation "has notifications silenced" affordance.
-// Also sets Matrix ghost presence for clients that render it.
+// Reflects the contact's Focus/DND on the DM's chat title — appending a 🌙 to
+// their name while silenced and removing it when available (a room-state change
+// updated in place, so it never bumps or unarchives the chat), similar to the
+// moon Apple shows next to a name. Also sets Matrix ghost presence for clients
+// that render it.
 //
 // IMPORTANT: this function is called from a Rust FFI callback (inside the APNs
 // receive loop). It must return quickly — any blocking work, especially any
