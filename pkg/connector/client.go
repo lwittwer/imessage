@@ -221,13 +221,15 @@ type IMClient struct {
 	// Peer iOS publishes status to every alias of the same Apple ID, so
 	// without this canonical dedup the bridge fires N notices per state
 	// change for a peer with N registered handles.
-	statusKitPresenceByPortal sync.Map // map[networkid.PortalID]string
+	statusKitPresenceByPortal     sync.Map // map[networkid.PortalID]string
+	statusKitPresenceSeenByPortal sync.Map // map[networkid.PortalID]time.Time
 
 	// statusKitPortalCache memoizes the resolved DM portal ID for a StatusKit
 	// presence handle. Populated after a successful IDS correlation lookup
 	// (see resolveStatusPortalViaIDS) so we only pay the IDS round trip once
 	// per unresolved handle per session. Values are networkid.PortalID.
-	statusKitPortalCache sync.Map // map[string]networkid.PortalID
+	statusKitPortalCache             sync.Map // map[string]networkid.PortalID
+	statusKitPresenceResolveInFlight sync.Map // map[string]struct{}
 
 	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
 	// driven by StatusKit alias resolution. Per-handle 6h negative cache
@@ -1354,6 +1356,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	go c.periodicStateSave(log)
 	go c.periodicPetRefresh(log)
 	go c.periodicStatusSharingReinvite(log)
+	go c.periodicStatusKitPresenceSweep(log)
 	go c.startSharedStreamsWatcher(log)
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
@@ -1741,6 +1744,7 @@ func logSafeHandles(handles []string) []string {
 }
 
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
+	observedAt := time.Now()
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Str("user", logSafeHandle(user)).
@@ -1751,294 +1755,167 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		return
 	}
 
-	// Suppress duplicate notices: only act when the state actually changes.
-	// Apple sends available=true for BOTH DND-on and DND-off; the real
-	// discriminator is whether mode is set. Track by mode string so that
-	// DND→Sleep (two different silenced modes) still fires two notices.
-	modeKey := "available"
-	if mode != nil && *mode != "" {
-		modeKey = *mode
-	}
-	// kvKeyFor returns the KV store key used to persist StatusKit state for
-	// a given user handle across bridge restarts.
-	kvKeyFor := func(u string) database.Key {
-		return database.Key("statuskit.presence." + u)
-	}
-
-	if prev, loaded := c.statusKitPresence.Load(user); loaded {
-		if prev.(string) == modeKey {
-			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged, skipping notice")
-			return
-		}
-	} else {
-		// Not in memory (first call this session for this user): check KV store
-		// for the state persisted from the previous bridge run.  If it matches
-		// the incoming state, warm the in-memory cache and skip the notice so
-		// users don't see a flood of "has notifications turned on/off" messages
-		// every time the bridge restarts.
-		if c.Main.Bridge.DB.KV.Get(context.Background(), kvKeyFor(user)) == modeKey {
-			c.statusKitPresence.Store(user, modeKey)
-			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged (restored from DB), skipping notice")
-			return
-		}
-	}
+	modeKey := statusKitModeKey(mode)
 
 	log.Info().
 		Bool("available", available).
 		Str("mode_key", modeKey).
 		Msg("StatusKit: received presence update — dispatching to goroutine")
 
-	// Capture values for the goroutine (mode is a pointer; copy the string).
-	var modeCopy *string
-	if mode != nil {
-		s := *mode
-		modeCopy = &s
-	}
-
-	// Optimistic dedup: store the new modeKey BEFORE dispatching so that
-	// rapid-fire re-deliveries of the same state (e.g. APNs replay on
-	// reconnect) are caught by the check above before the goroutine has
-	// had a chance to complete and store the key itself.
-	// Also persist to the KV store so the dedup survives a bridge restart.
-	c.statusKitPresence.Store(user, modeKey)
-	c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), modeKey)
-
 	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
 	go func() {
 		ctx := context.Background()
-
-		// Apple sends available=true for both DND-on and DND-off; the mode
-		// field is the real signal. mode non-nil/non-empty = DND/Focus active.
-		silenced := modeCopy != nil && *modeCopy != ""
-		presence := event.PresenceOnline
-		statusMsg := ""
-		if silenced {
-			presence = event.PresenceUnavailable
-			statusMsg = *modeCopy
-		}
-
-		// findPortal returns an existing, active portal or nil.
-		findPortal := func(id networkid.PortalID) *bridgev2.Portal {
-			p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-				ID:       id,
-				Receiver: c.UserLogin.ID,
-			})
-			if err != nil || p == nil || p.MXID == "" {
-				return nil
+		inFlightKey := statusKitCanonicalAlias(user) + "\x00" + modeKey
+		if inFlightKey != "\x00"+modeKey {
+			if _, loaded := c.statusKitPresenceResolveInFlight.LoadOrStore(inFlightKey, struct{}{}); loaded {
+				log.Debug().Str("mode", modeKey).Msg("StatusKit: resolver already in flight")
+				return
 			}
-			return p
+			defer c.statusKitPresenceResolveInFlight.Delete(inFlightKey)
 		}
+		portal := c.resolveStatusKitPortal(ctx, log, user)
+		if portal == nil || portal.MXID == "" {
+			c.storePendingStatusKitPresence(ctx, log, user, modeKey, observedAt)
+			return
+		}
+		c.applyStatusKitPresenceToPortal(ctx, log, user, portal, modeKey, observedAt)
+	}()
+}
 
-		normalizedUser := normalizeIdentifierForPortalID(user)
-
-		// Resolve the portal AND the ghost handle to use for sending.
-		//
-		// For mailto: handles the ghost often has no MXID (never joined a
-		// Matrix room) so ghost.Intent is nil. We must use the tel: ghost
-		// instead — it IS in the portal and has a valid MXID. portal.ID is
-		// the tel: handle, so we derive the ghost from the resolved portal.
-		//
-		// Resolution order for mailto: handles:
-		//   (0) statusKitPortalCache — learned from inbound message traffic,
-		//       covers any peer who has ever messaged bridge regardless of
-		//       whether they appear in iCloud contacts.
-		//   (1) address-book phones (fast, no network)
-		//   (2) IDS correlation — self-bounding 5s tokio timeout in Rust
-		//   (3) mailto: portal itself as absolute last resort
-		var portal *bridgev2.Portal
-
-		// (0) Fast path: check the learned sender→portal cache first. This
-		// is populated from every inbound message, so any peer who has
-		// messaged bridge has a direct mapping here that doesn't depend on
-		// iCloud CardDAV contact completeness (the common failure mode for
-		// reshare correlation).
-		for _, key := range [2]string{user, normalizedUser} {
-			if key == "" {
-				continue
+func (c *IMClient) resolveStatusKitPortal(ctx context.Context, log zerolog.Logger, alias string) *bridgev2.Portal {
+	normalizedUser := normalizeIdentifierForPortalID(alias)
+	for _, key := range [2]string{alias, normalizedUser} {
+		if key == "" {
+			continue
+		}
+		if cached, ok := c.statusKitPortalCache.Load(key); ok {
+			if p := c.findPortalByID(ctx, cached.(networkid.PortalID)); p != nil {
+				log.Info().Str("user", logSafeHandle(alias)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
+				c.rememberAliasPortal(ctx, alias, p.ID, true)
+				return p
 			}
-			if cached, ok := c.statusKitPortalCache.Load(key); ok {
-				if p := findPortal(cached.(networkid.PortalID)); p != nil {
+		}
+	}
+
+	var portal *bridgev2.Portal
+	if strings.HasPrefix(normalizedUser, "mailto:") {
+		if contact := c.lookupContact(alias); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				if !strings.HasPrefix(altID, "tel:") {
+					continue
+				}
+				if p := c.findPortalByID(ctx, networkid.PortalID(altID)); p != nil {
+					log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
 					portal = p
-					log.Info().Str("user", logSafeHandle(user)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
 					break
 				}
 			}
 		}
-
-		if portal == nil && strings.HasPrefix(normalizedUser, "mailto:") {
-			// (1) Address-book.
-			contact := c.lookupContact(user)
-			if contact != nil {
+		if portal == nil {
+			if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, alias); altPortal != nil {
+				log.Info().Str("user", logSafeHandle(alias)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+				portal = altPortal
+			}
+		}
+		if portal == nil {
+			portal = c.resolveViaCluster(ctx, log, alias)
+		}
+		if portal == nil {
+			if p := c.findPortalByID(ctx, networkid.PortalID(normalizedUser)); p != nil {
+				log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
+				portal = p
+			}
+		}
+	} else {
+		portalID := c.resolveContactPortalID(normalizedUser)
+		portalID = c.resolveExistingDMPortalID(string(portalID))
+		portal = c.findPortalByID(ctx, portalID)
+		if portal == nil {
+			if contact := c.lookupContact(alias); contact != nil {
 				for _, altID := range contactPortalIDs(contact) {
-					if !strings.HasPrefix(altID, "tel:") {
+					if altID == normalizedUser {
 						continue
 					}
-					if p := findPortal(networkid.PortalID(altID)); p != nil {
-						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
+					altPortalID := c.resolveContactPortalID(altID)
+					altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+					if p := c.findPortalByID(ctx, altPortalID); p != nil {
+						log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
 						portal = p
 						break
 					}
 				}
 			}
-
-			// (2) IDS correlation (self-bounding, safe to call from goroutine).
-			// Cached wrapper: skips repeat round-trips against handles
-			// that recently returned no result (negative cooldown), and
-			// short-circuits via the persistent alias_portal store on
-			// previously-resolved handles.
-			if portal == nil {
-				if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, user); altPortal != nil {
-					log.Info().Str("user", logSafeHandle(user)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
-					portal = altPortal
-				}
-			}
-
-			// (2.5) Cluster transitive lookup. Fires when contacts and IDS
-			// both came up empty — common for hidden-alias mailto:s where
-			// Apple's IDS returns LookupFailed (6001). Looks for sibling
-			// handles on the same StatusKit channel id; the first one that
-			// resolves via the live chain (or persisted alias→portal) hands
-			// the unknown handle its portal.
-			if portal == nil {
-				if p := c.resolveViaCluster(ctx, log, user); p != nil {
-					portal = p
-				}
-			}
-
-			// (3) mailto: portal as last resort.
-			if portal == nil {
-				if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
-					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
-					portal = p
-				}
-			}
-		} else if portal == nil {
-			portalID := c.resolveContactPortalID(normalizedUser)
-			portalID = c.resolveExistingDMPortalID(string(portalID))
-			portal = findPortal(portalID)
-
-			if portal == nil {
-				contact := c.lookupContact(user)
-				if contact != nil {
-					for _, altID := range contactPortalIDs(contact) {
-						if altID == normalizedUser {
-							continue
-						}
-						altPortalID := c.resolveContactPortalID(altID)
-						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
-						if p := findPortal(altPortalID); p != nil {
-							log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
-							portal = p
-							break
-						}
-					}
-				}
-			}
-
-			// Cluster transitive lookup for the tel: branch too — covers
-			// peers who publish from a tel: alias the bridge has not seen
-			// before but who share a channel id with a known sibling.
-			if portal == nil {
-				if p := c.resolveViaCluster(ctx, log, user); p != nil {
-					portal = p
-				}
-			}
 		}
-
-		if portal == nil || portal.MXID == "" {
-			log.Warn().
-				Str("user", normalizedUser).
-				Msg("StatusKit: no DM portal found for presence notice")
-			return
+		if portal == nil {
+			portal = c.resolveViaCluster(ctx, log, alias)
 		}
+	}
+	if portal != nil {
+		c.rememberAliasPortal(ctx, alias, portal.ID, true)
+		return portal
+	}
+	log.Warn().Str("user", normalizedUser).Msg("StatusKit: no DM portal found for presence notice")
+	return nil
+}
 
-		// Canonical (portal-keyed) dedup. The early dedup at the top of
-		// OnStatusUpdate keys by raw alias, so a peer with N registered
-		// handles produces N goroutines that all reach this point and
-		// resolve to the same portal. Collapse them here using portal ID
-		// as the canonical key so only the first alias of each state
-		// change actually sends the notice. Persisted to KV under a
-		// distinct prefix so the dedup survives bridge restarts.
-		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
-		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
-			if prev.(string) == modeKey {
-				log.Debug().
-					Str("portal_id", string(portal.ID)).
-					Str("alias", user).
-					Str("mode", modeKey).
-					Msg("StatusKit: presence unchanged for canonical portal, skipping duplicate alias notice")
-				return
-			}
-		} else if c.Main.Bridge.DB.KV.Get(ctx, portalKey) == modeKey {
-			c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
-			log.Debug().
-				Str("portal_id", string(portal.ID)).
-				Str("alias", user).
-				Str("mode", modeKey).
-				Msg("StatusKit: presence unchanged for canonical portal (restored from DB), skipping duplicate alias notice")
-			return
-		}
-		c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
-		c.Main.Bridge.DB.KV.Set(ctx, portalKey, modeKey)
+func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerolog.Logger, alias string, portal *bridgev2.Portal, modeKey string, observedAt time.Time) bool {
+	if portal == nil || portal.ID == "" {
+		return false
+	}
+	if latest := c.getStatusKitPortalSeen(ctx, portal.ID); !latest.IsZero() && latest.After(observedAt) {
+		log.Debug().Str("portal_id", string(portal.ID)).Str("mode", modeKey).Time("observed_at", observedAt).Time("latest_observed_at", latest).Msg("StatusKit: stale presence ignored")
+		return false
+	}
 
-		// Use the ghost keyed to the portal's handle — for a tel: portal this
-		// is the tel: ghost which has an MXID and is a member of the room.
-		// The mailto: ghost typically has no MXID (never joined a room) so
-		// ghost.Intent would be nil. Prefer portal ghost; fall back to the
-		// mailto: ghost if the portal ghost is unavailable.
+	previousMode, _ := c.statusKitPresenceByPortal.Load(portal.ID)
+	previousModeStr, _ := previousMode.(string)
+	if previousModeStr == "" {
+		previousModeStr = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)))
+	}
+	sameMode := previousModeStr == modeKey
+
+	c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
+	c.statusKitPresenceSeenByPortal.Store(portal.ID, observedAt)
+	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)), modeKey)
+	c.Main.Bridge.DB.KV.Set(ctx, statusKitPortalSeenKey(portal.ID), observedAt.UTC().Format(time.RFC3339Nano))
+
+	silenced := modeKey != "" && modeKey != "available"
+	presence := event.PresenceOnline
+	statusMsg := ""
+	if silenced {
+		presence = event.PresenceUnavailable
+		statusMsg = modeKey
+	}
+
+	if !sameMode {
 		ghostHandle := string(portal.ID)
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostHandle))
 		if err != nil || ghost == nil || ghost.Intent == nil {
-			// Fallback: try the original mailto: ghost.
-			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(alias))
 			if err != nil || ghost == nil || ghost.Intent == nil {
-				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
-					Msg("StatusKit: no usable ghost found — skipping notice")
-				return
-			}
-			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
-		} else {
-			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
-		}
-
-		// Set Matrix presence using whichever ghost we resolved.
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-				Presence:  presence,
-				StatusMsg: statusMsg,
-			}); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("alias", logSafeHandle(alias)).
+					Msg("StatusKit: no usable ghost found — skipping Matrix presence only")
 			}
 		}
+		if ghost != nil && ghost.Intent != nil {
+			if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+				if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+					Presence:  presence,
+					StatusMsg: statusMsg,
+				}); err != nil {
+					log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				}
+			}
+		}
+	}
 
-		// Reflect the focus state in the DM TITLE (room name) instead of
-		// posting a timeline notice: the contact's name normally, the name
-		// plus a trailing 🌙 while their Focus/DND is on. The title is
-		// persistent in the header and the chat-list row, never buried, and is
-		// updated in place with ExcludeChangesFromTimeline — so no wall, no
-		// tombstones, no inbox churn. DMs only: a group has a single shared
-		// title, so per-member focus can't ride on it (groups no longer
-		// surface focus at all).
-		//
-		// Routed through computeDMTitle so this live path and the periodic
-		// refreshDMPortalNamesFromContacts loop ALWAYS agree — the refresh
-		// re-applies the identical title every contact-sync tick (covering
-		// restarts and any toggle missed while the bridge was down), and a
-		// live change updates it immediately. The portal-keyed presence state
-		// was stored just above, so computeDMTitle sees the new state.
-		//
-		// Logs carry only the opaque room MXID + a boolean — never the
-		// contact name or handle.
-		// Only touch the title when there's something to own: the peer is
-		// silenced (add 🌙), or we already own the name (NameIsCustom — to
-		// maintain it or clear the moon). A pristine, never-silenced DM is left
-		// on implicit naming so we never mass-seize NameIsCustom (which would
-		// also freeze ghost avatar updates) across DMs. portal.Name may be
-		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
-		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
-			nameField := c.dmFocusName(ctx, portal)
+	if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom || previousModeStr != modeKey) {
+		nameField := c.dmFocusName(ctx, portal)
+		titleDiffers := nameField != nil && portal.Name != *nameField
+		releaseCustomName := nameField == nil && portal.NameIsCustom
+		if !sameMode || titleDiffers || releaseCustomName {
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
 					Type: bridgev2.RemoteEventChatInfoChange,
@@ -2062,7 +1939,8 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
 				Msg("StatusKit: updated DM title for focus change")
 		}
-	}()
+	}
+	return true
 }
 
 // isPortalSilenced reports whether the peer of the given DM portal currently
@@ -2304,7 +2182,7 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 					Str("alias", alias).
 					Str("resolved_portal_id", string(aliasPortalID)).
 					Msg("StatusKit: resolved DM portal via IDS correlation")
-				c.rememberAliasPortal(ctx, user, aliasPortalID)
+				c.rememberAliasPortal(ctx, user, aliasPortalID, true)
 				return altPortal
 			}
 		}
@@ -2404,19 +2282,19 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 					continue
 				}
 				if p := findPortal(networkid.PortalID(altID)); p != nil {
-					c.rememberAliasPortal(ctx, sender, p.ID)
+					c.rememberAliasPortal(ctx, sender, p.ID, true)
 					log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
 					return
 				}
 			}
 		}
 		if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, sender); altPortal != nil {
-			c.rememberAliasPortal(ctx, sender, altPortal.ID)
+			c.rememberAliasPortal(ctx, sender, altPortal.ID, true)
 			log.Info().Str("resolved_portal_id", string(altPortal.ID)).Msg("StatusKit: eager-resolved reshare sender via IDS correlation")
 			return
 		}
 		if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
-			c.rememberAliasPortal(ctx, sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID, true)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via direct mailto: portal")
 			return
 		}
@@ -2424,7 +2302,7 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 		portalID := c.resolveContactPortalID(normalizedUser)
 		portalID = c.resolveExistingDMPortalID(string(portalID))
 		if p := findPortal(portalID); p != nil {
-			c.rememberAliasPortal(ctx, sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID, true)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender (tel: direct)")
 			return
 		}
@@ -2813,7 +2691,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// stamping the cache on every inbound 1:1 message, we ensure any peer
 	// who's ever messaged bridge has a direct lookup path for presence.
 	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) {
-		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID)
+		replayPending := c.aliasPortalCacheChanged(*msg.Sender, portalKey.ID)
+		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID, replayPending)
 	}
 
 	// Track SMS portals so outbound replies use the correct service type.
