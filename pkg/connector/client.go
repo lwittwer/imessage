@@ -22,6 +22,7 @@ import (
 	"image/jpeg"
 	"math"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -8127,8 +8128,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 // 90-second timeout. When Rust stalls on a network hang or an unrecognised
 // attachment format the goroutine would otherwise block forever; the timeout
 // frees the semaphore slot so other downloads can proceed. The inner goroutine
-// is leaked until Rust eventually unblocks, but that is bounded to at most 32
-// goroutines and is temporary.
+// is leaked until Rust eventually unblocks, but that is bounded by
+// attachmentMaxParallelDownloads and is temporary.
 func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) ([]byte, error) {
 	type dlResult struct {
 		data []byte
@@ -8197,6 +8198,116 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 	}
 }
 
+// defaultMaxAttachmentSizeMB is the fallback ceiling when max_attachment_size_mb
+// is unset or invalid. 100 MB matches Beeper's upload limit and is safe on small
+// hosts. See the config doc (IMConfig.MaxAttachmentSizeMB) for the full rationale.
+const defaultMaxAttachmentSizeMB = 100
+
+// maxAttachmentBytes is the configured attachment-size ceiling in bytes.
+// Attachments larger than this are skipped outright — never downloaded,
+// transcoded, or uploaded. The homeserver rejects anything over its upload cap,
+// so bridging it just burns a download buffer (in Rust, outside the Go heap), a
+// doomed transcode, and disk for a guaranteed rejection — and a multi-GB blob
+// can wedge a small host. Operators with a homeserver that accepts larger
+// uploads (and the RAM to spare) can raise max_attachment_size_mb.
+func (c *IMClient) maxAttachmentBytes() int64 {
+	mb := c.Main.Config.MaxAttachmentSizeMB
+	if mb <= 0 {
+		mb = defaultMaxAttachmentSizeMB
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+// recoverAttachmentSize returns an attachment's real byte size from its
+// reported file_size. CloudKit stores file_size as a wrapped i32, so a blob in
+// [2 GiB, 4 GiB) surfaces as a NEGATIVE value; add 2^32 to recover it. This lets
+// the size gate compare correctly against any configured limit, including ones
+// raised above 2 GiB.
+func recoverAttachmentSize(fileSize int64) int64 {
+	if fileSize < 0 {
+		return fileSize + (1 << 32)
+	}
+	return fileSize
+}
+
+// oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
+// These legitimately take minutes over CloudKit, so it's far longer than the
+// in-memory path's 90s.
+const oversizedDownloadTimeout = 10 * time.Minute
+
+// minFreeDiskBytes is the free-space floor for downloading attachments to disk.
+// Below this, downloadAttachmentToTempFile defers the attachment (records a
+// retriable failure) instead of writing — so a burst of large concurrent
+// downloads can never fill the disk; it paces itself as in-flight temp files
+// finish uploading and get cleaned up. Sized to comfortably hold one worst-case
+// download plus its transcode output (input + MP4) with room to spare.
+const minFreeDiskBytes int64 = 6 << 30 // 6 GiB
+
+// safeCloudDownloadAttachmentToFile wraps the to-file FFI download with the same
+// panic recovery as safeCloudDownloadAttachment and a generous timeout. rustpush
+// writes the blob to destPath (never returning it over the i32-limited FFI) and
+// returns the byte count.
+func safeCloudDownloadAttachmentToFile(client *rustpushgo.Client, recordName, destPath string) (uint64, error) {
+	type dlResult struct {
+		n   uint64
+		err error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadAttachmentToFile").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachmentToFile: %v", r)}
+			}
+			ch <- res
+		}()
+		n, e := client.CloudDownloadAttachmentToFile(recordName, destPath)
+		res = dlResult{n: n, err: e}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-time.After(oversizedDownloadTimeout):
+		log.Error().Str("ffi_method", "CloudDownloadAttachmentToFile").
+			Str("record_name", recordName).
+			Msg("CloudDownloadAttachmentToFile timed out")
+		return 0, fmt.Errorf("CloudDownloadAttachmentToFile timed out after %s", oversizedDownloadTimeout)
+	}
+}
+
+// downloadAttachmentToTempFile downloads an attachment to a fresh temp file via
+// the to-file FFI. This is the single, uniform download path: it never lowers a
+// Vec over uniffi's i32-capped RustBuffer (so no "buffer too large" panic), it
+// doesn't rely on the unreliable wrapped-i32 file_size to predict size, and peak
+// memory is one copy rather than the Rust Vec and a Go []byte at once. Returns
+// the path and real byte count; the caller owns the file and must remove it.
+// Defers (returns an error) when free disk is below minFreeDiskBytes so a burst
+// of concurrent large downloads can't fill the disk — it paces itself as
+// in-flight temp files finish uploading and get cleaned up.
+func (c *IMClient) downloadAttachmentToTempFile(recordName string) (string, int64, error) {
+	if free, ok := freeDiskBytes(os.TempDir()); ok && free < uint64(minFreeDiskBytes) {
+		return "", 0, fmt.Errorf("low disk space (%d MiB free < %d MiB floor), deferring attachment",
+			free>>20, minFreeDiskBytes>>20)
+	}
+	tmp, err := os.CreateTemp("", "mautrix-cloud-att-*")
+	if err != nil {
+		return "", 0, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	n, err := safeCloudDownloadAttachmentToFile(c.client, recordName, tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return "", 0, err
+	}
+	return tmpPath, int64(n), nil
+}
+
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -8214,6 +8325,24 @@ func (c *IMClient) downloadAndUploadAttachment(
 	attID := row.GUID
 	if i > 0 || hasText {
 		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
+	}
+
+	// Skip over-limit attachments before doing ANY work. A blob bigger than the
+	// configured ceiling (max_attachment_size_mb) can't be uploaded (the
+	// homeserver rejects it), so downloading + transcoding it is pure waste —
+	// and a multi-GB download wedges small hosts. file_size is a wrapped i32, so
+	// recoverAttachmentSize un-wraps the negative ones before comparing. Not
+	// recorded as a retriable failure — it's permanently too large.
+	maxAttBytes := c.maxAttachmentBytes()
+	if recoverAttachmentSize(att.FileSize) > maxAttBytes {
+		log.Info().
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Int64("file_size", att.FileSize).
+			Int64("max_bytes", maxAttBytes).
+			Msg("Skipping over-limit attachment — too large to bridge (not downloaded)")
+		return nil
 	}
 
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
@@ -8244,8 +8373,12 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	// Download the lqa (still image) — this is always the baseline.
-	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
+	// Always download the lqa to a temp file rather than returning the bytes
+	// over the FFI. One uniform path: it never lowers a Vec across uniffi's
+	// i32-capped RustBuffer (no "buffer too large" panic), it doesn't depend on
+	// the unreliable wrapped-i32 file_size to guess size up front, and it's
+	// disk-space guarded. We learn the real size from the file, then decide.
+	tmpPath, n, err := c.downloadAttachmentToTempFile(att.RecordName)
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
@@ -8254,6 +8387,39 @@ func (c *IMClient) downloadAndUploadAttachment(
 			Str("record_name", att.RecordName).
 			Int("attempt", fe.retries).
 			Msg("Failed to download CloudKit attachment, skipping")
+		return nil
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	if n == 0 {
+		c.recordAttachmentFailure(att.RecordName, "empty data")
+		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Msg("CloudKit attachment returned empty data")
+		return nil
+	}
+
+	// Backstop the size gate: file_size is a wrapped i32, so a blob in the
+	// [4 GiB, ~4.4 GiB) window wraps to a small POSITIVE value that slips the
+	// pre-download check. Now that we know the real size, drop anything over the
+	// configured ceiling before reading it into memory or transcoding it — it
+	// can't be uploaded and would just spike RAM for a guaranteed rejection.
+	if n > maxAttBytes {
+		log.Info().
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Int64("bytes", n).
+			Int64("max_bytes", maxAttBytes).
+			Msg("Skipping over-limit attachment — too large to bridge (downloaded size)")
+		return nil
+	}
+
+	// Small enough: read it back for the normal in-memory pipeline.
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("attempt", fe.retries).
+			Msg("Failed to read downloaded attachment, skipping")
 		return nil
 	}
 	if len(data) == 0 {
@@ -8285,9 +8451,9 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
 	// Goes through transcodeToMP4 so this CloudKit-backfill path shares the same
 	// process-wide serialization and retry as the live and chat.db paths — the
-	// pre-upload runs up to 32 of these goroutines at once, so without the
-	// shared semaphore a low-memory host could have 32 ffmpeg re-encodes
-	// running simultaneously and OOM.
+	// pre-upload runs up to attachmentMaxParallelDownloads of these goroutines at
+	// once, so without the shared semaphore a low-memory host could have several
+	// ffmpeg re-encodes running simultaneously and OOM.
 	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
@@ -8516,9 +8682,17 @@ func (c *IMClient) downloadAndUploadAttachment(
 }
 
 const (
-	// attachmentMaxParallelDownloads caps the number of concurrent CloudKit
-	// downloads during pre-upload — bounds sockets/fds/goroutines.
-	attachmentMaxParallelDownloads = 32
+	// attachmentMaxParallelDownloads caps the number of concurrent attachment
+	// pipelines during pre-upload — each goroutine runs a full CloudKit
+	// download → transcode → Matrix upload, so this bounds the upload fan-out
+	// against the homeserver as well as sockets/fds/goroutines. Kept low (down
+	// from 32, then 8) so a backfill doesn't hammer the Matrix media repo with
+	// simultaneous uploads and — now that downloads land on disk — can't pile up
+	// many large temp files at once. On a single-core host the downloads are
+	// I/O-bound, so fewer in flight costs little speed and is meaningfully safer
+	// on memory and disk. Per-item memory/disk is bounded separately by
+	// attachmentByteSem and the minFreeDiskBytes floor.
+	attachmentMaxParallelDownloads = 4
 	// attachmentMaxInFlightBytes caps the total attachment payload resident in
 	// memory at once across the pre-upload fan-out. Each in-flight download
 	// holds its blob (and briefly its transcoded copy ≈ 2× this budget) in RAM,
@@ -8546,16 +8720,24 @@ const (
 var attachmentByteSem = semaphore.NewWeighted(attachmentMaxInFlightBytes)
 
 // clampAttachmentWeight turns an attachment's reported FileSize into a valid
-// weight for the in-flight-bytes semaphore: at least 1 (FileSize may be 0 or
-// unknown) and at most the whole budget. iMessage caps attachments at ~100 MB
-// — below the budget — so the upper clamp is a defensive guard that shouldn't
-// fire in practice; it keeps an unexpectedly oversized item running alone
-// instead of deadlocking on budget it could never acquire.
+// weight for the in-flight-bytes semaphore: at least 1 and at most the whole
+// budget.
+//
+// CRITICAL: an unknown or invalid size (0, or a NEGATIVE value from an
+// overflowed/corrupt CloudKit file_size — real records carry sizes like
+// -1,676,737,818, i.e. a ~2.6 GB blob wrapped past int32) must be treated as
+// WORST CASE, not as free. The old code returned weight 1 for fileSize < 1,
+// which defeated the budget entirely: a multi-GB download with a bogus size
+// cost one byte of budget, so a full fan-out of them ran concurrently and OOM-killed the
+// host (resident set blew past 5 GB before the kernel reaped the process).
+// Charging the full budget makes an unknown-size blob acquire the whole
+// semaphore and run ALONE, bounding peak resident bytes to a single download
+// instead of the fan-out's worth.
+//
+// The upper clamp does the same for a known-oversized item (> budget): it
+// runs alone rather than deadlocking on budget it could never acquire.
 func clampAttachmentWeight(fileSize int64) int64 {
-	if fileSize < 1 {
-		return 1
-	}
-	if fileSize > attachmentMaxInFlightBytes {
+	if fileSize < 1 || fileSize > attachmentMaxInFlightBytes {
 		return attachmentMaxInFlightBytes
 	}
 	return fileSize
@@ -8765,7 +8947,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 }
 
 // preUploadChunkAttachments downloads and uploads any uncached attachments in
-// the given rows in parallel (up to 32 concurrent). Called inline during
+// the given rows in parallel (up to attachmentMaxParallelDownloads concurrent). Called inline during
 // forward backfill before the sequential conversion loop, so that
 // downloadAndUploadAttachment gets instant cache hits instead of doing
 // sequential 90s CloudKit downloads that hang the portal event loop.
