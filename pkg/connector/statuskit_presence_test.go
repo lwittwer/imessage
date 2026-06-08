@@ -8,14 +8,46 @@ import (
 
 func TestStatusKitModeKey(t *testing.T) {
 	focus := "Sleep"
-	if got := statusKitModeKey(&focus); got != "Sleep" {
+	if got := statusKitModeKey(&focus, false); got != "Sleep" {
 		t.Fatalf("expected focus mode, got %q", got)
+	}
+	if got := statusKitModeKey(&focus, true); got != "available" {
+		t.Fatalf("expected available=true to override stale mode, got %q", got)
 	}
 	empty := ""
 	for _, mode := range []*string{nil, &empty} {
-		if got := statusKitModeKey(mode); got != "available" {
+		if got := statusKitModeKey(mode, true); got != "available" {
 			t.Fatalf("expected available, got %q", got)
 		}
+	}
+	if got := statusKitModeKey(nil, false); got != "unavailable" {
+		t.Fatalf("expected unavailable fallback, got %q", got)
+	}
+}
+
+func TestStatusKitModeSilenced(t *testing.T) {
+	tests := map[string]bool{
+		"":              false,
+		"available":     false,
+		"unavailable":   true,
+		"Sleep":         true,
+		"com.apple.foo": true,
+	}
+	for mode, want := range tests {
+		if got := statusKitModeSilenced(mode); got != want {
+			t.Fatalf("statusKitModeSilenced(%q) = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+func TestStatusKitRoomNameRepairValueIncludesName(t *testing.T) {
+	first := statusKitRoomNameRepairValue("Lauren Thomas")
+	second := statusKitRoomNameRepairValue("Lauren T.")
+	if first == second {
+		t.Fatal("repair marker should change when the bare DM name changes")
+	}
+	if first != statusKitRoomNameRepairValuePrefix+"Lauren Thomas" {
+		t.Fatalf("unexpected repair marker %q", first)
 	}
 }
 

@@ -5082,6 +5082,36 @@ pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Op
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct StatusKitAllowedModesState {
+    #[serde(default)]
+    keys: HashMap<String, StatusKitAllowedModesDevice>,
+}
+
+#[derive(serde::Deserialize)]
+struct StatusKitAllowedModesDevice {
+    from: String,
+    #[serde(default)]
+    personal_config: StatusKitAllowedModesConfig,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StatusKitAllowedModesConfig {
+    #[serde(rename = "a", default)]
+    allowed_modes: Vec<String>,
+}
+
+fn read_statuskit_allowed_modes_by_sender(path: &str) -> HashMap<String, Vec<String>> {
+    let Some(state) = read_plist_state::<StatusKitAllowedModesState>(path) else {
+        return HashMap::new();
+    };
+    let mut by_sender = HashMap::new();
+    for device in state.keys.into_values() {
+        by_sender.insert(device.from, device.personal_config.allowed_modes);
+    }
+    by_sender
+}
+
 pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
     // Write to a sibling tmp file, then atomic-rename. Sidesteps EACCES
     // when the existing file at `path` is owned by a UID different from
@@ -7056,6 +7086,9 @@ pub async fn new_client(
         Arc::new(tokio::sync::RwLock::new(None));
     let status_callback_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> =
         Arc::new(tokio::sync::RwLock::new(None));
+    let statuskit_allowed_modes_path = subsystem_state_path("statuskit-state.plist");
+    let statuskit_allowed_modes_for_recv: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>> =
+        Arc::new(tokio::sync::RwLock::new(read_statuskit_allowed_modes_by_sender(&statuskit_allowed_modes_path)));
 
     // Shared reconnect timestamp: set when APNs reconnects (generated_signal
     // fires) or when the drain task starts listening (initial connection).
@@ -7082,6 +7115,7 @@ pub async fn new_client(
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
+        let allowed_modes_for_recv = statuskit_allowed_modes_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
@@ -7580,6 +7614,10 @@ pub async fn new_client(
 
                                 let pc_value: plist::Value = plist::from_bytes(&pc_bytes)
                                     .map_err(|e| format!("personal_config plist: {e}"))?;
+                                let pc_config: StatusKitAllowedModesConfig =
+                                    plist::from_value(&pc_value)
+                                        .map_err(|e| format!("personal_config decode: {e}"))?;
+                                let pc_allowed_modes = pc_config.allowed_modes;
 
                                 let mut dict = plist::Dictionary::new();
                                 dict.insert(
@@ -7608,6 +7646,10 @@ pub async fn new_client(
                                     .insert(parsed.channel.clone(), device);
                                 let total = state_w.keys.len();
                                 drop(state_w);
+                                allowed_modes_for_recv
+                                    .write()
+                                    .await
+                                    .insert(sender.clone(), pc_allowed_modes);
 
                                 let action = if prev.is_some() { "replaced" } else { "added" };
                                 let state_path =
@@ -7718,7 +7760,17 @@ pub async fn new_client(
                                     // Use the first active Focus mode's identifier.
                                     let mode_id = focus_active[0].tag.id.clone()
                                         .or_else(|| Some(focus_active[0].state.r#type.clone()));
-                                    (false, mode_id)
+                                    let allowed = if let Some(mode) = mode_id.as_ref() {
+                                        allowed_modes_for_recv
+                                            .read()
+                                            .await
+                                            .get(&sender)
+                                            .map(|modes| modes.iter().any(|allowed_mode| allowed_mode == mode))
+                                            .unwrap_or(false)
+                                    } else {
+                                        false
+                                    };
+                                    (allowed, mode_id)
                                 };
 
                                 info!(

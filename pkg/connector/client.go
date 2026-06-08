@@ -1097,6 +1097,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 
 	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
+	c.migrateStatusKitPresenceState(context.Background(), log)
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
 	// for outbound, "nextincomingcall" for inbound). Done in the
@@ -1755,7 +1756,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		return
 	}
 
-	modeKey := statusKitModeKey(mode)
+	modeKey := statusKitModeKey(mode, available)
 
 	log.Info().
 		Bool("available", available).
@@ -1881,7 +1882,7 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)), modeKey)
 	c.Main.Bridge.DB.KV.Set(ctx, statusKitPortalSeenKey(portal.ID), observedAt.UTC().Format(time.RFC3339Nano))
 
-	silenced := modeKey != "" && modeKey != "available"
+	silenced := statusKitModeSilenced(modeKey)
 	presence := event.PresenceOnline
 	statusMsg := ""
 	if silenced {
@@ -1940,6 +1941,18 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 				Msg("StatusKit: updated DM title for focus change")
 		}
 	}
+	if portal.RoomType == database.RoomTypeDM {
+		if silenced {
+			c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), "")
+		} else if !portal.NameIsCustom {
+			name := c.dmBaseName(ctx, portal)
+			if name != "" && c.Main.Bridge.DB.KV.Get(ctx, statusKitRoomNameRepairKey(portal.ID)) != statusKitRoomNameRepairValue(name) {
+				if stampedName, ok := c.forceStampAvailableStatusKitDMRoomName(ctx, log, portal); ok {
+					c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), statusKitRoomNameRepairValue(stampedName))
+				}
+			}
+		}
+	}
 	return true
 }
 
@@ -1956,10 +1969,10 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
 	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
 		s, _ := v.(string)
-		return s != "" && s != "available"
+		return statusKitModeSilenced(s)
 	}
 	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
-	return s != "" && s != "available"
+	return statusKitModeSilenced(s)
 }
 
 // dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the

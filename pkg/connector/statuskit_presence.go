@@ -7,14 +7,21 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
 )
 
 const (
 	statusKitPresencePendingKeyPrefix    = "statuskit.presence.pending."
 	statusKitPresencePortalKeyPrefix     = "statuskit.presence.portal."
 	statusKitPresencePortalSeenKeyPrefix = "statuskit.presence.portal_seen."
+	statusKitRoomNameRepairKeyPrefix     = "statuskit.presence.room_name_repair."
+	statusKitPresenceStateVersionKey     = database.Key("statuskit.presence_state.version")
+	statusKitPresenceStateVersion        = "5"
+	statusKitRoomNameRepairValuePrefix   = "available_name_v2:"
 	statusKitPendingTTL                  = time.Hour
 )
 
@@ -23,11 +30,22 @@ type statusKitPendingPresence struct {
 	ObservedAt time.Time `json:"observed_at"`
 }
 
-func statusKitModeKey(mode *string) string {
+func statusKitModeKey(mode *string, available bool) string {
+	if available {
+		return "available"
+	}
 	if mode != nil && *mode != "" {
 		return *mode
 	}
-	return "available"
+	return "unavailable"
+}
+
+func statusKitModeSilenced(modeKey string) bool {
+	return modeKey != "" && modeKey != "available"
+}
+
+func statusKitRoomNameRepairValue(name string) string {
+	return statusKitRoomNameRepairValuePrefix + name
 }
 
 func encodeStatusKitPendingPresence(modeKey string, observedAt time.Time) string {
@@ -94,6 +112,10 @@ func statusKitPortalSeenKey(portalID networkid.PortalID) database.Key {
 	return database.Key(statusKitPresencePortalSeenKeyPrefix + string(portalID))
 }
 
+func statusKitRoomNameRepairKey(portalID networkid.PortalID) database.Key {
+	return database.Key(statusKitRoomNameRepairKeyPrefix + string(portalID))
+}
+
 func (c *IMClient) getStatusKitPortalSeen(ctx context.Context, portalID networkid.PortalID) time.Time {
 	if v, ok := c.statusKitPresenceSeenByPortal.Load(portalID); ok {
 		if ts, ok := v.(time.Time); ok {
@@ -110,6 +132,160 @@ func (c *IMClient) getStatusKitPortalSeen(ctx context.Context, portalID networki
 	}
 	c.statusKitPresenceSeenByPortal.Store(portalID, ts)
 	return ts
+}
+
+func (c *IMClient) migrateStatusKitPresenceState(ctx context.Context, log zerolog.Logger) {
+	if c == nil || c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.DB == nil {
+		return
+	}
+	if c.Main.Bridge.DB.KV.Get(ctx, statusKitPresenceStateVersionKey) == statusKitPresenceStateVersion {
+		return
+	}
+
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx,
+		"SELECT key, value FROM kv_store WHERE bridge_id=$1 AND key LIKE $2 AND value <> '' AND value <> 'available'",
+		c.Main.Bridge.ID, statusKitPresencePortalKeyPrefix+"%")
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit presence migration: failed to query old state")
+		return
+	}
+
+	now := time.Now()
+	changed := make(map[networkid.PortalID]struct{})
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			continue
+		}
+		portalID := networkid.PortalID(strings.TrimPrefix(key, statusKitPresencePortalKeyPrefix))
+		if portalID == "" {
+			continue
+		}
+		changed[portalID] = struct{}{}
+		c.statusKitPresenceByPortal.Store(portalID, "available")
+		c.statusKitPresenceSeenByPortal.Store(portalID, now)
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portalID)), "available")
+		c.Main.Bridge.DB.KV.Set(ctx, statusKitPortalSeenKey(portalID), now.UTC().Format(time.RFC3339Nano))
+		for _, variant := range statusKitAliasVariants(string(portalID)) {
+			c.Main.Bridge.DB.KV.Set(ctx, database.Key("statuskit.presence."+variant), "available")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit presence migration: row iteration failed")
+	}
+	if err := rows.Close(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit presence migration: failed to close query")
+	}
+
+	if c.UserLogin == nil {
+		log.Info().Int("cleared_modes", len(changed)).Msg("StatusKit presence migration: deferred title repair until login is ready")
+		return
+	}
+	releasedTitles := 0
+	for portalID := range changed {
+		portal := c.findPortalByID(ctx, portalID)
+		if portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM {
+			continue
+		}
+		if !portal.NameIsCustom && !strings.HasSuffix(portal.Name, "🌙") {
+			continue
+		}
+		nameField := c.dmFocusName(ctx, portal)
+		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventChatInfoChange,
+				PortalKey: networkid.PortalKey{
+					ID:       portal.ID,
+					Receiver: c.UserLogin.ID,
+				},
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("portal_mxid", string(portal.MXID)).
+						Str("source", "statuskit_presence_migration")
+				},
+			},
+			ChatInfoChange: &bridgev2.ChatInfoChange{
+				ChatInfo: &bridgev2.ChatInfo{
+					Name:                       nameField,
+					ExcludeChangesFromTimeline: true,
+				},
+			},
+		})
+		releasedTitles++
+	}
+	repairedTitles := c.repairAvailableStatusKitDMRoomNames(ctx, log)
+
+	c.Main.Bridge.DB.KV.Set(ctx, statusKitPresenceStateVersionKey, statusKitPresenceStateVersion)
+	if len(changed) > 0 || releasedTitles > 0 || repairedTitles > 0 {
+		log.Info().
+			Int("cleared_modes", len(changed)).
+			Int("released_titles", releasedTitles).
+			Int("repaired_titles", repairedTitles).
+			Msg("StatusKit presence migration: cleared pre-normalization active states")
+	}
+}
+
+func (c *IMClient) repairAvailableStatusKitDMRoomNames(ctx context.Context, log zerolog.Logger) int {
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx,
+		"SELECT key FROM kv_store WHERE bridge_id=$1 AND key LIKE $2 AND value = 'available'",
+		c.Main.Bridge.ID, statusKitPresencePortalKeyPrefix+"%")
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit room-name repair: failed to query available state")
+		return 0
+	}
+
+	var portalIDs []networkid.PortalID
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			continue
+		}
+		portalID := networkid.PortalID(strings.TrimPrefix(key, statusKitPresencePortalKeyPrefix))
+		if portalID != "" {
+			portalIDs = append(portalIDs, portalID)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit room-name repair: failed to close query")
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit room-name repair: row iteration failed")
+	}
+
+	repaired := 0
+	for _, portalID := range portalIDs {
+		portal := c.findPortalByID(ctx, portalID)
+		if name, ok := c.forceStampAvailableStatusKitDMRoomName(ctx, log, portal); ok {
+			c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), statusKitRoomNameRepairValue(name))
+			repaired++
+		}
+	}
+	return repaired
+}
+
+func (c *IMClient) forceStampAvailableStatusKitDMRoomName(ctx context.Context, log zerolog.Logger, portal *bridgev2.Portal) (string, bool) {
+	if portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM || portal.NameIsCustom {
+		return "", false
+	}
+	if c.isMyHandle(string(portal.ID)) || c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.Bot == nil {
+		return "", false
+	}
+	name := c.dmBaseName(ctx, portal)
+	if name == "" {
+		return "", false
+	}
+	_, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StateRoomName, "", &event.Content{
+		Parsed: &event.RoomNameEventContent{Name: name},
+		Raw: map[string]any{
+			"com.beeper.exclude_from_timeline": true,
+			"fi.mau.implicit_name":             true,
+		},
+	}, time.Now())
+	if err != nil {
+		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to force-stamp available DM title")
+		return "", false
+	}
+	log.Info().Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: force-stamped available DM title")
+	return name, true
 }
 
 func (c *IMClient) storePendingStatusKitPresence(ctx context.Context, log zerolog.Logger, alias, modeKey string, observedAt time.Time) {
