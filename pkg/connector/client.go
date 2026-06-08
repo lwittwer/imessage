@@ -8200,16 +8200,15 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 
 // maxBridgeableAttachmentBytes is the hard ceiling for bridging an attachment.
 // Anything larger is skipped outright — never downloaded, transcoded, or
-// uploaded. iMessage itself won't send an attachment larger than ~100 MiB (as
-// far as we know): bigger files go through Mail Drop as iCloud links, not as
-// inline attachments — so a multi-GB CloudKit blob isn't a normal iMessage
-// attachment in the first place. Matrix homeservers (Beeper: 100 MiB) reject
-// larger uploads too, so it can't render in any client anyway. Attempting one
-// just burns a multi-GB download buffer (in Rust, outside the Go heap), a
-// doomed transcode, and disk for a guaranteed rejection — and a 3 GB video can
-// wedge a small host outright. CloudKit reports the size as a wrapped i32, so a
-// blob in [2 GiB, 4 GiB) surfaces as a NEGATIVE file_size; treat negative (or
-// over the cap) as over-limit.
+// uploaded. CloudKit backfill surfaces some genuinely huge attachments (one
+// account has 3 GB videos — observed, not theoretical: they download as real
+// multi-GB blobs). Whatever produced them, they can't be bridged: they exceed
+// the Matrix homeserver upload cap (Beeper: 100 MiB) and won't render in any
+// client. Attempting one just burns a multi-GB download buffer (in Rust,
+// outside the Go heap), a doomed transcode, and disk for a guaranteed
+// rejection — and can wedge a small host. CloudKit reports the size as a
+// wrapped i32, so a blob in [2 GiB, 4 GiB) surfaces as a NEGATIVE file_size;
+// treat negative (or over the cap) as over-limit.
 const maxBridgeableAttachmentBytes = 100 * 1024 * 1024 // 100 MiB
 
 // oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
