@@ -8259,14 +8259,54 @@ func safeCloudDownloadAttachmentToFile(client *rustpushgo.Client, recordName, de
 	}
 }
 
+// transcodeFileToMP4 remuxes (cheap) or, failing that, re-encodes a video FILE
+// to an MP4 FILE on disk. Unlike transcodeToMP4's ConvertBytes — which loads the
+// whole input and output into memory — this streams input→output through ffmpeg
+// on disk, so it's safe for the multi-GB attachments handled by
+// streamOversizedAttachment. Serialized against all other transcodes via
+// transcodeSem (one ffmpeg at a time → bounded CPU/memory on small or
+// single-core hosts). The remux pass is near-free when the source is already
+// H.264/HEVC in a non-MP4 container — the common case — sparing a slow re-encode
+// (which on a single core can take hours for a large video). Returns the output
+// path (caller removes it) or an error (caller ships the original).
+func transcodeFileToMP4(ctx context.Context, log *zerolog.Logger, inputPath string) (string, error) {
+	outPath := inputPath + ".mp4"
+	// Detach from a short inbound deadline so it can't abort the encode mid-run,
+	// matching transcodeToMP4. A large encode on a single core is genuinely long.
+	base := context.WithoutCancel(ctx)
+	transcodeSem <- struct{}{}
+	defer func() { <-transcodeSem }()
+	// Attempt 1: stream-copy remux — rewrap the container, no re-encode.
+	err := ffmpeg.ConvertPathWithDestination(base, inputPath, outPath, nil,
+		[]string{"-c", "copy", "-movflags", "+faststart"}, false)
+	if err == nil {
+		return outPath, nil
+	}
+	log.Debug().Err(err).Str("input", inputPath).
+		Msg("Oversized video remux failed, falling back to full re-encode")
+	_ = os.Remove(outPath)
+	// Attempt 2: full re-encode (codec incompatible with a plain remux).
+	err = ffmpeg.ConvertPathWithDestination(base, inputPath, outPath, nil,
+		[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+			"-c:a", "aac", "-movflags", "+faststart"}, false)
+	if err != nil {
+		_ = os.Remove(outPath)
+		return "", err
+	}
+	return outPath, nil
+}
+
 // streamOversizedAttachment handles an attachment too large to return over the
 // FFI. rustpush writes it to a temp file, then UploadMediaStream streams it from
 // disk straight to Matrix (via its ReplacementFile path) — so neither Go nor the
-// homeserver upload ever holds the multi-GB blob in memory. Transcode/HEIC/
-// thumbnail are skipped: they all need the bytes resident and make no sense for
-// a multi-GB video. The homeserver's own media size limit then applies inside
-// UploadMediaStream (so a blob bigger than the server allows fails cleanly, not
-// as a lazy skip). Returns nil on any failure so the caller drops the item.
+// homeserver upload ever holds the multi-GB blob in memory. When video
+// transcoding is enabled the file is transcoded disk→disk first (remux when
+// possible, else re-encode) — we power through it without buffering, just slowly
+// on a small host. HEIC/thumbnail are still skipped (those need the bytes
+// resident and are meaningless for a multi-GB video). The homeserver's own media
+// size limit then applies inside UploadMediaStream (so a blob bigger than the
+// server allows fails cleanly, not as a lazy skip). Returns nil on any failure
+// so the caller drops the item.
 func (c *IMClient) streamOversizedAttachment(
 	ctx context.Context,
 	row cloudMessageRow,
@@ -8318,28 +8358,57 @@ func (c *IMClient) streamOversizedAttachment(
 		return nil
 	}
 
-	url, encFile, err := intent.UploadMediaStream(ctx, "", int64(n), true,
+	// What we'll stream up: the downloaded file as-is, unless we transcode.
+	uploadPath := tmpPath
+	uploadMime := mimeType
+	uploadName := fileName
+
+	// Power through a transcode even for these multi-GB videos when enabled —
+	// but disk→disk (see transcodeFileToMP4), never ConvertBytes, so ffmpeg
+	// streams through its own small working set instead of us loading the whole
+	// blob into RAM. On failure we ship the original rather than drop it.
+	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() &&
+		strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		if outPath, convErr := transcodeFileToMP4(ctx, &log, tmpPath); convErr != nil {
+			log.Warn().Err(convErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
+				Msg("Oversized video transcode failed after fallback, streaming original")
+		} else {
+			defer func() { _ = os.Remove(outPath) }()
+			uploadPath = outPath
+			uploadMime = "video/mp4"
+			uploadName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+			log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
+				Msg("Transcoded oversized video to MP4 on disk")
+		}
+	}
+
+	uploadSize := int64(n)
+	if fi, statErr := os.Stat(uploadPath); statErr == nil {
+		uploadSize = fi.Size()
+	}
+
+	url, encFile, err := intent.UploadMediaStream(ctx, "", uploadSize, true,
 		func(_ io.Writer) (*bridgev2.FileStreamResult, error) {
 			return &bridgev2.FileStreamResult{
-				FileName:        fileName,
-				MimeType:        mimeType,
-				ReplacementFile: tmpPath,
+				FileName:        uploadName,
+				MimeType:        uploadMime,
+				ReplacementFile: uploadPath,
 			}, nil
 		})
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int64("size", int64(n)).Int("attempt", fe.retries).
+			Int64("size", uploadSize).Int("attempt", fe.retries).
 			Msg("Failed to stream oversized attachment to Matrix, skipping")
 		return nil
 	}
 
 	content := &event.MessageEventContent{
-		MsgType: mimeToMsgType(mimeType),
-		Body:    fileName,
+		MsgType: mimeToMsgType(uploadMime),
+		Body:    uploadName,
 		Info: &event.FileInfo{
-			MimeType: mimeType,
-			Size:     int(n),
+			MimeType: uploadMime,
+			Size:     int(uploadSize),
 		},
 	}
 	if encFile != nil {
@@ -8351,7 +8420,7 @@ func (c *IMClient) streamOversizedAttachment(
 	// Intentionally NOT cached in attachmentContentCache: the temp file is gone
 	// after upload, and these are rare — a cache miss just re-streams on retry.
 	log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-		Int64("bytes", int64(n)).Str("mime", mimeType).Int("att_index", i).
+		Int64("bytes", uploadSize).Str("mime", uploadMime).Int("att_index", i).
 		Msg("Streamed oversized attachment to Matrix from disk (no in-memory buffer)")
 	return []*bridgev2.BackfillMessage{{
 		Sender:    sender,
