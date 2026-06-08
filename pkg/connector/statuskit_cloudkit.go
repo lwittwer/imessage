@@ -64,7 +64,34 @@ const statusKitFailureBackoffBase = 15 * time.Minute
 // peers within a day, and an order-of-magnitude reduction in CKKS
 // volume on the LimitedPeersAllowed view (the surface that produced
 // the clique-kick during early testing).
+//
+// This is the STEADY-STATE floor, applied only once peer keys are
+// established and have gone quiet. Before keys are established (or while
+// they're actively arriving) the much shorter statusKitFreshFloor applies
+// — see nextAllowedAt.
 const statusKitSuccessFloor = 12 * time.Hour
+
+// statusKitFreshFloor is the (gentle) minimum interval between successful
+// passes while the bridge has NOT yet pulled any peer keys, or while keys are
+// still actively arriving. A fresh or large account (James: 1,480 chats, 0
+// peer keys at first — presence can't decrypt anything) has its contacts'
+// reshares land in CloudKit gradually after the bridge publishes
+// share_status. With only the 12h floor, the single bootstrap pass runs
+// before those reshares arrive and nothing re-pulls them for 12h. This floor
+// keeps pulling every half hour until keys show up, then nextAllowedAt backs
+// off to statusKitSuccessFloor once keys are established and the stream is
+// quiet. At ~4–5 Apple round-trips per pass that's ~10/hour — within the
+// ~15–20/hour the clique-kick postmortem documents as tolerated, and far from
+// the wrong-class-unwrap / zone-probing bursts that actually caused the kick.
+// See docs/postmortem-statuskit-clique-kick-2026-05-09.md.
+const statusKitFreshFloor = 30 * time.Minute
+
+// statusKitPullTickInterval is how often the background loop (runStatusKitPullLoop)
+// offers the pass a chance to run. The pass's own floor gate decides whether to
+// actually contact Apple — once keys are established most ticks are a cheap
+// in-memory skip. Shorter than statusKitFreshFloor so a fresh account's keys
+// are pulled promptly after the floor elapses.
+const statusKitPullTickInterval = 15 * time.Minute
 
 // statusKitPassMaxBackoff caps the exponential backoff after consecutive
 // errors. Two hours is long enough that a transient CKKS rate-limit window
@@ -81,18 +108,29 @@ const statusKitPassMaxBackoff = 2 * time.Hour
 var statuskitPassRetryAfterRegex = cloudKitRetryAfterRegex
 
 // statusKitPassMeta is the parsed form of statusKitCloudPassMetaRow. Stored
-// flat in the existing TEXT column so no schema change is needed.
+// flat in the existing TEXT column so no schema change is needed. Old 2-field
+// rows ("<ms>:<errs>") parse with Established/LastPulledKeys defaulting false,
+// which just means a not-yet-established account starts on the fresh floor —
+// self-correcting on the first key-bearing pass.
 type statusKitPassMeta struct {
 	LastAttempt     time.Time
 	ConsecutiveErrs int
+	// Established is sticky: true once any pass has pulled at least one peer
+	// key. Until then the bridge pulls on the gentle fresh floor.
+	Established bool
+	// LastPulledKeys records whether the most recent successful pass pulled
+	// new keys. While true the bridge keeps pulling on the fresh floor to
+	// catch the rest of an in-flight reshare stream; once a pass comes up
+	// empty it backs off to the 12h steady-state floor.
+	LastPulledKeys bool
 }
 
 func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 	if raw == nil || *raw == "" {
 		return statusKitPassMeta{}
 	}
-	parts := strings.SplitN(*raw, ":", 2)
-	if len(parts) != 2 {
+	parts := strings.Split(*raw, ":")
+	if len(parts) < 2 {
 		return statusKitPassMeta{}
 	}
 	tsMS, err := strconv.ParseInt(parts[0], 10, 64)
@@ -103,14 +141,25 @@ func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 	if err != nil || errs < 0 {
 		errs = 0
 	}
-	return statusKitPassMeta{
+	m := statusKitPassMeta{
 		LastAttempt:     time.UnixMilli(tsMS),
 		ConsecutiveErrs: errs,
 	}
+	if len(parts) >= 4 {
+		m.Established = parts[2] == "1"
+		m.LastPulledKeys = parts[3] == "1"
+	}
+	return m
 }
 
 func (m statusKitPassMeta) encode() string {
-	return fmt.Sprintf("%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs)
+	b2i := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys))
 }
 
 // nextAllowedAt returns the earliest time at which a new pass may run.
@@ -123,6 +172,13 @@ func (m statusKitPassMeta) nextAllowedAt(retryAfterHint time.Duration) time.Time
 		return time.Time{}
 	}
 	if m.ConsecutiveErrs == 0 && retryAfterHint == 0 {
+		// Successful previous pass. Pull on the gentle fresh floor while keys
+		// haven't been established yet (fresh/large account whose reshares are
+		// still landing) or while keys are actively arriving; back off to the
+		// 12h steady-state only once we have keys AND the stream went quiet.
+		if !m.Established || m.LastPulledKeys {
+			return m.LastAttempt.Add(statusKitFreshFloor)
+		}
 		return m.LastAttempt.Add(statusKitSuccessFloor)
 	}
 	delay := statusKitFailureBackoffBase
@@ -166,6 +222,38 @@ func extractRetryAfterHint(err error) time.Duration {
 		hint = statusKitPassMaxBackoff
 	}
 	return hint
+}
+
+// runStatusKitPullLoop periodically offers the StatusKit-CloudKit peer-key
+// pull a chance to run. Without it the pass only fires at startup (the
+// bootstrap sync plus three one-shot delayed re-syncs) and never again until
+// the next bridge restart — so peer keys that reshare into CloudKit after
+// those early passes (the common case on a fresh or large account, where
+// contacts reshare gradually after the bridge publishes share_status) sit
+// un-pulled and presence can't decrypt them.
+//
+// The pass's own floor gate (nextAllowedAt) decides whether each tick actually
+// contacts Apple: gentle 30-min pulls while keys haven't been established or
+// are still arriving, backing off to 12h once established and quiet. Most ticks
+// in steady state are a cheap in-memory skip with no Apple traffic.
+func (c *IMClient) runStatusKitPullLoop(log zerolog.Logger, stopChan <-chan struct{}) {
+	if c.cloudStore == nil {
+		return
+	}
+	ticker := time.NewTicker(statusKitPullTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if err := c.syncCloudStatusKitPeers(ctx, log); err != nil {
+				log.Info().Err(err).Msg("StatusKit-CloudKit periodic pull: errored (continuing)")
+			}
+			cancel()
+		}
+	}
 }
 
 // syncCloudStatusKitPeers runs one StatusKit-CloudKit pull pass. Called as
@@ -323,14 +411,39 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// errors+1 + retry-after extension). Done via defer so a panic that
 	// escapes safeFFICall still leaves the gate in a recoverable state
 	// rather than stranding the bridge in "always run, no backoff".
+	// Drain accumulators, declared before the defer so the meta-row update can
+	// record whether THIS pass actually pulled keys — that drives the
+	// fresh-floor-vs-12h-floor decision in nextAllowedAt.
+	var (
+		totalFetched      uint32
+		totalInserted     uint32
+		totalAlreadyKnown uint32
+		totalDecodeFailed uint32
+		totalRecordsSeen  uint32
+		injectedHandles   []string
+	)
+
 	attemptStart := time.Now()
 	var ffiErr error
 	defer func() {
-		newMeta := statusKitPassMeta{LastAttempt: attemptStart}
-		if ffiErr == nil {
-			newMeta.ConsecutiveErrs = 0
-		} else {
+		newMeta := statusKitPassMeta{
+			LastAttempt:    attemptStart,
+			Established:    meta.Established,    // sticky — never un-establish
+			LastPulledKeys: meta.LastPulledKeys, // carried over unless a success updates it below
+		}
+		if ffiErr != nil {
 			newMeta.ConsecutiveErrs = meta.ConsecutiveErrs + 1
+		} else {
+			newMeta.ConsecutiveErrs = 0
+			// A pass that inserted new peer keys keeps us on the gentle fresh
+			// floor (more reshares may still be in flight) and marks the
+			// account established. An empty success lets the floor back off to
+			// the 12h steady-state.
+			pulled := totalInserted > 0
+			newMeta.LastPulledKeys = pulled
+			if pulled {
+				newMeta.Established = true
+			}
 		}
 		encoded := newMeta.encode()
 		if persistErr := c.cloudStore.setSyncStateSuccess(ctx, statusKitCloudPassMetaRow, &encoded); persistErr != nil {
@@ -342,7 +455,7 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// page with at most one Apple-side fetch round-trip; the continuation
 	// token in the response tells us whether more pages exist. Looping
 	// here means a single bootstrap pass ingests every available record
-	// instead of stranding pages behind the 12h success floor (the
+	// instead of stranding pages behind the success floor (the
 	// chat/message backfill paths get hit hundreds of times per session
 	// so they drain naturally; StatusKit doesn't, and architecturally
 	// pretending it does was the bug).
@@ -354,14 +467,6 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	const (
 		maxPagesPerPass = 30
 		interPageDelay  = 1 * time.Second
-	)
-	var (
-		totalFetched      uint32
-		totalInserted     uint32
-		totalAlreadyKnown uint32
-		totalDecodeFailed uint32
-		totalRecordsSeen  uint32
-		injectedHandles   []string
 	)
 	currentZone := cachedZone
 	currentToken := sinceToken

@@ -1516,6 +1516,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		if !debugDisablePrivacy {
 			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
 		}
+		// Periodically re-run the StatusKit-CloudKit peer-key pull. The cloud
+		// sync only fires it at startup; without this loop, peer keys that
+		// reshare in later (the common case on fresh/large accounts) are never
+		// pulled until the next restart. Self-gated to a gentle cadence — see
+		// runStatusKitPullLoop / statusKitFreshFloor.
+		go c.runStatusKitPullLoop(log.With().Str("component", "statuskit_pull").Logger(), c.stopChan)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
