@@ -274,6 +274,20 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create cloud_attachment_cache table: %w", err)
 	}
 
+	// Migration: add cloud_attachment_dead table if missing. Persists
+	// record_names that CloudKit no longer serves (Apple aged out the MMCS
+	// blob) so the bridge stops re-downloading-and-re-failing the same dead
+	// old attachments on every sync sweep / restart. Cleared on a full reset.
+	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_dead (
+		login_id    TEXT    NOT NULL,
+		record_name TEXT    NOT NULL,
+		reason      TEXT    NOT NULL DEFAULT '',
+		failed_at   BIGINT  NOT NULL,
+		PRIMARY KEY (login_id, record_name)
+	)`); err != nil {
+		return fmt.Errorf("failed to create cloud_attachment_dead table: %w", err)
+	}
+
 	// Create index that depends on record_name column (must be after migration)
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
 		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
@@ -419,7 +433,7 @@ func (s *cloudBackfillStore) setChatSyncVersion(ctx context.Context, version int
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
-	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache"} {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache", "cloud_attachment_dead"} {
 		if _, err := s.db.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
 			s.loginID,
@@ -3151,6 +3165,40 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 		cache[recordName] = contentJSON
 	}
 	return cache, rows.Err()
+}
+
+// loadDeadAttachments returns every record_name tombstoned as permanently
+// un-downloadable for this login. The caller seeds an in-memory set so
+// pre-upload and the portal loop skip these without touching CloudKit.
+func (s *cloudBackfillStore) loadDeadAttachments(ctx context.Context) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_attachment_dead WHERE login_id=$1`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// saveDeadAttachment tombstones a record_name that CloudKit no longer serves.
+// Idempotent (upsert). Best-effort — a failed write just means the attachment
+// re-fails and re-tombstones next time.
+func (s *cloudBackfillStore) saveDeadAttachment(ctx context.Context, recordName, reason string) {
+	_, _ = s.db.Exec(ctx, `
+		INSERT INTO cloud_attachment_dead (login_id, record_name, reason, failed_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (login_id, record_name) DO NOTHING
+	`, s.loginID, recordName, reason, time.Now().UnixMilli())
 }
 
 // saveAttachmentCacheEntry persists a record_name → MessageEventContent JSON

@@ -12096,36 +12096,44 @@ impl Client {
                     msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
                 });
             }
-            Err(_panic) => {
-                if !is_ford_asset {
-                    // Non-Ford asset (image / V1 per-chunk encryption) —
-                    // the panic is NOT a Ford dedup issue. Brute-forcing
-                    // cached keys can't help: there's no Ford blob, and
-                    // our cached keys are for Ford-encrypted records that
-                    // will never match. Return the panic as a terminal
-                    // error instead of burning retries.
+            Err(panic_payload) => {
+                // Surface what upstream actually panicked on (the catch_unwind
+                // payload) — e.g. "No body!!" (Apple no longer serves the asset)
+                // vs "No signature?" (our stored record is missing a field).
+                let payload = panic_payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>");
+                if is_ford_asset {
                     warn!(
-                        "cloud_download_attachment {}: non-Ford asset panic, skipping recovery (image or other V1-encrypted)",
-                        record_name
+                        "cloud_download_attachment {}: Ford SIV panic ({}), attempting recovery with {} cached Ford keys",
+                        record_name,
+                        payload,
+                        ford_key_cache_size()
                     );
-                    return Err(WrappedError::GenericError {
-                        msg: format!(
-                            "Failed to download CloudKit attachment {} (non-Ford panic, likely bundled_request_id or PCS issue)",
-                            record_name
-                        ),
-                    });
+                } else {
+                    // Non-Ford asset (image / V1 per-chunk encryption). Don't
+                    // give up here — the manual download path below ALSO handles
+                    // plain V1 chunks (decrypt_v1_chunk with the per-chunk key
+                    // from the authorize response), so it can recover a V1 image
+                    // that upstream's get_mmcs panicked on. If the asset is truly
+                    // gone (Apple aged out the MMCS blob → no body / no
+                    // reference), recovery returns a descriptive, ATTACHMENT_
+                    // UNRECOVERABLE-tagged error the bridge can tombstone.
+                    warn!(
+                        "cloud_download_attachment {}: non-Ford get_assets panic ({}); attempting manual V1 recovery",
+                        record_name,
+                        payload
+                    );
                 }
-                warn!(
-                    "cloud_download_attachment {}: Ford SIV panic, attempting recovery with {} cached Ford keys",
-                    record_name,
-                    ford_key_cache_size()
-                );
             }
         }
 
-        // Attempt 2 — Ford dedup recovery: iterate cached keys in parallel
-        // batches, mutate protection_info per attempt, re-try get_assets.
-        // Only reached when is_ford_asset == true.
+        // Attempt 2 — manual recovery. Handles V1 (per-chunk), V2 Ford, and
+        // Ford dedup (cross-batch brute force via the cached key set) in one
+        // pure-crypto pass. Reached for BOTH Ford and non-Ford panics: the
+        // manual path is a superset of upstream's get_mmcs.
         self.cloud_download_attachment_ford_recovery_with_record(
             container,
             records,
@@ -12673,9 +12681,14 @@ impl Client {
         //
         // The outer `cloud_download_attachment` attempted upstream's
         // happy path first and catch_unwind'd its panic; we're here
-        // because that failed. The ONLY path upstream takes to its
-        // panic is the Ford path, so we know this is a Ford-encrypted
-        // asset (is_ford_asset was also pre-checked by the caller).
+        // because that failed. Reached for BOTH Ford and non-Ford
+        // (plain V1) panics — the manual path handles all of them.
+        //
+        // Errors that mean the asset is no longer downloadable from
+        // CloudKit at all (Apple aged out the MMCS blob: no body, no
+        // matching reference, missing bundled_request_id/signature) are
+        // tagged "ATTACHMENT_UNRECOVERABLE:" so the Go side can persist a
+        // tombstone and stop re-attempting them on every sync sweep.
         //
         // What this function does NOT do that upstream does:
         //   - getComplete confirmation (CloudKit passes empty url, so
@@ -12687,12 +12700,12 @@ impl Client {
         let lqa = &base_record.lqa;
         let bundled_id = lqa.bundled_request_id.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
-                msg: format!("manual_ford_download {}: lqa.bundled_request_id is None", record_name),
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.bundled_request_id is None", record_name),
             }
         })?;
         let signature = lqa.signature.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
-                msg: format!("manual_ford_download {}: lqa.signature is None", record_name),
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.signature is None", record_name),
             }
         })?;
         let ford_key = lqa
@@ -12709,14 +12722,14 @@ impl Client {
             .find(|r| r.asset_id.as_ref() == Some(bundled_id))
             .ok_or_else(|| WrappedError::GenericError {
                 msg: format!(
-                    "manual_ford_download {}: no AssetGetResponse for bundled_request_id",
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: no AssetGetResponse for bundled_request_id",
                     record_name
                 ),
             })?;
         let body = asset_response.body.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
                 msg: format!(
-                    "manual_ford_download {}: AssetGetResponse.body is None",
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: AssetGetResponse.body is None",
                     record_name
                 ),
             }
@@ -12755,8 +12768,16 @@ impl Client {
             }
             Err(e) => {
                 warn!("manual_ford_download {}: FAILED: {}", record_name, e);
+                // "no references entry matches signature" / a server "GONE"
+                // reason means the asset is no longer in Apple's authorize
+                // response — it's not coming back. Tag it so Go tombstones it.
+                // Plain network/HTTP failures stay un-tagged → retriable.
+                let unrecoverable = e.contains("no references entry matches")
+                    || e.contains("AuthorizeGetResponse")
+                    || e.to_ascii_lowercase().contains("gone");
+                let tag = if unrecoverable { "ATTACHMENT_UNRECOVERABLE: " } else { "" };
                 Err(WrappedError::GenericError {
-                    msg: format!("Manual Ford download for {}: {}", record_name, e),
+                    msg: format!("{}Manual Ford download for {}: {}", tag, record_name, e),
                 })
             }
         }
