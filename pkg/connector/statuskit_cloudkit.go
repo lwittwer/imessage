@@ -282,6 +282,15 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		return nil
 	}
 
+	// Single-flight: the periodic pull loop, the post-backfill trigger, and the
+	// cloud-sync phases can all call this. Two concurrent passes would race on
+	// the continuation-token / pass-meta rows and double the CKKS round-trips.
+	if !c.statusKitPassInFlight.CompareAndSwap(false, true) {
+		log.Info().Msg("StatusKit-CloudKit pass: skipped (another pass already in flight)")
+		return nil
+	}
+	defer c.statusKitPassInFlight.Store(false)
+
 	// Avoid running concurrently with an invite sweep — both touch the
 	// rust-side StatusKit state mutex. Sweep wins; we'll pick up next pass.
 	if c.statusKitSweepRunning.Load() {

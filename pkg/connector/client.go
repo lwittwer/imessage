@@ -300,6 +300,13 @@ type IMClient struct {
 	// the persisted backoff resumes and steady-state behavior takes over.
 	statusKitCloudPassFirstCallDone atomic.Bool
 
+	// statusKitPassInFlight is a single-flight guard so only one
+	// syncCloudStatusKitPeers pass runs at a time. The periodic pull loop, the
+	// post-backfill trigger, and the cloud-sync phases can all call it; two
+	// concurrent passes would race on the shared continuation-token / pass-meta
+	// rows and double the CKKS round-trips. Released in a defer.
+	statusKitPassInFlight atomic.Bool
+
 	// statusKitShareMu serializes the cooldown-check / publish /
 	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
 	// Without it two concurrent callers can both pass the cooldown check
