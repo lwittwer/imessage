@@ -8198,18 +8198,37 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 	}
 }
 
-// maxBridgeableAttachmentBytes is the hard ceiling for bridging an attachment.
-// Anything larger is skipped outright — never downloaded, transcoded, or
-// uploaded. CloudKit backfill surfaces some genuinely huge attachments (one
-// account has 3 GB videos — observed, not theoretical: they download as real
-// multi-GB blobs). Whatever produced them, they can't be bridged: they exceed
-// the Matrix homeserver upload cap (Beeper: 100 MiB) and won't render in any
-// client. Attempting one just burns a multi-GB download buffer (in Rust,
-// outside the Go heap), a doomed transcode, and disk for a guaranteed
-// rejection — and can wedge a small host. CloudKit reports the size as a
-// wrapped i32, so a blob in [2 GiB, 4 GiB) surfaces as a NEGATIVE file_size;
-// treat negative (or over the cap) as over-limit.
-const maxBridgeableAttachmentBytes = 100 * 1024 * 1024 // 100 MiB
+// defaultMaxAttachmentSizeMB is the fallback ceiling when max_attachment_size_mb
+// is unset or invalid. 100 MB matches Beeper's upload limit and is safe on small
+// hosts. See the config doc (IMConfig.MaxAttachmentSizeMB) for the full rationale.
+const defaultMaxAttachmentSizeMB = 100
+
+// maxAttachmentBytes is the configured attachment-size ceiling in bytes.
+// Attachments larger than this are skipped outright — never downloaded,
+// transcoded, or uploaded. The homeserver rejects anything over its upload cap,
+// so bridging it just burns a download buffer (in Rust, outside the Go heap), a
+// doomed transcode, and disk for a guaranteed rejection — and a multi-GB blob
+// can wedge a small host. Operators with a homeserver that accepts larger
+// uploads (and the RAM to spare) can raise max_attachment_size_mb.
+func (c *IMClient) maxAttachmentBytes() int64 {
+	mb := c.Main.Config.MaxAttachmentSizeMB
+	if mb <= 0 {
+		mb = defaultMaxAttachmentSizeMB
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+// recoverAttachmentSize returns an attachment's real byte size from its
+// reported file_size. CloudKit stores file_size as a wrapped i32, so a blob in
+// [2 GiB, 4 GiB) surfaces as a NEGATIVE value; add 2^32 to recover it. This lets
+// the size gate compare correctly against any configured limit, including ones
+// raised above 2 GiB.
+func recoverAttachmentSize(fileSize int64) int64 {
+	if fileSize < 0 {
+		return fileSize + (1 << 32)
+	}
+	return fileSize
+}
 
 // oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
 // These legitimately take minutes over CloudKit, so it's far longer than the
@@ -8309,17 +8328,19 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	// Skip over-limit attachments before doing ANY work. A blob bigger than the
-	// bridgeable ceiling can't be uploaded (homeserver rejects it) and can't
-	// render in any client, so downloading + transcoding it is pure waste — and
-	// a multi-GB download wedges small hosts. file_size is a wrapped i32, so
-	// blobs ≥ 2 GiB surface as negative; treat negative or over-cap as too big.
-	// Not recorded as a retriable failure — it's permanently too large.
-	if att.FileSize < 0 || att.FileSize > maxBridgeableAttachmentBytes {
+	// configured ceiling (max_attachment_size_mb) can't be uploaded (the
+	// homeserver rejects it), so downloading + transcoding it is pure waste —
+	// and a multi-GB download wedges small hosts. file_size is a wrapped i32, so
+	// recoverAttachmentSize un-wraps the negative ones before comparing. Not
+	// recorded as a retriable failure — it's permanently too large.
+	maxAttBytes := c.maxAttachmentBytes()
+	if recoverAttachmentSize(att.FileSize) > maxAttBytes {
 		log.Info().
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
 			Str("record_name", att.RecordName).
 			Int64("file_size", att.FileSize).
+			Int64("max_bytes", maxAttBytes).
 			Msg("Skipping over-limit attachment — too large to bridge (not downloaded)")
 		return nil
 	}
@@ -8379,14 +8400,15 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Backstop the size gate: file_size is a wrapped i32, so a blob in the
 	// [4 GiB, ~4.4 GiB) window wraps to a small POSITIVE value that slips the
 	// pre-download check. Now that we know the real size, drop anything over the
-	// bridgeable ceiling before reading it into memory or transcoding it — it
+	// configured ceiling before reading it into memory or transcoding it — it
 	// can't be uploaded and would just spike RAM for a guaranteed rejection.
-	if n > maxBridgeableAttachmentBytes {
+	if n > maxAttBytes {
 		log.Info().
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
 			Str("record_name", att.RecordName).
 			Int64("bytes", n).
+			Int64("max_bytes", maxAttBytes).
 			Msg("Skipping over-limit attachment — too large to bridge (downloaded size)")
 		return nil
 	}
