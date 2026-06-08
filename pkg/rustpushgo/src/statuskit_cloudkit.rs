@@ -245,6 +245,29 @@ impl Client {
             since_token.is_some()
         );
 
+        // If the channel-map plist is empty — a fresh install, or it was
+        // cleared because it was corrupt — a saved continuation token is a
+        // trap: resuming incrementally fetches only records that CHANGED since
+        // the token, so the CD_ReceivedInvitation / CD_Channel keys already
+        // sitting in CloudKit are never re-fetched and the empty map can never
+        // rebuild. The pass drains 0 records and reports 0 keys forever. Force
+        // ONE full re-pull (drop the token) to re-fetch everything and rebuild
+        // the map; once the plist repopulates, later passes resume incrementally.
+        // Bounded by the existing 30-page-per-pass cap and the Go-side floor.
+        let since_token = {
+            let channel_map_path = subsystem_state_path(STATUSKIT_CHANNEL_MAP_FILE);
+            let persisted: PersistedChannelMap =
+                read_plist_state(&channel_map_path).unwrap_or_default();
+            if persisted.entries.is_empty() && since_token.is_some() {
+                info!(
+                    "StatusKit-CloudKit pass: channel-map plist is empty but a continuation token is set — forcing a full re-pull to rebuild from CloudKit"
+                );
+                None
+            } else {
+                since_token
+            }
+        };
+
         let cm = self.get_or_init_cloud_messages_client().await?;
 
         // Decide which candidate(s) to try.
