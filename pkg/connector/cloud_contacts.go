@@ -740,16 +740,75 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 // photoFetcher downloads a URL with authentication. Nil means use generic unauthenticated fetch.
 type photoFetcher func(ctx context.Context, url string) ([]byte, error)
 
+// deadContactPhotoURLs remembers photo URLs that returned a permanent HTTP
+// failure (401/403/404/410) so the contact-photo download phase doesn't
+// re-hammer the same dead host on every sync. The common case is a third-party
+// photo host embedded in a contact's vCard (e.g. img.contactsplus.com) that
+// blocks the bridge with a 403 — CardDAV re-supplies that URL from the vCard
+// on every sync, so nulling the in-memory contact isn't enough; the skip set
+// has to live across syncs. Keyed by URL → first-failure time; entries past
+// the TTL are retried once in case the host recovered. In-memory is sufficient
+// because the bridge runs continuously — a restart costs one retry per dead
+// URL, after which they're re-cached.
+var deadContactPhotoURLs sync.Map // url string -> time.Time
+
+// deadContactPhotoURLTTL is how long a permanently-failing photo URL stays in
+// the skip set before one retry is allowed. A week is long enough to stop the
+// per-sync hammering while still recovering if the host starts serving again.
+const deadContactPhotoURLTTL = 7 * 24 * time.Hour
+
+// contactPhotoURLDead reports whether url is currently in the dead-URL skip
+// set (and prunes the entry if its TTL has elapsed so it gets one retry).
+func contactPhotoURLDead(url string) bool {
+	v, ok := deadContactPhotoURLs.Load(url)
+	if !ok {
+		return false
+	}
+	failedAt, _ := v.(time.Time)
+	if time.Since(failedAt) > deadContactPhotoURLTTL {
+		deadContactPhotoURLs.Delete(url)
+		return false
+	}
+	return true
+}
+
+// photoFailurePermanent reports whether a photo-download error is a permanent
+// HTTP status worth caching, as opposed to a transient 429/5xx or network
+// blip that should be retried next sync. Both downloadURL and downloadAuthURL
+// format these as "HTTP <code> fetching <url>".
+func photoFailurePermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "HTTP 401 ") ||
+		strings.Contains(s, "HTTP 403 ") ||
+		strings.Contains(s, "HTTP 404 ") ||
+		strings.Contains(s, "HTTP 410 ")
+}
+
 // downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
 // set but no Avatar bytes. Uses bounded concurrency to avoid overwhelming
 // the server. If an authenticated fetcher is provided, iCloud URLs use it;
 // all other URLs use the generic unauthenticated downloader.
 func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, authFetch ...photoFetcher) {
 	var needsDownload []*imessage.Contact
+	skippedDead := 0
 	for _, c := range contacts {
 		if c.AvatarURL != "" && c.Avatar == nil {
+			if contactPhotoURLDead(c.AvatarURL) {
+				// Known-bad URL within its TTL — don't re-fetch the dead host.
+				// Treat as no photo this cycle (CardDAV re-supplies the URL next
+				// sync; it'll be skipped again until the TTL elapses).
+				c.AvatarURL = ""
+				skippedDead++
+				continue
+			}
 			needsDownload = append(needsDownload, c)
 		}
+	}
+	if skippedDead > 0 {
+		log.Debug().Int("skipped_dead_urls", skippedDead).Msg("Skipped contact photo URLs cached as permanently failing")
 	}
 	if len(needsDownload) == 0 {
 		return
@@ -784,6 +843,12 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				data, _, err = downloadURL(ctx, c.AvatarURL)
 			}
 			if err != nil {
+				// Cache permanent failures (403/401/404/410) so we stop
+				// re-fetching this dead host every sync. Transient errors
+				// (429/5xx/network) are left out so they retry next cycle.
+				if photoFailurePermanent(err) {
+					deadContactPhotoURLs.Store(c.AvatarURL, time.Now())
+				}
 				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
 					Str("name", c.Name()).
 					Str("url_host", logSafeURL(c.AvatarURL)).
