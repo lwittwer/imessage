@@ -6652,25 +6652,26 @@ impl WrappedStatusKitClient {
         self.interests.lock().await.clear();
     }
 
-    /// Returns contact handles with a confirmed-live StatusKit channel — i.e.
-    /// at least one channel for that peer has delivered a real status message
-    /// (recent_channels.last_msg_ns > 1). A peer with only placeholder
-    /// channels (last_msg_ns == 1) is NOT returned here, because that state
-    /// typically indicates the ratchet has drifted: the peer rotated to a
-    /// channel id the bridge hasn't discovered, and the stored channels
-    /// will never carry a status. Excluding them lets the Go-side re-invite
-    /// loop re-key that peer on its next tick (bounded by the per-peer 4h
-    /// KV backoff). Peers who have genuinely never toggled Focus since
-    /// keying will incur at most one extra invite every 4h, which upstream
-    /// processes as a c=227 no-op.
+    /// Returns one "from" handle (e.g. "mailto:user@icloud.com" or "tel:+1…")
+    /// for every peer the bridge holds a StatusKit key for — every entry in the
+    /// persisted `keys` map, deduped by handle.
     ///
-    /// Each returned entry is a "from" handle (e.g. "mailto:user@icloud.com"
-    /// or "tel:+1..."). Used by the Go layer both to suppress re-invites for
-    /// already-keyed peers and to resolve mailto:/tel: aliases via the IDS
-    /// correlation cache.
+    /// Both callers want exactly this set: the alias matchup links every keyed
+    /// peer to a portal so an incoming status can be ROUTED, and the re-invite
+    /// sweep skips every peer we already hold a key for. We deliberately do NOT
+    /// gate on `recent_channels.last_msg_ns`. Keys pulled from CloudKit (or
+    /// received via reshare) all start as placeholders (last_msg_ns == 1) and
+    /// only flip to "live" once a status is actually received — so gating on
+    /// live-status deadlocked the CloudKit-pull model: a bridge with hundreds
+    /// of valid keys reported ZERO handles, the alias matchup never ran (its
+    /// log: "no known peer handles, skipping" → presence never routed), AND the
+    /// re-invite sweep subtracted nothing and re-invited every keyed peer each
+    /// pass (the Apple-IDS pounding that manifests as receive-side deafness).
+    /// Holding a key is the correct criterion for both jobs, regardless of
+    /// whether that channel has carried a status yet.
     ///
-    /// Since upstream's StatusKitSharedDevice::from is private, this reads
-    /// the plist file directly.
+    /// Since upstream's StatusKitSharedDevice::from is private, this reads the
+    /// plist file directly.
     pub async fn get_known_handles(&self) -> Vec<String> {
         let state_path = subsystem_state_path("statuskit-state.plist");
         let data = match std::fs::read(&state_path) {
@@ -6686,34 +6687,13 @@ impl WrappedStatusKitClient {
             return Vec::new();
         };
 
-        // Collect channel ids (base64-encoded, matching the keys-dict key
-        // format) that have received a real status message. recent_channels
-        // stores the id as plist::Data; the keys dict uses its base64 form.
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use std::collections::HashSet;
-        let mut confirmed_ids: HashSet<String> = HashSet::new();
-        if let Some(rc) = dict.get("recent_channels").and_then(|v| v.as_array()) {
-            for entry in rc {
-                let Some(d) = entry.as_dictionary() else { continue };
-                let last_ns = d.get("last_msg_ns").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
-                if last_ns <= 1 {
-                    continue;
-                }
-                let Some(ident) = d.get("identifier").and_then(|v| v.as_dictionary()) else { continue };
-                let Some(id_data) = ident.get("id").and_then(|v| v.as_data()) else { continue };
-                confirmed_ids.insert(B64.encode(id_data));
-            }
-        }
-
-        // A handle is reported as known if ANY of its channels is confirmed.
-        // Dedup by handle so a single confirmed channel still covers peers
-        // with duplicate placeholder entries.
-        let mut seen: HashSet<String> = HashSet::new();
+        // One "from" handle per keyed peer, deduped. No last_msg_ns gate — see
+        // the doc comment above: every entry in keys_dict is a peer we hold a
+        // key for, which is exactly what both consumers (alias matchup +
+        // re-invite suppression) need, whether or not a live status has landed.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut handles = Vec::new();
-        for (channel_id, entry) in keys_dict {
-            if !confirmed_ids.contains(channel_id) {
-                continue;
-            }
+        for (_channel_id, entry) in keys_dict {
             let Some(entry_dict) = entry.as_dictionary() else { continue };
             let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else { continue };
             if seen.insert(from_str.to_string()) {
