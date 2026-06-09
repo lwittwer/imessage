@@ -146,6 +146,14 @@ type statusKitPassMeta struct {
 	// exactly right — a pre-existing account is treated as mid-drain on its
 	// first post-upgrade pass and gets one full walk.
 	DrainComplete bool
+	// RecoveryRepullDone records that we've already forced a one-shot full
+	// re-walk to recover from the stranded-keys trap: a cached continuation
+	// token parked past CD_ReceivedInvitation records that were never decoded
+	// into peer keys, so incremental fetches return 0 forever and Established
+	// never flips. Sticky once set so a genuinely peer-less account doesn't
+	// re-walk the whole zone on every pass. See the recovery block in
+	// syncCloudStatusKitPeers.
+	RecoveryRepullDone bool
 }
 
 func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
@@ -175,6 +183,9 @@ func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 	if len(parts) >= 5 {
 		m.DrainComplete = parts[4] == "1"
 	}
+	if len(parts) >= 6 {
+		m.RecoveryRepullDone = parts[5] == "1"
+	}
 	return m
 }
 
@@ -185,7 +196,7 @@ func (m statusKitPassMeta) encode() string {
 		}
 		return 0
 	}
-	return fmt.Sprintf("%d:%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys), b2i(m.DrainComplete))
+	return fmt.Sprintf("%d:%d:%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys), b2i(m.DrainComplete), b2i(m.RecoveryRepullDone))
 }
 
 // nextAllowedAt returns the earliest time at which a new pass may run.
@@ -443,10 +454,42 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		}
 	}
 
+	// Stranded-keys recovery guard. If we hold a continuation token but have
+	// never pulled a single peer key (Established=false), the token is parked
+	// past CD_ReceivedInvitation records that were already in CloudKit before
+	// we could decode them — incremental fetches return 0 forever, Established
+	// never flips, and presence never hydrates. A bridge can land here after
+	// running a build with the old 30-page cap on a large account (the tail
+	// stranded behind the token), or any time a full walk happened to insert 0
+	// keys. The Rust channel-map-empty guard does NOT catch this: the channel
+	// map can be fully populated from CD_Channel records while zero invitations
+	// were ever decoded into keys.
+	//
+	// Force ONE full re-walk by dropping the token. Bounded by
+	// RecoveryRepullDone (sticky) so a genuinely peer-less account doesn't
+	// re-walk the whole zone every pass: once attempted, later passes resume
+	// forward from the persisted mid-walk token via the normal drainComplete
+	// machinery instead of restarting. If the re-walk finds keys, Established
+	// flips true and this guard never fires again; if it finds none, the latch
+	// stops further forced walks and a future invitation arrives via the
+	// incremental token as a normal change.
+	forcedRecoveryRepull := false
+	if sinceToken != nil && !meta.Established && !meta.RecoveryRepullDone {
+		log.Info().
+			Time("parked_token_last_attempt", meta.LastAttempt).
+			Msg("StatusKit-CloudKit pass: cached token but no peer keys ever pulled — forcing a one-shot full re-walk to recover stranded keys")
+		sinceToken = nil
+		if clrErr := c.cloudStore.clearZoneToken(ctx, statusKitCloudTokenRow); clrErr != nil {
+			log.Info().Err(clrErr).Msg("StatusKit-CloudKit pass: failed to clear token row for recovery re-walk (continuing — FFI still gets a nil token)")
+		}
+		forcedRecoveryRepull = true
+	}
+
 	log.Info().
 		Bool("has_cached_zone", cachedZone != nil).
 		Interface("cached_zone", cachedZone).
 		Bool("has_cached_token", sinceToken != nil).
+		Bool("forced_recovery_repull", forcedRecoveryRepull).
 		Msg("StatusKit-CloudKit pass: invoking FFI")
 
 	// Wrap in safeFFICall to match the panic-isolation pattern used by
@@ -481,6 +524,12 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			LastAttempt:    attemptStart,
 			Established:    meta.Established,    // sticky — never un-establish
 			LastPulledKeys: meta.LastPulledKeys, // carried over unless a success updates it below
+			// Sticky once we've forced a recovery re-walk, so a peer-less account
+			// doesn't restart the walk from scratch every pass. Recorded
+			// regardless of pass outcome — the re-walk has been attempted either
+			// way, and a failed attempt left the token cleared so the next pass
+			// still does a full (no-token) walk.
+			RecoveryRepullDone: meta.RecoveryRepullDone || forcedRecoveryRepull,
 		}
 		if ffiErr != nil {
 			newMeta.ConsecutiveErrs = meta.ConsecutiveErrs + 1
