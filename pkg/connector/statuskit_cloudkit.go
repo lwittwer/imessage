@@ -86,6 +86,19 @@ const statusKitSuccessFloor = 12 * time.Hour
 // See docs/postmortem-statuskit-clique-kick-2026-05-09.md.
 const statusKitFreshFloor = 30 * time.Minute
 
+// statusKitDrainResumeFloor is the (short) interval before resuming a drain
+// that hasn't finished walking the zone yet. The 12h success floor — and even
+// the 30m fresh floor — must NOT apply while the continuation token is still
+// outstanding: a large account (James: 1,480 chats, many pages of
+// CD_ReceivedInvitation / CD_Channel records) can't be fully walked if the
+// gate parks the pass on a long floor mid-drain, and the un-walked tail of
+// peer keys then never hydrates so those contacts' presence stays dark. The
+// post-backfill restart trigger runs under context.Background (no timeout) and
+// drains the whole zone in one pass, so this floor only governs the rare case
+// where a bounded-ctx periodic pass is cancelled mid-walk — resume soon and
+// finish. See nextAllowedAt.
+const statusKitDrainResumeFloor = 2 * time.Minute
+
 // statusKitPullTickInterval is how often the background loop (runStatusKitPullLoop)
 // offers the pass a chance to run. The pass's own floor gate decides whether to
 // actually contact Apple — once keys are established most ticks are a cheap
@@ -123,6 +136,16 @@ type statusKitPassMeta struct {
 	// catch the rest of an in-flight reshare stream; once a pass comes up
 	// empty it backs off to the 12h steady-state floor.
 	LastPulledKeys bool
+	// DrainComplete records whether the most recent successful pass walked the
+	// zone all the way to the end (continuation token exhausted) rather than
+	// stopping early (a cancelled bounded-ctx pass, or the page backstop). The
+	// 12h success floor and the 30m fresh floor are BOTH gated on this: while a
+	// drain is incomplete the gate returns the short statusKitDrainResumeFloor
+	// so the pass resumes and finishes instead of stranding the un-walked tail
+	// of peer keys for hours. Defaults false for old 2/4-field rows, which is
+	// exactly right — a pre-existing account is treated as mid-drain on its
+	// first post-upgrade pass and gets one full walk.
+	DrainComplete bool
 }
 
 func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
@@ -149,6 +172,9 @@ func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 		m.Established = parts[2] == "1"
 		m.LastPulledKeys = parts[3] == "1"
 	}
+	if len(parts) >= 5 {
+		m.DrainComplete = parts[4] == "1"
+	}
 	return m
 }
 
@@ -159,7 +185,7 @@ func (m statusKitPassMeta) encode() string {
 		}
 		return 0
 	}
-	return fmt.Sprintf("%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys))
+	return fmt.Sprintf("%d:%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys), b2i(m.DrainComplete))
 }
 
 // nextAllowedAt returns the earliest time at which a new pass may run.
@@ -172,10 +198,22 @@ func (m statusKitPassMeta) nextAllowedAt(retryAfterHint time.Duration) time.Time
 		return time.Time{}
 	}
 	if m.ConsecutiveErrs == 0 && retryAfterHint == 0 {
-		// Successful previous pass. Pull on the gentle fresh floor while keys
-		// haven't been established yet (fresh/large account whose reshares are
-		// still landing) or while keys are actively arriving; back off to the
-		// 12h steady-state only once we have keys AND the stream went quiet.
+		// The longer floors only apply once the zone has been walked to the
+		// end. While a drain is still incomplete — the continuation token is
+		// outstanding because a bounded-ctx pass was cancelled mid-walk, or a
+		// large account spans more pages than one pass finished — resume on the
+		// short drain floor so the pass picks up where it left off and
+		// completes. Parking on a 30m/12h floor here would strand the
+		// un-walked tail of peer keys and presence for those contacts never
+		// hydrates. This is David's invariant: the 12h back-off only kicks in
+		// once the drain is complete.
+		if !m.DrainComplete {
+			return m.LastAttempt.Add(statusKitDrainResumeFloor)
+		}
+		// Drain complete. Pull on the gentle fresh floor while keys haven't
+		// been established yet (fresh/large account whose reshares are still
+		// landing) or while keys are actively arriving; back off to the 12h
+		// steady-state only once we have keys AND the stream went quiet.
 		if !m.Established || m.LastPulledKeys {
 			return m.LastAttempt.Add(statusKitFreshFloor)
 		}
@@ -430,6 +468,10 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		totalDecodeFailed uint32
 		totalRecordsSeen  uint32
 		injectedHandles   []string
+		// drainComplete latches true only when the drain loop walks the zone to
+		// the end (token exhausted / empty fetch). Stays false if the pass is
+		// cancelled mid-walk or hits the page backstop, so the gate resumes it.
+		drainComplete bool
 	)
 
 	attemptStart := time.Now()
@@ -453,6 +495,11 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			if pulled {
 				newMeta.Established = true
 			}
+			// Record whether the zone was walked to the end. The gate uses this
+			// to decide between the short resume floor (drain still in progress)
+			// and the fresh/12h floors (drain finished). A pass cancelled
+			// mid-walk leaves this false so the next pass resumes the drain.
+			newMeta.DrainComplete = drainComplete
 		}
 		encoded := newMeta.encode()
 		if persistErr := c.cloudStore.setSyncStateSuccess(ctx, statusKitCloudPassMetaRow, &encoded); persistErr != nil {
@@ -473,12 +520,32 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// the per-pass CKKS round-trip count bounded even if Apple keeps
 	// returning continuation tokens — far below the per-pass budget that
 	// produced the early-testing clique-kick.
+	// Walk every page to completion, the same way the message and chat CloudKit
+	// drains do (syncCloudMessages pages back-to-back up to maxCloudSyncPages
+	// with no artificial per-pass cap). The old 30-page cap is what stranded a
+	// large account like James's: his zone spans far more than 30 pages, so the
+	// pass stopped with the continuation token still outstanding and the
+	// inter-pass gate then parked it on the 12h floor before the tail ever
+	// drained — those peers' keys never hydrated and their presence stayed
+	// dark. drainComplete (below) latches only when the token is exhausted, and
+	// the gate keeps the pass on the short resume floor until then. The
+	// post-backfill restart trigger runs under context.Background (no timeout),
+	// so it can drain the whole zone in a single pass.
+	//
+	// Pacing is deliberately slow-and-steady at 5s/page — gentler than the
+	// message/chat drains (which page with no delay and don't trip Apple's
+	// rate limits in production) so a long initial walk of the rate-sensitive
+	// LimitedPeersAllowed view stays well clear of any throttle.
 	const (
-		maxPagesPerPass = 30
-		interPageDelay  = 1 * time.Second
+		maxPagesPerPass = maxCloudSyncPages
+		interPageDelay  = 5 * time.Second
 	)
 	currentZone := cachedZone
 	currentToken := sinceToken
+	prevTokenStr := ""
+	if currentToken != nil {
+		prevTokenStr = base64.StdEncoding.EncodeToString(*currentToken)
+	}
 
 	for pageNum := 1; pageNum <= maxPagesPerPass; pageNum++ {
 		page, err := safeFFICall("CloudSyncStatuskitPeers", func() (rustpushgo.CloudSyncStatusKitPage, error) {
@@ -574,15 +641,30 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			}
 		}
 
-		// Stop draining when there are no more pages, or when this page
-		// returned no records (steady-state empty fetch).
-		if page.NextToken == nil || len(*page.NextToken) == 0 || page.Fetched == 0 {
+		// Done detection mirrors syncCloudMessages: stop when the API signals
+		// no more pages (missing/empty continuation token or an empty fetch),
+		// or when the token stops advancing (defensive against a server that
+		// keeps echoing the same token). Any of these means the zone is fully
+		// walked, so latch drainComplete — the ONLY condition that lets the
+		// inter-pass gate fall through from the short resume floor to the
+		// fresh/12h floors.
+		nextTokenStr := ""
+		if page.NextToken != nil {
+			nextTokenStr = base64.StdEncoding.EncodeToString(*page.NextToken)
+		}
+		if page.NextToken == nil || len(*page.NextToken) == 0 || page.Fetched == 0 || (pageNum > 1 && nextTokenStr == prevTokenStr) {
+			drainComplete = true
 			break
 		}
+		prevTokenStr = nextTokenStr
 		currentToken = page.NextToken
 
-		// Pace the next page fetch — keeps the per-pass CKKS round-trip
-		// rate gentle even on a long initial drain.
+		// Pace the next page fetch — slow and steady. On the bounded-ctx
+		// periodic path a cancel here returns mid-walk with drainComplete still
+		// false, so the next pass resumes from the persisted token (the gate
+		// uses the short resume floor). The post-backfill restart path runs
+		// under context.Background and never cancels, so it drains the whole
+		// zone in one pass.
 		select {
 		case <-time.After(interPageDelay):
 		case <-ctx.Done():
@@ -597,6 +679,7 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		Uint32("total_decode_failed", totalDecodeFailed).
 		Uint32("total_records_seen", totalRecordsSeen).
 		Int("total_injected_handles", len(injectedHandles)).
+		Bool("drain_complete", drainComplete).
 		Msg("StatusKit-CloudKit pass: drain complete")
 
 	// If we injected any new peer keys (across all drained pages), fire a
