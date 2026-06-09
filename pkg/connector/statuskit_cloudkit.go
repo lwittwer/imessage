@@ -535,11 +535,15 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			Established:    meta.Established,    // sticky — never un-establish
 			LastPulledKeys: meta.LastPulledKeys, // carried over unless a success updates it below
 			// Sticky once we've forced a recovery re-walk, so a peer-less account
-			// doesn't restart the walk from scratch every pass. Recorded
-			// regardless of pass outcome — the re-walk has been attempted either
-			// way, and a failed attempt left the token cleared so the next pass
-			// still does a full (no-token) walk.
-			RecoveryRepullDone: meta.RecoveryRepullDone || forcedRecoveryRepull,
+			// doesn't restart the walk from scratch every pass — but ONLY latch on
+			// a successful pass. If the FFI errored AND the token-row clear also
+			// failed (DB write error), the parked token is still present; latching
+			// here would block the guard from ever re-firing and leave the account
+			// permanently re-stranded. Leaving the latch false on error lets the
+			// next pass re-attempt recovery. (On error where the clear succeeded,
+			// the now-nil token drives a full walk anyway and the guard's
+			// sinceToken!=nil check stops a redundant re-fire.)
+			RecoveryRepullDone: meta.RecoveryRepullDone || (forcedRecoveryRepull && ffiErr == nil),
 		}
 		if ffiErr != nil {
 			newMeta.ConsecutiveErrs = meta.ConsecutiveErrs + 1
