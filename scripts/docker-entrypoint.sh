@@ -125,6 +125,30 @@ if [ "$(id -u)" = "0" ] && [ -z "${ENTRYPOINT_PRIV_DROPPED:-}" ]; then
         esac
     fi
 
+    # Renumber the baked `bridge` user/group to the requested PUID/PGID so the
+    # override variable actually works. The image hardcodes bridge at 1000:1000;
+    # without this, setpriv drops to a bare numeric PUID that does NOT own
+    # /home/bridge (baked at 1000), so the bridge can't read/write its state
+    # plists under $HOME/.local/share/mautrix-imessage (statuskit-state.plist,
+    # trustedpeers.plist, …). They silently fail to load and keys/presence reset
+    # every start. Renumbering gives PUID a real /etc/passwd entry whose HOME
+    # (/home/bridge) and state dir it owns. No-op when PUID/PGID == 1000:1000
+    # (the default), so the common case is unchanged. -o permits a non-unique id
+    # (e.g. matching a host uid that collides with a system account).
+    cur_uid="$(id -u bridge 2>/dev/null || echo 1000)"
+    cur_gid="$(getent group bridge 2>/dev/null | cut -d: -f3)"
+    [ -n "$cur_gid" ] || cur_gid=1000
+    if [ "$PGID" != "$cur_gid" ]; then
+        groupmod -o -g "$PGID" bridge 2>/dev/null || true
+    fi
+    if [ "$PUID" != "$cur_uid" ]; then
+        usermod -o -u "$PUID" bridge 2>/dev/null || true
+    fi
+    if [ "$PUID" != "$cur_uid" ] || [ "$PGID" != "$cur_gid" ]; then
+        echo "[entrypoint] renumbered bridge user $cur_uid:$cur_gid → $PUID:$PGID; chowning /home/bridge"
+        chown -R "$PUID:$PGID" /home/bridge 2>/dev/null || true
+    fi
+
     # --clear-groups (not --init-groups): --init-groups looks PUID up in
     # /etc/passwd via getpwuid, which fails for arbitrary UIDs without an
     # /etc/passwd entry (UNRAID 99:100, TrueNAS 568:568, etc.). --clear-groups

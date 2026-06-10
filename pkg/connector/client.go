@@ -89,9 +89,28 @@ type recycleBinCandidate struct {
 // failedAttachmentEntry tracks a CloudKit attachment download/upload failure
 // with a retry count. After maxAttachmentRetries attempts the attachment is
 // abandoned to avoid infinite retries on permanently corrupted records.
+//
+// abandoned is sticky once set: the pre-upload filter keeps the entry instead
+// of deleting it, so an exhausted attachment stays skipped for the rest of the
+// session. Deleting it (the old behavior) reset the counter and made the same
+// dead attachment re-download on every sync sweep — an infinite loop.
 type failedAttachmentEntry struct {
 	lastError string
 	retries   int
+	abandoned bool
+}
+
+// unrecoverableAttachmentMarker is the prefix the Rust download path stamps on
+// errors that mean CloudKit no longer serves the asset at all (Apple aged out
+// the MMCS blob: no body / no matching reference / missing identifiers). Such
+// attachments are tombstoned immediately so the bridge never re-attempts them,
+// even across restarts. See cloud_download_attachment in pkg/rustpushgo.
+const unrecoverableAttachmentMarker = "ATTACHMENT_UNRECOVERABLE"
+
+// isUnrecoverableAttachmentError reports whether a download error means the
+// asset is permanently gone (vs a transient/network failure worth retrying).
+func isUnrecoverableAttachmentError(errMsg string) bool {
+	return strings.Contains(errMsg, unrecoverableAttachmentMarker)
 }
 
 type restoreStatusFunc func(format string, args ...any)
@@ -118,9 +137,66 @@ func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAtt
 	if prev, loaded := c.failedAttachments.Load(recordName); loaded {
 		old := prev.(*failedAttachmentEntry)
 		entry.retries = old.retries + 1
+		entry.abandoned = old.abandoned
+	}
+	// Permanently-gone assets (Apple no longer serves them) get a persistent
+	// tombstone on the FIRST failure so the bridge never re-downloads them,
+	// even across restarts. Transient failures fall back to the in-session
+	// retry budget: abandoned (skipped) for the rest of THIS session once
+	// exhausted, but re-tried after a restart in case the failure was a blip.
+	if isUnrecoverableAttachmentError(errMsg) {
+		entry.abandoned = true
+		c.markAttachmentDead(recordName, errMsg)
+	} else if entry.retries >= maxAttachmentRetries {
+		entry.abandoned = true
 	}
 	c.failedAttachments.Store(recordName, entry)
 	return entry
+}
+
+// ensureDeadAttachmentsLoaded populates the in-memory deadAttachments set from
+// the persistent cloud_attachment_dead table, exactly once per session. Loading
+// is lazy (first skip-check or first failure) so it works for both the bulk
+// startup pre-upload and the per-chunk capped-backfill path.
+func (c *IMClient) ensureDeadAttachmentsLoaded() {
+	c.deadAttachmentsOnce.Do(func() {
+		if c.cloudStore == nil {
+			return
+		}
+		names, err := c.cloudStore.loadDeadAttachments(context.Background())
+		if err != nil {
+			c.UserLogin.Log.Warn().Err(err).
+				Msg("Failed to load dead-attachment tombstones; may re-attempt aged-out attachments")
+			return
+		}
+		for _, name := range names {
+			c.deadAttachments.Store(name, struct{}{})
+		}
+		if len(names) > 0 {
+			c.UserLogin.Log.Debug().Int("count", len(names)).
+				Msg("Loaded dead-attachment tombstones (CloudKit no longer serves these)")
+		}
+	})
+}
+
+// isDeadAttachment reports whether record_name is tombstoned as permanently
+// un-downloadable, so callers skip it without touching CloudKit.
+func (c *IMClient) isDeadAttachment(recordName string) bool {
+	c.ensureDeadAttachmentsLoaded()
+	_, dead := c.deadAttachments.Load(recordName)
+	return dead
+}
+
+// markAttachmentDead tombstones an attachment that CloudKit no longer serves,
+// in memory and persistently. Best-effort: a failed DB write just means the
+// skip won't survive a restart (the attachment re-fails and re-tombstones).
+func (c *IMClient) markAttachmentDead(recordName, reason string) {
+	if _, loaded := c.deadAttachments.LoadOrStore(recordName, struct{}{}); loaded {
+		return // already tombstoned this session
+	}
+	if c.cloudStore != nil {
+		c.cloudStore.saveDeadAttachment(context.Background(), recordName, reason)
+	}
 }
 
 type IMClient struct {
@@ -223,6 +299,13 @@ type IMClient struct {
 	// its natural "let me try again" semantics; if that pass also fails,
 	// the persisted backoff resumes and steady-state behavior takes over.
 	statusKitCloudPassFirstCallDone atomic.Bool
+
+	// statusKitPassInFlight is a single-flight guard so only one
+	// syncCloudStatusKitPeers pass runs at a time. The periodic pull loop, the
+	// post-backfill trigger, and the cloud-sync phases can all call it; two
+	// concurrent passes would race on the shared continuation-token / pass-meta
+	// rows and double the CKKS round-trips. Released in a defer.
+	statusKitPassInFlight atomic.Bool
 
 	// statusKitShareMu serializes the cooldown-check / publish /
 	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
@@ -397,6 +480,15 @@ type IMClient struct {
 	// attachment loss. Capped at maxAttachmentRetries to avoid infinite retries
 	// on permanently corrupted CloudKit records.
 	failedAttachments sync.Map
+
+	// deadAttachments is a persistent negative cache of CloudKit record_names
+	// that CloudKit no longer serves (Apple aged out the underlying MMCS blob).
+	// Backed by the cloud_attachment_dead table so the skip survives restarts —
+	// without it the bridge re-downloads-and-re-fails the same dead old
+	// attachments on every sync sweep. Loaded once via deadAttachmentsOnce.
+	// Values are struct{}.
+	deadAttachments     sync.Map
+	deadAttachmentsOnce sync.Once
 
 	// startupTime records when this session connected. Used to suppress
 	// read receipts for messages that pre-date this session: re-delivered
@@ -1431,6 +1523,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		if !debugDisablePrivacy {
 			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
 		}
+		// Periodically re-run the StatusKit-CloudKit peer-key pull. The cloud
+		// sync only fires it at startup; without this loop, peer keys that
+		// reshare in later (the common case on fresh/large accounts) are never
+		// pulled until the next restart. Self-gated to a gentle cadence — see
+		// runStatusKitPullLoop / statusKitFreshFloor.
+		go c.runStatusKitPullLoop(log.With().Str("component", "statuskit_pull").Logger(), c.stopChan)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -8345,6 +8443,18 @@ func (c *IMClient) downloadAndUploadAttachment(
 		return nil
 	}
 
+	// Permanently tombstoned: CloudKit no longer serves this asset (Apple aged
+	// out the MMCS blob). Skip without touching CloudKit — re-attempting it just
+	// re-fails. Not recorded as a retriable failure; it's gone for good.
+	if c.isDeadAttachment(att.RecordName) {
+		log.Debug().
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Msg("Skipping tombstoned attachment — CloudKit no longer serves it")
+		return nil
+	}
+
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
@@ -8843,19 +8953,28 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 				continue // already cached from a previous pass
 			}
+			// Permanently tombstoned (CloudKit no longer serves it). Skip
+			// without re-attempting — this is what stops the dead old
+			// attachments from being re-downloaded on every sync sweep.
+			if c.isDeadAttachment(att.RecordName) {
+				continue
+			}
 			// Check if this attachment has failed before and whether
 			// it has exceeded the retry limit.
 			prev, isFailed := c.failedAttachments.Load(att.RecordName)
 			if isFailed {
 				fe := prev.(*failedAttachmentEntry)
-				if fe.retries >= maxAttachmentRetries {
-					log.Warn().
+				if fe.abandoned || fe.retries >= maxAttachmentRetries {
+					// Don't delete the entry — keep it so this attachment stays
+					// skipped for the rest of the session. Deleting it reset the
+					// retry counter and made the same dead attachment re-download
+					// on the next sweep (the infinite-loop bug).
+					log.Debug().
 						Str("record_name", att.RecordName).
 						Str("portal_id", row.PortalID).
 						Str("last_error", fe.lastError).
 						Int("retries", fe.retries).
-						Msg("Pre-upload: abandoning attachment after max retries")
-					c.failedAttachments.Delete(att.RecordName)
+						Msg("Pre-upload: skipping attachment, retry budget exhausted")
 					continue
 				}
 			}
@@ -9223,22 +9342,57 @@ func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
 // behind CardDAV success — refreshAllSharedProfiles only needs CloudKit
 // (ProfilesClient) and runs independently even if SyncContacts errors.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
+	const (
+		base = 15 * time.Minute
+		max  = 6 * time.Hour
+	)
+	interval := base
+	failures := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if err := c.contacts.SyncContacts(log); err != nil {
-				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
+				failures++
+				interval = contactSyncBackoff(base, max, failures)
+				ev := log.Warn().Err(err).Int("failures", failures).Dur("next_in", interval)
+				if errors.Is(err, errICloudContactsThrottled) {
+					ev = ev.Bool("throttled", true)
+				}
+				ev.Msg("Periodic CardDAV sync failed — backing off to avoid hammering iCloud")
 			} else {
+				if failures > 0 {
+					log.Info().Msg("CardDAV sync recovered — resetting to base interval")
+				}
+				failures = 0
+				interval = base
 				c.setContactsReady(log)
 				c.persistMmeDelegate(log)
 			}
 			c.refreshAllSharedProfiles(log)
+			timer.Reset(interval)
 		case <-c.stopChan:
 			return
 		}
 	}
+}
+
+// contactSyncBackoff returns base doubled per consecutive failure, capped at
+// max: 15m → 30m → 1h → 2h → 4h → 6h. Keeps a throttled (403) contacts sync
+// from retrying at its fixed cadence and compounding the rate limit.
+func contactSyncBackoff(base, max time.Duration, failures int) time.Duration {
+	if failures <= 1 {
+		return base
+	}
+	d := base
+	for i := 1; i < failures && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 // persistMmeDelegate saves the current MobileMe delegate to user_login metadata
@@ -9272,16 +9426,28 @@ func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
 // when it fails on startup (e.g., expired MobileMe delegate). Once contacts
 // succeed, the readiness gate opens and cloud sync begins.
 func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
+	const (
+		base = 2 * time.Minute
+		max  = 1 * time.Hour
+	)
+	interval := base
+	failures := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
 			c.contacts = newCloudContactsClient(c.client, log)
 			if c.contacts != nil {
 				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
-					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
+					failures++
+					interval = contactSyncBackoff(base, max, failures)
+					ev := log.Warn().Err(syncErr).Int("failures", failures).Dur("next_in", interval)
+					if errors.Is(syncErr, errICloudContactsThrottled) {
+						ev = ev.Bool("throttled", true)
+					}
+					ev.Msg("Cloud contacts retry: sync failed — backing off to avoid hammering iCloud")
 				} else {
 					c.setContactsReady(log)
 					c.persistMmeDelegate(log)
@@ -9290,8 +9456,11 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 					return
 				}
 			} else {
-				log.Warn().Msg("Cloud contacts retry: still unavailable")
+				failures++
+				interval = contactSyncBackoff(base, max, failures)
+				log.Warn().Int("failures", failures).Dur("next_in", interval).Msg("Cloud contacts retry: still unavailable — backing off")
 			}
+			timer.Reset(interval)
 		case <-c.stopChan:
 			return
 		}
