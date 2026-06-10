@@ -7,3 +7,9 @@ func TestIMessageBridgeIconUsesMatrixMediaURI(t *testing.T) {
 		t.Fatalf("iMessageBridgeIconMXC = %q, want official mautrix iMessage icon", iMessageBridgeIconMXC)
 	}
 }
+
+func TestIMessageBeeperBridgeTypeUsesBridgeSoftwareID(t *testing.T) {
+	if iMessageBeeperBridgeType != "imessagego" {
+		t.Fatalf("iMessageBeeperBridgeType = %q, want imessagego", iMessageBeeperBridgeType)
+	}
+}

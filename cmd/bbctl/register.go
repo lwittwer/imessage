@@ -17,7 +17,10 @@ import (
 	"github.com/lrhodin/imessage/pkg/imconfig"
 )
 
-const iMessageBridgeIconMXC = "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX"
+const (
+	iMessageBridgeIconMXC    = "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX"
+	iMessageBeeperBridgeType = "imessagego"
+)
 
 var configCommand = &cli.Command{
 	Name:      "config",
@@ -109,11 +112,14 @@ func cmdConfig(ctx *cli.Context) error {
 	output := imconfig.WrapNetwork() + baseConfig
 
 	// Notify Beeper that this bridge is registered and starting
+	// Beeper's account-level bridge metadata uses the bridge software ID
+	// (`imessagego`) for icon lookup. Room bridge info still uses the Matrix
+	// protocol ID (`imessage`) in pkg/connector.
 	err = beeperapi.PostBridgeState(baseDomain, envCfg.Username, bridge, reg.AppToken, beeperapi.ReqPostBridgeState{
 		StateEvent:   status.StateStarting,
 		Reason:       "SELF_HOST_REGISTERED",
 		IsSelfHosted: true,
-		BridgeType:   "imessage",
+		BridgeType:   iMessageBeeperBridgeType,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to post bridge state: %v\n", err)
