@@ -39,6 +39,11 @@ var (
 	BuildTime = "unknown"
 )
 
+const (
+	legacyBeeperIMessageIconMXC = "mxc://beeper.com/imessage"
+	iMessageBridgeIconMXC       = "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX"
+)
+
 var m = mxmain.BridgeMain{
 	Name:        "mautrix-imessage",
 	URL:         "https://github.com/lrhodin/imessage",
@@ -140,6 +145,7 @@ func main() {
 	// Instead of m.Run(), manually call PreInit/Init/Start so we can
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
+	repairBeeperBotAvatar(&m)
 	ensureSecureDeleteDSN(&m)
 	repairPermissions(&m)
 	m.Init()
@@ -173,6 +179,37 @@ func ensureSecureDeleteDSN(br *mxmain.BridgeMain) {
 		sep = "&"
 	}
 	br.Config.Database.URI = uri + sep + "_secure_delete=on"
+}
+
+// repairBeeperBotAvatar replaces the Beeper-only pseudo-MXC once used by this
+// repo's bbctl config path. Element cannot resolve that URI as normal Matrix
+// media, so use the same public iMessage icon as the official mautrix templates.
+func repairBeeperBotAvatar(br *mxmain.BridgeMain) {
+	if br.Config == nil || br.Config.AppService.Bot.Avatar != legacyBeeperIMessageIconMXC {
+		return
+	}
+	parsed, err := id.ParseContentURI(iMessageBridgeIconMXC)
+	if err != nil {
+		return
+	}
+	br.Config.AppService.Bot.Avatar = iMessageBridgeIconMXC
+	br.Config.AppService.Bot.ParsedAvatar = parsed
+
+	if br.ConfigPath != "" {
+		repairBeeperBotAvatarOnDisk(br.ConfigPath)
+	}
+}
+
+func repairBeeperBotAvatarOnDisk(configPath string) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	updated := strings.ReplaceAll(string(data), legacyBeeperIMessageIconMXC, iMessageBridgeIconMXC)
+	if updated == string(data) {
+		return
+	}
+	_ = os.WriteFile(configPath, []byte(updated), 0600)
 }
 
 // repairPermissions detects and fixes broken bridge.permissions before the
