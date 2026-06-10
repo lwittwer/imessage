@@ -6767,25 +6767,26 @@ impl WrappedStatusKitClient {
         self.interests.lock().await.clear();
     }
 
-    /// Returns contact handles with a confirmed-live StatusKit channel — i.e.
-    /// at least one channel for that peer has delivered a real status message
-    /// (recent_channels.last_msg_ns > 1). A peer with only placeholder
-    /// channels (last_msg_ns == 1) is NOT returned here, because that state
-    /// typically indicates the ratchet has drifted: the peer rotated to a
-    /// channel id the bridge hasn't discovered, and the stored channels
-    /// will never carry a status. Excluding them lets the Go-side re-invite
-    /// loop re-key that peer on its next tick (bounded by the per-peer 4h
-    /// KV backoff). Peers who have genuinely never toggled Focus since
-    /// keying will incur at most one extra invite every 4h, which upstream
-    /// processes as a c=227 no-op.
+    /// Returns one "from" handle (e.g. "mailto:user@icloud.com" or "tel:+1…")
+    /// for every peer the bridge holds a StatusKit key for — every entry in the
+    /// persisted `keys` map, deduped by handle.
     ///
-    /// Each returned entry is a "from" handle (e.g. "mailto:user@icloud.com"
-    /// or "tel:+1..."). Used by the Go layer both to suppress re-invites for
-    /// already-keyed peers and to resolve mailto:/tel: aliases via the IDS
-    /// correlation cache.
+    /// Both callers want exactly this set: the alias matchup links every keyed
+    /// peer to a portal so an incoming status can be ROUTED, and the re-invite
+    /// sweep skips every peer we already hold a key for. We deliberately do NOT
+    /// gate on `recent_channels.last_msg_ns`. Keys pulled from CloudKit (or
+    /// received via reshare) all start as placeholders (last_msg_ns == 1) and
+    /// only flip to "live" once a status is actually received — so gating on
+    /// live-status deadlocked the CloudKit-pull model: a bridge with hundreds
+    /// of valid keys reported ZERO handles, the alias matchup never ran (its
+    /// log: "no known peer handles, skipping" → presence never routed), AND the
+    /// re-invite sweep subtracted nothing and re-invited every keyed peer each
+    /// pass (the Apple-IDS pounding that manifests as receive-side deafness).
+    /// Holding a key is the correct criterion for both jobs, regardless of
+    /// whether that channel has carried a status yet.
     ///
-    /// Since upstream's StatusKitSharedDevice::from is private, this reads
-    /// the plist file directly.
+    /// Since upstream's StatusKitSharedDevice::from is private, this reads the
+    /// plist file directly.
     pub async fn get_known_handles(&self) -> Vec<String> {
         let state_path = subsystem_state_path("statuskit-state.plist");
         let data = match std::fs::read(&state_path) {
@@ -6801,34 +6802,13 @@ impl WrappedStatusKitClient {
             return Vec::new();
         };
 
-        // Collect channel ids (base64-encoded, matching the keys-dict key
-        // format) that have received a real status message. recent_channels
-        // stores the id as plist::Data; the keys dict uses its base64 form.
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use std::collections::HashSet;
-        let mut confirmed_ids: HashSet<String> = HashSet::new();
-        if let Some(rc) = dict.get("recent_channels").and_then(|v| v.as_array()) {
-            for entry in rc {
-                let Some(d) = entry.as_dictionary() else { continue };
-                let last_ns = d.get("last_msg_ns").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
-                if last_ns <= 1 {
-                    continue;
-                }
-                let Some(ident) = d.get("identifier").and_then(|v| v.as_dictionary()) else { continue };
-                let Some(id_data) = ident.get("id").and_then(|v| v.as_data()) else { continue };
-                confirmed_ids.insert(B64.encode(id_data));
-            }
-        }
-
-        // A handle is reported as known if ANY of its channels is confirmed.
-        // Dedup by handle so a single confirmed channel still covers peers
-        // with duplicate placeholder entries.
-        let mut seen: HashSet<String> = HashSet::new();
+        // One "from" handle per keyed peer, deduped. No last_msg_ns gate — see
+        // the doc comment above: every entry in keys_dict is a peer we hold a
+        // key for, which is exactly what both consumers (alias matchup +
+        // re-invite suppression) need, whether or not a live status has landed.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut handles = Vec::new();
-        for (channel_id, entry) in keys_dict {
-            if !confirmed_ids.contains(channel_id) {
-                continue;
-            }
+        for (_channel_id, entry) in keys_dict {
             let Some(entry_dict) = entry.as_dictionary() else { continue };
             let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else { continue };
             if seen.insert(from_str.to_string()) {
@@ -8844,61 +8824,96 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
-        // Contacts may key back under a different handle form than their ghost
-        // ID (e.g. mailto: vs tel:). Augment the ghost list with every "from"
-        // handle persisted in statuskit-state.plist so request_handles matches
-        // all available channels regardless of handle form.
         let ghost_count = handles.len();
-        let mut augmented = handles;
+
+        // Count StatusKit channels per "from" handle from statuskit-state.plist.
+        // request_handles subscribes ALL channels for the handles we pass, and
+        // Apple bounces a single SubscribeToChannels that carries too many channels
+        // ("Subscribe confirmed failed!" from rustpush::aps), which silently kills
+        // ALL inbound presence for a heavily-keyed ("popular") account with
+        // hundreds of Focus-sharing peers. So we bin-pack handles into
+        // channel-budgeted chunks and subscribe each separately. The StatusKit
+        // channel-task accumulates per-channel interest (refcounts), so the union
+        // ends up subscribed; a short pause between chunks lets it drain and emit
+        // each batch as its own small SubscribeToChannels under Apple's ceiling.
+        let mut from_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         {
-            let mut extra: Vec<String> = Vec::new();
             let state_path = subsystem_state_path("statuskit-state.plist");
             if let Ok(data) = std::fs::read(&state_path) {
                 if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
-                    if let Some(dict) = value.as_dictionary() {
-                        if let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) {
-                            let handle_set: std::collections::HashSet<&str> =
-                                augmented.iter().map(|s| s.as_str()).collect();
-                            for (_channel_id, entry) in keys_dict {
-                                if let Some(from_str) = entry.as_dictionary()
-                                    .and_then(|d| d.get("from"))
-                                    .and_then(|v| v.as_string())
-                                {
-                                    if !handle_set.contains(from_str) {
-                                        extra.push(from_str.to_string());
-                                    }
-                                }
+                    if let Some(keys_dict) = value
+                        .as_dictionary()
+                        .and_then(|d| d.get("keys"))
+                        .and_then(|v| v.as_dictionary())
+                    {
+                        for (_channel_id, entry) in keys_dict {
+                            if let Some(from_str) = entry
+                                .as_dictionary()
+                                .and_then(|d| d.get("from"))
+                                .and_then(|v| v.as_string())
+                            {
+                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
                 }
             }
-            augmented.extend(extra);
         }
+        // Make sure every requested ghost handle is represented even if it has no
+        // key yet (so a future reshare for it still lands); it contributes 0
+        // channels and is therefore "free" in the budget.
+        for h in &handles {
+            from_counts.entry(h.clone()).or_insert(0);
+        }
+        let distinct_from = from_counts.len();
 
-        let token = sk.request_handles(&augmented).await;
-        // Replace (not accumulate) interest tokens. subscribe_to_status
-        // may be called multiple times (post-init + post-backfill + future
-        // re-subscribe paths); without clearing, each call leaks the
-        // previous token, pinning stale per-handle subscriptions on
-        // StatusKitClient's internal channel-interest map. Callers treat
-        // this function as "set the current subscription set", matching
-        // OB-Android's `requestHandles(to: [participant])` semantics —
-        // one authoritative interest list per chat activation.
-        {
+        // Greedily bin-pack handles into chunks of <= CHANNEL_BUDGET channels. A
+        // single handle whose channel count exceeds the budget unavoidably forms
+        // its own (over-budget) chunk — request_handles cannot split one handle's
+        // channels — but that is rare and isolates the risk to that one peer.
+        const CHANNEL_BUDGET: usize = 30;
+        let mut chunks: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_count = 0usize;
+        for (handle, count) in from_counts {
+            if cur_count + count > CHANNEL_BUDGET && !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+                cur_count = 0;
+            }
+            cur.push(handle);
+            cur_count += count;
+        }
+        if !cur.is_empty() {
+            chunks.push(cur);
+        }
+        let total_chunks = chunks.len();
+
+        // Subscribe the new chunks, THEN drop the old interest tokens. Holding the
+        // old tokens alive until the new ones are in place keeps shared channels at
+        // refcount >= 1, so we never trigger a bulk unsubscribe (which would itself
+        // overflow Apple's per-subscribe ceiling); only genuinely-removed channels
+        // (a small delta) get torn down when the old tokens finally drop.
+        let old_tokens = {
             let mut tokens = self.statuskit_interest_tokens.lock().await;
-            let prev = tokens.len();
-            tokens.clear();
-            tokens.push(token);
-            if prev > 0 {
-                info!("Dropped {} previous interest token(s) before re-subscribing", prev);
+            std::mem::take(&mut *tokens)
+        };
+        let mut new_tokens = Vec::with_capacity(total_chunks);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            new_tokens.push(sk.request_handles(&chunk).await);
+            if i + 1 < total_chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
+        {
+            let mut tokens = self.statuskit_interest_tokens.lock().await;
+            *tokens = new_tokens;
+        }
+        drop(old_tokens);
+
         info!(
-            "Requested presence subscription for {} handle(s) ({} ghost + {} from keys)",
-            augmented.len(),
-            ghost_count,
-            augmented.len() - ghost_count,
+            "Requested presence subscription in {} channel-budgeted chunk(s) ({} ghost handles, {} distinct from-handles)",
+            total_chunks, ghost_count, distinct_from,
         );
         Ok(())
     }
@@ -12233,36 +12248,44 @@ impl Client {
                     msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
                 });
             }
-            Err(_panic) => {
-                if !is_ford_asset {
-                    // Non-Ford asset (image / V1 per-chunk encryption) —
-                    // the panic is NOT a Ford dedup issue. Brute-forcing
-                    // cached keys can't help: there's no Ford blob, and
-                    // our cached keys are for Ford-encrypted records that
-                    // will never match. Return the panic as a terminal
-                    // error instead of burning retries.
+            Err(panic_payload) => {
+                // Surface what upstream actually panicked on (the catch_unwind
+                // payload) — e.g. "No body!!" (Apple no longer serves the asset)
+                // vs "No signature?" (our stored record is missing a field).
+                let payload = panic_payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>");
+                if is_ford_asset {
                     warn!(
-                        "cloud_download_attachment {}: non-Ford asset panic, skipping recovery (image or other V1-encrypted)",
-                        record_name
+                        "cloud_download_attachment {}: Ford SIV panic ({}), attempting recovery with {} cached Ford keys",
+                        record_name,
+                        payload,
+                        ford_key_cache_size()
                     );
-                    return Err(WrappedError::GenericError {
-                        msg: format!(
-                            "Failed to download CloudKit attachment {} (non-Ford panic, likely bundled_request_id or PCS issue)",
-                            record_name
-                        ),
-                    });
+                } else {
+                    // Non-Ford asset (image / V1 per-chunk encryption). Don't
+                    // give up here — the manual download path below ALSO handles
+                    // plain V1 chunks (decrypt_v1_chunk with the per-chunk key
+                    // from the authorize response), so it can recover a V1 image
+                    // that upstream's get_mmcs panicked on. If the asset is truly
+                    // gone (Apple aged out the MMCS blob → no body / no
+                    // reference), recovery returns a descriptive, ATTACHMENT_
+                    // UNRECOVERABLE-tagged error the bridge can tombstone.
+                    warn!(
+                        "cloud_download_attachment {}: non-Ford get_assets panic ({}); attempting manual V1 recovery",
+                        record_name,
+                        payload
+                    );
                 }
-                warn!(
-                    "cloud_download_attachment {}: Ford SIV panic, attempting recovery with {} cached Ford keys",
-                    record_name,
-                    ford_key_cache_size()
-                );
             }
         }
 
-        // Attempt 2 — Ford dedup recovery: iterate cached keys in parallel
-        // batches, mutate protection_info per attempt, re-try get_assets.
-        // Only reached when is_ford_asset == true.
+        // Attempt 2 — manual recovery. Handles V1 (per-chunk), V2 Ford, and
+        // Ford dedup (cross-batch brute force via the cached key set) in one
+        // pure-crypto pass. Reached for BOTH Ford and non-Ford panics: the
+        // manual path is a superset of upstream's get_mmcs.
         self.cloud_download_attachment_ford_recovery_with_record(
             container,
             records,
@@ -12270,6 +12293,35 @@ impl Client {
             &record_name,
         )
         .await
+    }
+
+    /// Download an attachment to a file on disk instead of returning the bytes
+    /// over the FFI.
+    ///
+    /// uniffi lowers a returned `Vec<u8>` into a `RustBuffer` whose length and
+    /// capacity are `i32`, so any blob ≥ 2 GiB panics on the way out of
+    /// `cloud_download_attachment` ("buffer capacity cannot fit into a i32.")
+    /// even though the download itself succeeded — CloudKit reports such sizes
+    /// as a NEGATIVE (i32-wrapped) file_size, e.g. -1,676,737,818 for a ~2.6 GB
+    /// blob. The Go side routes those oversized attachments here: we run the
+    /// normal download path by calling `cloud_download_attachment` in-process
+    /// (a plain Rust call — no uniffi lowering, so no i32 panic), stream the
+    /// bytes to `dest_path`, and return only the length. Nothing large crosses
+    /// the FFI boundary. The caller reads the file back and removes it.
+    pub async fn cloud_download_attachment_to_file(
+        &self,
+        record_name: String,
+        dest_path: String,
+    ) -> Result<u64, WrappedError> {
+        let bytes = self.cloud_download_attachment(record_name.clone()).await?;
+        let len = bytes.len() as u64;
+        std::fs::write(&dest_path, &bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!(
+                "cloud_download_attachment_to_file {}: write {}: {e}",
+                record_name, dest_path
+            ),
+        })?;
+        Ok(len)
     }
 
     // Ford recovery helper lives in a separate non-uniffi impl block below
@@ -12781,9 +12833,14 @@ impl Client {
         //
         // The outer `cloud_download_attachment` attempted upstream's
         // happy path first and catch_unwind'd its panic; we're here
-        // because that failed. The ONLY path upstream takes to its
-        // panic is the Ford path, so we know this is a Ford-encrypted
-        // asset (is_ford_asset was also pre-checked by the caller).
+        // because that failed. Reached for BOTH Ford and non-Ford
+        // (plain V1) panics — the manual path handles all of them.
+        //
+        // Errors that mean the asset is no longer downloadable from
+        // CloudKit at all (Apple aged out the MMCS blob: no body, no
+        // matching reference, missing bundled_request_id/signature) are
+        // tagged "ATTACHMENT_UNRECOVERABLE:" so the Go side can persist a
+        // tombstone and stop re-attempting them on every sync sweep.
         //
         // What this function does NOT do that upstream does:
         //   - getComplete confirmation (CloudKit passes empty url, so
@@ -12795,12 +12852,12 @@ impl Client {
         let lqa = &base_record.lqa;
         let bundled_id = lqa.bundled_request_id.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
-                msg: format!("manual_ford_download {}: lqa.bundled_request_id is None", record_name),
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.bundled_request_id is None", record_name),
             }
         })?;
         let signature = lqa.signature.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
-                msg: format!("manual_ford_download {}: lqa.signature is None", record_name),
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.signature is None", record_name),
             }
         })?;
         let ford_key = lqa
@@ -12817,14 +12874,14 @@ impl Client {
             .find(|r| r.asset_id.as_ref() == Some(bundled_id))
             .ok_or_else(|| WrappedError::GenericError {
                 msg: format!(
-                    "manual_ford_download {}: no AssetGetResponse for bundled_request_id",
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: no AssetGetResponse for bundled_request_id",
                     record_name
                 ),
             })?;
         let body = asset_response.body.as_ref().ok_or_else(|| {
             WrappedError::GenericError {
                 msg: format!(
-                    "manual_ford_download {}: AssetGetResponse.body is None",
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: AssetGetResponse.body is None",
                     record_name
                 ),
             }
@@ -12863,8 +12920,16 @@ impl Client {
             }
             Err(e) => {
                 warn!("manual_ford_download {}: FAILED: {}", record_name, e);
+                // "no references entry matches signature" / a server "GONE"
+                // reason means the asset is no longer in Apple's authorize
+                // response — it's not coming back. Tag it so Go tombstones it.
+                // Plain network/HTTP failures stay un-tagged → retriable.
+                let unrecoverable = e.contains("no references entry matches")
+                    || e.contains("AuthorizeGetResponse")
+                    || e.to_ascii_lowercase().contains("gone");
+                let tag = if unrecoverable { "ATTACHMENT_UNRECOVERABLE: " } else { "" };
                 Err(WrappedError::GenericError {
-                    msg: format!("Manual Ford download for {}: {}", record_name, e),
+                    msg: format!("{}Manual Ford download for {}: {}", tag, record_name, e),
                 })
             }
         }

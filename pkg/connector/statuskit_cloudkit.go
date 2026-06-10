@@ -64,7 +64,47 @@ const statusKitFailureBackoffBase = 15 * time.Minute
 // peers within a day, and an order-of-magnitude reduction in CKKS
 // volume on the LimitedPeersAllowed view (the surface that produced
 // the clique-kick during early testing).
+//
+// This is the STEADY-STATE floor, applied only once peer keys are
+// established and have gone quiet. Before keys are established (or while
+// they're actively arriving) the much shorter statusKitFreshFloor applies
+// — see nextAllowedAt.
 const statusKitSuccessFloor = 12 * time.Hour
+
+// statusKitFreshFloor is the (gentle) minimum interval between successful
+// passes while the bridge has NOT yet pulled any peer keys, or while keys are
+// still actively arriving. A fresh or large account (James: 1,480 chats, 0
+// peer keys at first — presence can't decrypt anything) has its contacts'
+// reshares land in CloudKit gradually after the bridge publishes
+// share_status. With only the 12h floor, the single bootstrap pass runs
+// before those reshares arrive and nothing re-pulls them for 12h. This floor
+// keeps pulling every half hour until keys show up, then nextAllowedAt backs
+// off to statusKitSuccessFloor once keys are established and the stream is
+// quiet. At ~4–5 Apple round-trips per pass that's ~10/hour — within the
+// ~15–20/hour the clique-kick postmortem documents as tolerated, and far from
+// the wrong-class-unwrap / zone-probing bursts that actually caused the kick.
+// See docs/postmortem-statuskit-clique-kick-2026-05-09.md.
+const statusKitFreshFloor = 30 * time.Minute
+
+// statusKitDrainResumeFloor is the (short) interval before resuming a drain
+// that hasn't finished walking the zone yet. The 12h success floor — and even
+// the 30m fresh floor — must NOT apply while the continuation token is still
+// outstanding: a large account (James: 1,480 chats, many pages of
+// CD_ReceivedInvitation / CD_Channel records) can't be fully walked if the
+// gate parks the pass on a long floor mid-drain, and the un-walked tail of
+// peer keys then never hydrates so those contacts' presence stays dark. The
+// post-backfill restart trigger runs under context.Background (no timeout) and
+// drains the whole zone in one pass, so this floor only governs the rare case
+// where a bounded-ctx periodic pass is cancelled mid-walk — resume soon and
+// finish. See nextAllowedAt.
+const statusKitDrainResumeFloor = 2 * time.Minute
+
+// statusKitPullTickInterval is how often the background loop (runStatusKitPullLoop)
+// offers the pass a chance to run. The pass's own floor gate decides whether to
+// actually contact Apple — once keys are established most ticks are a cheap
+// in-memory skip. Shorter than statusKitFreshFloor so a fresh account's keys
+// are pulled promptly after the floor elapses.
+const statusKitPullTickInterval = 15 * time.Minute
 
 // statusKitPassMaxBackoff caps the exponential backoff after consecutive
 // errors. Two hours is long enough that a transient CKKS rate-limit window
@@ -81,18 +121,47 @@ const statusKitPassMaxBackoff = 2 * time.Hour
 var statuskitPassRetryAfterRegex = cloudKitRetryAfterRegex
 
 // statusKitPassMeta is the parsed form of statusKitCloudPassMetaRow. Stored
-// flat in the existing TEXT column so no schema change is needed.
+// flat in the existing TEXT column so no schema change is needed. Old 2-field
+// rows ("<ms>:<errs>") parse with Established/LastPulledKeys defaulting false,
+// which just means a not-yet-established account starts on the fresh floor —
+// self-correcting on the first key-bearing pass.
 type statusKitPassMeta struct {
 	LastAttempt     time.Time
 	ConsecutiveErrs int
+	// Established is sticky: true once any pass has pulled at least one peer
+	// key. Until then the bridge pulls on the gentle fresh floor.
+	Established bool
+	// LastPulledKeys records whether the most recent successful pass pulled
+	// new keys. While true the bridge keeps pulling on the fresh floor to
+	// catch the rest of an in-flight reshare stream; once a pass comes up
+	// empty it backs off to the 12h steady-state floor.
+	LastPulledKeys bool
+	// DrainComplete records whether the most recent successful pass walked the
+	// zone all the way to the end (continuation token exhausted) rather than
+	// stopping early (a cancelled bounded-ctx pass, or the page backstop). The
+	// 12h success floor and the 30m fresh floor are BOTH gated on this: while a
+	// drain is incomplete the gate returns the short statusKitDrainResumeFloor
+	// so the pass resumes and finishes instead of stranding the un-walked tail
+	// of peer keys for hours. Defaults false for old 2/4-field rows, which is
+	// exactly right — a pre-existing account is treated as mid-drain on its
+	// first post-upgrade pass and gets one full walk.
+	DrainComplete bool
+	// RecoveryRepullDone records that we've already forced a one-shot full
+	// re-walk to recover from the stranded-keys trap: a cached continuation
+	// token parked past CD_ReceivedInvitation records that were never decoded
+	// into peer keys, so incremental fetches return 0 forever and Established
+	// never flips. Sticky once set so a genuinely peer-less account doesn't
+	// re-walk the whole zone on every pass. See the recovery block in
+	// syncCloudStatusKitPeers.
+	RecoveryRepullDone bool
 }
 
 func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 	if raw == nil || *raw == "" {
 		return statusKitPassMeta{}
 	}
-	parts := strings.SplitN(*raw, ":", 2)
-	if len(parts) != 2 {
+	parts := strings.Split(*raw, ":")
+	if len(parts) < 2 {
 		return statusKitPassMeta{}
 	}
 	tsMS, err := strconv.ParseInt(parts[0], 10, 64)
@@ -103,14 +172,31 @@ func parseStatusKitPassMeta(raw *string) statusKitPassMeta {
 	if err != nil || errs < 0 {
 		errs = 0
 	}
-	return statusKitPassMeta{
+	m := statusKitPassMeta{
 		LastAttempt:     time.UnixMilli(tsMS),
 		ConsecutiveErrs: errs,
 	}
+	if len(parts) >= 4 {
+		m.Established = parts[2] == "1"
+		m.LastPulledKeys = parts[3] == "1"
+	}
+	if len(parts) >= 5 {
+		m.DrainComplete = parts[4] == "1"
+	}
+	if len(parts) >= 6 {
+		m.RecoveryRepullDone = parts[5] == "1"
+	}
+	return m
 }
 
 func (m statusKitPassMeta) encode() string {
-	return fmt.Sprintf("%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs)
+	b2i := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	return fmt.Sprintf("%d:%d:%d:%d:%d:%d", m.LastAttempt.UnixMilli(), m.ConsecutiveErrs, b2i(m.Established), b2i(m.LastPulledKeys), b2i(m.DrainComplete), b2i(m.RecoveryRepullDone))
 }
 
 // nextAllowedAt returns the earliest time at which a new pass may run.
@@ -123,6 +209,25 @@ func (m statusKitPassMeta) nextAllowedAt(retryAfterHint time.Duration) time.Time
 		return time.Time{}
 	}
 	if m.ConsecutiveErrs == 0 && retryAfterHint == 0 {
+		// The longer floors only apply once the zone has been walked to the
+		// end. While a drain is still incomplete — the continuation token is
+		// outstanding because a bounded-ctx pass was cancelled mid-walk, or a
+		// large account spans more pages than one pass finished — resume on the
+		// short drain floor so the pass picks up where it left off and
+		// completes. Parking on a 30m/12h floor here would strand the
+		// un-walked tail of peer keys and presence for those contacts never
+		// hydrates. This is David's invariant: the 12h back-off only kicks in
+		// once the drain is complete.
+		if !m.DrainComplete {
+			return m.LastAttempt.Add(statusKitDrainResumeFloor)
+		}
+		// Drain complete. Pull on the gentle fresh floor while keys haven't
+		// been established yet (fresh/large account whose reshares are still
+		// landing) or while keys are actively arriving; back off to the 12h
+		// steady-state only once we have keys AND the stream went quiet.
+		if !m.Established || m.LastPulledKeys {
+			return m.LastAttempt.Add(statusKitFreshFloor)
+		}
 		return m.LastAttempt.Add(statusKitSuccessFloor)
 	}
 	delay := statusKitFailureBackoffBase
@@ -168,6 +273,38 @@ func extractRetryAfterHint(err error) time.Duration {
 	return hint
 }
 
+// runStatusKitPullLoop periodically offers the StatusKit-CloudKit peer-key
+// pull a chance to run. Without it the pass only fires at startup (the
+// bootstrap sync plus three one-shot delayed re-syncs) and never again until
+// the next bridge restart — so peer keys that reshare into CloudKit after
+// those early passes (the common case on a fresh or large account, where
+// contacts reshare gradually after the bridge publishes share_status) sit
+// un-pulled and presence can't decrypt them.
+//
+// The pass's own floor gate (nextAllowedAt) decides whether each tick actually
+// contacts Apple: gentle 30-min pulls while keys haven't been established or
+// are still arriving, backing off to 12h once established and quiet. Most ticks
+// in steady state are a cheap in-memory skip with no Apple traffic.
+func (c *IMClient) runStatusKitPullLoop(log zerolog.Logger, stopChan <-chan struct{}) {
+	if c.cloudStore == nil {
+		return
+	}
+	ticker := time.NewTicker(statusKitPullTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if err := c.syncCloudStatusKitPeers(ctx, log); err != nil {
+				log.Info().Err(err).Msg("StatusKit-CloudKit periodic pull: errored (continuing)")
+			}
+			cancel()
+		}
+	}
+}
+
 // syncCloudStatusKitPeers runs one StatusKit-CloudKit pull pass. Called as
 // the fourth phase of runCloudSyncOnce, after the existing chats / messages
 // / attachments backfill completes.
@@ -193,6 +330,15 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		log.Info().Msg("StatusKit-CloudKit pass: skipped (no UserLogin)")
 		return nil
 	}
+
+	// Single-flight: the periodic pull loop, the post-backfill trigger, and the
+	// cloud-sync phases can all call this. Two concurrent passes would race on
+	// the continuation-token / pass-meta rows and double the CKKS round-trips.
+	if !c.statusKitPassInFlight.CompareAndSwap(false, true) {
+		log.Info().Msg("StatusKit-CloudKit pass: skipped (another pass already in flight)")
+		return nil
+	}
+	defer c.statusKitPassInFlight.Store(false)
 
 	// Avoid running concurrently with an invite sweep — both touch the
 	// rust-side StatusKit state mutex. Sweep wins; we'll pick up next pass.
@@ -308,10 +454,52 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		}
 	}
 
+	// Stranded-keys recovery guard. If we hold a continuation token but have
+	// never pulled a single peer key (Established=false), the token is parked
+	// past CD_ReceivedInvitation records that were already in CloudKit before
+	// we could decode them — incremental fetches return 0 forever, Established
+	// never flips, and presence never hydrates. A bridge can land here after
+	// running a build with the old 30-page cap on a large account (the tail
+	// stranded behind the token), or any time a full walk happened to insert 0
+	// keys. The Rust channel-map-empty guard does NOT catch this: the channel
+	// map can be fully populated from CD_Channel records while zero invitations
+	// were ever decoded into keys.
+	//
+	// Force ONE full re-walk by dropping the token. Bounded by
+	// RecoveryRepullDone (sticky) so a genuinely peer-less account doesn't
+	// re-walk the whole zone every pass: once attempted, later passes resume
+	// forward from the persisted mid-walk token via the normal drainComplete
+	// machinery instead of restarting. If the re-walk finds keys, Established
+	// flips true and this guard never fires again; if it finds none, the latch
+	// stops further forced walks and a future invitation arrives via the
+	// incremental token as a normal change.
+	//
+	// DrainComplete is part of the trigger so we only ever recover from a walk
+	// that FINISHED (token exhausted) and still produced zero keys — the real
+	// stuck state. A drain that's merely in progress (a large account still
+	// walking, or a bounded-ctx pass cancelled mid-walk before reaching an
+	// invitation page) has DrainComplete=false; it must NOT be disrupted —
+	// dropping its mid-walk token would throw away progress and restart from
+	// scratch. The normal resume floor finishes those instead. A pre-existing
+	// row that predates DrainComplete parses false, so it just takes one extra
+	// (cheap, fetched=0) pass to set DrainComplete before recovery fires.
+	forcedRecoveryRepull := false
+	if sinceToken != nil && !meta.Established && meta.DrainComplete && !meta.RecoveryRepullDone {
+		log.Info().
+			Time("parked_token_last_attempt", meta.LastAttempt).
+			Msg("StatusKit-CloudKit pass: completed walk left a cached token but no peer keys ever pulled — forcing a one-shot full re-walk to recover stranded keys")
+		sinceToken = nil
+		if clrErr := c.cloudStore.clearZoneToken(ctx, statusKitCloudTokenRow); clrErr != nil {
+			log.Info().Err(clrErr).Msg("StatusKit-CloudKit pass: failed to clear token row for recovery re-walk (continuing — FFI still gets a nil token)")
+		}
+		forcedRecoveryRepull = true
+	}
+
 	log.Info().
 		Bool("has_cached_zone", cachedZone != nil).
 		Interface("cached_zone", cachedZone).
 		Bool("has_cached_token", sinceToken != nil).
+		Bool("forced_recovery_repull", forcedRecoveryRepull).
 		Msg("StatusKit-CloudKit pass: invoking FFI")
 
 	// Wrap in safeFFICall to match the panic-isolation pattern used by
@@ -323,14 +511,58 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// errors+1 + retry-after extension). Done via defer so a panic that
 	// escapes safeFFICall still leaves the gate in a recoverable state
 	// rather than stranding the bridge in "always run, no backoff".
+	// Drain accumulators, declared before the defer so the meta-row update can
+	// record whether THIS pass actually pulled keys — that drives the
+	// fresh-floor-vs-12h-floor decision in nextAllowedAt.
+	var (
+		totalFetched      uint32
+		totalInserted     uint32
+		totalAlreadyKnown uint32
+		totalDecodeFailed uint32
+		totalRecordsSeen  uint32
+		injectedHandles   []string
+		// drainComplete latches true only when the drain loop walks the zone to
+		// the end (token exhausted / empty fetch). Stays false if the pass is
+		// cancelled mid-walk or hits the page backstop, so the gate resumes it.
+		drainComplete bool
+	)
+
 	attemptStart := time.Now()
 	var ffiErr error
 	defer func() {
-		newMeta := statusKitPassMeta{LastAttempt: attemptStart}
-		if ffiErr == nil {
-			newMeta.ConsecutiveErrs = 0
-		} else {
+		newMeta := statusKitPassMeta{
+			LastAttempt:    attemptStart,
+			Established:    meta.Established,    // sticky — never un-establish
+			LastPulledKeys: meta.LastPulledKeys, // carried over unless a success updates it below
+			// Sticky once we've forced a recovery re-walk, so a peer-less account
+			// doesn't restart the walk from scratch every pass — but ONLY latch on
+			// a successful pass. If the FFI errored AND the token-row clear also
+			// failed (DB write error), the parked token is still present; latching
+			// here would block the guard from ever re-firing and leave the account
+			// permanently re-stranded. Leaving the latch false on error lets the
+			// next pass re-attempt recovery. (On error where the clear succeeded,
+			// the now-nil token drives a full walk anyway and the guard's
+			// sinceToken!=nil check stops a redundant re-fire.)
+			RecoveryRepullDone: meta.RecoveryRepullDone || (forcedRecoveryRepull && ffiErr == nil),
+		}
+		if ffiErr != nil {
 			newMeta.ConsecutiveErrs = meta.ConsecutiveErrs + 1
+		} else {
+			newMeta.ConsecutiveErrs = 0
+			// A pass that inserted new peer keys keeps us on the gentle fresh
+			// floor (more reshares may still be in flight) and marks the
+			// account established. An empty success lets the floor back off to
+			// the 12h steady-state.
+			pulled := totalInserted > 0
+			newMeta.LastPulledKeys = pulled
+			if pulled {
+				newMeta.Established = true
+			}
+			// Record whether the zone was walked to the end. The gate uses this
+			// to decide between the short resume floor (drain still in progress)
+			// and the fresh/12h floors (drain finished). A pass cancelled
+			// mid-walk leaves this false so the next pass resumes the drain.
+			newMeta.DrainComplete = drainComplete
 		}
 		encoded := newMeta.encode()
 		if persistErr := c.cloudStore.setSyncStateSuccess(ctx, statusKitCloudPassMetaRow, &encoded); persistErr != nil {
@@ -342,7 +574,7 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// page with at most one Apple-side fetch round-trip; the continuation
 	// token in the response tells us whether more pages exist. Looping
 	// here means a single bootstrap pass ingests every available record
-	// instead of stranding pages behind the 12h success floor (the
+	// instead of stranding pages behind the success floor (the
 	// chat/message backfill paths get hit hundreds of times per session
 	// so they drain naturally; StatusKit doesn't, and architecturally
 	// pretending it does was the bug).
@@ -351,20 +583,32 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// the per-pass CKKS round-trip count bounded even if Apple keeps
 	// returning continuation tokens — far below the per-pass budget that
 	// produced the early-testing clique-kick.
+	// Walk every page to completion, the same way the message and chat CloudKit
+	// drains do (syncCloudMessages pages back-to-back up to maxCloudSyncPages
+	// with no artificial per-pass cap). The old 30-page cap is what stranded a
+	// large account like James's: his zone spans far more than 30 pages, so the
+	// pass stopped with the continuation token still outstanding and the
+	// inter-pass gate then parked it on the 12h floor before the tail ever
+	// drained — those peers' keys never hydrated and their presence stayed
+	// dark. drainComplete (below) latches only when the token is exhausted, and
+	// the gate keeps the pass on the short resume floor until then. The
+	// post-backfill restart trigger runs under context.Background (no timeout),
+	// so it can drain the whole zone in a single pass.
+	//
+	// Pacing is deliberately slow-and-steady at 5s/page — gentler than the
+	// message/chat drains (which page with no delay and don't trip Apple's
+	// rate limits in production) so a long initial walk of the rate-sensitive
+	// LimitedPeersAllowed view stays well clear of any throttle.
 	const (
-		maxPagesPerPass = 30
-		interPageDelay  = 1 * time.Second
-	)
-	var (
-		totalFetched      uint32
-		totalInserted     uint32
-		totalAlreadyKnown uint32
-		totalDecodeFailed uint32
-		totalRecordsSeen  uint32
-		injectedHandles   []string
+		maxPagesPerPass = maxCloudSyncPages
+		interPageDelay  = 5 * time.Second
 	)
 	currentZone := cachedZone
 	currentToken := sinceToken
+	prevTokenStr := ""
+	if currentToken != nil {
+		prevTokenStr = base64.StdEncoding.EncodeToString(*currentToken)
+	}
 
 	for pageNum := 1; pageNum <= maxPagesPerPass; pageNum++ {
 		page, err := safeFFICall("CloudSyncStatuskitPeers", func() (rustpushgo.CloudSyncStatusKitPage, error) {
@@ -463,15 +707,30 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 			}
 		}
 
-		// Stop draining when there are no more pages, or when this page
-		// returned no records (steady-state empty fetch).
-		if page.NextToken == nil || len(*page.NextToken) == 0 || page.Fetched == 0 {
+		// Done detection mirrors syncCloudMessages: stop when the API signals
+		// no more pages (missing/empty continuation token or an empty fetch),
+		// or when the token stops advancing (defensive against a server that
+		// keeps echoing the same token). Any of these means the zone is fully
+		// walked, so latch drainComplete — the ONLY condition that lets the
+		// inter-pass gate fall through from the short resume floor to the
+		// fresh/12h floors.
+		nextTokenStr := ""
+		if page.NextToken != nil {
+			nextTokenStr = base64.StdEncoding.EncodeToString(*page.NextToken)
+		}
+		if page.NextToken == nil || len(*page.NextToken) == 0 || page.Fetched == 0 || (pageNum > 1 && nextTokenStr == prevTokenStr) {
+			drainComplete = true
 			break
 		}
+		prevTokenStr = nextTokenStr
 		currentToken = page.NextToken
 
-		// Pace the next page fetch — keeps the per-pass CKKS round-trip
-		// rate gentle even on a long initial drain.
+		// Pace the next page fetch — slow and steady. On the bounded-ctx
+		// periodic path a cancel here returns mid-walk with drainComplete still
+		// false, so the next pass resumes from the persisted token (the gate
+		// uses the short resume floor). The post-backfill restart path runs
+		// under context.Background and never cancels, so it drains the whole
+		// zone in one pass.
 		select {
 		case <-time.After(interPageDelay):
 		case <-ctx.Done():
@@ -486,6 +745,7 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 		Uint32("total_decode_failed", totalDecodeFailed).
 		Uint32("total_records_seen", totalRecordsSeen).
 		Int("total_injected_handles", len(injectedHandles)).
+		Bool("drain_complete", drainComplete).
 		Msg("StatusKit-CloudKit pass: drain complete")
 
 	// If we injected any new peer keys (across all drained pages), fire a

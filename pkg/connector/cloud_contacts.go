@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,8 +109,24 @@ func (c *cloudContactsClient) doRequest(method, url, body string, depth string) 
 	if depth != "" {
 		req.Header.Set("Depth", depth)
 	}
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// Apple throttle: a 403/429 means we're hitting iCloud too hard. Surface it
+	// as an error so the sync loops back off instead of retrying at their fixed
+	// cadence (which compounds the throttle and risks escalation to a clique
+	// kick). Close the body since the caller won't.
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: iCloud CardDAV returned HTTP %d", errICloudContactsThrottled, resp.StatusCode)
+	}
+	return resp, nil
 }
+
+// errICloudContactsThrottled marks an Apple rate-limit (403/429) on the
+// CardDAV contacts endpoint, so the sync loops can back off hard.
+var errICloudContactsThrottled = errors.New("icloud contacts throttled")
 
 // SyncContacts fetches all contacts from iCloud via CardDAV and rebuilds the cache.
 func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
@@ -148,7 +165,16 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		allContacts = append(allContacts, contacts...)
 	}
 
-	// Step 4.5: Download any photo URLs — use authenticated fetcher for iCloud URLs
+	// Step 4.5: Carry over avatars already downloaded in a previous sync, then
+	// download only the genuinely-new ones. SyncContacts rebuilds allContacts
+	// fresh from vCards every time (Avatar==nil), so without this every photo
+	// is re-fetched from iCloud on every sync — hundreds of requests per cycle
+	// that hammer Apple and trip a 403. Reuse is keyed on an unchanged
+	// AvatarURL, so a contact who changes their photo is still re-downloaded.
+	reused := c.carryOverAvatars(allContacts)
+	if reused > 0 {
+		log.Debug().Int("reused", reused).Msg("CardDAV: reused cached contact avatars (skipped re-download)")
+	}
 	downloadContactPhotos(allContacts, log, c.downloadAuthURL)
 
 	// Step 5: Build lookup caches
@@ -177,6 +203,50 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		Int("email_keys", len(c.byEmail)).
 		Msg("Contact cache synced from iCloud CardDAV")
 	return nil
+}
+
+// carryOverAvatars fills in each fresh contact's Avatar from the previous
+// sync's cache when the AvatarURL is unchanged, so downloadContactPhotos only
+// fetches new/changed photos instead of re-downloading every one from iCloud.
+// Returns the number reused. Reads the old cache under RLock; the caller has
+// not yet rebuilt it.
+func (c *cloudContactsClient) carryOverAvatars(fresh []*imessage.Contact) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.byPhone) == 0 && len(c.byEmail) == 0 {
+		return 0
+	}
+	reused := 0
+	for _, ct := range fresh {
+		if ct.AvatarURL == "" || ct.Avatar != nil {
+			continue
+		}
+		var old *imessage.Contact
+		for _, phone := range ct.Phones {
+			for _, suffix := range phoneSuffixes(phone) {
+				if o, ok := c.byPhone[suffix]; ok {
+					old = o
+					break
+				}
+			}
+			if old != nil {
+				break
+			}
+		}
+		if old == nil {
+			for _, email := range ct.Emails {
+				if o, ok := c.byEmail[strings.ToLower(email)]; ok {
+					old = o
+					break
+				}
+			}
+		}
+		if old != nil && old.Avatar != nil && old.AvatarURL == ct.AvatarURL {
+			ct.Avatar = old.Avatar
+			reused++
+		}
+	}
+	return reused
 }
 
 // GetContactInfo looks up a contact by phone number or email.
@@ -670,16 +740,75 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 // photoFetcher downloads a URL with authentication. Nil means use generic unauthenticated fetch.
 type photoFetcher func(ctx context.Context, url string) ([]byte, error)
 
+// deadContactPhotoURLs remembers photo URLs that returned a permanent HTTP
+// failure (401/403/404/410) so the contact-photo download phase doesn't
+// re-hammer the same dead host on every sync. The common case is a third-party
+// photo host embedded in a contact's vCard (e.g. img.contactsplus.com) that
+// blocks the bridge with a 403 — CardDAV re-supplies that URL from the vCard
+// on every sync, so nulling the in-memory contact isn't enough; the skip set
+// has to live across syncs. Keyed by URL → first-failure time; entries past
+// the TTL are retried once in case the host recovered. In-memory is sufficient
+// because the bridge runs continuously — a restart costs one retry per dead
+// URL, after which they're re-cached.
+var deadContactPhotoURLs sync.Map // url string -> time.Time
+
+// deadContactPhotoURLTTL is how long a permanently-failing photo URL stays in
+// the skip set before one retry is allowed. A week is long enough to stop the
+// per-sync hammering while still recovering if the host starts serving again.
+const deadContactPhotoURLTTL = 7 * 24 * time.Hour
+
+// contactPhotoURLDead reports whether url is currently in the dead-URL skip
+// set (and prunes the entry if its TTL has elapsed so it gets one retry).
+func contactPhotoURLDead(url string) bool {
+	v, ok := deadContactPhotoURLs.Load(url)
+	if !ok {
+		return false
+	}
+	failedAt, _ := v.(time.Time)
+	if time.Since(failedAt) > deadContactPhotoURLTTL {
+		deadContactPhotoURLs.Delete(url)
+		return false
+	}
+	return true
+}
+
+// photoFailurePermanent reports whether a photo-download error is a permanent
+// HTTP status worth caching, as opposed to a transient 429/5xx or network
+// blip that should be retried next sync. Both downloadURL and downloadAuthURL
+// format these as "HTTP <code> fetching <url>".
+func photoFailurePermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "HTTP 401 ") ||
+		strings.Contains(s, "HTTP 403 ") ||
+		strings.Contains(s, "HTTP 404 ") ||
+		strings.Contains(s, "HTTP 410 ")
+}
+
 // downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
 // set but no Avatar bytes. Uses bounded concurrency to avoid overwhelming
 // the server. If an authenticated fetcher is provided, iCloud URLs use it;
 // all other URLs use the generic unauthenticated downloader.
 func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, authFetch ...photoFetcher) {
 	var needsDownload []*imessage.Contact
+	skippedDead := 0
 	for _, c := range contacts {
 		if c.AvatarURL != "" && c.Avatar == nil {
+			if contactPhotoURLDead(c.AvatarURL) {
+				// Known-bad URL within its TTL — don't re-fetch the dead host.
+				// Treat as no photo this cycle (CardDAV re-supplies the URL next
+				// sync; it'll be skipped again until the TTL elapses).
+				c.AvatarURL = ""
+				skippedDead++
+				continue
+			}
 			needsDownload = append(needsDownload, c)
 		}
+	}
+	if skippedDead > 0 {
+		log.Debug().Int("skipped_dead_urls", skippedDead).Msg("Skipped contact photo URLs cached as permanently failing")
 	}
 	if len(needsDownload) == 0 {
 		return
@@ -714,6 +843,12 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				data, _, err = downloadURL(ctx, c.AvatarURL)
 			}
 			if err != nil {
+				// Cache permanent failures (403/401/404/410) so we stop
+				// re-fetching this dead host every sync. Transient errors
+				// (429/5xx/network) are left out so they retry next cycle.
+				if photoFailurePermanent(err) {
+					deadContactPhotoURLs.Store(c.AvatarURL, time.Now())
+				}
 				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
 					Str("name", c.Name()).
 					Str("url_host", logSafeURL(c.AvatarURL)).

@@ -52,6 +52,16 @@ type IMConfig struct {
 	// converting HEIC/HEIF images. Default is 95.
 	HEICJPEGQuality int `yaml:"heic_jpeg_quality"`
 
+	// MaxAttachmentSizeMB is the maximum attachment size to bridge, in MB.
+	// Attachments larger than this are skipped entirely — not downloaded,
+	// transcoded, or uploaded. The default 100 matches Beeper's upload limit;
+	// the homeserver rejects anything larger, so bridging it just wastes
+	// bandwidth, CPU, and memory for a guaranteed rejection. Raise this ONLY if
+	// your homeserver accepts larger uploads (e.g. a self-hosted Synapse with a
+	// higher max_upload_size) AND the host has the RAM to spare — attachments
+	// are buffered in memory while downloading. Default 100.
+	MaxAttachmentSizeMB int `yaml:"max_attachment_size_mb"`
+
 	// URLPreviewsInBackfill controls whether the bridge fetches link-preview
 	// metadata (og:/twitter: tags + thumbnail image) for messages that
 	// contain a URL during backfill. Each URL-bearing message triggers up to
@@ -248,6 +258,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
+	helper.Copy(up.Int, "max_attachment_size_mb")
 	helper.Copy(up.Bool, "url_previews_in_backfill")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "facetime_display_name")
