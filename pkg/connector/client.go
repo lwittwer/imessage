@@ -4017,6 +4017,19 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 		Str("msg_uuid", msg.Uuid).
 		Msg("Processing incoming Apple chat delete")
 
+	if msg.IsPermanentDelete {
+		// Apple can include chat metadata on permanent-delete payloads for
+		// individual messages. If no message UUIDs made it through parsing,
+		// this chat-level delete is ambiguous. Whole-chat deletes should arrive
+		// as MoveToRecycleBin, so fail closed instead of deleting a portal or
+		// scrubbing local chat history.
+		log.Warn().
+			Str("portal_id", portalID).
+			Str("msg_uuid", msg.Uuid).
+			Msg("Ignoring ambiguous Apple permanent chat delete")
+		return
+	}
+
 	// Track as recently deleted so APNs echoes don't recreate it.
 	c.trackDeletedChat(portalID)
 

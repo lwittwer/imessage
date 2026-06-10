@@ -159,7 +159,7 @@ Platform-specific Go code generally follows `_darwin.go` and `_other.go` splits.
 
 ### `third_party/rustpush-upstream/`
 
-This is a vendored dependency tree, but it is edited in-repo through path dependencies. Keep changes intentional and scoped. If you change Rust types or APIs consumed by Go, audit `pkg/rustpushgo/src/lib.rs` at the same time.
+This is a vendored dependency tree. Do not edit it directly unless the user explicitly asks for an upstream vendored change. Rust changes are allowed in repo-owned Rust code such as `pkg/rustpushgo` and `rustpush/open-absinthe`; the restriction is specifically on vendored `third_party/rustpush-upstream`. Prefer fixes in `pkg/connector` or wrapper code, and only audit this tree to understand upstream behavior.
 
 ## Keep these in sync
 
