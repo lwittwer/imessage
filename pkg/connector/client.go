@@ -2346,9 +2346,13 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
 		if c.trackDeliveryReceipt(msg.Uuid) {
 			go func() {
+				sent := false
 				defer func() {
 					if r := recover(); r != nil {
 						log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in SendDeliveryReceipt")
+					}
+					if !sent {
+						c.untrackDeliveryReceipt(msg.Uuid)
 					}
 				}()
 				conv := c.makeConversation(msg.Participants, msg.GroupName)
@@ -2357,7 +2361,9 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 				}
 				if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
 					log.Warn().Err(err).Msg("Failed to send delivery receipt")
+					return
 				}
+				sent = true
 			}()
 		} else {
 			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping duplicate delivery receipt")
@@ -11632,6 +11638,15 @@ func (c *IMClient) trackDeliveryReceipt(uuid string) bool {
 	}
 	c.recentDeliveryReceipts[key] = now
 	return true
+}
+
+func (c *IMClient) untrackDeliveryReceipt(uuid string) {
+	if uuid == "" {
+		return
+	}
+	c.recentDeliveryReceiptsLock.Lock()
+	defer c.recentDeliveryReceiptsLock.Unlock()
+	delete(c.recentDeliveryReceipts, strings.ToUpper(uuid))
 }
 
 func (c *IMClient) wasUnsent(uuid string) bool {
