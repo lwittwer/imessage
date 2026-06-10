@@ -244,7 +244,7 @@ func (c *IMClient) eagerLinkClusterToPortal(ctx context.Context, log zerolog.Log
 			if p := c.resolveSiblingHandleLive(ctx, log, sibling); p != nil {
 				portal = p
 				via = sibling
-				c.rememberAliasPortal(ctx, sibling, p.ID)
+				c.rememberAliasPortal(ctx, sibling, p.ID, true)
 				break
 			}
 		}
@@ -256,7 +256,7 @@ func (c *IMClient) eagerLinkClusterToPortal(ctx context.Context, log zerolog.Log
 		if c.lookupAliasPortal(ctx, sibling) != nil {
 			continue
 		}
-		c.rememberAliasPortal(ctx, sibling, portal.ID)
+		c.rememberAliasPortal(ctx, sibling, portal.ID, true)
 		log.Info().
 			Str("channel_id", channelID).
 			Str("alias", sibling).
@@ -301,7 +301,7 @@ func (c *IMClient) resolveViaCluster(ctx context.Context, log zerolog.Logger, un
 					Str("channel_id", channelID).
 					Str("portal_id", string(portal.ID)).
 					Msg("StatusKit alias-resolver: resolved via persisted sibling")
-				c.rememberAliasPortal(ctx, unknown, portal.ID)
+				c.rememberAliasPortal(ctx, unknown, portal.ID, true)
 				return portal
 			}
 
@@ -312,8 +312,8 @@ func (c *IMClient) resolveViaCluster(ctx context.Context, log zerolog.Logger, un
 					Str("channel_id", channelID).
 					Str("portal_id", string(portal.ID)).
 					Msg("StatusKit alias-resolver: resolved via live sibling chain")
-				c.rememberAliasPortal(ctx, sibling, portal.ID)
-				c.rememberAliasPortal(ctx, unknown, portal.ID)
+				c.rememberAliasPortal(ctx, sibling, portal.ID, true)
+				c.rememberAliasPortal(ctx, unknown, portal.ID, true)
 				return portal
 			}
 		}
@@ -398,7 +398,7 @@ func (c *IMClient) findPortalByID(ctx context.Context, id networkid.PortalID) *b
 // rememberAliasPortal writes alias→portal into both the in-memory cache
 // and the persistent KV mirror. Use this everywhere the bridge resolves
 // a StatusKit alias so future lookups are O(1) and survive restarts.
-func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portalID networkid.PortalID) {
+func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portalID networkid.PortalID, replayPending bool) {
 	if alias == "" || portalID == "" {
 		return
 	}
@@ -408,6 +408,20 @@ func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portal
 	}
 	c.statusKitPortalCache.Store(alias, portalID)
 	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitAliasPortalKeyPrefix+alias), string(portalID))
+	if replayPending {
+		c.replayPendingStatusKitPresence(ctx, c.UserLogin.Log.With().Str("component", "statuskit").Logger(), alias, portalID)
+	}
+}
+
+func (c *IMClient) aliasPortalCacheChanged(alias string, portalID networkid.PortalID) bool {
+	alias = normalizeIdentifierForPortalID(alias)
+	if alias == "" || portalID == "" {
+		return false
+	}
+	if cached, ok := c.statusKitPortalCache.Load(alias); ok {
+		return cached.(networkid.PortalID) != portalID
+	}
+	return true
 }
 
 // hydrateAliasPortalCacheFromKV pre-loads the in-memory
@@ -464,7 +478,7 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 			continue
 		}
 		if portal := c.resolveSiblingHandleLive(ctx, log, ghostID); portal != nil {
-			c.rememberAliasPortal(ctx, ghostID, portal.ID)
+			c.rememberAliasPortal(ctx, ghostID, portal.ID, false)
 			primed++
 		}
 	}
@@ -601,7 +615,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 			continue
 		}
 		if portal := c.resolveSiblingHandleLive(ctx, log, h); portal != nil {
-			c.rememberAliasPortal(ctx, h, portal.ID)
+			c.rememberAliasPortal(ctx, h, portal.ID, true)
 			chainLinked++
 			continue
 		}
@@ -661,55 +675,22 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 	persistCtx := context.Background()
 
 	idsLinked := 0
-	newMappings := 0
 	for unknown, aliases := range results {
 		portal := c.findPortalForAliases(ctx, log, unknown, aliases)
 		if portal == nil {
 			continue
 		}
-		// Detect first-time mapping so we can clear stale presence dedupe.
-		// Without this step, an earlier presence update that arrived BEFORE
-		// the alias_portal mapping existed will have left a "available"
-		// state cached against this handle. Subsequent updates with the
-		// same mode are then deduped as "unchanged" and the matrix portal
-		// never sees the indicator — even though routing now works.
-		preExisting := c.Main.Bridge.DB.KV.Get(persistCtx, database.Key(statusKitAliasPortalKeyPrefix+unknown))
-		isNewMapping := preExisting != string(portal.ID)
-
 		// Persist explicitly with the detached ctx. findPortalForAliases
 		// also calls rememberAliasPortal internally, but it uses the cycle
 		// ctx — that's the path that was silently failing. This redundant
 		// write is the durable one. Idempotent at the SQL layer (UPSERT).
-		c.rememberAliasPortal(persistCtx, unknown, portal.ID)
+		c.rememberAliasPortal(persistCtx, unknown, portal.ID, true)
 		// Clear the per-presence resolver's negative cooldown stamp so the
 		// next presence update for this handle doesn't get short-circuited
 		// to "already attempted, skip" — the batch path just succeeded for
 		// it. lookupAliasPortal would short-circuit first anyway, but
 		// clearing keeps the KV honest.
 		c.Main.Bridge.DB.KV.Set(persistCtx, database.Key(statusKitIDSAttemptKeyPrefix+unknown), "")
-
-		if isNewMapping {
-			// Clear the presence dedupe state keyed on the raw (prefix-stripped)
-			// handle. The presence handler stores last-known mode in
-			// `statuskit.presence.<raw>` and an in-memory sync.Map; both must
-			// drop the cached state so the next update for this handle is
-			// treated as a fresh first-sighting and routes to the now-mapped
-			// portal instead of being silently deduped.
-			raw := unknown
-			if strings.HasPrefix(raw, "mailto:") {
-				raw = strings.TrimPrefix(raw, "mailto:")
-			} else if strings.HasPrefix(raw, "tel:") {
-				raw = strings.TrimPrefix(raw, "tel:")
-			}
-			c.statusKitPresence.Delete(raw)
-			c.Main.Bridge.DB.KV.Set(persistCtx, database.Key("statuskit.presence."+raw), "")
-			newMappings++
-			log.Info().
-				Str("alias", unknown).
-				Str("raw_handle", raw).
-				Str("portal_id", string(portal.ID)).
-				Msg("StatusKit alias-resolver: batch link created new mapping (presence dedupe cleared)")
-		}
 
 		// Read-after-write verification surfaces silent KV failures so
 		// future regressions are immediately visible in the logs.
@@ -719,7 +700,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 				Str("expected_portal_id", string(portal.ID)).
 				Str("read_back", got).
 				Msg("StatusKit alias-resolver: batch link write failed to persist (read-after-write mismatch)")
-		} else if !isNewMapping {
+		} else {
 			log.Info().
 				Str("alias", unknown).
 				Str("portal_id", string(portal.ID)).
@@ -731,18 +712,6 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 		c.statusKitIDSGate.recordSuccess()
 	} else {
 		c.statusKitIDSGate.recordFailure()
-	}
-
-	// If we created any new mappings, ask the StatusKit subsystem to
-	// re-establish APNs interest tokens. Apple replays recent presence on
-	// resubscribe, so the now-routed handle's cached availability gets
-	// re-delivered and lands in the matrix portal — without waiting for
-	// the peer to publish a state change.
-	if newMappings > 0 {
-		log.Info().
-			Int("new_mappings", newMappings).
-			Msg("StatusKit alias-resolver: triggering presence resubscribe for newly-linked aliases")
-		c.subscribeToContactPresence(log)
 	}
 
 	log.Info().

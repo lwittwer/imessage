@@ -782,14 +782,13 @@ if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
     sed -i '/video_transcoding:/a\    heic_conversion: false' "$CONFIG"
 fi
 
-# ── HEIC conversion (libheif) ─────────────────────────────────
+# ── HEIC conversion (enable/disable in config) ────────────────
 CURRENT_HEIC_CONVERSION=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
 if [ -t 0 ]; then
     echo ""
     echo "HEIC Conversion:"
     echo "  When enabled, HEIC/HEIF images are automatically converted to JPEG"
     echo "  for broad Matrix client compatibility."
-    echo "  Requires libheif."
     echo ""
     if [ "$CURRENT_HEIC_CONVERSION" = "true" ]; then
         read -p "Enable HEIC to JPEG conversion? [Y/n]: " ENABLE_HC
@@ -1004,4 +1003,3 @@ else
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
 echo ""
-

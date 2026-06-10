@@ -110,9 +110,9 @@ func TestIMConfig_FormatDisplayname_DefaultTemplate(t *testing.T) {
 
 func TestIMConfig_UseChatDBBackfill(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     IMConfig
-		want    bool
+		name string
+		cfg  IMConfig
+		want bool
 	}{
 		{"enabled chatdb", IMConfig{CloudKitBackfill: true, BackfillSource: "chatdb"}, true},
 		{"enabled cloudkit", IMConfig{CloudKitBackfill: true, BackfillSource: "cloudkit"}, false},
@@ -169,6 +169,60 @@ backfill_source: chatdb
 	}
 	if c.displaynameTemplate == nil {
 		t.Error("displaynameTemplate should be set after unmarshal (PostProcess called)")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_StatusKitShareDefault(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if !c.StatusKitShareOnStartup {
+		t.Error("StatusKitShareOnStartup should default to true when omitted")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_StatusKitShareExplicitFalse(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+statuskit_share_on_startup: false
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if c.StatusKitShareOnStartup {
+		t.Error("StatusKitShareOnStartup should preserve explicit false")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_StatusKitNotificationsDefault(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if !c.StatusKitNotifications {
+		t.Error("StatusKitNotifications should default to true when omitted")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_StatusKitNotificationsExplicitFalse(t *testing.T) {
+	yamlData := `
+displayname_template: "{{.ID}}"
+statuskit_notifications: false
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("UnmarshalYAML error: %v", err)
+	}
+	if c.StatusKitNotifications {
+		t.Error("StatusKitNotifications should preserve explicit false")
 	}
 }
 

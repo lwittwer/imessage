@@ -4527,11 +4527,13 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_guid = normal.reply_guid.clone();
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
-            if let MessageType::SMS { from_handle: Some(ref fh), .. } = normal.service {
+            if let MessageType::SMS { from_handle: Some(from_handle), .. } = &normal.service {
                 // Apple's SMS relay puts the forwarding iPhone's handle in the APNs
                 // envelope sender, causing the bridge to misidentify it as IsFromMe.
                 // The true sender of an inbound SMS is stored in from_handle.
-                w.sender = Some(fh.clone());
+                if let Some(sender) = normalize_sms_sender_handle(from_handle) {
+                    w.sender = Some(sender);
+                }
             }
             // iOS piggybacks Name & Photo Sharing keys on regular text
             // messages from contacts who have sharing enabled; lift them so
@@ -4796,6 +4798,89 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
     w
 }
 
+fn normalize_sms_sender_handle(handle: &str) -> Option<String> {
+    let handle = handle.trim();
+    if handle.is_empty() {
+        None
+    } else if handle.starts_with("tel:") || handle.starts_with("mailto:") {
+        Some(handle.to_string())
+    } else if handle.contains('@') {
+        Some(format!("mailto:{handle}"))
+    } else {
+        Some(format!("tel:{handle}"))
+    }
+}
+
+#[cfg(test)]
+mod sms_sender_tests {
+    use super::*;
+
+    fn sms_message(sender: Option<String>, from_handle: Option<String>) -> MessageInst {
+        MessageInst {
+            id: "SMS-SENDER-TEST".to_string(),
+            sender,
+            conversation: Some(ConversationData {
+                participants: vec![
+                    "tel:+18449203767".to_string(),
+                    "tel:+16308902900".to_string(),
+                ],
+                cv_name: None,
+                sender_guid: None,
+                after_guid: None,
+            }),
+            message: Message::Message(NormalMessage::new(
+                "hello".to_string(),
+                MessageType::SMS {
+                    is_phone: false,
+                    using_number: "tel:+16308902900".to_string(),
+                    from_handle,
+                },
+            )),
+            sent_timestamp: 1234,
+            target: None,
+            send_delivered: false,
+            verification_failed: false,
+            certified_context: None,
+        }
+    }
+
+    #[test]
+    fn inbound_sms_sender_prefers_sms_from_handle() {
+        let msg = sms_message(
+            Some("tel:+16308902900".to_string()),
+            Some("+18449203767".to_string()),
+        );
+
+        let wrapped = message_inst_to_wrapped(&msg);
+
+        assert!(wrapped.is_sms);
+        assert_eq!(wrapped.sender.as_deref(), Some("tel:+18449203767"));
+    }
+
+    #[test]
+    fn outgoing_sms_sender_keeps_envelope_handle() {
+        let msg = sms_message(Some("tel:+16308902900".to_string()), None);
+
+        let wrapped = message_inst_to_wrapped(&msg);
+
+        assert!(wrapped.is_sms);
+        assert_eq!(wrapped.sender.as_deref(), Some("tel:+16308902900"));
+    }
+
+    #[test]
+    fn inbound_sms_sender_preserves_mailto_handle() {
+        let msg = sms_message(
+            Some("tel:+16308902900".to_string()),
+            Some("relay@example.com".to_string()),
+        );
+
+        let wrapped = message_inst_to_wrapped(&msg);
+
+        assert!(wrapped.is_sms);
+        assert_eq!(wrapped.sender.as_deref(), Some("mailto:relay@example.com"));
+    }
+}
+
 // ============================================================================
 // Callback interfaces
 // ============================================================================
@@ -4995,6 +5080,36 @@ pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Op
             None
         }
     }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StatusKitAllowedModesState {
+    #[serde(default)]
+    keys: HashMap<String, StatusKitAllowedModesDevice>,
+}
+
+#[derive(serde::Deserialize)]
+struct StatusKitAllowedModesDevice {
+    from: String,
+    #[serde(default)]
+    personal_config: StatusKitAllowedModesConfig,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StatusKitAllowedModesConfig {
+    #[serde(rename = "a", default)]
+    allowed_modes: Vec<String>,
+}
+
+fn read_statuskit_allowed_modes_by_sender(path: &str) -> HashMap<String, Vec<String>> {
+    let Some(state) = read_plist_state::<StatusKitAllowedModesState>(path) else {
+        return HashMap::new();
+    };
+    let mut by_sender = HashMap::new();
+    for device in state.keys.into_values() {
+        by_sender.insert(device.from, device.personal_config.allowed_modes);
+    }
+    by_sender
 }
 
 pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
@@ -6951,6 +7066,9 @@ pub async fn new_client(
         Arc::new(tokio::sync::RwLock::new(None));
     let status_callback_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> =
         Arc::new(tokio::sync::RwLock::new(None));
+    let statuskit_allowed_modes_path = subsystem_state_path("statuskit-state.plist");
+    let statuskit_allowed_modes_for_recv: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>> =
+        Arc::new(tokio::sync::RwLock::new(read_statuskit_allowed_modes_by_sender(&statuskit_allowed_modes_path)));
 
     // Shared reconnect timestamp: set when APNs reconnects (generated_signal
     // fires) or when the drain task starts listening (initial connection).
@@ -6977,6 +7095,7 @@ pub async fn new_client(
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
+        let allowed_modes_for_recv = statuskit_allowed_modes_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
@@ -7475,6 +7594,10 @@ pub async fn new_client(
 
                                 let pc_value: plist::Value = plist::from_bytes(&pc_bytes)
                                     .map_err(|e| format!("personal_config plist: {e}"))?;
+                                let pc_config: StatusKitAllowedModesConfig =
+                                    plist::from_value(&pc_value)
+                                        .map_err(|e| format!("personal_config decode: {e}"))?;
+                                let pc_allowed_modes = pc_config.allowed_modes;
 
                                 let mut dict = plist::Dictionary::new();
                                 dict.insert(
@@ -7503,6 +7626,10 @@ pub async fn new_client(
                                     .insert(parsed.channel.clone(), device);
                                 let total = state_w.keys.len();
                                 drop(state_w);
+                                allowed_modes_for_recv
+                                    .write()
+                                    .await
+                                    .insert(sender.clone(), pc_allowed_modes);
 
                                 let action = if prev.is_some() { "replaced" } else { "added" };
                                 let state_path =
@@ -7613,7 +7740,17 @@ pub async fn new_client(
                                     // Use the first active Focus mode's identifier.
                                     let mode_id = focus_active[0].tag.id.clone()
                                         .or_else(|| Some(focus_active[0].state.r#type.clone()));
-                                    (false, mode_id)
+                                    let allowed = if let Some(mode) = mode_id.as_ref() {
+                                        allowed_modes_for_recv
+                                            .read()
+                                            .await
+                                            .get(&sender)
+                                            .map(|modes| modes.iter().any(|allowed_mode| allowed_mode == mode))
+                                            .unwrap_or(false)
+                                    } else {
+                                        false
+                                    };
+                                    (allowed, mode_id)
                                 };
 
                                 info!(

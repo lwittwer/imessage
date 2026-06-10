@@ -702,13 +702,14 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 
 // restoreChatCandidate represents a chat that can be restored.
 type restoreChatCandidate struct {
-	portalID       string
-	displayName    string
-	participants   []string // normalized participants from recycle bin (may be nil)
-	groupID        string   // CloudKit group UUID (for groups)
-	chatID         string   // CloudKit chat_identifier
-	groupPhotoGuid string   // CloudKit group photo GUID (for group avatar)
-	source         string   // debug: which source produced this candidate
+	portalID        string
+	displayName     string
+	seedDisplayName string
+	participants    []string // normalized participants from recycle bin (may be nil)
+	groupID         string   // CloudKit group UUID (for groups)
+	chatID          string   // CloudKit chat_identifier
+	groupPhotoGuid  string   // CloudKit group photo GUID (for group avatar)
+	source          string   // debug: which source produced this candidate
 }
 
 // fnRestoreChatFromCloudKit finds deleted chats from CloudKit recycle-bin
@@ -748,8 +749,10 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 				// friendlyPortalName falls back to member names which prevents
 				// the old portalID-equality check from triggering.
 				name := ""
-				if chat.DisplayName != nil && *chat.DisplayName != "" {
+				seedDisplayName := ""
+				if chat.DisplayName != nil && *chat.DisplayName != "" && !isPlaceholderGroupName(*chat.DisplayName) {
 					name = *chat.DisplayName
+					seedDisplayName = *chat.DisplayName
 				}
 				if name == "" {
 					name = friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
@@ -766,7 +769,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 						}
 					}
 					if len(normalized) > 0 {
-						if built := client.buildGroupName(normalized); built != "" && built != "Group Chat" {
+						if built := client.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 							name = built
 						}
 					}
@@ -783,13 +786,14 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 					photoGuid = *chat.GroupPhotoGuid
 				}
 				candidates = append(candidates, restoreChatCandidate{
-					portalID:       portalID,
-					displayName:    name,
-					participants:   normParts,
-					groupID:        chat.GroupId,
-					chatID:         chat.CloudChatId,
-					groupPhotoGuid: photoGuid,
-					source:         "S1:recycle",
+					portalID:        portalID,
+					displayName:     name,
+					seedDisplayName: seedDisplayName,
+					participants:    normParts,
+					groupID:         chat.GroupId,
+					chatID:          chat.CloudChatId,
+					groupPhotoGuid:  photoGuid,
+					source:          "S1:recycle",
 				})
 				seenPortalIDs[portalID] = true
 			}
@@ -1073,15 +1077,16 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 			chosen := candidates[n-1]
 			portalKey := networkid.PortalKey{ID: networkid.PortalID(chosen.portalID), Receiver: login.ID}
 			if err := client.startRestoreBackfillPipeline(restorePipelineOptions{
-				PortalID:       chosen.portalID,
-				PortalKey:      portalKey,
-				Source:         "restore_chat_cmd",
-				DisplayName:    chosen.displayName,
-				Participants:   chosen.participants,
-				ChatID:         chosen.chatID,
-				GroupID:        chosen.groupID,
-				GroupPhotoGuid: chosen.groupPhotoGuid,
-				RecoverOnApple: true,
+				PortalID:        chosen.portalID,
+				PortalKey:       portalKey,
+				Source:          "restore_chat_cmd",
+				DisplayName:     chosen.displayName,
+				SeedDisplayName: chosen.seedDisplayName,
+				Participants:    chosen.participants,
+				ChatID:          chosen.chatID,
+				GroupID:         chosen.groupID,
+				GroupPhotoGuid:  chosen.groupPhotoGuid,
+				RecoverOnApple:  true,
 				Notify: func(format string, args ...any) {
 					ce.Reply(format, args...)
 				},
@@ -1099,24 +1104,32 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 // then falls back to formatting the portal_id.
 func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IMClient, key networkid.PortalKey, portalID string) string {
 	if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
-		return portal.Name
+		if !isRefreshableGroupName(portal.Name) {
+			return portal.Name
+		}
 	}
 	// For group chats, resolve from cloud store (display_name / contact names).
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 	if isGroup && client != nil {
-		if name, _ := client.resolveGroupName(ctx, portalID); name != "" && name != "Group Chat" {
+		if name, authoritative := client.resolveGroupName(ctx, portalID); name != "" && (authoritative || !isPlaceholderGroupName(name)) {
 			return name
+		}
+		if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
+			return portal.Name
 		}
 	}
 	// For DM portals, try to resolve a contact name.
 	if client != nil && !isGroup {
-		contact := client.lookupContact(portalID)
+		contact, localID, err := client.lookupContactForDisplay(portalID)
+		if err != nil {
+			client.Main.Bridge.Log.Debug().Err(err).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 		if contact != nil && contact.HasName() {
 			name := client.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
 				Nickname:  contact.Nickname,
-				ID:        stripIdentifierPrefix(portalID),
+				ID:        localID,
 			})
 			if name != "" {
 				return name
@@ -1124,7 +1137,7 @@ func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IM
 		}
 	}
 	// Strip URI prefix for a cleaner display.
-	id := strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:")
+	id := stripIdentifierPrefix(portalID)
 	if strings.HasPrefix(portalID, "gid:") {
 		trimmed := strings.TrimPrefix(portalID, "gid:")
 		if len(trimmed) > 8 {

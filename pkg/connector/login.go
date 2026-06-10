@@ -344,8 +344,8 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 				"Start it with: go run tools/nac-relay/main.go"
 		}
 		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: LoginStepAppleIDPassword,
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       LoginStepAppleIDPassword,
 			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
@@ -887,6 +887,7 @@ func completeLoginWithMeta(
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
+		recentDeliveryReceipts:  make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
 		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
 		sharedAlbumRooms:        make(map[string]id.RoomID),

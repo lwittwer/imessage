@@ -119,7 +119,7 @@ var cmdStatuskitClearLatch = &commands.FullHandler{
 	Func: fnStatuskitClearLatch,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionStatusKit,
-		Description: "Clear the StatusKit invite latch for one handle so the next sweep re-invites it. Use when a peer's reshare never arrives despite a successful dispatch (for individual recovery without flushing every latch).",
+		Description: "Clear the StatusKit invite/no-keys latches for one handle. Use before a manual retry when a peer's StatusKit key state changed.",
 		Args:        "<handle>",
 	},
 	RequiresLogin: true,
@@ -389,11 +389,13 @@ func fnStatuskitClearLatch(ce *commands.Event) {
 	bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle), "")
 	bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), "")
+	bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+handle), "")
 	normalized := normalizeIdentifierForPortalID(handle)
 	if normalized != handle {
 		bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), "")
 		bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+normalized), "")
+		bridge.DB.KV.Set(ctx, database.Key(statusKitNoKeysKeyPrefix+normalized), "")
 	}
-	ce.Reply("Cleared StatusKit latches for %q (and normalized %q). Next invite sweep will retry this handle.", handle, normalized)
+	ce.Reply("Cleared StatusKit invite/no-keys latches for %q (and normalized %q).", handle, normalized)
 }

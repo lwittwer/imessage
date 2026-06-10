@@ -954,8 +954,9 @@ func (c *IMClient) maybeNotifyIncomingFaceTimeInvite(log zerolog.Logger, msg *ru
 
 func (c *IMClient) sendFaceTimeInviteNotice(log zerolog.Logger, portalKey networkid.PortalKey, sender string, link string, createPortal bool) {
 	ctx := context.Background()
-	markdown := fmt.Sprintf("📞 **Incoming FaceTime invite** from **%s**\\n\\n[Join FaceTime](%s)", sender, link)
+	markdown := fmt.Sprintf("📞 **Incoming FaceTime invite** from **%s**\n\n[Join FaceTime](%s)", sender, link)
 	content := format.RenderMarkdown(markdown, true, false)
+	content.MsgType = event.MsgNotice
 
 	attempts := 1
 	if createPortal {

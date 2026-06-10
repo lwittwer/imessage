@@ -17,6 +17,8 @@ import (
 	"github.com/lrhodin/imessage/pkg/imconfig"
 )
 
+const iMessageBridgeIconMXC = "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX"
+
 var configCommand = &cli.Command{
 	Name:      "config",
 	Usage:     "Register a bridge and generate its configuration file",
@@ -89,7 +91,7 @@ func cmdConfig(ctx *cli.Context) error {
 			CommandPrefix:    "!im",
 			DatabaseFileName: "mautrix-imessage",
 			BridgeTypeName:   "iMessage",
-			BridgeTypeIcon:   "mxc://beeper.com/imessage",
+			BridgeTypeIcon:   iMessageBridgeIconMXC,
 			DefaultPickleKey: "beeper",
 		},
 	}

@@ -1437,4 +1437,3 @@ else
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
 echo ""
-

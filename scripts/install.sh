@@ -966,4 +966,3 @@ echo "  Logs:    tail -f $LOG_OUT"
 echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
 echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
 echo ""
-

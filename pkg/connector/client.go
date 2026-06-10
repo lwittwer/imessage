@@ -116,16 +116,76 @@ func isUnrecoverableAttachmentError(errMsg string) bool {
 type restoreStatusFunc func(format string, args ...any)
 
 type restorePipelineOptions struct {
-	PortalID       string
-	PortalKey      networkid.PortalKey
-	Source         string
-	DisplayName    string
-	Participants   []string
-	ChatID         string
-	GroupID        string
-	GroupPhotoGuid string
-	RecoverOnApple bool
-	Notify         restoreStatusFunc
+	PortalID        string
+	PortalKey       networkid.PortalKey
+	Source          string
+	DisplayName     string
+	SeedDisplayName string
+	Participants    []string
+	ChatID          string
+	GroupID         string
+	GroupPhotoGuid  string
+	RecoverOnApple  bool
+	Notify          restoreStatusFunc
+}
+
+func isPlaceholderGroupName(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	return trimmed == "" || strings.EqualFold(trimmed, "Group Chat")
+}
+
+func isRawIdentifierGroupName(name string) bool {
+	parts := strings.Split(name, ",")
+	hasPart := false
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		hasPart = true
+		if strings.Contains(part, "@") {
+			at := strings.Index(part, "@")
+			if at > 0 && at == strings.LastIndex(part, "@") && at < len(part)-1 && !strings.ContainsAny(part, " \t") {
+				continue
+			}
+			return false
+		}
+		digits := 0
+		for _, r := range part {
+			if r >= '0' && r <= '9' {
+				digits++
+			} else if r != '+' && r != '-' && r != '(' && r != ')' && r != ' ' && r != '.' {
+				return false
+			}
+		}
+		if digits < 7 {
+			return false
+		}
+	}
+	return hasPart
+}
+
+func isRefreshableGroupName(name string) bool {
+	return isPlaceholderGroupName(name) || isRawIdentifierGroupName(name)
+}
+
+func shouldApplyGroupNameRefresh(currentName, newName string, authoritative bool) bool {
+	newName = strings.TrimSpace(newName)
+	if newName == "" || newName == currentName {
+		return false
+	}
+	if isPlaceholderGroupName(newName) {
+		return false
+	}
+	if authoritative {
+		return true
+	}
+	return isRefreshableGroupName(currentName)
+}
+
+func (c *IMClient) isGroupPortalSignal(participants []string, groupName *string) bool {
+	hasRealGroupName := groupName != nil && !isPlaceholderGroupName(*groupName)
+	return c.getUniqueParticipantCount(participants) > 2 || hasRealGroupName
 }
 
 const maxAttachmentRetries = 3
@@ -238,13 +298,15 @@ type IMClient struct {
 	// Peer iOS publishes status to every alias of the same Apple ID, so
 	// without this canonical dedup the bridge fires N notices per state
 	// change for a peer with N registered handles.
-	statusKitPresenceByPortal sync.Map // map[networkid.PortalID]string
+	statusKitPresenceByPortal     sync.Map // map[networkid.PortalID]string
+	statusKitPresenceSeenByPortal sync.Map // map[networkid.PortalID]time.Time
 
 	// statusKitPortalCache memoizes the resolved DM portal ID for a StatusKit
 	// presence handle. Populated after a successful IDS correlation lookup
 	// (see resolveStatusPortalViaIDS) so we only pay the IDS round trip once
 	// per unresolved handle per session. Values are networkid.PortalID.
-	statusKitPortalCache sync.Map // map[string]networkid.PortalID
+	statusKitPortalCache             sync.Map // map[string]networkid.PortalID
+	statusKitPresenceResolveInFlight sync.Map // map[string]struct{}
 
 	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
 	// driven by StatusKit alias resolution. Per-handle 6h negative cache
@@ -388,6 +450,12 @@ type IMClient struct {
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
 	recentOutboundUnsends     map[string]time.Time
 	recentOutboundUnsendsLock sync.Mutex
+
+	// Delivery receipt dedup: tracks UUIDs for which a delivery receipt
+	// (command 101) has already been sent this session. Prevents redundant
+	// receipts when APNs re-delivers the same message on reconnect.
+	recentDeliveryReceipts     map[string]time.Time
+	recentDeliveryReceiptsLock sync.Mutex
 
 	// Outbound delete echo suppression: tracks portal IDs where a chat delete
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
@@ -1128,6 +1196,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 
 	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
+	c.migrateStatusKitPresenceState(context.Background(), log)
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
 	// for outbound, "nextincomingcall" for inbound). Done in the
@@ -1387,6 +1456,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	go c.periodicStateSave(log)
 	go c.periodicPetRefresh(log)
 	go c.periodicStatusSharingReinvite(log)
+	go c.periodicStatusKitPresenceSweep(log)
 	go c.startSharedStreamsWatcher(log)
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
@@ -1780,6 +1850,7 @@ func logSafeHandles(handles []string) []string {
 }
 
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
+	observedAt := time.Now()
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Str("user", logSafeHandle(user)).
@@ -1790,294 +1861,167 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		return
 	}
 
-	// Suppress duplicate notices: only act when the state actually changes.
-	// Apple sends available=true for BOTH DND-on and DND-off; the real
-	// discriminator is whether mode is set. Track by mode string so that
-	// DND→Sleep (two different silenced modes) still fires two notices.
-	modeKey := "available"
-	if mode != nil && *mode != "" {
-		modeKey = *mode
-	}
-	// kvKeyFor returns the KV store key used to persist StatusKit state for
-	// a given user handle across bridge restarts.
-	kvKeyFor := func(u string) database.Key {
-		return database.Key("statuskit.presence." + u)
-	}
-
-	if prev, loaded := c.statusKitPresence.Load(user); loaded {
-		if prev.(string) == modeKey {
-			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged, skipping notice")
-			return
-		}
-	} else {
-		// Not in memory (first call this session for this user): check KV store
-		// for the state persisted from the previous bridge run.  If it matches
-		// the incoming state, warm the in-memory cache and skip the notice so
-		// users don't see a flood of "has notifications turned on/off" messages
-		// every time the bridge restarts.
-		if c.Main.Bridge.DB.KV.Get(context.Background(), kvKeyFor(user)) == modeKey {
-			c.statusKitPresence.Store(user, modeKey)
-			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged (restored from DB), skipping notice")
-			return
-		}
-	}
+	modeKey := statusKitModeKey(mode, available)
 
 	log.Info().
 		Bool("available", available).
 		Str("mode_key", modeKey).
 		Msg("StatusKit: received presence update — dispatching to goroutine")
 
-	// Capture values for the goroutine (mode is a pointer; copy the string).
-	var modeCopy *string
-	if mode != nil {
-		s := *mode
-		modeCopy = &s
-	}
-
-	// Optimistic dedup: store the new modeKey BEFORE dispatching so that
-	// rapid-fire re-deliveries of the same state (e.g. APNs replay on
-	// reconnect) are caught by the check above before the goroutine has
-	// had a chance to complete and store the key itself.
-	// Also persist to the KV store so the dedup survives a bridge restart.
-	c.statusKitPresence.Store(user, modeKey)
-	c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), modeKey)
-
 	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
 	go func() {
 		ctx := context.Background()
-
-		// Apple sends available=true for both DND-on and DND-off; the mode
-		// field is the real signal. mode non-nil/non-empty = DND/Focus active.
-		silenced := modeCopy != nil && *modeCopy != ""
-		presence := event.PresenceOnline
-		statusMsg := ""
-		if silenced {
-			presence = event.PresenceUnavailable
-			statusMsg = *modeCopy
-		}
-
-		// findPortal returns an existing, active portal or nil.
-		findPortal := func(id networkid.PortalID) *bridgev2.Portal {
-			p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-				ID:       id,
-				Receiver: c.UserLogin.ID,
-			})
-			if err != nil || p == nil || p.MXID == "" {
-				return nil
+		inFlightKey := statusKitCanonicalAlias(user) + "\x00" + modeKey
+		if inFlightKey != "\x00"+modeKey {
+			if _, loaded := c.statusKitPresenceResolveInFlight.LoadOrStore(inFlightKey, struct{}{}); loaded {
+				log.Debug().Str("mode", modeKey).Msg("StatusKit: resolver already in flight")
+				return
 			}
-			return p
+			defer c.statusKitPresenceResolveInFlight.Delete(inFlightKey)
 		}
+		portal := c.resolveStatusKitPortal(ctx, log, user)
+		if portal == nil || portal.MXID == "" {
+			c.storePendingStatusKitPresence(ctx, log, user, modeKey, observedAt)
+			return
+		}
+		c.applyStatusKitPresenceToPortal(ctx, log, user, portal, modeKey, observedAt)
+	}()
+}
 
-		normalizedUser := normalizeIdentifierForPortalID(user)
-
-		// Resolve the portal AND the ghost handle to use for sending.
-		//
-		// For mailto: handles the ghost often has no MXID (never joined a
-		// Matrix room) so ghost.Intent is nil. We must use the tel: ghost
-		// instead — it IS in the portal and has a valid MXID. portal.ID is
-		// the tel: handle, so we derive the ghost from the resolved portal.
-		//
-		// Resolution order for mailto: handles:
-		//   (0) statusKitPortalCache — learned from inbound message traffic,
-		//       covers any peer who has ever messaged bridge regardless of
-		//       whether they appear in iCloud contacts.
-		//   (1) address-book phones (fast, no network)
-		//   (2) IDS correlation — self-bounding 5s tokio timeout in Rust
-		//   (3) mailto: portal itself as absolute last resort
-		var portal *bridgev2.Portal
-
-		// (0) Fast path: check the learned sender→portal cache first. This
-		// is populated from every inbound message, so any peer who has
-		// messaged bridge has a direct mapping here that doesn't depend on
-		// iCloud CardDAV contact completeness (the common failure mode for
-		// reshare correlation).
-		for _, key := range [2]string{user, normalizedUser} {
-			if key == "" {
-				continue
+func (c *IMClient) resolveStatusKitPortal(ctx context.Context, log zerolog.Logger, alias string) *bridgev2.Portal {
+	normalizedUser := normalizeIdentifierForPortalID(alias)
+	for _, key := range [2]string{alias, normalizedUser} {
+		if key == "" {
+			continue
+		}
+		if cached, ok := c.statusKitPortalCache.Load(key); ok {
+			if p := c.findPortalByID(ctx, cached.(networkid.PortalID)); p != nil {
+				log.Info().Str("user", logSafeHandle(alias)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
+				c.rememberAliasPortal(ctx, alias, p.ID, true)
+				return p
 			}
-			if cached, ok := c.statusKitPortalCache.Load(key); ok {
-				if p := findPortal(cached.(networkid.PortalID)); p != nil {
+		}
+	}
+
+	var portal *bridgev2.Portal
+	if strings.HasPrefix(normalizedUser, "mailto:") {
+		if contact := c.lookupContact(alias); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				if !strings.HasPrefix(altID, "tel:") {
+					continue
+				}
+				if p := c.findPortalByID(ctx, networkid.PortalID(altID)); p != nil {
+					log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
 					portal = p
-					log.Info().Str("user", logSafeHandle(user)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
 					break
 				}
 			}
 		}
-
-		if portal == nil && strings.HasPrefix(normalizedUser, "mailto:") {
-			// (1) Address-book.
-			contact := c.lookupContact(user)
-			if contact != nil {
+		if portal == nil {
+			if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, alias); altPortal != nil {
+				log.Info().Str("user", logSafeHandle(alias)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+				portal = altPortal
+			}
+		}
+		if portal == nil {
+			portal = c.resolveViaCluster(ctx, log, alias)
+		}
+		if portal == nil {
+			if p := c.findPortalByID(ctx, networkid.PortalID(normalizedUser)); p != nil {
+				log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
+				portal = p
+			}
+		}
+	} else {
+		portalID := c.resolveContactPortalID(normalizedUser)
+		portalID = c.resolveExistingDMPortalID(string(portalID))
+		portal = c.findPortalByID(ctx, portalID)
+		if portal == nil {
+			if contact := c.lookupContact(alias); contact != nil {
 				for _, altID := range contactPortalIDs(contact) {
-					if !strings.HasPrefix(altID, "tel:") {
+					if altID == normalizedUser {
 						continue
 					}
-					if p := findPortal(networkid.PortalID(altID)); p != nil {
-						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
+					altPortalID := c.resolveContactPortalID(altID)
+					altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+					if p := c.findPortalByID(ctx, altPortalID); p != nil {
+						log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
 						portal = p
 						break
 					}
 				}
 			}
-
-			// (2) IDS correlation (self-bounding, safe to call from goroutine).
-			// Cached wrapper: skips repeat round-trips against handles
-			// that recently returned no result (negative cooldown), and
-			// short-circuits via the persistent alias_portal store on
-			// previously-resolved handles.
-			if portal == nil {
-				if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, user); altPortal != nil {
-					log.Info().Str("user", logSafeHandle(user)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
-					portal = altPortal
-				}
-			}
-
-			// (2.5) Cluster transitive lookup. Fires when contacts and IDS
-			// both came up empty — common for hidden-alias mailto:s where
-			// Apple's IDS returns LookupFailed (6001). Looks for sibling
-			// handles on the same StatusKit channel id; the first one that
-			// resolves via the live chain (or persisted alias→portal) hands
-			// the unknown handle its portal.
-			if portal == nil {
-				if p := c.resolveViaCluster(ctx, log, user); p != nil {
-					portal = p
-				}
-			}
-
-			// (3) mailto: portal as last resort.
-			if portal == nil {
-				if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
-					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
-					portal = p
-				}
-			}
-		} else if portal == nil {
-			portalID := c.resolveContactPortalID(normalizedUser)
-			portalID = c.resolveExistingDMPortalID(string(portalID))
-			portal = findPortal(portalID)
-
-			if portal == nil {
-				contact := c.lookupContact(user)
-				if contact != nil {
-					for _, altID := range contactPortalIDs(contact) {
-						if altID == normalizedUser {
-							continue
-						}
-						altPortalID := c.resolveContactPortalID(altID)
-						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
-						if p := findPortal(altPortalID); p != nil {
-							log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
-							portal = p
-							break
-						}
-					}
-				}
-			}
-
-			// Cluster transitive lookup for the tel: branch too — covers
-			// peers who publish from a tel: alias the bridge has not seen
-			// before but who share a channel id with a known sibling.
-			if portal == nil {
-				if p := c.resolveViaCluster(ctx, log, user); p != nil {
-					portal = p
-				}
-			}
 		}
-
-		if portal == nil || portal.MXID == "" {
-			log.Warn().
-				Str("user", normalizedUser).
-				Msg("StatusKit: no DM portal found for presence notice")
-			return
+		if portal == nil {
+			portal = c.resolveViaCluster(ctx, log, alias)
 		}
+	}
+	if portal != nil {
+		c.rememberAliasPortal(ctx, alias, portal.ID, true)
+		return portal
+	}
+	log.Warn().Str("user", normalizedUser).Msg("StatusKit: no DM portal found for presence notice")
+	return nil
+}
 
-		// Canonical (portal-keyed) dedup. The early dedup at the top of
-		// OnStatusUpdate keys by raw alias, so a peer with N registered
-		// handles produces N goroutines that all reach this point and
-		// resolve to the same portal. Collapse them here using portal ID
-		// as the canonical key so only the first alias of each state
-		// change actually sends the notice. Persisted to KV under a
-		// distinct prefix so the dedup survives bridge restarts.
-		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
-		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
-			if prev.(string) == modeKey {
-				log.Debug().
-					Str("portal_id", string(portal.ID)).
-					Str("alias", user).
-					Str("mode", modeKey).
-					Msg("StatusKit: presence unchanged for canonical portal, skipping duplicate alias notice")
-				return
-			}
-		} else if c.Main.Bridge.DB.KV.Get(ctx, portalKey) == modeKey {
-			c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
-			log.Debug().
-				Str("portal_id", string(portal.ID)).
-				Str("alias", user).
-				Str("mode", modeKey).
-				Msg("StatusKit: presence unchanged for canonical portal (restored from DB), skipping duplicate alias notice")
-			return
-		}
-		c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
-		c.Main.Bridge.DB.KV.Set(ctx, portalKey, modeKey)
+func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerolog.Logger, alias string, portal *bridgev2.Portal, modeKey string, observedAt time.Time) bool {
+	if portal == nil || portal.ID == "" {
+		return false
+	}
+	if latest := c.getStatusKitPortalSeen(ctx, portal.ID); !latest.IsZero() && latest.After(observedAt) {
+		log.Debug().Str("portal_id", string(portal.ID)).Str("mode", modeKey).Time("observed_at", observedAt).Time("latest_observed_at", latest).Msg("StatusKit: stale presence ignored")
+		return false
+	}
 
-		// Use the ghost keyed to the portal's handle — for a tel: portal this
-		// is the tel: ghost which has an MXID and is a member of the room.
-		// The mailto: ghost typically has no MXID (never joined a room) so
-		// ghost.Intent would be nil. Prefer portal ghost; fall back to the
-		// mailto: ghost if the portal ghost is unavailable.
+	previousMode, _ := c.statusKitPresenceByPortal.Load(portal.ID)
+	previousModeStr, _ := previousMode.(string)
+	if previousModeStr == "" {
+		previousModeStr = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)))
+	}
+	sameMode := previousModeStr == modeKey
+
+	c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
+	c.statusKitPresenceSeenByPortal.Store(portal.ID, observedAt)
+	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)), modeKey)
+	c.Main.Bridge.DB.KV.Set(ctx, statusKitPortalSeenKey(portal.ID), observedAt.UTC().Format(time.RFC3339Nano))
+
+	silenced := statusKitModeSilenced(modeKey)
+	presence := event.PresenceOnline
+	statusMsg := ""
+	if silenced {
+		presence = event.PresenceUnavailable
+		statusMsg = modeKey
+	}
+
+	if !sameMode {
 		ghostHandle := string(portal.ID)
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostHandle))
 		if err != nil || ghost == nil || ghost.Intent == nil {
-			// Fallback: try the original mailto: ghost.
-			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(alias))
 			if err != nil || ghost == nil || ghost.Intent == nil {
-				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
-					Msg("StatusKit: no usable ghost found — skipping notice")
-				return
-			}
-			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
-		} else {
-			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
-		}
-
-		// Set Matrix presence using whichever ghost we resolved.
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-				Presence:  presence,
-				StatusMsg: statusMsg,
-			}); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("alias", logSafeHandle(alias)).
+					Msg("StatusKit: no usable ghost found — skipping Matrix presence only")
 			}
 		}
+		if ghost != nil && ghost.Intent != nil {
+			if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+				if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+					Presence:  presence,
+					StatusMsg: statusMsg,
+				}); err != nil {
+					log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				}
+			}
+		}
+	}
 
-		// Reflect the focus state in the DM TITLE (room name) instead of
-		// posting a timeline notice: the contact's name normally, the name
-		// plus a trailing 🌙 while their Focus/DND is on. The title is
-		// persistent in the header and the chat-list row, never buried, and is
-		// updated in place with ExcludeChangesFromTimeline — so no wall, no
-		// tombstones, no inbox churn. DMs only: a group has a single shared
-		// title, so per-member focus can't ride on it (groups no longer
-		// surface focus at all).
-		//
-		// Routed through computeDMTitle so this live path and the periodic
-		// refreshDMPortalNamesFromContacts loop ALWAYS agree — the refresh
-		// re-applies the identical title every contact-sync tick (covering
-		// restarts and any toggle missed while the bridge was down), and a
-		// live change updates it immediately. The portal-keyed presence state
-		// was stored just above, so computeDMTitle sees the new state.
-		//
-		// Logs carry only the opaque room MXID + a boolean — never the
-		// contact name or handle.
-		// Only touch the title when there's something to own: the peer is
-		// silenced (add 🌙), or we already own the name (NameIsCustom — to
-		// maintain it or clear the moon). A pristine, never-silenced DM is left
-		// on implicit naming so we never mass-seize NameIsCustom (which would
-		// also freeze ghost avatar updates) across DMs. portal.Name may be
-		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
-		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
-			nameField := c.dmFocusName(ctx, portal)
+	if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom || previousModeStr != modeKey) {
+		nameField := c.dmFocusName(ctx, portal)
+		titleDiffers := nameField != nil && portal.Name != *nameField
+		releaseCustomName := nameField == nil && portal.NameIsCustom
+		if !sameMode || titleDiffers || releaseCustomName {
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
 					Type: bridgev2.RemoteEventChatInfoChange,
@@ -2101,7 +2045,20 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
 				Msg("StatusKit: updated DM title for focus change")
 		}
-	}()
+	}
+	if portal.RoomType == database.RoomTypeDM {
+		if silenced {
+			c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), "")
+		} else if !portal.NameIsCustom {
+			name := c.dmBaseName(ctx, portal)
+			if name != "" && c.Main.Bridge.DB.KV.Get(ctx, statusKitRoomNameRepairKey(portal.ID)) != statusKitRoomNameRepairValue(name) {
+				if stampedName, ok := c.forceStampAvailableStatusKitDMRoomName(ctx, log, portal); ok {
+					c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), statusKitRoomNameRepairValue(stampedName))
+				}
+			}
+		}
+	}
+	return true
 }
 
 // isPortalSilenced reports whether the peer of the given DM portal currently
@@ -2117,10 +2074,10 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
 	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
 		s, _ := v.(string)
-		return s != "" && s != "available"
+		return statusKitModeSilenced(s)
 	}
 	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
-	return s != "" && s != "available"
+	return statusKitModeSilenced(s)
 }
 
 // dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the
@@ -2343,7 +2300,7 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 					Str("alias", alias).
 					Str("resolved_portal_id", string(aliasPortalID)).
 					Msg("StatusKit: resolved DM portal via IDS correlation")
-				c.rememberAliasPortal(ctx, user, aliasPortalID)
+				c.rememberAliasPortal(ctx, user, aliasPortalID, true)
 				return altPortal
 			}
 		}
@@ -2443,19 +2400,19 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 					continue
 				}
 				if p := findPortal(networkid.PortalID(altID)); p != nil {
-					c.rememberAliasPortal(ctx, sender, p.ID)
+					c.rememberAliasPortal(ctx, sender, p.ID, true)
 					log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
 					return
 				}
 			}
 		}
 		if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, sender); altPortal != nil {
-			c.rememberAliasPortal(ctx, sender, altPortal.ID)
+			c.rememberAliasPortal(ctx, sender, altPortal.ID, true)
 			log.Info().Str("resolved_portal_id", string(altPortal.ID)).Msg("StatusKit: eager-resolved reshare sender via IDS correlation")
 			return
 		}
 		if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
-			c.rememberAliasPortal(ctx, sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID, true)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via direct mailto: portal")
 			return
 		}
@@ -2463,7 +2420,7 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 		portalID := c.resolveContactPortalID(normalizedUser)
 		portalID = c.resolveExistingDMPortalID(string(portalID))
 		if p := findPortal(portalID); p != nil {
-			c.rememberAliasPortal(ctx, sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID, true)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender (tel: direct)")
 			return
 		}
@@ -2486,20 +2443,30 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		Logger()
 	// Send delivery receipt if requested
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in SendDeliveryReceipt")
+		if c.trackDeliveryReceipt(msg.Uuid) {
+			go func() {
+				sent := false
+				defer func() {
+					if r := recover(); r != nil {
+						log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in SendDeliveryReceipt")
+					}
+					if !sent {
+						c.untrackDeliveryReceipt(msg.Uuid)
+					}
+				}()
+				conv := c.makeConversation(msg.Participants, msg.GroupName)
+				if c.client == nil {
+					return
 				}
+				if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
+					log.Warn().Err(err).Msg("Failed to send delivery receipt")
+					return
+				}
+				sent = true
 			}()
-			conv := c.makeConversation(msg.Participants, msg.GroupName)
-			if c.client == nil {
-				return
-			}
-			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
-				log.Warn().Err(err).Msg("Failed to send delivery receipt")
-			}
-		}()
+		} else {
+			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping duplicate delivery receipt")
+		}
 	}
 
 	if msg.IsDelivered {
@@ -2527,10 +2494,20 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		return
 	}
 	if msg.IsError {
-		log.Warn().
+		statusStr := ptrStringOr(msg.ErrorStatusStr, "")
+		status := ptrUint64Or(msg.ErrorStatus, 0)
+
+		// Apple Message Protection delivery confirmations are informational,
+		// not actionable errors. Downgrade to Debug to reduce log noise.
+		logEvent := log.Warn()
+		if statusStr == "ec-com.apple.messageprotection-6" && status == 200 {
+			logEvent = log.Debug()
+		}
+
+		logEvent.
 			Str("for_uuid", ptrStringOr(msg.ErrorForUuid, "")).
-			Uint64("status", ptrUint64Or(msg.ErrorStatus, 0)).
-			Str("status_str", ptrStringOr(msg.ErrorStatusStr, "")).
+			Uint64("status", status).
+			Str("status_str", statusStr).
 			Msg("Received iMessage error")
 		return
 	}
@@ -2738,11 +2715,19 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// buffer flushes, delayed APNs deliveries can arrive with IsStoredMessage=false
 	// for messages that CloudKit already bridged. Check the Bridge DB for any
 	// message whose UUID is already known to prevent duplicates.
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	if msg.Uuid != "" {
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
+			if portalKey.ID == "unknown" {
+				log.Debug().
+					Str("uuid", msg.Uuid).
+					Bool("is_stored", msg.IsStoredMessage).
+					Str("existing_portal", string(dbMsgs[0].Room.ID)).
+					Msg("Skipping message already in bridge DB with unresolved APNs portal")
+				return
+			}
 			// Only skip if the existing message is in the SAME portal.
 			// Apple's SMS relay can reuse UUIDs across different short-code
 			// conversations, causing false-positive dedup drops.
@@ -2787,7 +2772,42 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+
+	// SMS/RCS group reactions and other messages sometimes arrive from the
+	// iPhone relay with an empty participant list. makePortalKey() then falls
+	// back to [sender, our_number] and computes a DM portal key, which can split
+	// one group chat into spurious DM portals.
+	//
+	// Only redirect DM->group when there is unambiguous evidence that this
+	// payload belongs to a known group. If evidence is ambiguous, keep the DM
+	// portal to avoid misrouting legitimate 1:1 SMS traffic.
+	if msg.IsSms && (portalKey.ID == "unknown" || isComputedDMPortalID(portalKey.ID)) {
+		if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
+			log.Debug().
+				Bool("has_sender", msg.Sender != nil && *msg.Sender != "").
+				Str("sender_guid", ptr.Val(msg.SenderGuid)).
+				Str("dm_portal", string(portalKey.ID)).
+				Str("group_portal", string(groupKey.ID)).
+				Msg("Redirecting SMS message to known group portal")
+			portalKey = groupKey
+		}
+	}
+
+	// Drop messages that couldn't be resolved to a real portal.
+	// makePortalKey returns ID:"unknown" when participants and sender are both
+	// empty/unresolvable. Letting these through creates a junk "unknown" room.
+	if portalKey.ID == "unknown" {
+		log.Warn().
+			Str("msg_uuid", msg.Uuid).
+			Bool("is_sms", msg.IsSms).
+			Bool("has_sender", msg.Sender != nil && *msg.Sender != "").
+			Bool("has_sender_guid", msg.SenderGuid != nil && *msg.SenderGuid != "").
+			Bool("has_group_name", msg.GroupName != nil && !isPlaceholderGroupName(*msg.GroupName)).
+			Strs("participants", msg.Participants).
+			Msg("Dropping message: could not resolve portal key (no participants/sender)")
+		return
+	}
+
 	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	// Keep the stored gid: group roster in sync with the sender's current view
@@ -2808,39 +2828,9 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// CardDAV-based resolver often fails for peers missing from contacts. By
 	// stamping the cache on every inbound 1:1 message, we ensure any peer
 	// who's ever messaged bridge has a direct lookup path for presence.
-	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) && portalKey.ID != "unknown" {
-		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID)
-	}
-
-	// Drop messages that couldn't be resolved to a real portal.
-	// makePortalKey returns ID:"unknown" when participants and sender are both
-	// empty/unresolvable. Letting these through creates a junk "unknown" room.
-	if portalKey.ID == "unknown" {
-		log.Warn().
-			Str("msg_uuid", msg.Uuid).
-			Strs("participants", msg.Participants).
-			Msg("Dropping message: could not resolve portal key (no participants/sender)")
-		return
-	}
-
-	// SMS/RCS group reactions and other messages sometimes arrive from the
-	// iPhone relay with an empty participant list. makePortalKey() then falls
-	// back to [sender, our_number] and computes a DM portal key, which can split
-	// one group chat into spurious DM portals.
-	//
-	// Only redirect DM->group when there is unambiguous evidence that this
-	// payload belongs to a known group. If evidence is ambiguous, keep the DM
-	// portal to avoid misrouting legitimate 1:1 SMS traffic.
-	if msg.IsSms && isComputedDMPortalID(portalKey.ID) {
-		if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
-			log.Debug().
-				Str("sender", ptr.Val(msg.Sender)).
-				Str("sender_guid", ptr.Val(msg.SenderGuid)).
-				Str("dm_portal", string(portalKey.ID)).
-				Str("group_portal", string(groupKey.ID)).
-				Msg("Redirecting SMS message from DM portal to known group portal")
-			portalKey = groupKey
-		}
+	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) {
+		replayPending := c.aliasPortalCacheChanged(*msg.Sender, portalKey.ID)
+		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID, replayPending)
 	}
 
 	// Track SMS portals so outbound replies use the correct service type.
@@ -3079,11 +3069,17 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	// Live Photo handling: bridge both the still image and the video.
+	// Live Photo handling: skip iris=true MOV companions; bridge only the HEIC still.
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
+		// Skip Live Photo MOV companions — only the HEIC still is bridged (mirrors
+		// CloudKit's avid-skip logic). For sent Live Photos the APNs echo delivers
+		// the MOV (iris=true); the HEIC arrives via CloudKit backfill.
+		if att.Iris {
 			continue
 		}
 		attID := msg.Uuid
@@ -3337,41 +3333,43 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		return
 	}
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	newName := ptrStringOr(msg.NewChatName, "")
+	newName := strings.TrimSpace(ptrStringOr(msg.NewChatName, ""))
+	if isPlaceholderGroupName(newName) {
+		log.Debug().Str("name", newName).Msg("Skipping placeholder group rename")
+		return
+	}
 
 	// Update the cached iMessage group name to the NEW name so outbound
 	// messages (portalToConversation) use it. makePortalKey cached whatever
 	// was in the conversation envelope (msg.GroupName), which may be the old
 	// name. Also persist to portal metadata so it survives restarts.
-	if newName != "" {
-		portalID := string(portalKey.ID)
-		c.imGroupNamesMu.Lock()
-		c.imGroupNames[portalID] = newName
-		c.imGroupNamesMu.Unlock()
+	portalID := string(portalKey.ID)
+	c.imGroupNamesMu.Lock()
+	c.imGroupNames[portalID] = newName
+	c.imGroupNamesMu.Unlock()
 
-		go func() {
-			ctx := context.Background()
-			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-			if err == nil && portal != nil {
-				meta := &PortalMetadata{}
-				if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-					*meta = *existing
-				}
-				if meta.GroupName != newName {
-					meta.GroupName = newName
-					portal.Metadata = meta
-					_ = portal.Save(ctx)
-				}
+	go func() {
+		ctx := context.Background()
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if err == nil && portal != nil {
+			meta := &PortalMetadata{}
+			if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+				*meta = *existing
 			}
-			// Also correct the stale CloudKit display_name in cloud_chat
-			// so resolveGroupName doesn't fall back to the old name.
-			if c.cloudStore != nil {
-				if err := c.cloudStore.updateDisplayNameByPortalID(ctx, portalID, newName); err != nil {
-					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to update cloud_chat display_name after rename")
-				}
+			if meta.GroupName != newName {
+				meta.GroupName = newName
+				portal.Metadata = meta
+				_ = portal.Save(ctx)
 			}
-		}()
-	}
+		}
+		// Also correct the stale CloudKit display_name in cloud_chat
+		// so resolveGroupName doesn't fall back to the old name.
+		if c.cloudStore != nil {
+			if err := c.cloudStore.updateDisplayNameByPortalID(ctx, portalID, newName); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to update cloud_chat display_name after rename")
+			}
+		}
+	}()
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
@@ -3455,14 +3453,13 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	// sender_guids.
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
 		portalIDStr := string(finalPortalKey.ID)
-		isGidPortal := strings.HasPrefix(portalIDStr, "gid:")
-		if strings.Contains(portalIDStr, ",") || isGidPortal {
+		if shouldCacheSenderGUIDForPortal(portalIDStr, *msg.SenderGuid) {
 			c.imGroupGuidsMu.Lock()
 			c.imGroupGuids[portalIDStr] = *msg.SenderGuid
 			c.imGroupGuidsMu.Unlock()
 		}
 	}
-	if msg.GroupName != nil && *msg.GroupName != "" {
+	if msg.GroupName != nil && *msg.GroupName != "" && !isPlaceholderGroupName(*msg.GroupName) {
 		c.imGroupNamesMu.Lock()
 		c.imGroupNames[string(finalPortalKey.ID)] = *msg.GroupName
 		c.imGroupNamesMu.Unlock()
@@ -4145,6 +4142,19 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 		Str("msg_uuid", msg.Uuid).
 		Msg("Processing incoming Apple chat delete")
 
+	if msg.IsPermanentDelete {
+		// Apple can include chat metadata on permanent-delete payloads for
+		// individual messages. If no message UUIDs made it through parsing,
+		// this chat-level delete is ambiguous. Whole-chat deletes should arrive
+		// as MoveToRecycleBin, so fail closed instead of deleting a portal or
+		// scrubbing local chat history.
+		log.Warn().
+			Str("portal_id", portalID).
+			Str("msg_uuid", msg.Uuid).
+			Msg("Ignoring ambiguous Apple permanent chat delete")
+		return
+	}
+
 	// Track as recently deleted so APNs echoes don't recreate it.
 	c.trackDeletedChat(portalID)
 
@@ -4449,13 +4459,13 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	c.recentlyDeletedPortalsMu.Lock()
 	delete(c.recentlyDeletedPortals, portalID)
 	c.recentlyDeletedPortalsMu.Unlock()
-	if len(opts.Participants) > 0 || opts.DisplayName != "" || opts.ChatID != "" || opts.GroupID != "" || opts.GroupPhotoGuid != "" {
+	if len(opts.Participants) > 0 || opts.SeedDisplayName != "" || opts.ChatID != "" || opts.GroupID != "" || opts.GroupPhotoGuid != "" {
 		c.cloudStore.seedChatFromRecycleBin(
 			ctx,
 			portalID,
 			opts.ChatID,
 			opts.GroupID,
-			opts.DisplayName,
+			opts.SeedDisplayName,
 			opts.GroupPhotoGuid,
 			opts.Participants,
 		)
@@ -5442,6 +5452,17 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 	}
 
+	// Fall back to bridge DB message lookup — msg.Uuid is the target message's
+	// UUID, which may already be stored. This tells us exactly which portal
+	// the read message belongs to, avoiding sender-based guessing.
+	if candidateKey := c.resolvePortalByTargetMessage(log, msg.Uuid); candidateKey.ID != "" {
+		// Validate the resolved portal still exists before accepting it.
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, candidateKey); p != nil && p.MXID != "" {
+			portalKey = candidateKey
+			goto resolved
+		}
+	}
+
 	// Last resort: use the initial portal key if it resolves to a valid portal.
 	{
 		portal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
@@ -6190,11 +6211,15 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	})
 	if err != nil {
 		errStr := err.Error()
-		// Suppress non-actionable failures: IDS lookup errors (6001) for
+		// Suppress non-actionable receipt failures: IDS lookup errors (6001) for
 		// urn:biz: business chat portals and edge cases between restart and SMS
-		// state restoration; NoValidTargets for contacts with no reachable handle.
-		// All other errors propagate normally so real network/auth failures surface.
-		if strings.Contains(errStr, "6001") || strings.Contains(errStr, "NoValidTargets") {
+		// state restoration; NoValidTargets for contacts with no reachable handle;
+		// and Apple's generic "could not deliver" response for read receipts. The
+		// latter is actionable for message sends, but read receipts are best-effort
+		// and should not surface as bridge errors.
+		if strings.Contains(errStr, "6001") ||
+			strings.Contains(errStr, "NoValidTargets") ||
+			strings.Contains(errStr, "Failed to send read receipt: Could not deliver message") {
 			zerolog.Ctx(ctx).Warn().Err(err).
 				Str("portal_id", string(receipt.Portal.ID)).
 				Msg("Read receipt failed (non-actionable, suppressed)")
@@ -6214,7 +6239,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
 	}
-	targetGUID := string(msg.EditTarget.ID)
+	targetGUID, _ := extractTapbackTarget(string(msg.EditTarget.ID))
 
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
@@ -6235,9 +6260,11 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
 	}
 
+	targetGUID, _ := extractTapbackTarget(string(msg.TargetMessage.ID))
+
 	// If this Matrix event was bridged as two iMessages (attachment + caption text),
 	// unsend the sibling first. The attachment was sent before the text on the wire,
-	// so unsend it first to keep the same wire ordering — some peers ignore unsends
+	// so unsend it first to keep the same wire ordering - some peers ignore unsends
 	// that arrive out of timeline order for an attachment.
 	var siblingUUID string
 	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
@@ -6266,9 +6293,9 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	}
 
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	c.trackOutboundUnsend(targetGUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	_, err := c.client.SendUnsend(conv, targetGUID, 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
@@ -7032,6 +7059,30 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				}
 			}
 		}
+		if chatInfo.Avatar == nil && c.chatDB != nil && len(memberList) > 0 {
+			photoLog := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
+			chatGUID := c.chatDB.findGroupChatGUIDByMembers(memberList, c)
+			if chatGUID != "" {
+				att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
+				if attErr != nil {
+					photoLog.Warn().Err(attErr).Str("chat_guid", chatGUID).Msg("group_photo: chatdb avatar lookup error")
+				} else if att != nil {
+					photoData, readErr := att.Read()
+					if readErr != nil {
+						photoLog.Warn().Err(readErr).Str("chat_guid", chatGUID).Msg("group_photo: failed to read chatdb avatar file")
+					} else if len(photoData) > 0 {
+						hash := sha256.Sum256(photoData)
+						avatarID := networkid.AvatarID(fmt.Sprintf("chatdb-avatar:%x", hash[:8]))
+						photoLog.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from chatdb")
+						cachedData := photoData
+						chatInfo.Avatar = &bridgev2.Avatar{
+							ID:  avatarID,
+							Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
+						}
+					}
+				}
+			}
+		}
 
 		// Persist sender_guid to portal metadata for gid: portals.
 		// Only persist iMessage protocol-level group names (cv_name) to
@@ -7180,20 +7231,17 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 // given identifier (e.g. "tel:+1234567890"). Falls back to formatting the
 // raw identifier if no contact is found.
 func (c *IMClient) resolveContactDisplayname(identifier string) string {
-	localID := stripIdentifierPrefix(identifier)
-	if c.contacts != nil {
-		contact, contactErr := c.contacts.GetContactInfo(localID)
-		if contactErr != nil {
-			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
-		}
-		if contact != nil && contact.HasName() {
-			return c.Main.Config.FormatDisplayname(DisplaynameParams{
-				FirstName: contact.FirstName,
-				LastName:  contact.LastName,
-				Nickname:  contact.Nickname,
-				ID:        localID,
-			})
-		}
+	contact, localID, contactErr := c.lookupContactForDisplay(identifier)
+	if contactErr != nil {
+		c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+	}
+	if contact != nil && contact.HasName() {
+		return c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
 	}
 	return c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 }
@@ -7210,51 +7258,74 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		Identifiers: []string{identifier},
 	}
 
-	// Try contact info from cloud contacts (iCloud CardDAV)
-	localID := stripIdentifierPrefix(identifier)
-	var contact *imessage.Contact
+	displayContact, localID, displayErr := c.lookupContactForDisplay(identifier)
+	if displayErr != nil {
+		zerolog.Ctx(ctx).Debug().Err(displayErr).Str("id", localID).Msg("Failed to resolve contact info")
+	}
+
+	if displayContact != nil {
+		for _, phone := range displayContact.Phones {
+			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
+		}
+		for _, email := range displayContact.Emails {
+			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
+		}
+		if displayContact.HasName() {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: displayContact.FirstName,
+				LastName:  displayContact.LastName,
+				Nickname:  displayContact.Nickname,
+				ID:        localID,
+			})
+			ui.Name = &name
+		}
+	}
+
+	var nativeContact *imessage.Contact
 	if c.contacts != nil {
 		var contactErr error
-		contact, contactErr = c.contacts.GetContactInfo(localID)
+		nativeContact, contactErr = c.contacts.GetContactInfo(localID)
 		if contactErr != nil {
 			zerolog.Ctx(ctx).Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
 	}
 
-	// User-provided contacts (CardDAV / iCloud) always win. Any match from
-	// c.contacts fully overrides the shared iMessage profile, regardless of
-	// whether the contact has a name or photo: the user adding an entry is
-	// itself the signal that they want their own data used. Shared profiles
-	// only fill the gap when the identifier is unknown to the address book.
-	if contact != nil {
-		if contact.HasName() {
-			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-				FirstName: contact.FirstName,
-				LastName:  contact.LastName,
-				Nickname:  contact.Nickname,
-				ID:        localID,
-			})
-			ui.Name = &name
-		} else {
+	// User-provided contacts win over shared iMessage profiles when present.
+	// lookupContactForDisplay may use the local macOS contact snapshot for
+	// hardened display matching; exact GetContactInfo is still used for avatar
+	// bytes because the local snapshot intentionally omits them.
+	if nativeContact != nil && len(nativeContact.Avatar) > 0 {
+		avatarHash := sha256.Sum256(nativeContact.Avatar)
+		avatarData := nativeContact.Avatar // capture for closure
+		ui.Avatar = &bridgev2.Avatar{
+			ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+			Get: func(ctx context.Context) ([]byte, error) {
+				return avatarData, nil
+			},
+		}
+	}
+
+	if displayContact != nil {
+		if ui.Name == nil {
 			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 			ui.Name = &name
 		}
-		for _, phone := range contact.Phones {
-			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-		}
-		for _, email := range contact.Emails {
-			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
-		}
-		if len(contact.Avatar) > 0 {
-			avatarHash := sha256.Sum256(contact.Avatar)
-			avatarData := contact.Avatar // capture for closure
-			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return avatarData, nil
-				},
-			}
-		}
+		return ui, nil
+	}
+
+	if nativeContact != nil && nativeContact.HasName() {
+		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: nativeContact.FirstName,
+			LastName:  nativeContact.LastName,
+			Nickname:  nativeContact.Nickname,
+			ID:        localID,
+		})
+		ui.Name = &name
+		return ui, nil
+	}
+	if nativeContact != nil {
+		name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
+		ui.Name = &name
 		return ui, nil
 	}
 
@@ -7377,6 +7448,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}()
 	}
 
+	if params.Portal == nil || params.ThreadRoot != "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+	portalID := string(params.Portal.ID)
+	if portalID == "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
 	// When the user has capped max_initial_messages, skip backward backfill
 	// entirely. Forward backfill already delivered the capped N messages;
 	// returning empty here marks the backward task as done immediately.
@@ -7399,16 +7480,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	count := params.Count
 	if count <= 0 {
 		count = 50
-	}
-
-	if params.Portal == nil || params.ThreadRoot != "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-	portalID := string(params.Portal.ID)
-	if portalID == "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
 	// Guard: if this portal was recently deleted, only backfill if there are
@@ -7559,6 +7630,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// targeting messages in this batch go into BackfillMessage.Reactions
 		// (correct DAG ordering) instead of QueueRemoteEvent (end of DAG).
 		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
+		allMessages = c.filterExistingBackfillMessages(ctx, portalID, allMessages)
 
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
@@ -7600,6 +7672,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Beeper clients display as "Read at [now]". Instead, rely on
 			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
+				// Skip read-state evaluation for portals that already completed
+				// their initial forward backfill. Delayed re-syncs (15s/60s/3min)
+				// and version-bump re-syncs should not send a read receipt that
+				// overrides the authoritative Matrix read state set by real-time
+				// APNs messages after initial backfill.
+				if cloudStoreDone.isForwardBackfillDone(context.Background(), portalID) {
+					cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+					c.onForwardBackfillDone()
+					return
+				}
 				// Compute read state BEFORE markForwardBackfillDone, which may
 				// insert a synthetic cloud_chat row with is_filtered=0 default
 				// that would defeat the "no chat row → unread" safeguard.
@@ -7717,6 +7799,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						rows[i], rows[j] = rows[j], rows[i]
 					}
 					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					allMessages = c.filterExistingBackfillMessages(ctx, portalID, allMessages)
 					log.Info().
 						Str("portal_id", portalID).
 						Int("db_rows", len(rows)).
@@ -7759,6 +7842,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 
 	convertStart := time.Now()
 	messages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+	messages = c.filterExistingBackfillMessages(ctx, portalID, messages)
 	convertElapsed := time.Since(convertStart)
 
 	var nextCursor networkid.PaginationCursor
@@ -7803,6 +7887,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	var messages []*bridgev2.BackfillMessage
 	var tapbackRows []cloudMessageRow
 	messageByGUID := make(map[string]*bridgev2.BackfillMessage)
+	messageByID := make(map[networkid.MessageID]*bridgev2.BackfillMessage)
 
 	for _, row := range rows {
 		if row.TapbackType != nil && *row.TapbackType >= 2000 {
@@ -7811,9 +7896,10 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		}
 		converted := c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)
 		messages = append(messages, converted...)
-		// Key by row GUID so tapbacks can find their target. A row may
-		// produce multiple BackfillMessages (text + attachments); attach
-		// the reaction to the first one (text, or first attachment).
+		for _, msg := range converted {
+			messageByID[msg.ID] = msg
+		}
+		// Key the bare row GUID for body tapbacks and attachment-only rows.
 		if len(converted) > 0 {
 			messageByGUID[row.GUID] = converted[0]
 		}
@@ -7844,19 +7930,11 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 
 		// Removes can't use BackfillReaction (framework only supports add).
 		// Tapbacks targeting messages outside this batch also fall back.
-		targetMsg, inBatch := messageByGUID[targetGUID]
+		targetMsg, targetPart, inBatch := resolveInBatchTapbackTarget(messageByGUID, messageByID, targetGUID, bp)
 		if !isRemove && inBatch {
 			ts := time.UnixMilli(row.TimestampMS)
 			idx := tapbackType - 2000
 			emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
-			// Map balloon-part index to bridge part ID:
-			// bp 0 = text body (nil TargetPart → first part),
-			// bp >= 1 = attachment (att0, att1, …).
-			var targetPart *networkid.PartID
-			if bp >= 1 {
-				p := networkid.PartID(fmt.Sprintf("att%d", bp-1))
-				targetPart = &p
-			}
 			targetMsg.Reactions = append(targetMsg.Reactions, &bridgev2.BackfillReaction{
 				Sender:     sender,
 				Emoji:      emoji,
@@ -7870,6 +7948,33 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	}
 
 	return messages
+}
+
+func (c *IMClient) filterExistingBackfillMessages(ctx context.Context, portalID string, messages []*bridgev2.BackfillMessage) []*bridgev2.BackfillMessage {
+	if len(messages) == 0 || c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.DB == nil {
+		return messages
+	}
+	filtered := messages[:0]
+	skipped := 0
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		existing, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, c.UserLogin.ID, msg.ID)
+		if err == nil && existing != nil {
+			skipped++
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	if skipped > 0 {
+		c.Main.Bridge.Log.Debug().
+			Str("portal_id", portalID).
+			Int("skipped", skipped).
+			Int("remaining", len(filtered)).
+			Msg("Skipped already-inserted backfill messages")
+	}
+	return filtered
 }
 
 // cloudReactionMinType is the lowest tapback_type that denotes a real reaction.
@@ -8151,17 +8256,16 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		// Skip rich-link plugin payload sidebands. The URL itself is in the
 		// message text and the preview card renders from it; bridging the
 		// plist as a file is noise. We deliberately do NOT filter on
-		// HideAttachment broadly because Live Photo MOV companions also
-		// carry that flag and we intentionally bridge them.
+		// HideAttachment broadly here; Live Photo motion companions are
+		// skipped by bridging only the lqa still below.
 		if isPluginPayloadAttachment(att) {
 			continue
 		}
 		downloadable = append(downloadable, indexedAtt{index: i, att: att})
 	}
 
-	// Live Photo handling: when HasAvid is true on an attachment, the download
-	// step will fetch both the lqa (HEIC still) and avid (video) from the same
-	// CloudKit record and return two BackfillMessages.
+	// Live Photo handling: when HasAvid is true on an attachment, only the lqa
+	// (HEIC still) is bridged. The avid (MOV video) is intentionally skipped.
 	if len(downloadable) == 0 {
 		return nil
 	}
@@ -8258,41 +8362,6 @@ func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (
 			Str("record_name", recordName).
 			Msg("CloudDownloadAttachment timed out after 90s — inner goroutine leaked until FFI unblocks")
 		return nil, fmt.Errorf("CloudDownloadAttachment timed out after 90s")
-	}
-}
-
-// safeCloudDownloadAttachmentAvid wraps the avid FFI call with the same
-// panic recovery and timeout as safeCloudDownloadAttachment.
-func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName string) ([]byte, error) {
-	type dlResult struct {
-		data []byte
-		err  error
-	}
-	ch := make(chan dlResult, 1)
-	go func() {
-		var res dlResult
-		defer func() {
-			if r := recover(); r != nil {
-				stack := string(debug.Stack())
-				log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
-					Str("record_name", recordName).
-					Str("stack", stack).
-					Msgf("FFI panic recovered: %v", r)
-				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachmentAvid: %v", r)}
-			}
-			ch <- res
-		}()
-		d, e := client.CloudDownloadAttachmentAvid(recordName)
-		res = dlResult{data: d, err: e}
-	}()
-	select {
-	case res := <-ch:
-		return res.data, res.err
-	case <-time.After(90 * time.Second):
-		log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
-			Str("record_name", recordName).
-			Msg("CloudDownloadAttachmentAvid timed out after 90s")
-		return nil, fmt.Errorf("CloudDownloadAttachmentAvid timed out after 90s")
 	}
 }
 
@@ -8458,12 +8527,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
-	// NOTE: Skip cache for non-MP4 videos that need transcoding, and for
-	// Live Photo HasAvid records (old cache entries only have one part, not
-	// both still+video). Regular videos with HasAvid use the cache normally
-	// since we only bridge the lqa (the video itself), not the avid duplicate.
-	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !isLivePhoto {
+	// NOTE: Skip cache for non-MP4 videos that need transcoding.
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
@@ -8710,83 +8775,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 			Parts: parts,
 		},
 	}}
-
-	// Live Photo: if this attachment has an avid (video) asset, also download
-	// and bridge the video so recipients see both the still and the motion.
-	// Skip when the lqa itself is already a video — that means this is a regular
-	// video attachment (not a Live Photo), and CloudKit stores the same video in
-	// both lqa and avid fields. Bridging both would produce duplicates.
-	if att.HasAvid && !strings.HasPrefix(mimeType, "video/") {
-		avidData, avidErr := safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
-		if avidErr != nil || len(avidData) == 0 {
-			log.Warn().Err(avidErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Live Photo avid download failed, bridging still only")
-			return messages
-		}
-		avidMime := "video/quicktime"
-		avidFileName := "livephoto.MOV"
-		if fileName != "" {
-			base := filenameBase(fileName)
-			if base != "" {
-				avidFileName = base + ".MOV"
-			}
-		}
-
-		// Remux/transcode the avid video if enabled. Shares transcodeToMP4's
-		// serialization + retry with the other paths (see the lqa branch above).
-		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
-			origSize := len(avidData)
-			converted, method, convertErr := transcodeToMP4(ctx, &log, avidData, avidMime)
-			if convertErr != nil {
-				log.Warn().Err(convertErr).Str("guid", row.GUID).
-					Msg("Live Photo avid ffmpeg conversion failed after retries, uploading original")
-			} else {
-				log.Info().Str("guid", row.GUID).
-					Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
-					Msg("Live Photo avid transcoded to MP4")
-				avidData = converted
-				avidMime = "video/mp4"
-				avidFileName = strings.TrimSuffix(avidFileName, filepath.Ext(avidFileName)) + ".mp4"
-			}
-		}
-
-		avidMsgType := mimeToMsgType(avidMime)
-		avidContent := &event.MessageEventContent{
-			MsgType: avidMsgType,
-			Body:    avidFileName,
-			Info: &event.FileInfo{
-				MimeType: avidMime,
-				Size:     len(avidData),
-			},
-		}
-		avidURL, avidEnc, avidUploadErr := intent.UploadMedia(ctx, "", avidData, avidFileName, avidMime)
-		if avidUploadErr != nil {
-			log.Warn().Err(avidUploadErr).Str("guid", row.GUID).
-				Msg("Live Photo avid upload failed, bridging still only")
-			return messages
-		}
-		if avidEnc != nil {
-			avidContent.File = avidEnc
-		} else {
-			avidContent.URL = avidURL
-		}
-
-		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int("bytes", len(avidData)).
-			Msg("Live Photo: bridging both HEIC still and avid video")
-
-		messages = append(messages, &bridgev2.BackfillMessage{
-			Sender:    sender,
-			ID:        makeMessageID(attID + "_avid"),
-			Timestamp: ts,
-			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: avidContent,
-				}},
-			},
-		})
-	}
 
 	return messages
 }
@@ -9478,7 +9466,10 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 
 	// Query all ghost IDs from the bridge database.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id FROM ghost WHERE bridge_id=$1",
+		`SELECT id FROM ghost
+		 WHERE bridge_id=$1
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
+		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -9829,6 +9820,12 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	if err != nil {
 		return result, portal, err
 	}
+	if c.cloudStore != nil {
+		err = c.cloudStore.rekeyPortalID(ctx, oldID, newID)
+		if err != nil {
+			return result, portal, err
+		}
+	}
 
 	// Move group name cache
 	if name, ok := c.imGroupNames[oldID]; ok {
@@ -9874,6 +9871,19 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	}
 
 	return result, portal, nil
+}
+
+func shouldCacheSenderGUIDForPortal(portalID, senderGUID string) bool {
+	if portalID == "" || senderGUID == "" {
+		return false
+	}
+	if strings.Contains(portalID, ",") {
+		return true
+	}
+	if strings.HasPrefix(portalID, "gid:") {
+		return strings.EqualFold(portalID, "gid:"+senderGUID)
+	}
+	return false
 }
 
 // resolveExistingGroupPortalID checks whether an existing group portal matches
@@ -9964,7 +9974,17 @@ func isComputedDMPortalID(id networkid.PortalID) bool {
 }
 
 func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) (networkid.PortalKey, bool) {
-	if len(msg.Participants) != 0 || msg.Sender == nil || *msg.Sender == "" {
+	return c.resolveSMSGroupRedirectPortalWithExists(msg, func(ctx context.Context, groupKey networkid.PortalKey) bool {
+		existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
+		return existing != nil && existing.MXID != ""
+	})
+}
+
+func (c *IMClient) resolveSMSGroupRedirectPortalWithExists(
+	msg rustpushgo.WrappedMessage,
+	portalExists func(context.Context, networkid.PortalKey) bool,
+) (networkid.PortalKey, bool) {
+	if len(msg.Participants) != 0 {
 		return networkid.PortalKey{}, false
 	}
 
@@ -9995,29 +10015,40 @@ func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) 
 	}
 
 	// Fallback: unique group membership match only (no "last active" heuristic).
-	normalized := normalizeIdentifierForPortalID(*msg.Sender)
-	if normalized != "" {
-		c.ensureGroupPortalIndex()
-		c.groupPortalMu.RLock()
-		portals := c.groupPortalIndex[normalized]
-		c.groupPortalMu.RUnlock()
-		if len(portals) == 1 {
-			for portalID := range portals {
-				addCandidate(portalID)
+	if msg.Sender != nil && *msg.Sender != "" {
+		normalized := normalizeIdentifierForPortalID(*msg.Sender)
+		if normalized != "" {
+			c.ensureGroupPortalIndex()
+			c.groupPortalMu.RLock()
+			portals := c.groupPortalIndex[normalized]
+			c.groupPortalMu.RUnlock()
+			if len(portals) == 1 {
+				for portalID := range portals {
+					addCandidate(portalID)
+				}
 			}
 		}
 	}
 
-	if len(candidates) != 1 {
+	if len(candidates) == 0 {
 		return networkid.PortalKey{}, false
 	}
 
 	ctx := context.Background()
+	var resolved networkid.PortalKey
+	resolvedCount := 0
 	for portalID := range candidates {
 		groupKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
-		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey); existing != nil && existing.MXID != "" {
-			return groupKey, true
+		if portalExists(ctx, groupKey) {
+			resolved = groupKey
+			resolvedCount++
+			if resolvedCount > 1 {
+				return networkid.PortalKey{}, false
+			}
 		}
+	}
+	if resolvedCount == 1 {
+		return resolved, true
 	}
 	return networkid.PortalKey{}, false
 }
@@ -10122,61 +10153,69 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	// 1. Check imGroupGuids cache: does any existing portal already have
 	//    this guid cached? (covers comma-based portals that previously
 	//    received messages with this same guid)
+	//
+	// Snapshot matching entries under lock, then process outside the iteration
+	// to avoid a "concurrent map iteration and map write" panic.
+	type guidCandidate struct {
+		portalIDStr string
+		guid        string
+	}
+	var guidCandidates []guidCandidate
 	c.imGroupGuidsMu.RLock()
 	for portalIDStr, guid := range c.imGroupGuids {
 		if strings.ToLower(guid) == normalizedGuid {
-			c.imGroupGuidsMu.RUnlock()
-			if c.guidCacheMatchIsStale(portalIDStr, participants) {
-				c.UserLogin.Log.Warn().
-					Str("gid_portal_id", gidPortalID).
-					Str("candidate_portal", portalIDStr).
-					Str("stale_guid", guid).
-					Msg("Skipping stale guid cache entry: participant mismatch — clearing")
-				// Self-heal: remove from in-memory cache
-				c.imGroupGuidsMu.Lock()
-				if c.imGroupGuids[portalIDStr] == guid {
-					delete(c.imGroupGuids, portalIDStr)
-				}
-				c.imGroupGuidsMu.Unlock()
-				// Self-heal: clear stale SenderGuid from DB metadata.
-				// MUST be synchronous — portalToConversation (Site E) lazily
-				// loads metadata into cache and would re-poison it.
-				staleKey := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-				if stalePortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, staleKey); err != nil {
-					c.UserLogin.Log.Warn().Err(err).
-						Str("portal_id", portalIDStr).
-						Msg("Failed to look up portal for stale guid self-heal")
-				} else if stalePortal != nil {
-					if meta, ok := stalePortal.Metadata.(*PortalMetadata); ok && meta.SenderGuid == guid {
-						meta.SenderGuid = ""
-						stalePortal.Metadata = meta
-						if err := stalePortal.Save(ctx); err != nil {
-							c.UserLogin.Log.Warn().Err(err).
-								Str("portal_id", portalIDStr).
-								Msg("Failed to clear stale SenderGuid from DB metadata")
-						} else {
-							c.UserLogin.Log.Info().
-								Str("portal_id", portalIDStr).
-								Str("cleared_guid", guid).
-								Msg("Cleared stale SenderGuid from DB metadata")
-						}
-					}
-				}
-				c.imGroupGuidsMu.RLock()
-				continue
-			}
-			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
-				c.UserLogin.Log.Info().
-					Str("gid_portal_id", gidPortalID).
-					Str("resolved_portal", portalIDStr).
-					Msg("Resolved unknown gid to existing portal via guid cache")
-				return networkid.PortalID(portalIDStr)
-			}
-			c.imGroupGuidsMu.RLock()
+			guidCandidates = append(guidCandidates, guidCandidate{portalIDStr, guid})
 		}
 	}
 	c.imGroupGuidsMu.RUnlock()
+	for _, cand := range guidCandidates {
+		if c.guidCacheMatchIsStale(cand.portalIDStr, participants) {
+			c.UserLogin.Log.Warn().
+				Str("gid_portal_id", gidPortalID).
+				Str("candidate_portal", cand.portalIDStr).
+				Str("stale_guid", cand.guid).
+				Msg("Skipping stale guid cache entry: participant mismatch — clearing")
+			// Self-heal: remove from in-memory cache
+			c.imGroupGuidsMu.Lock()
+			if c.imGroupGuids[cand.portalIDStr] == cand.guid {
+				delete(c.imGroupGuids, cand.portalIDStr)
+			}
+			c.imGroupGuidsMu.Unlock()
+			// Self-heal: clear stale SenderGuid from DB metadata.
+			// MUST be synchronous — portalToConversation (Site E) lazily
+			// loads metadata into cache and would re-poison it.
+			staleKey := networkid.PortalKey{ID: networkid.PortalID(cand.portalIDStr), Receiver: c.UserLogin.ID}
+			if stalePortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, staleKey); err != nil {
+				c.UserLogin.Log.Warn().Err(err).
+					Str("portal_id", cand.portalIDStr).
+					Msg("Failed to look up portal for stale guid self-heal")
+			} else if stalePortal != nil {
+				if meta, ok := stalePortal.Metadata.(*PortalMetadata); ok && meta.SenderGuid == cand.guid {
+					meta.SenderGuid = ""
+					stalePortal.Metadata = meta
+					if err := stalePortal.Save(ctx); err != nil {
+						c.UserLogin.Log.Warn().Err(err).
+							Str("portal_id", cand.portalIDStr).
+							Msg("Failed to clear stale SenderGuid from DB metadata")
+					} else {
+						c.UserLogin.Log.Info().
+							Str("portal_id", cand.portalIDStr).
+							Str("cleared_guid", cand.guid).
+							Msg("Cleared stale SenderGuid from DB metadata")
+					}
+				}
+			}
+			continue
+		}
+		key := networkid.PortalKey{ID: networkid.PortalID(cand.portalIDStr), Receiver: c.UserLogin.ID}
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+			c.UserLogin.Log.Info().
+				Str("gid_portal_id", gidPortalID).
+				Str("resolved_portal", cand.portalIDStr).
+				Msg("Resolved unknown gid to existing portal via guid cache")
+			return networkid.PortalID(cand.portalIDStr)
+		}
+	}
 
 	// Build normalized participant set for matching.
 	if len(participants) == 0 {
@@ -10197,28 +10236,30 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    participant sets. Comma-based portals are intentionally excluded here
 	//    because step 3 (groupPortalIndex) handles them using the authoritative
 	//    portal ID rather than the potentially-stale in-memory cache.
+	//
+	// Snapshot matching portal IDs under lock, then process outside the iteration
+	// to avoid a "concurrent map iteration and map write" panic.
+	var partCandidates []string
 	c.imGroupParticipantsMu.RLock()
 	for portalIDStr, parts := range c.imGroupParticipants {
-		if portalIDStr == gidPortalID {
-			continue
-		}
-		if !strings.HasPrefix(portalIDStr, "gid:") {
+		if portalIDStr == gidPortalID || !strings.HasPrefix(portalIDStr, "gid:") {
 			continue
 		}
 		if participantSetsMatch(parts, normalizedParts, c.isMyHandle) {
-			c.imGroupParticipantsMu.RUnlock()
-			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
-			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
-				c.UserLogin.Log.Info().
-					Str("gid_portal_id", gidPortalID).
-					Str("resolved_portal", portalIDStr).
-					Msg("Resolved unknown gid to existing portal via participant cache")
-				return networkid.PortalID(portalIDStr)
-			}
-			c.imGroupParticipantsMu.RLock()
+			partCandidates = append(partCandidates, portalIDStr)
 		}
 	}
 	c.imGroupParticipantsMu.RUnlock()
+	for _, portalIDStr := range partCandidates {
+		key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+			c.UserLogin.Log.Info().
+				Str("gid_portal_id", gidPortalID).
+				Str("resolved_portal", portalIDStr).
+				Msg("Resolved unknown gid to existing portal via participant cache")
+			return networkid.PortalID(portalIDStr)
+		}
+	}
 
 	// 3. Check comma-based portals via groupPortalIndex fuzzy matching.
 	//    We intentionally skip the guid mismatch rejection here because the
@@ -10280,7 +10321,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    (e.g., gid: portals from CloudKit sync that haven't received
 	//    live messages yet, so imGroupParticipants is empty).
 	//    Only consider group portals (gid: or comma-based). DM portals
-	//    can accidentally match via ±1 participant tolerance because a
+	//    could match if self-inclusion differs between participant lists because a
 	//    DM's [self, A] is one member short of a group's [self, A, B].
 	if c.cloudStore != nil {
 		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts, c.isMyHandle)
@@ -10310,7 +10351,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
+	isGroup := c.isGroupPortalSignal(participants, groupName)
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
@@ -10377,6 +10418,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			computedID := strings.Join(deduped, ",")
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
+		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
 		// Cache the actual iMessage group name (cv_name) so outbound
 		// messages can route to the correct conversation. Also push a
 		// room name update when the envelope name differs from what's
@@ -10386,7 +10428,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// the correct cv_name from APNs overrides any stale data.
 		// bridgev2's updateName deduplicates — no state event if the
 		// name is already correct.
-		if groupName != nil && *groupName != "" {
+		if groupName != nil && *groupName != "" && !isPlaceholderGroupName(*groupName) {
 			c.imGroupNamesMu.Lock()
 			old := c.imGroupNames[string(portalID)]
 			c.imGroupNames[string(portalID)] = *groupName
@@ -10420,6 +10462,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// can find them immediately. The cloud_chat DB write happens async
 		// and may not complete before GetChatInfo is called during portal
 		// creation, which would cause the group name to resolve as "Group Chat".
+		var normalizedParticipants []string
 		if len(participants) > 0 {
 			normalized := make([]string, 0, len(participants))
 			for _, p := range participants {
@@ -10432,9 +10475,10 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 				c.imGroupParticipantsMu.Lock()
 				c.imGroupParticipants[string(portalID)] = normalized
 				c.imGroupParticipantsMu.Unlock()
+				normalizedParticipants = normalized
 			}
 		}
-		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
+		c.queueParticipantNameRepair(portalKey, normalizedParticipants)
 
 		// Cache the original-case sender_guid so outbound messages reuse the
 		// same UUID casing and Apple Messages recipients match them to the
@@ -10459,7 +10503,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			persistGuid = *senderGuid
 		}
 		persistName := ""
-		if groupName != nil {
+		if groupName != nil && !isPlaceholderGroupName(*groupName) {
 			persistName = *groupName
 		}
 		// Persist participants to cloud_chat so portalToConversation can
@@ -10564,6 +10608,65 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
 }
 
+func (c *IMClient) queueParticipantNameRepair(portalKey networkid.PortalKey, normalizedParticipants []string) {
+	if len(normalizedParticipants) == 0 {
+		return
+	}
+
+	parts := append([]string(nil), normalizedParticipants...)
+	go func() {
+		delay := 100 * time.Millisecond
+		for attempt := 0; attempt < 8; attempt++ {
+			if attempt > 0 {
+				time.Sleep(delay)
+				if delay < 2*time.Second {
+					delay *= 2
+					if delay > 2*time.Second {
+						delay = 2 * time.Second
+					}
+				}
+			}
+			if !c.contactsAreReady() {
+				continue
+			}
+
+			ctx := context.Background()
+			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if err != nil || portal == nil || portal.MXID == "" {
+				continue
+			}
+			if !isRefreshableGroupName(portal.Name) {
+				return
+			}
+
+			candidate, authoritative := c.resolveAuthoritativeGroupName(ctx, string(portalKey.ID))
+			if candidate == "" {
+				candidate = c.buildGroupName(parts)
+			}
+			if !shouldApplyGroupNameRefresh(portal.Name, candidate, authoritative) {
+				return
+			}
+
+			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatInfoChange,
+					PortalKey: portalKey,
+					LogContext: func(lc zerolog.Context) zerolog.Context {
+						return lc.Str("portal_id", string(portalKey.ID)).Str("source", "participant_name_repair")
+					},
+				},
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					ChatInfo: &bridgev2.ChatInfo{
+						Name:                       &candidate,
+						ExcludeChangesFromTimeline: true,
+					},
+				},
+			})
+			return
+		}
+	}()
+}
+
 // makeReceiptPortalKey handles receipt messages where participants may be empty.
 // When participants is empty (rustpush sets conversation: None for receipts),
 // use the sender field to identify the DM portal.
@@ -10618,13 +10721,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 				// Last resort: extract from portal ID (lowercase, lossy)
 				guid = strings.TrimPrefix(portalID, "gid:")
 			}
-			// Look up participants from cloud store
-			if c.cloudStore != nil {
-				ctx := context.Background()
-				if parts, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(parts) > 0 {
-					participants = parts
-				}
-			}
+			participants = c.resolveGroupMembers(context.Background(), portalID)
 		} else {
 			participants = strings.Split(portalID, ",")
 		}
@@ -10637,7 +10734,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		c.imGroupNamesMu.RUnlock()
 		if name == "" {
 			// Not in memory cache - try loading from portal metadata
-			if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.GroupName != "" {
+			if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.GroupName != "" && !isPlaceholderGroupName(meta.GroupName) {
 				name = meta.GroupName
 				c.imGroupNamesMu.Lock()
 				c.imGroupNames[portalID] = name
@@ -10746,9 +10843,9 @@ func (c *IMClient) persistGroupParticipantsIfChanged(portalID string, participan
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
-// For gid: portals it checks the in-memory cache first (populated synchronously
-// by makePortalKey), then the cloud store DB; for legacy comma-separated
-// portal IDs it splits the ID string.
+// For gid: portals it checks the cloud store DB first, then falls back to the
+// in-memory cache populated synchronously by makePortalKey; for legacy
+// comma-separated portal IDs it splits the ID string.
 func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []string {
 	if strings.HasPrefix(portalID, "gid:") {
 		// 1) Check cloud store DB (persisted from CloudKit sync or previous messages)
@@ -10771,6 +10868,60 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 	return strings.Split(portalID, ",")
 }
 
+func (c *IMClient) contactsAreReady() bool {
+	if c.contacts == nil {
+		return false
+	}
+	c.contactsReadyLock.RLock()
+	defer c.contactsReadyLock.RUnlock()
+	return c.contactsReady
+}
+
+func normalizeAndDedupeSenders(senders []string) []string {
+	seen := make(map[string]bool, len(senders))
+	normalized := make([]string, 0, len(senders))
+	for _, sender := range senders {
+		n := normalizeIdentifierForPortalID(sender)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		normalized = append(normalized, n)
+	}
+	return normalized
+}
+
+func (c *IMClient) resolveGroupMembersForDisplay(ctx context.Context, portalID string) []string {
+	if members := c.resolveGroupMembers(ctx, portalID); len(members) > 0 {
+		return members
+	}
+	if c.cloudStore == nil {
+		return nil
+	}
+	senders, err := c.cloudStore.getSenderHistoryByPortalID(ctx, portalID)
+	if err != nil {
+		c.Main.Bridge.Log.Debug().Err(err).Str("portal_id", portalID).Msg("Failed to load sender history for group display name")
+		return nil
+	}
+	return normalizeAndDedupeSenders(senders)
+}
+
+func (c *IMClient) resolveAuthoritativeGroupName(ctx context.Context, portalID string) (name string, ok bool) {
+	c.imGroupNamesMu.RLock()
+	cached := c.imGroupNames[portalID]
+	c.imGroupNamesMu.RUnlock()
+	if cached != "" && !isPlaceholderGroupName(cached) {
+		return cached, true
+	}
+
+	if c.cloudStore != nil {
+		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" && !isPlaceholderGroupName(dn) {
+			return dn, true
+		}
+	}
+	return "", false
+}
+
 // resolveGroupName determines the best display name for a group portal.
 // Returns the name and whether it came from an authoritative source
 // (imGroupNames cache or CloudKit display_name). When authoritative is
@@ -10782,23 +10933,12 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 //	   the "name" field on CKChatRecord = cv_name from chat.db)
 //	3) contact-resolved member names via buildGroupName (non-authoritative)
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) (name string, authoritative bool) {
-	// 1) In-memory cache (populated from real-time iMessage rename messages)
-	c.imGroupNamesMu.RLock()
-	cached := c.imGroupNames[portalID]
-	c.imGroupNamesMu.RUnlock()
-	if cached != "" {
-		return cached, true
-	}
-
-	// 2) CloudKit display_name (user-set group name from iCloud).
-	if c.cloudStore != nil {
-		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
-			return dn, true
-		}
+	if name, ok := c.resolveAuthoritativeGroupName(ctx, portalID); ok {
+		return name, true
 	}
 
 	// 3) Build from contact-resolved member names (fallback, non-authoritative)
-	members := c.resolveGroupMembers(ctx, portalID)
+	members := c.resolveGroupMembersForDisplay(ctx, portalID)
 	if len(members) == 0 {
 		return "Group Chat", false
 	}
@@ -10813,16 +10953,10 @@ func (c *IMClient) buildGroupName(members []string) string {
 		if c.isMyHandle(memberID) {
 			continue // skip self
 		}
-		// Strip tel:/mailto: prefix for contact lookup
-		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
-		var contact *imessage.Contact
-		if c.contacts != nil {
-			var contactErr error
-			contact, contactErr = c.contacts.GetContactInfo(lookupID)
-			if contactErr != nil {
-				c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", lookupID).Msg("Failed to resolve contact info")
-			}
+		contact, localID, contactErr := c.lookupContactForDisplay(memberID)
+		if contactErr != nil {
+			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
 
 		if contact != nil && contact.HasName() {
@@ -10830,11 +10964,11 @@ func (c *IMClient) buildGroupName(members []string) string {
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
 				Nickname:  contact.Nickname,
-				ID:        lookupID,
+				ID:        localID,
 			})
 		}
 		if name == "" {
-			name = lookupID // raw phone/email without prefix
+			name = localID // raw phone/email without prefix
 		}
 		names = append(names, name)
 	}
@@ -11458,6 +11592,25 @@ func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.M
 	return makeMessageID(targetGUID)
 }
 
+func resolveInBatchTapbackTarget(
+	messageByGUID map[string]*bridgev2.BackfillMessage,
+	messageByID map[networkid.MessageID]*bridgev2.BackfillMessage,
+	targetGUID string,
+	bp int,
+) (*bridgev2.BackfillMessage, *networkid.PartID, bool) {
+	if bp >= 1 {
+		suffixedID := makeMessageID(fmt.Sprintf("%s_att%d", targetGUID, bp-1))
+		if targetMsg, ok := messageByID[suffixedID]; ok {
+			return targetMsg, nil, true
+		}
+	}
+	targetMsg, ok := messageByGUID[targetGUID]
+	if !ok {
+		return nil, nil, false
+	}
+	return targetMsg, nil, true
+}
+
 // ============================================================================
 // Static helpers
 // ============================================================================
@@ -11814,6 +11967,39 @@ func (c *IMClient) trackUnsend(uuid string) {
 	}
 }
 
+// trackDeliveryReceipt records a delivery receipt as sent and returns true,
+// or returns false if one was already sent for this UUID this session.
+// An empty UUID is allowed through unconditionally (can't dedup without a key).
+func (c *IMClient) trackDeliveryReceipt(uuid string) bool {
+	if uuid == "" {
+		return true
+	}
+	c.recentDeliveryReceiptsLock.Lock()
+	defer c.recentDeliveryReceiptsLock.Unlock()
+	key := strings.ToUpper(uuid)
+	now := time.Now()
+	// GC old entries on each call (same pattern as trackSmsReactionEcho).
+	for k, t := range c.recentDeliveryReceipts {
+		if now.Sub(t) > 5*time.Minute {
+			delete(c.recentDeliveryReceipts, k)
+		}
+	}
+	if _, exists := c.recentDeliveryReceipts[key]; exists {
+		return false
+	}
+	c.recentDeliveryReceipts[key] = now
+	return true
+}
+
+func (c *IMClient) untrackDeliveryReceipt(uuid string) {
+	if uuid == "" {
+		return
+	}
+	c.recentDeliveryReceiptsLock.Lock()
+	defer c.recentDeliveryReceiptsLock.Unlock()
+	delete(c.recentDeliveryReceipts, strings.ToUpper(uuid))
+}
+
 func (c *IMClient) wasUnsent(uuid string) bool {
 	c.recentUnsendsLock.Lock()
 	defer c.recentUnsendsLock.Unlock()
@@ -12011,7 +12197,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			members := make([]string, 0, len(info.Members)+1)
 			members = append(members, addIdentifierPrefix(c.handle))
 			for _, m := range info.Members {
-				members = append(members, addIdentifierPrefix(stripSmsSuffix(m)))
+				members = append(members, normalizeIdentifierForPortalID(stripSmsSuffix(m)))
 			}
 			sort.Strings(members)
 			portalKey = networkid.PortalKey{
@@ -12063,13 +12249,24 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			if len(group.indices) <= 1 {
 				continue
 			}
-			primaryIdx := group.indices[0]
-			for _, idx := range group.indices[1:] {
-				skip[idx] = true
-				log.Info().
-					Str("skip_portal", string(entries[idx].portalKey.ID)).
-					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
-					Msg("Merging DM portal for contact with multiple phone numbers")
+			// Prefer the entry whose portal ID matches the canonical handle.
+			firstPortalID := string(entries[group.indices[0]].portalKey.ID)
+			canonical := c.canonicalContactHandle(firstPortalID)
+			primaryIdx := group.indices[0] // default: most recent
+			for _, idx := range group.indices {
+				if string(entries[idx].portalKey.ID) == canonical {
+					primaryIdx = idx
+					break
+				}
+			}
+			for _, idx := range group.indices {
+				if idx != primaryIdx {
+					skip[idx] = true
+					log.Info().
+						Str("skip_portal", string(entries[idx].portalKey.ID)).
+						Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
+						Msg("Merging DM portal for contact with multiple handles")
+				}
 			}
 		}
 
@@ -12082,6 +12279,53 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			}
 			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
 			entries = merged
+		}
+	}
+
+	// Deduplicate group chat entries with the same portal key (same participants,
+	// different GUIDs). Prefer entries with a display name; otherwise keep the
+	// first (most-recent-activity) entry since the list is still in DESC order.
+	{
+		groups := make(map[string][]int)
+		for i, entry := range entries {
+			if portalID := string(entry.portalKey.ID); strings.Contains(portalID, ",") {
+				groups[portalID] = append(groups[portalID], i)
+			}
+		}
+
+		skip := make(map[int]bool)
+		for portalID, indices := range groups {
+			if len(indices) <= 1 {
+				continue
+			}
+			bestIdx := indices[0]
+			for _, idx := range indices[1:] {
+				if entries[bestIdx].info.DisplayName == "" && entries[idx].info.DisplayName != "" {
+					bestIdx = idx
+				}
+			}
+			for _, idx := range indices {
+				if idx == bestIdx {
+					continue
+				}
+				skip[idx] = true
+				log.Info().
+					Str("skip_guid", entries[idx].chatGUID).
+					Str("keep_guid", entries[bestIdx].chatGUID).
+					Str("portal_id", portalID).
+					Msg("Deduplicating group chat entry with same portal key")
+			}
+		}
+
+		if len(skip) > 0 {
+			var deduped []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					deduped = append(deduped, entry)
+				}
+			}
+			log.Info().Int("before", len(entries)).Int("after", len(deduped)).Msg("Deduplicated group chat entries by portal key")
+			entries = deduped
 		}
 	}
 
@@ -12098,7 +12342,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	synced := 0
 	for _, entry := range entries {
 		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.chatGUID)
 		chatGUID := entry.chatGUID
 		isSms := entry.isSms
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
@@ -12163,14 +12407,15 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 }
 
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatGUID string) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
 	}
 
 	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: true,
+		CanBackfill:                true,
+		ExcludeChangesFromTimeline: true,
 	}
 
 	if parsed.IsGroup {
@@ -12197,16 +12442,40 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			Membership: event.MembershipJoin,
 		}
 		for _, memberID := range info.Members {
-			userID := makeUserID(addIdentifierPrefix(stripSmsSuffix(memberID)))
+			userID := makeUserID(normalizeIdentifierForPortalID(stripSmsSuffix(memberID)))
 			members.MemberMap[userID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{Sender: userID},
 				Membership:  event.MembershipJoin,
 			}
 		}
 		chatInfo.Members = members
+
+		// Set group avatar from chat.db (local group action message, or
+		// chat.properties BLOB fallback for avatars set on another device).
+		if c.chatDB != nil && chatGUID != "" {
+			avatarStart := time.Now()
+			att, attErr := c.chatDB.api.GetGroupAvatar(chatGUID)
+			if attErr != nil {
+				c.Main.Bridge.Log.Warn().Err(attErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: chatdb avatar lookup error (initial sync)")
+			} else if att != nil {
+				photoData, readErr := att.Read()
+				if readErr != nil {
+					c.Main.Bridge.Log.Warn().Err(readErr).Str("chat_guid", chatGUID).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: failed to read chatdb avatar file (initial sync)")
+				} else if len(photoData) > 0 {
+					hash := sha256.Sum256(photoData)
+					avatarID := networkid.AvatarID(fmt.Sprintf("chatdb-avatar:%x", hash[:8]))
+					cachedData := photoData
+					chatInfo.Avatar = &bridgev2.Avatar{
+						ID:  avatarID,
+						Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
+					}
+					c.Main.Bridge.Log.Info().Str("chat_guid", chatGUID).Int("bytes", len(photoData)).Dur("lookup_ms", time.Since(avatarStart)).Msg("group_photo: setting avatar from chatdb (initial sync)")
+				}
+			}
+		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
+		portalID := normalizeIdentifierForPortalID(stripSmsSuffix(parsed.LocalID))
 		otherUser := makeUserID(portalID)
 		isSelfChat := c.isMyHandle(portalID)
 

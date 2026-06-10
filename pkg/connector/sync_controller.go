@@ -330,7 +330,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			// bin zone but their messages are still in the main zone).
 			if hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID); msgErr == nil && hasMessages {
 				dn := ""
-				if chat.DisplayName != nil {
+				if chat.DisplayName != nil && !isPlaceholderGroupName(*chat.DisplayName) {
 					dn = *chat.DisplayName
 				}
 				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, dn, "", chat.Participants)
@@ -385,7 +385,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
 			name := friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, portalID)
 			isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
-			if chat.DisplayName != nil && *chat.DisplayName != "" && (name == portalID || name == strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:") || (isGroup && strings.HasPrefix(name, "Group "))) {
+			if chat.DisplayName != nil && *chat.DisplayName != "" && !isPlaceholderGroupName(*chat.DisplayName) && (name == portalID || name == strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:") || (isGroup && strings.HasPrefix(name, "Group "))) {
 				name = *chat.DisplayName
 			}
 			if isGroup && strings.HasPrefix(name, "Group ") && len(chat.Participants) > 0 {
@@ -396,7 +396,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 					}
 				}
 				if len(normalized) > 0 {
-					if built := c.buildGroupName(normalized); built != "" && built != "Group Chat" {
+					if built := c.buildGroupName(normalized); built != "" && !isPlaceholderGroupName(built) {
 						name = built
 					}
 				}
@@ -1040,9 +1040,8 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 // hydrates whatever we're missing — so the bridge never bulk-invites anyone. This
 // removes the sweep's IDS queries entirely AND unblocks the pull (the sweep used
 // to defer it via statusKitSweepRunning). Per-peer manual invites remain via the
-// !statuskit-invite-channel command (a separate, bounded path); the dangerous
-// bulk !statuskit-invite-all command was removed. Set true only to re-enable the
-// legacy auto bulk sweep.
+// !statuskit-invite-channel command (a separate, bounded path). Set true only to
+// re-enable the legacy auto bulk sweep.
 const statusKitAutoInvite = false
 
 // inviteContactsToStatusSharingOpts is the core invite sweep.
@@ -1052,9 +1051,8 @@ const statusKitAutoInvite = false
 //     an unresponsive peer. Startup / post-backfill paths pass false.
 //   - bypassLatch (user-invoked retry): ignore the invited_ok one-shot
 //     latch so every pending 1:1 portal target is re-invited, even peers
-//     that previously got an accepted invite. Use for !statuskit-invite-all;
-//     automatic paths leave it false to preserve the "invite once per peer"
-//     contract with peer iOS.
+//     that previously got an accepted invite. Automatic paths leave it false
+//     to preserve the "invite once per peer" contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.handle == "" {
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
@@ -1153,8 +1151,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			continue
 		}
 		// Skip peers recently confirmed NOT on the keysharing sub-service —
-		// see statusKitNoKeysGated. bypassLatch (user-invoked
-		// !statuskit-invite-all) ignores this so a manual retry forces a look.
+		// see statusKitNoKeysGated. bypassLatch ignores this so a manual retry
+		// forces a look.
 		if !bypassLatch && c.statusKitNoKeysGated(ctx, h, now) {
 			skippedNoKeys++
 			continue
@@ -1498,8 +1496,15 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	ctx := context.Background()
 
 	// Use bridge_id-scoped query and fetch the current name for diff-gating.
+	// Also include legacy ghosts with bridge_id IS NULL that are nameless and
+	// have an iMessage-style identifier — these were created before bridge_id
+	// tracking was added (or by certain bridgev2 edge cases) and are silently
+	// excluded by the bridge_id=$1 equality check in SQL.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
+		`SELECT id, COALESCE(name, '') FROM ghost
+		 WHERE bridge_id=$1
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
+		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -1524,18 +1529,33 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
 	}
-	rows.Close()
 
 	updated := 0
 	for _, g := range ghosts {
-		// Skip ghosts with no matching contact (efficiency: avoids loading
-		// the full ghost object for participants who aren't in the address book).
-		localID := stripIdentifierPrefix(string(g.id))
+		contact, localID, err := c.lookupContactForDisplay(string(g.id))
 		if localID == "" {
 			continue
 		}
-		contact, _ := c.contacts.GetContactInfo(localID)
+		if err != nil {
+			log.Debug().Err(err).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 		if contact == nil || !contact.HasName() {
+			// No contact found (or contact has no name). If the ghost also has
+			// no display name, still set an identifier-based fallback so clients
+			// show "+13124048025" or "user@example.com" rather than the raw MXID.
+			if g.name == "" {
+				ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
+				if err != nil || ghost == nil {
+					log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load nameless ghost for fallback name")
+					continue
+				}
+				info, err := c.GetUserInfo(ctx, ghost)
+				if err != nil || info == nil {
+					continue
+				}
+				ghost.UpdateInfo(ctx, info)
+				updated++
+			}
 			continue
 		}
 		// Diff-gate: compute the expected displayname and skip if it matches
@@ -1573,7 +1593,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 // numbers / email addresses as the room name. This also picks up contact
 // edits on subsequent periodic syncs.
 func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
-	if c.contacts == nil {
+	if !c.contactsAreReady() {
 		return
 	}
 	ctx := context.Background()
@@ -1598,13 +1618,14 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		total++
 
 		newName, authoritative := c.resolveGroupName(ctx, portalID)
-		if newName == "" || newName == portal.Name {
-			continue
-		}
-		// Don't overwrite an existing portal name with a contact-derived
-		// fallback — only authoritative sources (user-set iMessage group
-		// names from the in-memory cache or CloudKit) should rename.
-		if !authoritative && portal.Name != "" {
+		if !shouldApplyGroupNameRefresh(portal.Name, newName, authoritative) {
+			if !authoritative && !isPlaceholderGroupName(newName) && !isRefreshableGroupName(portal.Name) && newName != portal.Name {
+				log.Debug().
+					Str("portal_id", portalID).
+					Str("current_name", portal.Name).
+					Str("fallback_name", newName).
+					Msg("Skipping fallback rename for portal with existing name")
+			}
 			continue
 		}
 

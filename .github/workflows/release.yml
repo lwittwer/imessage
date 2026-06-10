@@ -195,7 +195,10 @@ jobs:
           echo "" >> changelog.md
           echo "## Checksums" >> changelog.md
           echo '```' >> changelog.md
-          sha256sum artifacts/**/*.tar.gz artifacts/**//extract-key >> changelog.md
+          sha256sum \
+            artifacts/macos-arm64/mautrix-imessage-v2-macos-arm64.tar.gz \
+            artifacts/linux-amd64/mautrix-imessage-v2-linux-amd64.tar.gz \
+            artifacts/extract-key-macos/extract-key >> changelog.md
           echo '```' >> changelog.md
 
       - name: Create GitHub Release

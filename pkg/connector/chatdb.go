@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -110,6 +109,53 @@ func (db *chatDB) findGroupChatGUID(portalID string, c *IMClient) string {
 	return ""
 }
 
+// findGroupChatGUIDByMembers finds a group chat GUID by matching a resolved member list.
+// Unlike findGroupChatGUID, it accepts a pre-resolved member slice (e.g. from CloudKit)
+// and adds self to the set, matching the chat.db side.
+func (db *chatDB) findGroupChatGUIDByMembers(members []string, c *IMClient) string {
+	portalMemberSet := make(map[string]struct{})
+	portalMemberSet[strings.ToLower(stripIdentifierPrefix(c.handle))] = struct{}{}
+	for _, m := range members {
+		portalMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+	}
+
+	chats, err := db.api.GetChatsWithMessagesAfter(time.Time{})
+	if err != nil {
+		return ""
+	}
+
+	for _, chat := range chats {
+		parsed := imessage.ParseIdentifier(chat.ChatGUID)
+		if !parsed.IsGroup {
+			continue
+		}
+		info, err := db.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			continue
+		}
+
+		chatMemberSet := make(map[string]struct{})
+		chatMemberSet[strings.ToLower(stripIdentifierPrefix(c.handle))] = struct{}{}
+		for _, m := range info.Members {
+			chatMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+		}
+
+		if len(chatMemberSet) == len(portalMemberSet) {
+			match := true
+			for m := range portalMemberSet {
+				if _, ok := chatMemberSet[m]; !ok {
+					match = false
+					break
+				}
+			}
+			if match {
+				return chat.ChatGUID
+			}
+		}
+	}
+	return ""
+}
+
 // chatDBReplyTarget returns the correct MessageOptionalPartID for a reply,
 // mapping chat.db balloon-part index to the emitted part IDs:
 // bp<=0 -> base GUID (text body); bp>=1 -> {guid}_att{bp-1} (attachment).
@@ -184,6 +230,20 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
 	}
 
+	// Deduplicate messages that appear under multiple chat GUIDs
+	// (e.g., same message linked to both any;-; and iMessage;-; variants,
+	// or across multiple email aliases for the same contact).
+	rawCount := len(messages)
+	seen := make(map[string]bool, len(messages))
+	unique := messages[:0]
+	for _, msg := range messages {
+		if !seen[msg.GUID] {
+			seen[msg.GUID] = true
+			unique = append(unique, msg)
+		}
+	}
+	messages = unique
+
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].Time.Before(messages[j].Time)
@@ -250,31 +310,12 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				Timestamp:        msg.Time.Add(time.Duration(i+1) * time.Millisecond),
 				StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
 			})
-
-			// If there's a Live Photo MOV companion on disk, bridge it too.
-			movAtt := chatDBResolveLivePhoto(att, log)
-			if movAtt.PathOnDisk != att.PathOnDisk {
-				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
-				if movErr != nil {
-					log.Warn().Err(movErr).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert Live Photo MOV companion, skipping")
-				} else {
-					movID := fmt.Sprintf("%s_att%d_mov", msg.GUID, i)
-					backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
-						ConvertedMessage: movCm,
-						Sender:           sender,
-						ID:               makeMessageID(movID),
-						TxnID:            networkid.TransactionID(movID),
-						Timestamp:        msg.Time.Add(time.Duration(i+1)*time.Millisecond + 500*time.Microsecond),
-						StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
-					})
-				}
-			}
 		}
 	}
 
 	return &bridgev2.FetchMessagesResponse{
 		Messages:                backfillMessages,
-		HasMore:                 len(messages) >= count,
+		HasMore:                 rawCount >= count,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
@@ -344,7 +385,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(addIdentifierPrefix(stripSmsSuffix(msg.Sender.LocalID))),
+		Sender:   makeUserID(normalizeIdentifierForPortalID(stripSmsSuffix(msg.Sender.LocalID))),
 	}
 }
 
@@ -513,48 +554,4 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			Content: content,
 		}},
 	}, nil
-}
-
-// chatDBResolveLivePhoto checks if a HEIC/JPG attachment has a companion .MOV
-// file on disk (Apple stores Live Photo videos as sibling files but doesn't
-// list them in the attachment table). If found, returns a new Attachment
-// pointing to the MOV. Returns the original attachment unchanged if no
-// companion is found.
-func chatDBResolveLivePhoto(att *imessage.Attachment, log *zerolog.Logger) *imessage.Attachment {
-	path := att.PathOnDisk
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return att
-		}
-		path = filepath.Join(home, path[2:])
-	}
-
-	lower := strings.ToLower(filepath.Base(path))
-	if !strings.HasSuffix(lower, ".heic") && !strings.HasSuffix(lower, ".jpg") && !strings.HasSuffix(lower, ".jpeg") {
-		return att
-	}
-
-	// Check for sibling .MOV in the same directory
-	dir := filepath.Dir(path)
-	base := filenameBase(filepath.Base(path))
-	movPath := filepath.Join(dir, base+".MOV")
-
-	if _, err := os.Stat(movPath); err != nil {
-		// Try lowercase extension
-		movPath = filepath.Join(dir, base+".mov")
-		if _, err := os.Stat(movPath); err != nil {
-			return att // No companion MOV found — keep the HEIC
-		}
-	}
-
-	log.Info().Str("heic", filepath.Base(path)).Str("mov", filepath.Base(movPath)).
-		Msg("Live Photo: swapping HEIC for MOV companion")
-
-	return &imessage.Attachment{
-		GUID:       att.GUID,
-		PathOnDisk: movPath,
-		FileName:   base + ".MOV",
-		MimeType:   "video/quicktime",
-	}
 }
