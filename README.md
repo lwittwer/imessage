@@ -1,6 +1,6 @@
-# Rustpush-Matrix
+# Corten-Matrix
 
-A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix client.
+A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
 
