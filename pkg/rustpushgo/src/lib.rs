@@ -8793,6 +8793,29 @@ impl Client {
                 }
             }
 
+            // Invite dates (CD_dateInvitationCreated) written by the CloudKit
+            // pull: channel_id -> raw seconds. The MOST-RECENT invite is the
+            // peer's current channel, so when dates are present we keep those
+            // deterministically and converge immediately. Before a dated pull has
+            // run (or for non-CloudKit keys), dates are absent and we fall back to
+            // rotating the placeholder window across subscribes.
+            let mut chan_date: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            {
+                let dates_path = subsystem_state_path("statuskit-channel-dates.plist");
+                if let Ok(data) = std::fs::read(&dates_path) {
+                    if let Ok(plist::Value::Dictionary(d)) =
+                        plist::from_bytes::<plist::Value>(&data)
+                    {
+                        for (cid, v) in d {
+                            if let Some(i) = v.as_signed_integer() {
+                                chan_date.insert(cid, i);
+                            }
+                        }
+                    }
+                }
+            }
+
             static ROTATION: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
             let rot = ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8810,15 +8833,33 @@ impl Client {
                     .take(CHANNEL_BUDGET)
                     .cloned()
                     .collect();
-                let placeholders: Vec<&String> = sorted
+                let mut placeholders: Vec<&String> = sorted
                     .iter()
                     .filter(|c| !*chan_live.get(*c).unwrap_or(&false))
                     .collect();
                 let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
                 if remaining > 0 && !placeholders.is_empty() {
-                    let start = rot.wrapping_mul(remaining) % placeholders.len();
-                    for i in 0..remaining.min(placeholders.len()) {
-                        keep.insert(placeholders[(start + i) % placeholders.len()].clone());
+                    // Prefer the most-recently-invited channels (current first)
+                    // when we have dates; otherwise rotate the window.
+                    let have_dates = placeholders
+                        .iter()
+                        .any(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if have_dates {
+                        placeholders.sort_by(|a, b| {
+                            chan_date
+                                .get(*b)
+                                .copied()
+                                .unwrap_or(0)
+                                .cmp(&chan_date.get(*a).copied().unwrap_or(0))
+                        });
+                        for c in placeholders.iter().take(remaining) {
+                            keep.insert((*c).clone());
+                        }
+                    } else {
+                        let start = rot.wrapping_mul(remaining) % placeholders.len();
+                        for i in 0..remaining.min(placeholders.len()) {
+                            keep.insert(placeholders[(start + i) % placeholders.len()].clone());
+                        }
                     }
                 }
                 for c in cids {
