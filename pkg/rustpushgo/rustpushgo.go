@@ -1897,6 +1897,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed(uniffiStatus)
+		})
+		if checksum != 56503 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_updateuserscallback_update_users(uniffiStatus)
 		})
 		if checksum != 85 {
@@ -8219,6 +8228,8 @@ type StatusCallback interface {
 	OnKeysReceived()
 
 	OnReshareSender(sender string, channelId string)
+
+	OnStatusDecryptFailed(sender *string)
 }
 
 // foreignCallbackCallbackInterfaceStatusCallback cannot be callable be a compiled function at a same time
@@ -8250,6 +8261,11 @@ func rustpushgo_cgo_StatusCallback(handle C.uint64_t, method C.int32_t, argsPtr 
 		args := unsafe.Slice((*byte)(argsPtr), argsLen)
 		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnReshareSender(cb, args, outBuf)
 		return C.int32_t(result)
+	case 4:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnStatusDecryptFailed(cb, args, outBuf)
+		return C.int32_t(result)
 
 	default:
 		// This should never happen, because an out of bounds method index won't
@@ -8273,6 +8289,12 @@ func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnKeysReceived(callb
 func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnReshareSender(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
 	reader := bytes.NewReader(args)
 	callback.OnReshareSender(FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnStatusDecryptFailed(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	reader := bytes.NewReader(args)
+	callback.OnStatusDecryptFailed(FfiConverterOptionalStringINSTANCE.Read(reader))
 
 	return uniffiCallbackResultSuccess
 }

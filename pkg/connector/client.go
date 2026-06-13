@@ -307,6 +307,12 @@ type IMClient struct {
 	// rows and double the CKKS round-trips. Released in a defer.
 	statusKitPassInFlight atomic.Bool
 
+	// lastDecryptFailureRepull is the unix-millisecond time of the last CloudKit
+	// re-pull forced by a presence decrypt failure (a stale peer key). Cooldown-
+	// gates onPresenceDecryptFailed so a burst of undecryptable presence updates
+	// can't hammer CKKS and re-trigger the clique-kick. Accessed atomically.
+	lastDecryptFailureRepull int64
+
 	// statusKitShareMu serializes the cooldown-check / publish /
 	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
 	// Without it two concurrent callers can both pass the cooldown check
@@ -2012,6 +2018,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// change actually sends the notice. Persisted to KV under a
 		// distinct prefix so the dedup survives bridge restarts.
 		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
+		// We successfully decrypted and resolved a presence event for this portal —
+		// refresh the moon-TTL freshness clock BEFORE the dedup early-returns, so a
+		// same-state re-confirmation still counts as "still hearing valid presence"
+		// and keeps a legitimate moon alive. A moon only goes stale when these stop.
+		c.touchPresenceAt(ctx, portal.ID)
 		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
 			if prev.(string) == modeKey {
 				log.Debug().
@@ -2120,6 +2131,48 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	}()
 }
 
+// presenceMoonTTL is how long a silenced (Focus/DND) state survives without
+// being re-confirmed by a freshly-decrypted presence event before isPortalSilenced
+// treats it as STALE and clears the 🌙. This self-heals "stuck moons": when a peer
+// rotates their StatusKit key and we can no longer decrypt their "now available"
+// update, the persisted focus mode would otherwise pin the moon forever. 16h is
+// comfortably longer than any normal Focus (Sleep ~8–10h, Work ~9h) so a genuine
+// DND is never prematurely cleared — only a state we've stopped hearing about.
+const presenceMoonTTL = 16 * time.Hour
+
+// presenceAtRefreshThrottle bounds how often touchPresenceAt writes the freshness
+// timestamp to KV, so a single presence change fanned across a peer's N aliases
+// doesn't write N times.
+const presenceAtRefreshThrottle = 5 * time.Minute
+
+// presenceAtKey is the KV key holding the unix-millis timestamp of the last
+// successfully-processed presence event for a portal — the freshness clock the
+// moon-TTL reads.
+func presenceAtKey(portalID networkid.PortalID) database.Key {
+	return database.Key("statuskit.presence.portal." + string(portalID) + ".at")
+}
+
+// touchPresenceAt refreshes the moon-TTL freshness clock for this portal. It
+// fires when a presence event reaches portal-level processing — i.e. a state
+// CHANGE (the handle-level dedup at the top of OnStatusUpdate, ~line 1829, lets
+// changes through) — so the clock tracks "time of last state change we processed"
+// for this peer. Same-state re-deliveries caught by that earlier handle dedup do
+// NOT reach here, so the TTL measures time-since-last-change, not time-since-last-
+// heard. That's the right signal for the bug we're fixing: a stuck moon is a
+// missed "now available" transition, which leaves the clock frozen at the DND-on
+// change and clears at TTL. Known tradeoff: a genuinely continuous Focus lasting
+// >presenceMoonTTL also clears (rare; self-corrects on the peer's next change).
+// Throttled to avoid KV churn on alias fan-out.
+func (c *IMClient) touchPresenceAt(ctx context.Context, portalID networkid.PortalID) {
+	key := presenceAtKey(portalID)
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, key); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && time.Since(time.UnixMilli(ms)) < presenceAtRefreshThrottle {
+			return
+		}
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, key, strconv.FormatInt(time.Now().UnixMilli(), 10))
+}
+
 // isPortalSilenced reports whether the peer of the given DM portal currently
 // has iMessage Focus/DND on. Map-first (statusKitPresenceByPortal), KV-fallback:
 // the in-memory map is cold after a restart, but the per-portal presence state
@@ -2127,16 +2180,41 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 // across restarts instead of stripping it until the next live toggle. A stored
 // value of "available" (or absent) = not silenced; any focus mode = silenced.
 //
+// Silenced states are additionally gated on presenceMoonTTL: a focus mode whose
+// last-state-change is older than the TTL is treated as stale (not silenced) so a
+// stuck moon self-clears on the next title refresh (which runs every ~15min via
+// setContactsReady, regardless of contact changes). A pre-TTL row with no
+// freshness timestamp is stamped now, giving already-stuck moons a TTL window to
+// clear instead of sticking forever.
+//
 // Note: depends on StatusKitNotifications being enabled — when it's off,
 // OnStatusUpdate early-returns before recording presence, so this is always
 // false and no moon appears (intended).
 func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
+	silenced := false
 	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
 		s, _ := v.(string)
-		return s != "" && s != "available"
+		silenced = s != "" && s != "available"
+	} else {
+		s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
+		silenced = s != "" && s != "available"
 	}
-	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
-	return s != "" && s != "available"
+	if !silenced {
+		return false
+	}
+	raw := c.Main.Bridge.DB.KV.Get(ctx, presenceAtKey(portalID))
+	if raw == "" {
+		// Pre-TTL row (set before this code shipped, or never timestamped). Stamp
+		// it now so a genuinely-stuck moon gets a TTL window and self-clears later
+		// instead of persisting forever.
+		c.Main.Bridge.DB.KV.Set(ctx, presenceAtKey(portalID), strconv.FormatInt(time.Now().UnixMilli(), 10))
+		return true
+	}
+	ms, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return true
+	}
+	return time.Since(time.UnixMilli(ms)) < presenceMoonTTL
 }
 
 // dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the
@@ -2403,6 +2481,27 @@ func (c *IMClient) OnKeysReceived() {
 		Logger()
 	log.Info().Msg("StatusKit: key-sharing message received — scheduling presence re-subscribe")
 	c.schedulePresenceSubscribe(log)
+}
+
+// OnStatusDecryptFailed is called by StatusKit when a presence update on the
+// presence.mode.status topic could not be decoded — almost always a peer who
+// rotated their StatusKit channel key, leaving the copy we pulled from CloudKit
+// stale. We force a rate-limited CloudKit peer-key re-pull to fetch the fresh key
+// right away (instead of waiting for the steady-state pull floor), which then
+// re-subscribes and lets the peer's real presence flow again — clearing a moon
+// that would otherwise be stuck. sender is best-effort (the peer handle when the
+// envelope exposes it) and used only for logging.
+func (c *IMClient) OnStatusDecryptFailed(sender *string) {
+	if !c.Main.Config.StatusKitNotifications {
+		return
+	}
+	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
+	s := ""
+	if sender != nil {
+		s = *sender
+	}
+	log.Info().Str("sender", s).Msg("StatusKit: presence decrypt failed (likely stale peer key) — forcing rate-limited CloudKit re-pull")
+	c.onPresenceDecryptFailed(log)
 }
 
 // OnReshareSender is called once per reshare with the peer handle that sent

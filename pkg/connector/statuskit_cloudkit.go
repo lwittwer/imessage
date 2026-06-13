@@ -69,7 +69,16 @@ const statusKitFailureBackoffBase = 15 * time.Minute
 // established and have gone quiet. Before keys are established (or while
 // they're actively arriving) the much shorter statusKitFreshFloor applies
 // — see nextAllowedAt.
-const statusKitSuccessFloor = 12 * time.Hour
+//
+// Lowered 12h → 4h: a peer ROTATING their StatusKit key (re-registration /
+// fresh reshare) makes our stored key stale, and if that key only lands in
+// CloudKit (not delivered to the bridge's device via APNs key-sharing) the old
+// 12h floor left presence undecryptable — and the moon stuck — for up to half a
+// day. 4h picks up rotations far sooner while staying ~1.25 passes/hr, well
+// under the ~15–20/hr the clique-kick postmortem documents as tolerated (the
+// kick was wrong-class-unwrap/zone-probing bursts, not steady pull rate). The
+// moon-TTL in isPortalSilenced is the backstop for keys that never re-pull.
+const statusKitSuccessFloor = 4 * time.Hour
 
 // statusKitFreshFloor is the (gentle) minimum interval between successful
 // passes while the bridge has NOT yet pulled any peer keys, or while keys are
@@ -322,6 +331,46 @@ func (c *IMClient) runStatusKitPullLoop(log zerolog.Logger, stopChan <-chan stru
 //     newly-keyed peers get APNs subscriptions immediately rather than
 //     waiting for the next periodic loop.
 func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logger) error {
+	return c.syncCloudStatusKitPeersForce(ctx, log, false)
+}
+
+// decryptFailureRepullCooldown bounds how often a presence decrypt failure (a
+// stale peer key) can force an out-of-cycle CloudKit re-pull. A peer who rotated
+// their key emits a stream of undecodable presence updates; without this cooldown
+// each one would force a pull, hammering CKKS and re-triggering the clique-kick.
+// One forced pull per window is enough to fetch the rotated key.
+const decryptFailureRepullCooldown = 15 * time.Minute
+
+// onPresenceDecryptFailed forces a rate-limited CloudKit peer-key re-pull in
+// response to a presence update we couldn't decode (OnStatusDecryptFailed). The
+// re-pull bypasses the steady-state floor (force=true) so the fresh key is
+// fetched right away, but is gated by decryptFailureRepullCooldown and inherits
+// every other safety guard (single-flight, sweep, backfill-settle). Runs the pull
+// in a goroutine so the Rust recv-loop callback returns immediately.
+func (c *IMClient) onPresenceDecryptFailed(log zerolog.Logger) {
+	last := atomic.LoadInt64(&c.lastDecryptFailureRepull)
+	if last != 0 && time.Since(time.UnixMilli(last)) < decryptFailureRepullCooldown {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&c.lastDecryptFailureRepull, last, time.Now().UnixMilli()) {
+		// Another decrypt-failure goroutine claimed the slot — it'll run the pull.
+		return
+	}
+	go func() {
+		if err := c.syncCloudStatusKitPeersForce(context.Background(), log, true); err != nil {
+			log.Info().Err(err).Msg("StatusKit: decrypt-failure-forced CloudKit re-pull errored")
+		}
+	}()
+}
+
+// syncCloudStatusKitPeersForce is syncCloudStatusKitPeers with an explicit force
+// flag. When force is true the inter-pass backoff/floor gate is bypassed (the
+// caller has a concrete reason to pull NOW — e.g. a presence decrypt failure that
+// means a peer key is stale), but every OTHER guard still applies: single-flight,
+// the invite-sweep deferral, and the backfill-settle window. Forced callers are
+// responsible for their own cooldown so they can't defeat the clique-kick rate
+// limit (see onPresenceDecryptFailed).
+func (c *IMClient) syncCloudStatusKitPeersForce(ctx context.Context, log zerolog.Logger, force bool) error {
 	if c.client == nil {
 		log.Info().Msg("StatusKit-CloudKit pass: skipped (rust client not ready)")
 		return nil
@@ -398,7 +447,7 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// per process gets the bypass; subsequent calls fall through to the
 	// gate normally.
 	bypassForFirstCall := c.statusKitCloudPassFirstCallDone.CompareAndSwap(false, true)
-	if !bypassForFirstCall && !meta.LastAttempt.IsZero() {
+	if !bypassForFirstCall && !force && !meta.LastAttempt.IsZero() {
 		nextAllowed := meta.nextAllowedAt(0)
 		if time.Now().Before(nextAllowed) {
 			log.Info().

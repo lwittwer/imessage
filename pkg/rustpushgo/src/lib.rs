@@ -4838,6 +4838,14 @@ pub trait StatusCallback: Send + Sync {
     /// unknown alias to the DM portal of any sibling alias that does
     /// resolve via the standard chain.
     fn on_reshare_sender(&self, sender: String, channel_id: String);
+    /// Called when a presence update arrives on the StatusKit presence topic but
+    /// we could NOT turn it into a status — almost always because the sending peer
+    /// rotated their StatusKit key (re-registration / fresh reshare) and our stored
+    /// copy is now stale, so the encrypted payload won't open. The Go side should
+    /// force a rate-limited CloudKit peer-key re-pull to fetch the fresh key right
+    /// away instead of waiting for the steady-state pull floor, then re-subscribe.
+    /// `sender` is the peer handle when the envelope exposes it (best-effort).
+    fn on_status_decrypt_failed(&self, sender: Option<String>);
 }
 
 // ============================================================================
@@ -7702,6 +7710,32 @@ pub async fn new_client(
                             continue;
                         }
                         Ok(Ok(None)) => {
+                            // A Notification on the PRESENCE topic (Shared Channels
+                            // path) that handle() couldn't turn into a StatusChanged is
+                            // a presence update we failed to decode — almost always a
+                            // peer who rotated their StatusKit channel key, leaving the
+                            // copy we pulled from CloudKit stale. Signal the Go side to
+                            // force a rate-limited CloudKit re-pull for the fresh key.
+                            // (The personal-status path uses IDS keys, not StatusKit
+                            // channel keys, so a re-pull can't help it — only
+                            // presence.mode.status is the stale-key signal. Over-firing
+                            // is bounded by the Go-side cooldown, so a benign undecoded
+                            // notification at worst costs one rate-limited pull.)
+                            let presence_topic: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                            if msg_topic == Some(presence_topic) {
+                                let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                    plist::from_bytes::<plist::Value>(payload)
+                                        .ok()
+                                        .and_then(|v| v.into_dictionary())
+                                        .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                                } else {
+                                    None
+                                };
+                                warn!("StatusKit: presence.mode.status update could not be decoded (likely stale peer key) — signalling decrypt-failure re-pull, sender={:?}", df_sender);
+                                if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                    cb.on_status_decrypt_failed(df_sender);
+                                }
+                            }
                             // Not a StatusKit presence update — but check whether it
                             // was a key-sharing message. Only fire on_keys_received
                             // if state.keys gained a new channel id.
