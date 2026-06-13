@@ -2078,6 +2078,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
 		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
 			nameField := c.dmFocusName(ctx, portal)
+			if nameField == nil {
+				// Contact name not resolved yet — leave the title untouched
+				// rather than blanking it. A later refresh tick will set it.
+				return
+			}
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
 					Type: bridgev2.RemoteEventChatInfoChange,
@@ -2163,27 +2168,51 @@ func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) 
 // dmFocusName returns the ChatInfo.Name to set for a DM given the peer's focus
 // state:
 //   - silenced  → the moon title ("<name> 🌙"), which we own (NameIsCustom=true).
-//   - available, regular DM → bridgev2.DefaultChatName, which RELEASES ownership
-//     (NameIsCustom=false) so the framework restores the bare ghost name AND
-//     re-enables ghost name+avatar sync. (Re-stamping the bare name would keep
-//     NameIsCustom=true forever and freeze the ghost avatar.)
+//   - available, regular DM → see the release-path comment below; depends on
+//     private_chat_portal_meta.
 //   - available, self-chat → the bare connector name. The connector permanently
 //     owns the self-chat name (NameIsCustom is always set by GetChatInfo), so
 //     releasing would just fight GetChatInfo and flip; restore the same bare
 //     name dmBaseName uses, keeping it stable.
 //
-// Returns the DefaultChatName package sentinel by identity (the framework
-// matches it by pointer at portal.go:4983) — never a copy of "".
+// Returns nil when the contact name hasn't resolved yet, meaning "leave the name
+// alone" — never stamp an empty/lone-🌙 title (that blanks the DM).
 func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *string {
 	if c.isPortalSilenced(ctx, portal.ID) {
 		title := c.computeDMTitle(ctx, portal)
+		// computeDMTitle returns "" when the contact name isn't resolved yet
+		// (e.g. contacts not loaded). Don't stamp that — it would blank the DM
+		// or, with the moon appended, leave a nameless "🌙". Leave the name as-is.
+		if title == "" {
+			return nil
+		}
 		return &title
 	}
 	if c.isMyHandle(string(portal.ID)) {
 		base := c.dmBaseName(ctx, portal)
 		return &base
 	}
-	return bridgev2.DefaultChatName
+	// Releasing the moon (peer available again): the title must return to the
+	// plain contact name. HOW depends on private_chat_portal_meta:
+	//   - true:  hand the title back with DefaultChatName, which RELEASES ownership
+	//     (NameIsCustom=false) so the framework restores the bare ghost name AND
+	//     re-enables ghost name+avatar sync. (Re-stamping would keep NameIsCustom
+	//     true forever and freeze the ghost avatar — which matters only here.)
+	//   - false: the framework will NOT restore the name — UpdateInfoFromGhost
+	//     early-returns at portal.go:4960 when PrivateChatPortalMeta is off — so
+	//     DefaultChatName leaves an explicit empty m.room.name and the DM renders
+	//     blank (the "lost contact name" bug). Re-stamp the bare contact name
+	//     ourselves. NameIsCustom stays true, but under PCPM=false the framework
+	//     never syncs DM name/avatar from the ghost anyway (ghost.go:320), so
+	//     nothing is frozen that wasn't already manual.
+	if c.Main.Bridge.Config.PrivateChatPortalMeta {
+		return bridgev2.DefaultChatName
+	}
+	base := c.dmBaseName(ctx, portal)
+	if base == "" {
+		return nil
+	}
+	return &base
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so

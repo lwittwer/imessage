@@ -1665,12 +1665,17 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		// Only touch DMs we should: silenced (apply 🌙) or already owned
-		// (NameIsCustom — maintain it or clear the moon). Leave pristine,
-		// never-silenced DMs on implicit naming — portal.Name may be empty for
-		// them, so stamping would mass-seize NameIsCustom (and freeze ghost
-		// avatars) across every DM on the first tick.
-		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom {
+		// Only touch DMs we should: silenced (apply 🌙), already owned
+		// (NameIsCustom — maintain it or clear the moon), or BROKEN — a DM the
+		// moon path previously blanked (name was set, but to ""). A blanked DM
+		// renders with no contact name at all (the "lost name" regression from
+		// releasing the moon via DefaultChatName under private_chat_portal_meta=
+		// false); dmFocusName now re-stamps the contact name, healing it.
+		// Leave pristine, never-named DMs (NameSet=false) on implicit naming —
+		// stamping those would mass-seize NameIsCustom (and freeze ghost avatars)
+		// across every DM on the first tick.
+		broken := portal.NameSet && portal.Name == ""
+		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom && !broken {
 			continue
 		}
 		// Recompute the title (contact name + 🌙 when silenced) or, when
@@ -1680,6 +1685,10 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		// check go hand in hand. Skip no-op moon-title rewrites; DefaultChatName
 		// must proceed so it releases ownership and restores name + avatar.
 		nameField := c.dmFocusName(ctx, portal)
+		if nameField == nil {
+			// Contact name not resolved yet — leave it for a later tick.
+			continue
+		}
 		if nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name) {
 			continue
 		}
