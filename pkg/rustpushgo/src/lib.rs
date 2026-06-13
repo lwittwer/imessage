@@ -8735,7 +8735,15 @@ impl Client {
         // single handle whose channel count exceeds the budget unavoidably forms
         // its own (over-budget) chunk — request_handles cannot split one handle's
         // channels — but that is rare and isolates the risk to that one peer.
-        const CHANNEL_BUDGET: usize = 30;
+        //
+        // 15: the first cut at 30 cleared a 244-channel account, but an even more
+        // heavily-keyed account still got bounced ("Subscribe confirmed failed!")
+        // at 30, so Apple's per-SubscribeToChannels ceiling is lower than first
+        // estimated. Halving to 15 keeps each subscribe well under it. The cost is
+        // more chunks per subscribe (each paced 250ms apart) — acceptable because
+        // subscribe_to_status only runs on first-ready and on key arrival, not on
+        // a timer. If a user is STILL bounced, drop this further.
+        const CHANNEL_BUDGET: usize = 15;
         let mut chunks: Vec<Vec<String>> = Vec::new();
         let mut cur: Vec<String> = Vec::new();
         let mut cur_count = 0usize;
