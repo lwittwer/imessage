@@ -49,6 +49,13 @@ type cloudMessageRow struct {
 	// participant changes) do not.
 	HasBody bool
 
+	// Reply target, mirroring the live-receive WrappedMessage.reply_guid/part.
+	// ReplyToGUID is the GUID of the message this one replies to (empty when not
+	// a reply); ReplyToPart is the raw balloon-part string parsed by
+	// parseBalloonPart at conversion time (chatDBReplyTarget maps it to _attN).
+	ReplyToGUID string
+	ReplyToPart string
+
 	// True once the body has been scrubbed because the message was bridged
 	// to Matrix. Identifiers (guid, timestamps, record_name) are kept for
 	// echo dedup and routing; text/subject/sender/attachments_json are NULL.
@@ -199,6 +206,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		// was bridged to Matrix. Set by scrubBridgedBodies and preserved
 		// across CloudKit re-syncs by the upsert ON CONFLICT clause.
 		{"body_scrubbed", "BOOLEAN NOT NULL DEFAULT FALSE"},
+		// Reply target (from msgProto2.reply). reply_to_part is the raw balloon
+		// part string; conversion maps part>=1 to the {guid}_attN target ID.
+		{"reply_to_guid", "TEXT"},
+		{"reply_to_part", "TEXT"},
 	} {
 		var exists int
 		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
@@ -575,8 +586,9 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			sender, is_from_me, text, subject, service, deleted,
 			tapback_type, tapback_target_guid, tapback_emoji,
 			attachments_json, date_read_ms, has_body,
+			reply_to_guid, reply_to_part,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -594,6 +606,13 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			attachments_json=excluded.attachments_json,
 			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
 			has_body=excluded.has_body,
+			-- Preserve a previously-captured reply if a later re-sync returns no
+			-- reply (msgProto2 is "always empty afaict??" upstream, so it may be
+			-- intermittently present). Gate on the GUID: reply_to_part can be a
+			-- legitimate "0"/empty for a text reply, so the GUID is the
+			-- authoritative "this is a reply" signal.
+			reply_to_guid=CASE WHEN excluded.reply_to_guid <> '' THEN excluded.reply_to_guid ELSE cloud_message.reply_to_guid END,
+			reply_to_part=CASE WHEN excluded.reply_to_guid <> '' THEN excluded.reply_to_part ELSE cloud_message.reply_to_part END,
 			updated_ts=excluded.updated_ts
 	`)
 	if err != nil {
@@ -609,6 +628,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
 			row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
 			row.AttachmentsJSON, row.DateReadMS, row.HasBody,
+			row.ReplyToGUID, row.ReplyToPart,
 			nowMS, nowMS,
 		)
 		if err != nil {
@@ -2581,6 +2601,7 @@ const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestam
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
 	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
+	COALESCE(reply_to_guid, ''), COALESCE(reply_to_part, ''),
 	COALESCE(body_scrubbed, FALSE)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
@@ -2694,6 +2715,8 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.AttachmentsJSON,
 			&row.DateReadMS,
 			&row.HasBody,
+			&row.ReplyToGUID,
+			&row.ReplyToPart,
 			&row.BodyScrubbed,
 		); err != nil {
 			return nil, err

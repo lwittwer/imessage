@@ -8163,6 +8163,20 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		})
 	}
 
+	// Reply: apply the same target to every part this row produced (text,
+	// attachment(s), notice placeholder), mirroring the live convertMessage
+	// path. Reactions/tapbacks already returned above, so they're unaffected.
+	// bridgev2 resolves the target via deterministic event IDs during backfill,
+	// so a same-batch reply target renders even before its DB row is inserted.
+	if row.ReplyToGUID != "" {
+		replyTo := chatDBReplyTarget(row.ReplyToGUID, parseBalloonPart(row.ReplyToPart, "%d:"))
+		for _, m := range messages {
+			if m.ConvertedMessage != nil {
+				m.ConvertedMessage.ReplyTo = replyTo
+			}
+		}
+	}
+
 	return messages
 }
 

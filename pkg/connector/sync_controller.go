@@ -3473,6 +3473,15 @@ func (c *IMClient) ingestCloudMessages(
 			tapbackEmoji = *msg.TapbackEmoji
 		}
 
+		replyToGUID := ""
+		if msg.ReplyGuid != nil {
+			replyToGUID = *msg.ReplyGuid
+		}
+		replyToPart := ""
+		if msg.ReplyPart != nil {
+			replyToPart = *msg.ReplyPart
+		}
+
 		// Enrich and serialize attachment metadata.
 		//
 		// Merge two sources of attachment GUIDs so we don't silently drop
@@ -3591,6 +3600,8 @@ func (c *IMClient) ingestCloudMessages(
 			AttachmentsJSON:   attachmentsJSON,
 			DateReadMS:        msg.DateReadMs,
 			HasBody:           msg.HasBody,
+			ReplyToGUID:       replyToGUID,
+			ReplyToPart:       replyToPart,
 		})
 
 		if existingSet[msg.Guid] {

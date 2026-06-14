@@ -7074,6 +7074,8 @@ type WrappedCloudSyncMessage struct {
 	DateReadMs        int64
 	MsgType           int64
 	HasBody           bool
+	ReplyGuid         *string
+	ReplyPart         *string
 }
 
 func (r *WrappedCloudSyncMessage) Destroy() {
@@ -7094,6 +7096,8 @@ func (r *WrappedCloudSyncMessage) Destroy() {
 	FfiDestroyerInt64{}.Destroy(r.DateReadMs)
 	FfiDestroyerInt64{}.Destroy(r.MsgType)
 	FfiDestroyerBool{}.Destroy(r.HasBody)
+	FfiDestroyerOptionalString{}.Destroy(r.ReplyGuid)
+	FfiDestroyerOptionalString{}.Destroy(r.ReplyPart)
 }
 
 type FfiConverterTypeWrappedCloudSyncMessage struct{}
@@ -7123,6 +7127,8 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedC
 		FfiConverterInt64INSTANCE.Read(reader),
 		FfiConverterInt64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -7148,6 +7154,8 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value W
 	FfiConverterInt64INSTANCE.Write(writer, value.DateReadMs)
 	FfiConverterInt64INSTANCE.Write(writer, value.MsgType)
 	FfiConverterBoolINSTANCE.Write(writer, value.HasBody)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ReplyGuid)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ReplyPart)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncMessage struct{}

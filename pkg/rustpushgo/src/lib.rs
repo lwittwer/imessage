@@ -2852,6 +2852,30 @@ fn encode_recoverable_message_entry(
     }
 }
 
+/// Parse a CloudKit `msgProto2.reply` value (format `r:<part>:<guid>`) into
+/// (reply_guid, reply_part), mirroring the live-receive parse in upstream
+/// rustpush (imessage/messages.rs) so the Go backfill path can reuse the same
+/// chatDBReplyTarget/parseBalloonPart logic as the live path. The GUID is the
+/// `:`-segment containing a `-` (a UUID); the remaining segments are the part.
+/// Returns (None, None) for an absent, empty, or malformed value. Panic-free:
+/// the recoverable-backfill normalizer is not wrapped in catch_unwind.
+fn parse_cloud_reply(reply: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(to) = reply.filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let mut parts: Vec<&str> = to.split(':').collect();
+    if parts.is_empty() {
+        return (None, None);
+    }
+    parts.remove(0); // drop the leading "r"
+    let Some(guididx) = parts.iter().position(|p| p.contains('-')) else {
+        return (None, None);
+    };
+    let guid = parts[guididx].to_string();
+    parts.remove(guididx);
+    (Some(guid), Some(parts.join(":")))
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct WrappedCloudSyncMessage {
     pub record_name: String,
@@ -2888,6 +2912,13 @@ pub struct WrappedCloudSyncMessage {
     // (group renames, participant changes) never do. Used by Go to filter
     // system messages that slip past flag-based filters.
     pub has_body: bool,
+
+    // Reply target, parsed from msgProto2.reply (format `r:<part>:<guid>`).
+    // Mirrors the live-receive WrappedMessage.reply_guid/reply_part so the Go
+    // backfill conversion reuses chatDBReplyTarget identically. None when the
+    // message is not a reply (the common case — msgProto2 is empty for most).
+    pub reply_guid: Option<String>,
+    pub reply_part: Option<String>,
 }
 
 /// Metadata for an attachment referenced by a CloudKit message.
@@ -11237,6 +11268,10 @@ impl Client {
 
                     let has_body = msg.msg_proto.attributed_body.is_some();
 
+                    let (reply_guid, reply_part) = parse_cloud_reply(
+                        msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                    );
+
                     WrappedCloudSyncMessage {
                         record_name: rn,
                         guid,
@@ -11257,6 +11292,8 @@ impl Client {
                         date_read_ms,
                         msg_type: msg.r#type,
                         has_body,
+                        reply_guid,
+                        reply_part,
                     }
                 }));
 
@@ -11296,6 +11333,8 @@ impl Client {
                     date_read_ms: 0,
                     msg_type: 0,
                     has_body: false,
+                    reply_guid: None,
+                    reply_part: None,
                 });
             }
         }
@@ -11307,9 +11346,14 @@ impl Client {
             );
         }
 
+        // reply_count surfaces whether CloudKit records actually carry the
+        // msgProto2.reply field (the upstream struct comments it "always empty
+        // afaict??"). A non-zero count on a thread with known replies confirms
+        // backfill reply chains have real data to resolve.
+        let reply_count = normalized.iter().filter(|m| m.reply_guid.is_some()).count();
         info!(
-            "CloudKit message sync page: {} messages normalized, {} skipped",
-            normalized.len(), skipped_messages
+            "CloudKit message sync page: {} messages normalized, {} skipped, {} with reply",
+            normalized.len(), skipped_messages, reply_count
         );
 
         Ok(WrappedCloudSyncMessagesPage {
@@ -12677,6 +12721,10 @@ impl Client {
                     .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                     .unwrap_or(0);
 
+                let (reply_guid, reply_part) = parse_cloud_reply(
+                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                );
+
                 // Extract attachment GUIDs from attributedBody + messageSummaryInfo
                 let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
                     .as_ref()
@@ -12717,6 +12765,8 @@ impl Client {
                         date_read_ms,
                         msg_type: msg.r#type,
                         has_body: msg.msg_proto.attributed_body.is_some(),
+                        reply_guid,
+                        reply_part,
                     },
                 );
 
