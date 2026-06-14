@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -287,7 +288,17 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 	// recoverable-message snapshot to count per-portal recoverables, so a
 	// continuation token would break recovery.
 	const recycleBinSeedCooldown = 30 * time.Minute
+	// A scan that FAILS (CloudKit/auth error or a panic in either walk) backs off
+	// for a SHORT window rather than the full success cooldown: this retries a
+	// transient failure within minutes to recover newly-deleted chats, while still
+	// bounding re-walks of a large recycle bin during a crash/restart loop (an
+	// expensive walk that errors deep in pagination must not re-run on every boot).
+	// Strictly better than the old pre-fetch stamp, which suppressed BOTH success
+	// and failure for 30 min and, worse, armed the cooldown on a mid-scan crash —
+	// hiding real deletes for half an hour.
+	const recycleBinSeedFailCooldown = 5 * time.Minute
 	seedKey := database.Key("recyclebin.seed.last")
+	failKey := database.Key("recyclebin.seed.lastfail")
 	if raw := c.Main.Bridge.DB.KV.Get(ctx, seedKey); raw != "" {
 		if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedCooldown {
 			log.Info().Time("last_seed", last).Dur("cooldown", recycleBinSeedCooldown).
@@ -295,10 +306,69 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			return
 		}
 	}
-	c.Main.Bridge.DB.KV.Set(ctx, seedKey, time.Now().Format(time.RFC3339))
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, failKey); raw != "" {
+		if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedFailCooldown {
+			log.Info().Time("last_fail", last).Dur("fail_cooldown", recycleBinSeedFailCooldown).
+				Msg("DELETE-SEED: skipping recycle-bin scan — a recent scan failed; backing off briefly before retry (persisted soft-deletes still cover known deletions)")
+			return
+		}
+	}
+	// Fetch both recycle-bin walks concurrently. They hit different CloudKit
+	// zones with independent, CALL-LOCAL continuation tokens (lib.rs
+	// list_recoverable_chats / list_recoverable_message_guids each declare
+	// `let mut token = None` per call), so parallel pagination cannot interleave
+	// or drop pages — the results are identical to running them serially, just
+	// ~2x faster wall-clock on a large recycle bin (the dominant cost of a slow
+	// startup on heavily-deleted accounts). Concurrent CloudKit FFI is already an
+	// established pattern (preUploadCloudAttachments fans out many parallel
+	// downloads). We join BEFORE any matching so all the unsynchronized
+	// candidateMap / recentlyDeletedPortals bookkeeping below stays strictly
+	// serial. Each goroutine carries its own recover(): a panic in a child
+	// goroutine is NOT caught by the function-level defer above and would
+	// otherwise crash the process.
+	var (
+		recoverableChats []rustpushgo.WrappedCloudSyncChat
+		chatErr          error
+		guids            []string
+		guidErr          error
+		fetchWG          sync.WaitGroup
+	)
+	fetchWG.Add(2)
+	go func() {
+		defer fetchWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				chatErr = fmt.Errorf("ListRecoverableChats panicked: %v", r)
+				log.Error().Interface("panic", r).Msg("DELETE-SEED: ListRecoverableChats panicked")
+			}
+		}()
+		log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
+		recoverableChats, chatErr = c.client.ListRecoverableChats()
+	}()
+	go func() {
+		defer fetchWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				guidErr = fmt.Errorf("ListRecoverableMessageGuids panicked: %v", r)
+				log.Error().Interface("panic", r).Msg("DELETE-SEED: ListRecoverableMessageGuids panicked")
+			}
+		}()
+		log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
+		guids, guidErr = c.client.ListRecoverableMessageGuids()
+	}()
+	fetchWG.Wait()
 
-	log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
-	recoverableChats, chatErr := c.client.ListRecoverableChats()
+	// Arm the cooldown based on outcome: the full 30-min window on a clean scan,
+	// a short failure backoff otherwise so a transient CloudKit/auth error retries
+	// soon without re-walking a large recycle bin on every restart. A clean scan
+	// clears any prior failure marker (empty value reads as "no marker").
+	if chatErr == nil && guidErr == nil {
+		c.Main.Bridge.DB.KV.Set(ctx, seedKey, time.Now().Format(time.RFC3339))
+		c.Main.Bridge.DB.KV.Set(ctx, failKey, "")
+	} else {
+		c.Main.Bridge.DB.KV.Set(ctx, failKey, time.Now().Format(time.RFC3339))
+	}
+
 	if chatErr != nil {
 		log.Warn().Err(chatErr).Msg("DELETE-SEED: failed to read recoverable chats")
 	} else {
@@ -438,10 +508,8 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		}
 	}
 
-	log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
-	guids, err := c.client.ListRecoverableMessageGuids()
-	if err != nil {
-		log.Warn().Err(err).Msg("DELETE-SEED: failed to read recoverable message GUIDs")
+	if guidErr != nil {
+		log.Warn().Err(guidErr).Msg("DELETE-SEED: failed to read recoverable message GUIDs")
 	} else if len(guids) == 0 {
 		log.Info().Msg("DELETE-SEED: no recoverable messages found, nothing to seed")
 	} else {
@@ -1994,7 +2062,29 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// creation. This populates attachmentContentCache so that FetchMessages
 	// (which runs inside the portal event loop goroutine) gets instant cache
 	// hits instead of blocking on CloudKit for 30+ minutes.
-	c.preUploadCloudAttachments(ctx)
+	//
+	// Run it CONCURRENTLY with the recycle-bin seed + portal-ID normalization
+	// below. Pre-upload is network-bound (CloudKit downloads -> Matrix uploads)
+	// and shares no decision state with the seed: it already ran BEFORE the seed
+	// in the old serial order, so it never depended on the seed's tombstones. We
+	// join (preUploadWG.Wait) before createPortalsFromCloudSync so the attachment
+	// cache is fully warm AND — the load-bearing delete-safety invariant — the
+	// seed has finished tombstoning every deleted chat before any portal is
+	// created. The recover() guards the goroutine: a panic here must not crash
+	// the controller (which would leave setCloudSyncDone uncalled and wedge the
+	// APNs buffer).
+	var preUploadWG sync.WaitGroup
+	preUploadWG.Add(1)
+	go func() {
+		defer preUploadWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Interface("panic", r).
+					Msg("preUploadCloudAttachments panicked — attachments will fall back to on-demand fetch")
+			}
+		}()
+		c.preUploadCloudAttachments(ctx)
+	}()
 
 	// Seed delete knowledge from Apple's recycle bin BEFORE creating portals.
 	// Must run after runCloudSyncOnce (PCS keys needed) but before
@@ -2004,6 +2094,18 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// which would make portalHasChat match live CloudKit rows for chats
 	// that are actually in the recycle bin.
 	c.seedDeletedChatsFromRecycleBin(log)
+
+	// Join the concurrent pre-upload now, right after the seed. Step 1 shrank the
+	// message-portal normalize below to ~tens of ms, so the only work worth
+	// overlapping preUpload with is the ~41s seed above — joining here instead of
+	// before createPortals costs no wall-clock (preUpload finishes inside the
+	// seed's window) and keeps preUpload's parallel DB writes from running
+	// alongside the `ANALYZE cloud_chat` inside the message normalize (which bumps
+	// the schema cookie and briefly takes the write lock). Delete-safety is
+	// unchanged: the seed has fully completed before this Wait, and
+	// createPortalsFromCloudSync still runs strictly after both the join and the
+	// normalizes.
+	preUploadWG.Wait()
 
 	// Normalize inconsistent group portal IDs in cloud_chat: unify all
 	// rows for the same group to use gid:<group_id> as the canonical portal_id.
