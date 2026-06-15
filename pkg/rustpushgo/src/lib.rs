@@ -8961,6 +8961,8 @@ impl Client {
         let ghost_count = handles.len();
 
         const CHANNEL_BUDGET: usize = 15;
+        let mut transient_pruned_keys = Vec::new();
+        let mut transient_pruned_recents = Vec::new();
 
         // PRUNE over-budget "from" handles before subscribing. A heavy
         // re-registration churner accumulates dozens of dead StatusKit channels
@@ -9058,7 +9060,10 @@ impl Client {
             static PRUNE_ROTATION_OFFSET: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
             let mut prune_rotation_offset: Option<usize> = None;
-            let mut prune: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut persisted_prune: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut transient_prune: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut capped_handles = 0usize;
             for (from, cids) in &chan_by_from {
                 if cids.len() <= CHANNEL_BUDGET {
@@ -9076,14 +9081,22 @@ impl Client {
                     .iter()
                     .filter(|c| !*chan_live.get(*c).unwrap_or(&false))
                     .collect();
+                let mut persist_prune_for_handle = true;
+                let mut selection_diag = "live".to_string();
+                let have_complete_dates = placeholders
+                    .iter()
+                    .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                if !placeholders.is_empty() && !have_complete_dates {
+                    persist_prune_for_handle = false;
+                }
                 let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
                 if remaining > 0 && !placeholders.is_empty() {
                     // Prefer the most-recently-invited channels (current first)
-                    // when we have dates; otherwise rotate the window.
-                    let have_dates = placeholders
-                        .iter()
-                        .any(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
-                    if have_dates {
+                    // when every placeholder has a date. If dates are absent or
+                    // partial, rotate the window only in memory for this
+                    // subscribe; persisting an undated window would delete every
+                    // other candidate and prevent the next rotation.
+                    if have_complete_dates {
                         placeholders.sort_by(|a, b| {
                             chan_date
                                 .get(*b)
@@ -9094,6 +9107,7 @@ impl Client {
                         for c in placeholders.iter().take(remaining) {
                             keep.insert((*c).clone());
                         }
+                        selection_diag = "dated".to_string();
                     } else {
                         let rot = *prune_rotation_offset.get_or_insert_with(|| {
                             PRUNE_ROTATION_OFFSET
@@ -9103,47 +9117,91 @@ impl Client {
                         for i in 0..remaining.min(placeholders.len()) {
                             keep.insert(placeholders[(start + i) % placeholders.len()].clone());
                         }
+                        selection_diag = format!("rot={}", rot);
                     }
                 }
                 for c in cids {
                     if !keep.contains(c) {
-                        prune.insert(c.clone());
+                        if persist_prune_for_handle {
+                            persisted_prune.insert(c.clone());
+                        } else {
+                            transient_prune.insert(c.clone());
+                        }
                     }
                 }
                 capped_handles += 1;
-                let rotation_diag = prune_rotation_offset
-                    .map(|rot| rot.to_string())
-                    .unwrap_or_else(|| "unused".to_string());
+                let prune_mode = if persist_prune_for_handle {
+                    "persisted"
+                } else {
+                    "transient"
+                };
                 warn!(
-                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, prune_rotation={})",
+                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — {} pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, selection={})",
                     from,
                     cids.len(),
                     CHANNEL_BUDGET,
+                    prune_mode,
                     cids.len() - keep.len(),
                     keep.len(),
-                    rotation_diag,
+                    selection_diag,
                 );
             }
-            if !prune.is_empty() {
+            if !persisted_prune.is_empty() || !transient_prune.is_empty() {
                 let mut state = sk.state.write().await;
-                state.keys.retain(|cid, _| !prune.contains(cid));
-                state
-                    .recent_channels
-                    .retain(|rc| !prune.contains(&base64_encode(&rc.identifier.id)));
+                if !persisted_prune.is_empty() {
+                    state.keys.retain(|cid, _| !persisted_prune.contains(cid));
+                    state
+                        .recent_channels
+                        .retain(|rc| !persisted_prune.contains(&base64_encode(&rc.identifier.id)));
+                    persist_plist_state(&state_path, &*state);
+                }
+                if !transient_prune.is_empty() {
+                    let old_keys = std::mem::take(&mut state.keys);
+                    let mut kept_keys = std::collections::HashMap::with_capacity(old_keys.len());
+                    for (cid, device) in old_keys {
+                        if transient_prune.contains(&cid) {
+                            transient_pruned_keys.push((cid, device));
+                        } else {
+                            kept_keys.insert(cid, device);
+                        }
+                    }
+                    state.keys = kept_keys;
+
+                    let old_recents = std::mem::take(&mut state.recent_channels);
+                    let mut kept_recents = Vec::with_capacity(old_recents.len());
+                    for rc in old_recents {
+                        if transient_prune.contains(&base64_encode(&rc.identifier.id)) {
+                            transient_pruned_recents.push(rc);
+                        } else {
+                            kept_recents.push(rc);
+                        }
+                    }
+                    state.recent_channels = kept_recents;
+                }
                 let remaining_keys = state.keys.len();
-                persist_plist_state(&state_path, &*state);
                 drop(state);
-                info!(
-                    "StatusKit: pruned {} dead channel(s) from {} over-budget handle(s); state.keys now {} channel(s)",
-                    prune.len(),
-                    capped_handles,
-                    remaining_keys,
-                );
+                if !persisted_prune.is_empty() {
+                    info!(
+                        "StatusKit: persisted prune of {} dead channel(s) from {} over-budget handle(s)",
+                        persisted_prune.len(),
+                        capped_handles,
+                    );
+                }
+                if !transient_prune.is_empty() {
+                    info!(
+                        "StatusKit: transiently pruned {} dead channel(s) from {} over-budget handle(s) for this subscribe; state.keys now {} channel(s)",
+                        transient_prune.len(),
+                        capped_handles,
+                        remaining_keys,
+                    );
+                }
             }
         }
 
-        // Count StatusKit channels per "from" handle from the (now-pruned)
-        // statuskit-state.plist. request_handles subscribes ALL channels for the
+        // Count StatusKit channels per "from" handle from the current in-memory
+        // state. This includes transient undated pruning that must affect the
+        // request_handles call below, but must not be persisted to disk.
+        // request_handles subscribes ALL channels for the
         // handles we pass, and Apple bounces a single SubscribeToChannels that
         // carries too many channels ("Subscribe confirmed failed!" from
         // rustpush::aps), which silently kills ALL inbound presence for a
@@ -9154,28 +9212,24 @@ impl Client {
         // batch as its own small SubscribeToChannels under Apple's ceiling.
         let mut from_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        {
-            let state_path = subsystem_state_path("statuskit-state.plist");
-            if let Ok(data) = std::fs::read(&state_path) {
-                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
-                    if let Some(keys_dict) = value
+        if let Ok(value) = plist::to_value(&*sk.state.read().await) {
+            if let Some(keys_dict) = value
+                .as_dictionary()
+                .and_then(|d| d.get("keys"))
+                .and_then(|v| v.as_dictionary())
+            {
+                for (_channel_id, entry) in keys_dict {
+                    if let Some(from_str) = entry
                         .as_dictionary()
-                        .and_then(|d| d.get("keys"))
-                        .and_then(|v| v.as_dictionary())
+                        .and_then(|d| d.get("from"))
+                        .and_then(|v| v.as_string())
                     {
-                        for (_channel_id, entry) in keys_dict {
-                            if let Some(from_str) = entry
-                                .as_dictionary()
-                                .and_then(|d| d.get("from"))
-                                .and_then(|v| v.as_string())
-                            {
-                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
-                            }
-                        }
+                        *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
                     }
                 }
             }
         }
+
         // Make sure every requested ghost handle is represented even if it has no
         // key yet (so a future reshare for it still lands); it contributes 0
         // channels and is therefore "free" in the budget.
@@ -9234,6 +9288,24 @@ impl Client {
             *tokens = new_tokens;
         }
         drop(old_tokens);
+
+        if !transient_pruned_keys.is_empty() || !transient_pruned_recents.is_empty() {
+            let mut state = sk.state.write().await;
+            for (cid, device) in transient_pruned_keys {
+                state.keys.entry(cid).or_insert(device);
+            }
+            let mut existing_recent_ids: std::collections::HashSet<String> = state
+                .recent_channels
+                .iter()
+                .map(|rc| base64_encode(&rc.identifier.id))
+                .collect();
+            for rc in transient_pruned_recents {
+                if existing_recent_ids.insert(base64_encode(&rc.identifier.id)) {
+                    state.recent_channels.push(rc);
+                }
+            }
+            info!("StatusKit: restored transiently-pruned undated channels after subscribe");
+        }
 
         info!(
             "Requested presence subscription in {} channel-budgeted chunk(s) ({} ghost handles, {} distinct from-handles)",

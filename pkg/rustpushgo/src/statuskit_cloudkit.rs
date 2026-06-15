@@ -1135,9 +1135,7 @@ async fn inject_into_state(
         for (cid, d) in channel_dates {
             dates.insert(cid, plist::Value::Integer(d.into()));
         }
-        if let Err(e) = plist::to_file_xml(&dates_path, &dates) {
-            info!("StatusKit-CloudKit inject: failed to persist channel dates: {}", e);
-        }
+        persist_plist_state(&dates_path, &dates);
     }
 
     Ok(InjectStats {
