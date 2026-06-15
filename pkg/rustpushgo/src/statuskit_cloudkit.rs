@@ -780,6 +780,35 @@ struct DecodedPeer {
     channel_id: String,
     from: String,
     device: StatusKitSharedDevice,
+    /// CD_dateInvitationCreated as raw seconds (CloudKit epoch — only relative
+    /// ordering matters). Identifies a peer's MOST-RECENT channel so the
+    /// subscribe-side prune can keep a heavy re-registration churner's current
+    /// channel instead of guessing among dozens of dead ones. 0 if absent.
+    invite_date: i64,
+}
+
+/// Read a CloudKit date field (CD_dateInvitationCreated) as raw seconds. Handles
+/// the plaintext fast-path and the encrypted form, mirroring decrypt_string_field.
+fn read_date_field(
+    rec: &cloudkit_proto::retrieve_changes_response::RecordChange,
+    name: &str,
+    encryptor: &rustpush::pcs::PCSEncryptor,
+) -> Option<i64> {
+    let f = find_field(rec, name)?;
+    let v = f.value.as_ref()?;
+    if v.is_encrypted != Some(true) {
+        if let Some(d) = &v.date_value {
+            return d.time.map(|t| t as i64);
+        }
+    }
+    let ct = v.bytes_value.as_deref()?;
+    let plaintext = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encryptor.decrypt_data(ct, name)
+    }))
+    .ok()
+    .filter(|b| !b.is_empty())?;
+    let ev = cloudkit_proto::record::field::EncryptedValue::decode(&plaintext[..]).ok()?;
+    ev.date_value.and_then(|d| d.time).map(|t| t as i64)
 }
 
 async fn decode_invitation_record<P: omnisette::AnisetteProvider>(
@@ -895,10 +924,16 @@ async fn decode_invitation_record<P: omnisette::AnisetteProvider>(
     // an empty StatusKitPersonalConfig in that case.
     let device = build_shared_device(sender_handle.clone(), &share_message, "")?;
 
+    // Best-effort: when did the peer share THIS channel? The most-recent invite
+    // is the peer's current channel (a churner re-registers, minting a new one
+    // each time). 0 when absent — those sort oldest, which is correct.
+    let invite_date = read_date_field(rec, "CD_dateInvitationCreated", &encryptor).unwrap_or(0);
+
     Ok(Some(DecodedPeer {
         channel_id,
         from: sender_handle,
         device,
+        invite_date,
     }))
 }
 
@@ -1055,8 +1090,15 @@ async fn inject_into_state(
     let mut inserted: u32 = 0;
     let mut already_known: u32 = 0;
     let mut injected_handles: Vec<String> = Vec::new();
+    // channel_id -> CD_dateInvitationCreated, recorded for EVERY decoded peer
+    // (not just newly-inserted) so the subscribe-side prune can rank a churner's
+    // dozens of channels by recency and keep their CURRENT one.
+    let mut channel_dates: Vec<(String, i64)> = Vec::with_capacity(peers.len());
 
     for p in peers {
+        if p.invite_date != 0 {
+            channel_dates.push((p.channel_id.clone(), p.invite_date));
+        }
         if let Some(existing) = state.keys.get(&p.channel_id) {
             let existing_bytes = device_canonical_bytes(existing);
             let new_bytes = device_canonical_bytes(&p.device);
@@ -1081,6 +1123,21 @@ async fn inject_into_state(
             inserted, path
         );
         persist_plist_state(&path, &*state);
+    }
+    drop(state);
+
+    // Merge the invite dates into the side plist the prune reads. Channel ids are
+    // stable; merging keeps dates for channels seen in earlier passes too.
+    if !channel_dates.is_empty() {
+        let dates_path = subsystem_state_path("statuskit-channel-dates.plist");
+        let mut dates: plist::Dictionary =
+            read_plist_state::<plist::Dictionary>(&dates_path).unwrap_or_default();
+        for (cid, d) in channel_dates {
+            dates.insert(cid, plist::Value::Integer(d.into()));
+        }
+        if let Err(e) = plist::to_file_xml(&dates_path, &dates) {
+            info!("StatusKit-CloudKit inject: failed to persist channel dates: {}", e);
+        }
     }
 
     Ok(InjectStats {
