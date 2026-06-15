@@ -7936,6 +7936,33 @@ pub async fn new_client(
                     } else {
                         None
                     };
+                    let signal_presence_decrypt_failed = |reason: &'static str| {
+                        let msg = msg.clone();
+                        let status_cb_for_recv = status_cb_for_recv.clone();
+                        async move {
+                            let presence_topic: [u8; 20] = presence_mode_status_topic_hash();
+                            let msg_topic = if let rustpush::APSMessage::Notification { topic, .. } = &msg {
+                                Some(*topic)
+                            } else {
+                                None
+                            };
+                            if msg_topic != Some(presence_topic) {
+                                return;
+                            }
+                            let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                plist::from_bytes::<plist::Value>(payload)
+                                    .ok()
+                                    .and_then(|v| v.into_dictionary())
+                                    .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                            } else {
+                                None
+                            };
+                            warn!("StatusKit: presence.mode.status update could not be decoded ({}) — signalling decrypt-failure re-pull, sender={:?}", reason, df_sender);
+                            if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                cb.on_status_decrypt_failed(df_sender);
+                            }
+                        }
+                    };
                     match handle_result {
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
@@ -7958,21 +7985,7 @@ pub async fn new_client(
                             // presence.mode.status is the stale-key signal. Over-firing
                             // is bounded by the Go-side cooldown, so a benign undecoded
                             // notification at worst costs one rate-limited pull.)
-                            let presence_topic: [u8; 20] = presence_mode_status_topic_hash();
-                            if msg_topic == Some(presence_topic) {
-                                let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
-                                    plist::from_bytes::<plist::Value>(payload)
-                                        .ok()
-                                        .and_then(|v| v.into_dictionary())
-                                        .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
-                                } else {
-                                    None
-                                };
-                                warn!("StatusKit: presence.mode.status update could not be decoded (likely stale peer key) — signalling decrypt-failure re-pull, sender={:?}", df_sender);
-                                if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
-                                    cb.on_status_decrypt_failed(df_sender);
-                                }
-                            }
+                            signal_presence_decrypt_failed("likely stale peer key").await;
                             // Not a StatusKit presence update — but check whether it
                             // was a key-sharing message. Only fire on_keys_received
                             // if state.keys gained a new channel id.
@@ -8092,12 +8105,15 @@ pub async fn new_client(
                         }
                         Ok(Err(rustpush::PushError::VerificationFailed)) => {
                             warn!("StatusKit signature verification failed (c={:?} topic={}) — key ratchet mismatch, will resolve on next keysharing message", diag_cmd, topic_label);
+                            signal_presence_decrypt_failed("signature verification failed").await;
                         }
                         Ok(Err(e)) => {
                             warn!("StatusKit handle error (c={:?} topic={}): {:?}", diag_cmd, topic_label, e);
+                            signal_presence_decrypt_failed("handle error").await;
                         }
                         Err(_) => {
                             warn!("StatusKit handle panicked (c={:?} topic={}) — channel may lack shared keys", diag_cmd, topic_label);
+                            signal_presence_decrypt_failed("handle panic").await;
                         }
                     }
                 }
