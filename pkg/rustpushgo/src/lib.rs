@@ -2856,24 +2856,88 @@ fn encode_recoverable_message_entry(
 /// (reply_guid, reply_part), mirroring the live-receive parse in upstream
 /// rustpush (imessage/messages.rs) so the Go backfill path can reuse the same
 /// chatDBReplyTarget/parseBalloonPart logic as the live path. The GUID is the
-/// `:`-segment containing a `-` (a UUID); the remaining segments are the part.
-/// Returns (None, None) for an absent, empty, or malformed value. Panic-free:
-/// the recoverable-backfill normalizer is not wrapped in catch_unwind.
+/// UUID-shaped `:` segment; the remaining segments are the part. Returns
+/// (None, None) for an absent, empty, or malformed value. Panic-free: the
+/// recoverable-backfill normalizer is not wrapped in catch_unwind.
 fn parse_cloud_reply(reply: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(to) = reply.filter(|s| !s.is_empty()) else {
         return (None, None);
     };
     let mut parts: Vec<&str> = to.split(':').collect();
-    if parts.is_empty() {
+    if parts.first() != Some(&"r") {
         return (None, None);
     }
     parts.remove(0); // drop the leading "r"
-    let Some(guididx) = parts.iter().position(|p| p.contains('-')) else {
+    let Some(guididx) = parts.iter().position(|p| is_uuid_like(p)) else {
         return (None, None);
     };
     let guid = parts[guididx].to_string();
     parts.remove(guididx);
     (Some(guid), Some(parts.join(":")))
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(idx, ch)| {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            ch == '-'
+        } else {
+            ch.is_ascii_hexdigit()
+        }
+    })
+}
+
+#[cfg(test)]
+mod cloud_reply_tests {
+    use super::*;
+
+    #[test]
+    fn parse_cloud_reply_standard_format() {
+        let (guid, part) =
+            parse_cloud_reply(Some("r:bp:123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("bp"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_preserves_multi_segment_part() {
+        let (guid, part) =
+            parse_cloud_reply(Some("r:0:1:123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("0:1"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_ignores_hyphenated_non_guid_part() {
+        let (guid, part) = parse_cloud_reply(Some(
+            "r:balloon-part:123e4567-e89b-12d3-a456-426614174000",
+        ));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("balloon-part"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_rejects_malformed_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("x:bp:123e4567-e89b-12d3-a456-426614174000"),
+            Some("r:bp:not-a-guid"),
+        ] {
+            assert_eq!(parse_cloud_reply(value), (None, None));
+        }
+    }
 }
 
 #[derive(uniffi::Record, Clone)]

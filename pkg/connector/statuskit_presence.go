@@ -191,6 +191,9 @@ func (c *IMClient) migrateStatusKitPresenceState(ctx context.Context, log zerolo
 			continue
 		}
 		nameField := c.dmFocusName(ctx, portal)
+		if nameField == nil {
+			continue
+		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventChatInfoChange,
