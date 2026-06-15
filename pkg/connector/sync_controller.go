@@ -313,29 +313,18 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 			return
 		}
 	}
-	// Fetch both recycle-bin walks concurrently. They hit different CloudKit
-	// zones with independent, CALL-LOCAL continuation tokens (lib.rs
-	// list_recoverable_chats / list_recoverable_message_guids each declare
-	// `let mut token = None` per call), so parallel pagination cannot interleave
-	// or drop pages — the results are identical to running them serially, just
-	// ~2x faster wall-clock on a large recycle bin (the dominant cost of a slow
-	// startup on heavily-deleted accounts). Concurrent CloudKit FFI is already an
-	// established pattern (preUploadCloudAttachments fans out many parallel
-	// downloads). We join BEFORE any matching so all the unsynchronized
-	// candidateMap / recentlyDeletedPortals bookkeeping below stays strictly
-	// serial. Each goroutine carries its own recover(): a panic in a child
-	// goroutine is NOT caught by the function-level defer above and would
-	// otherwise crash the process.
+	// Keep the two recycle-bin FFI walks serial. They share the same Rust
+	// CloudMessagesClient instance, and this startup path is more sensitive to
+	// correctness than shaving wall-clock time. The per-call recover wrappers let
+	// one failing walk fall back to the other data source without crashing or
+	// relying on concurrent FFI re-entrancy.
 	var (
 		recoverableChats []rustpushgo.WrappedCloudSyncChat
 		chatErr          error
 		guids            []string
 		guidErr          error
-		fetchWG          sync.WaitGroup
 	)
-	fetchWG.Add(2)
-	go func() {
-		defer fetchWG.Done()
+	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				chatErr = fmt.Errorf("ListRecoverableChats panicked: %v", r)
@@ -345,8 +334,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
 		recoverableChats, chatErr = c.client.ListRecoverableChats()
 	}()
-	go func() {
-		defer fetchWG.Done()
+	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				guidErr = fmt.Errorf("ListRecoverableMessageGuids panicked: %v", r)
@@ -356,7 +344,6 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
 		guids, guidErr = c.client.ListRecoverableMessageGuids()
 	}()
-	fetchWG.Wait()
 
 	// Arm the cooldown based on outcome: the full 30-min window on a clean scan,
 	// a short failure backoff otherwise so a transient CloudKit/auth error retries

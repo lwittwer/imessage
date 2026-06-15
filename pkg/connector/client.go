@@ -8280,9 +8280,13 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 	// Reply: apply the same target to every part this row produced (text,
 	// attachment(s), notice placeholder), mirroring the live convertMessage
-	// path. Reactions/tapbacks already returned above, so they're unaffected.
-	// bridgev2 resolves the target via deterministic event IDs during backfill,
-	// so a same-batch reply target renders even before its DB row is inserted.
+	// path. ConvertedMessagePart.Content is always *event.MessageEventContent;
+	// bridgev2's send/backfill emitters attach m.relates_to in applyRelationMeta
+	// before sending each part, so media msgtypes and notice placeholders handle
+	// replies the same way as text. Reactions/tapbacks already returned above,
+	// so they're unaffected. bridgev2 resolves the target via deterministic event
+	// IDs during backfill, so a same-batch reply target renders even before its
+	// DB row is inserted.
 	if row.ReplyToGUID != "" {
 		replyTo := chatDBReplyTarget(row.ReplyToGUID, parseBalloonPart(row.ReplyToPart, "%d:"))
 		for _, m := range messages {

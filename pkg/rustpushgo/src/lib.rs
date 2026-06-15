@@ -93,6 +93,11 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
     hex::decode(s)
 }
 
+fn presence_mode_status_topic_hash() -> [u8; 20] {
+    static HASH: std::sync::OnceLock<[u8; 20]> = std::sync::OnceLock::new();
+    *HASH.get_or_init(|| openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes()))
+}
+
 // ============================================================================
 // Ford key cache (wrapper-level reimplementation of the 94f7b8e fix)
 // ============================================================================
@@ -7916,7 +7921,7 @@ pub async fn new_client(
                     // Build a human-readable topic label for diagnostic log lines.
                     let topic_label = if let Some(t) = msg_topic {
                         let ks: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
-                        let ps: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                        let ps: [u8; 20] = presence_mode_status_topic_hash();
                         let cm: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes());
                         let sp: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes());
                         if t == ks { "keysharing" } else if t == ps { "presence" } else if t == cm { "channel-mgmt" } else if t == sp { "personal" } else { "unknown" }
@@ -7953,7 +7958,7 @@ pub async fn new_client(
                             // presence.mode.status is the stale-key signal. Over-firing
                             // is bounded by the Go-side cooldown, so a benign undecoded
                             // notification at worst costs one rate-limited pull.)
-                            let presence_topic: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                            let presence_topic: [u8; 20] = presence_mode_status_topic_hash();
                             if msg_topic == Some(presence_topic) {
                                 let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
                                     plist::from_bytes::<plist::Value>(payload)
@@ -8970,11 +8975,13 @@ impl Client {
         // private `aps` module and isn't constructible from here. So instead we
         // prune state.keys down to <= CHANNEL_BUDGET channels per handle, keeping
         // every LIVE channel (last_msg_ns>1) plus a ROTATING window of dead
-        // placeholders — no per-channel recency exists to identify the churner's
-        // *current* channel, so we rotate coverage across subscribes until it
-        // lands, after which liveness pins it. Pruned channels are provably dead
-        // husks; the CloudKit pull re-establishes the real ones and the next
-        // subscribe re-prunes. This also shrinks the bloated statuskit-state.plist.
+        // placeholders. Before the CloudKit pull records per-channel invite
+        // dates, no per-channel recency exists to identify the churner's current
+        // channel, so we rotate coverage across subscribes until it lands, after
+        // which liveness pins it. Liveness comes from persisted last_msg_ns in
+        // statuskit-state.plist; if that plist lags after a crash, the CloudKit
+        // pull re-establishes keys and the next subscribe repairs coverage. This
+        // also shrinks the bloated statuskit-state.plist.
         {
             let state_path = subsystem_state_path("statuskit-state.plist");
             let mut chan_by_from: std::collections::HashMap<String, Vec<String>> =
@@ -9048,9 +9055,9 @@ impl Client {
                 }
             }
 
-            static ROTATION: std::sync::atomic::AtomicUsize =
+            static PRUNE_ROTATION_OFFSET: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
-            let rot = ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut prune_rotation_offset: Option<usize> = None;
             let mut prune: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut capped_handles = 0usize;
             for (from, cids) in &chan_by_from {
@@ -9088,6 +9095,10 @@ impl Client {
                             keep.insert((*c).clone());
                         }
                     } else {
+                        let rot = *prune_rotation_offset.get_or_insert_with(|| {
+                            PRUNE_ROTATION_OFFSET
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        });
                         let start = rot.wrapping_mul(remaining) % placeholders.len();
                         for i in 0..remaining.min(placeholders.len()) {
                             keep.insert(placeholders[(start + i) % placeholders.len()].clone());
@@ -9100,14 +9111,17 @@ impl Client {
                     }
                 }
                 capped_handles += 1;
+                let rotation_diag = prune_rotation_offset
+                    .map(|rot| rot.to_string())
+                    .unwrap_or_else(|| "unused".to_string());
                 warn!(
-                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, rot={})",
+                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, prune_rotation={})",
                     from,
                     cids.len(),
                     CHANNEL_BUDGET,
                     cids.len() - keep.len(),
                     keep.len(),
-                    rot,
+                    rotation_diag,
                 );
             }
             if !prune.is_empty() {
