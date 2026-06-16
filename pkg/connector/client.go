@@ -529,6 +529,14 @@ type IMClient struct {
 	recentlyDeletedPortals   map[string]deletedPortalEntry
 	recentlyDeletedPortalsMu sync.RWMutex
 
+	// recycleBinSeededThisSession is set true after seedDeletedChatsFromRecycleBin
+	// completes its first attempt this process lifetime. The success cooldown is
+	// bypassed on the first call so offline deletes (chats deleted on another
+	// Apple device while the bridge was stopped) are always caught on restart,
+	// even if the last successful scan was recent. The failure cooldown still
+	// applies on first run to protect crash loops.
+	recycleBinSeededThisSession atomic.Bool
+
 	// recycleBinCandidates stores portal IDs found in Apple's recycle bin
 	// during bootstrap. NOT auto-deleted — shown to the user via bridgebot
 	// notification so they can decide which to remove with !delete-stale.

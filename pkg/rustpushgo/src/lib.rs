@@ -9087,53 +9087,105 @@ impl Client {
                 }
                 let mut sorted = cids.clone();
                 sorted.sort();
-                let mut keep: std::collections::HashSet<String> = sorted
+                let mut live_channels: Vec<&String> = sorted
                     .iter()
                     .filter(|c| *chan_live.get(*c).unwrap_or(&false))
-                    .take(CHANNEL_BUDGET)
-                    .cloned()
                     .collect();
                 let mut placeholders: Vec<&String> = sorted
                     .iter()
                     .filter(|c| !*chan_live.get(*c).unwrap_or(&false))
                     .collect();
+                let mut keep: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 let mut persist_prune_for_handle = true;
-                let mut selection_diag = "live".to_string();
-                let have_complete_dates = placeholders
-                    .iter()
-                    .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
-                if !placeholders.is_empty() && !have_complete_dates {
-                    persist_prune_for_handle = false;
-                }
-                let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
-                if remaining > 0 && !placeholders.is_empty() {
-                    // Prefer the most-recently-invited channels (current first)
-                    // when every placeholder has a date. If dates are absent or
-                    // partial, rotate the window only in memory for this
-                    // subscribe; persisting an undated window would delete every
-                    // other candidate and prevent the next rotation.
-                    if have_complete_dates {
-                        placeholders.sort_by(|a, b| {
+                let mut selection_diag;
+
+                let live_overflow = live_channels.len() > CHANNEL_BUDGET;
+                if live_overflow {
+                    // More live channels than the budget — must prune live ones
+                    // too. Rank by invite date when all are dated (deterministic,
+                    // converges to the current channel on the next CloudKit pull);
+                    // fall back to a rotating window when any date is missing so
+                    // we never permanently persist a lexicographic cut that may
+                    // exclude the peer's active channel.
+                    let have_complete_live_dates = live_channels
+                        .iter()
+                        .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if have_complete_live_dates {
+                        live_channels.sort_by(|a, b| {
                             chan_date
                                 .get(*b)
                                 .copied()
                                 .unwrap_or(0)
                                 .cmp(&chan_date.get(*a).copied().unwrap_or(0))
                         });
-                        for c in placeholders.iter().take(remaining) {
+                        for c in live_channels.iter().take(CHANNEL_BUDGET) {
                             keep.insert((*c).clone());
                         }
-                        selection_diag = "dated".to_string();
+                        selection_diag = "live-dated".to_string();
                     } else {
+                        persist_prune_for_handle = false;
                         let rot = *prune_rotation_offset.get_or_insert_with(|| {
                             PRUNE_ROTATION_OFFSET
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         });
-                        let start = rot.wrapping_mul(remaining) % placeholders.len();
-                        for i in 0..remaining.min(placeholders.len()) {
-                            keep.insert(placeholders[(start + i) % placeholders.len()].clone());
+                        let start = rot.wrapping_mul(CHANNEL_BUDGET) % live_channels.len();
+                        for i in 0..CHANNEL_BUDGET.min(live_channels.len()) {
+                            keep.insert(
+                                live_channels[(start + i) % live_channels.len()].clone(),
+                            );
                         }
-                        selection_diag = format!("rot={}", rot);
+                        selection_diag = format!("live-rot={}", rot);
+                    }
+                } else {
+                    // All live channels fit; fill remaining slots with placeholders.
+                    for c in &live_channels {
+                        keep.insert((*c).clone());
+                    }
+                    let have_complete_dates = placeholders
+                        .iter()
+                        .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if !placeholders.is_empty() && !have_complete_dates {
+                        persist_prune_for_handle = false;
+                    }
+                    let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
+                    selection_diag = if live_channels.is_empty() {
+                        "placeholder".to_string()
+                    } else {
+                        "live".to_string()
+                    };
+                    if remaining > 0 && !placeholders.is_empty() {
+                        // Prefer the most-recently-invited channels (current
+                        // first) when every placeholder has a date. If dates are
+                        // absent or partial, rotate the window only in memory
+                        // for this subscribe; persisting an undated window would
+                        // delete every other candidate and prevent the next
+                        // rotation.
+                        if have_complete_dates {
+                            placeholders.sort_by(|a, b| {
+                                chan_date
+                                    .get(*b)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .cmp(&chan_date.get(*a).copied().unwrap_or(0))
+                            });
+                            for c in placeholders.iter().take(remaining) {
+                                keep.insert((*c).clone());
+                            }
+                            selection_diag = "dated".to_string();
+                        } else {
+                            let rot = *prune_rotation_offset.get_or_insert_with(|| {
+                                PRUNE_ROTATION_OFFSET
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            });
+                            let start = rot.wrapping_mul(remaining) % placeholders.len();
+                            for i in 0..remaining.min(placeholders.len()) {
+                                keep.insert(
+                                    placeholders[(start + i) % placeholders.len()].clone(),
+                                );
+                            }
+                            selection_diag = format!("rot={}", rot);
+                        }
                     }
                 }
                 for c in cids {
@@ -9152,7 +9204,7 @@ impl Client {
                     "transient"
                 };
                 warn!(
-                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — {} pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, selection={})",
+                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — {} pruning {} channel(s) to avoid a SubscribeToChannels bounce (keeping {}, selection={})",
                     from,
                     cids.len(),
                     CHANNEL_BUDGET,

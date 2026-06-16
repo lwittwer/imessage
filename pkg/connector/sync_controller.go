@@ -297,13 +297,22 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 	// and failure for 30 min and, worse, armed the cooldown on a mid-scan crash —
 	// hiding real deletes for half an hour.
 	const recycleBinSeedFailCooldown = 5 * time.Minute
+	// firstRunThisSession is true on the very first call in this process lifetime.
+	// The success cooldown is bypassed for it so that chats deleted on another
+	// Apple device while the bridge was stopped are always caught on restart, even
+	// if the last scan was recent. The failure cooldown still applies to protect
+	// crash loops: if the previous scan failed within recycleBinSeedFailCooldown,
+	// we back off regardless of whether this is the first session call.
+	firstRunThisSession := !c.recycleBinSeededThisSession.Swap(true)
 	seedKey := database.Key("recyclebin.seed.last")
 	failKey := database.Key("recyclebin.seed.lastfail")
-	if raw := c.Main.Bridge.DB.KV.Get(ctx, seedKey); raw != "" {
-		if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedCooldown {
-			log.Info().Time("last_seed", last).Dur("cooldown", recycleBinSeedCooldown).
-				Msg("DELETE-SEED: skipping recycle-bin scan — ran recently; persisted soft-deletes already cover known deletions (unblocks rapid restarts)")
-			return
+	if !firstRunThisSession {
+		if raw := c.Main.Bridge.DB.KV.Get(ctx, seedKey); raw != "" {
+			if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedCooldown {
+				log.Info().Time("last_seed", last).Dur("cooldown", recycleBinSeedCooldown).
+					Msg("DELETE-SEED: skipping recycle-bin scan — ran recently; persisted soft-deletes already cover known deletions (unblocks rapid restarts)")
+				return
+			}
 		}
 	}
 	if raw := c.Main.Bridge.DB.KV.Get(ctx, failKey); raw != "" {
