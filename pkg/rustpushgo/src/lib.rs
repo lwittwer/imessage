@@ -93,6 +93,11 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
     hex::decode(s)
 }
 
+fn presence_mode_status_topic_hash() -> [u8; 20] {
+    static HASH: std::sync::OnceLock<[u8; 20]> = std::sync::OnceLock::new();
+    *HASH.get_or_init(|| openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes()))
+}
+
 // ============================================================================
 // Ford key cache (wrapper-level reimplementation of the 94f7b8e fix)
 // ============================================================================
@@ -2852,6 +2857,94 @@ fn encode_recoverable_message_entry(
     }
 }
 
+/// Parse a CloudKit `msgProto2.reply` value (format `r:<part>:<guid>`) into
+/// (reply_guid, reply_part), mirroring the live-receive parse in upstream
+/// rustpush (imessage/messages.rs) so the Go backfill path can reuse the same
+/// chatDBReplyTarget/parseBalloonPart logic as the live path. The GUID is the
+/// UUID-shaped `:` segment; the remaining segments are the part. Returns
+/// (None, None) for an absent, empty, or malformed value. Panic-free: the
+/// recoverable-backfill normalizer is not wrapped in catch_unwind.
+fn parse_cloud_reply(reply: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(to) = reply.filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let mut parts: Vec<&str> = to.split(':').collect();
+    if parts.first() != Some(&"r") {
+        return (None, None);
+    }
+    parts.remove(0); // drop the leading "r"
+    let Some(guididx) = parts.iter().position(|p| is_uuid_like(p)) else {
+        return (None, None);
+    };
+    let guid = parts[guididx].to_string();
+    parts.remove(guididx);
+    (Some(guid), Some(parts.join(":")))
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(idx, ch)| {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            ch == '-'
+        } else {
+            ch.is_ascii_hexdigit()
+        }
+    })
+}
+
+#[cfg(test)]
+mod cloud_reply_tests {
+    use super::*;
+
+    #[test]
+    fn parse_cloud_reply_standard_format() {
+        let (guid, part) =
+            parse_cloud_reply(Some("r:bp:123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("bp"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_preserves_multi_segment_part() {
+        let (guid, part) =
+            parse_cloud_reply(Some("r:0:1:123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("0:1"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_ignores_hyphenated_non_guid_part() {
+        let (guid, part) = parse_cloud_reply(Some(
+            "r:balloon-part:123e4567-e89b-12d3-a456-426614174000",
+        ));
+        assert_eq!(
+            guid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(part.as_deref(), Some("balloon-part"));
+    }
+
+    #[test]
+    fn parse_cloud_reply_rejects_malformed_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("x:bp:123e4567-e89b-12d3-a456-426614174000"),
+            Some("r:bp:not-a-guid"),
+        ] {
+            assert_eq!(parse_cloud_reply(value), (None, None));
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct WrappedCloudSyncMessage {
     pub record_name: String,
@@ -2888,6 +2981,13 @@ pub struct WrappedCloudSyncMessage {
     // (group renames, participant changes) never do. Used by Go to filter
     // system messages that slip past flag-based filters.
     pub has_body: bool,
+
+    // Reply target, parsed from msgProto2.reply (format `r:<part>:<guid>`).
+    // Mirrors the live-receive WrappedMessage.reply_guid/reply_part so the Go
+    // backfill conversion reuses chatDBReplyTarget identically. None when the
+    // message is not a reply (the common case — msgProto2 is empty for most).
+    pub reply_guid: Option<String>,
+    pub reply_part: Option<String>,
 }
 
 /// Metadata for an attachment referenced by a CloudKit message.
@@ -4923,6 +5023,14 @@ pub trait StatusCallback: Send + Sync {
     /// unknown alias to the DM portal of any sibling alias that does
     /// resolve via the standard chain.
     fn on_reshare_sender(&self, sender: String, channel_id: String);
+    /// Called when a presence update arrives on the StatusKit presence topic but
+    /// we could NOT turn it into a status — almost always because the sending peer
+    /// rotated their StatusKit key (re-registration / fresh reshare) and our stored
+    /// copy is now stale, so the encrypted payload won't open. The Go side should
+    /// force a rate-limited CloudKit peer-key re-pull to fetch the fresh key right
+    /// away instead of waiting for the steady-state pull floor, then re-subscribe.
+    /// `sender` is the peer handle when the envelope exposes it (best-effort).
+    fn on_status_decrypt_failed(&self, sender: Option<String>);
 }
 
 // ============================================================================
@@ -7813,7 +7921,7 @@ pub async fn new_client(
                     // Build a human-readable topic label for diagnostic log lines.
                     let topic_label = if let Some(t) = msg_topic {
                         let ks: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
-                        let ps: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                        let ps: [u8; 20] = presence_mode_status_topic_hash();
                         let cm: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes());
                         let sp: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes());
                         if t == ks { "keysharing" } else if t == ps { "presence" } else if t == cm { "channel-mgmt" } else if t == sp { "personal" } else { "unknown" }
@@ -7828,6 +7936,33 @@ pub async fn new_client(
                     } else {
                         None
                     };
+                    let signal_presence_decrypt_failed = |reason: &'static str| {
+                        let msg = msg.clone();
+                        let status_cb_for_recv = status_cb_for_recv.clone();
+                        async move {
+                            let presence_topic: [u8; 20] = presence_mode_status_topic_hash();
+                            let msg_topic = if let rustpush::APSMessage::Notification { topic, .. } = &msg {
+                                Some(*topic)
+                            } else {
+                                None
+                            };
+                            if msg_topic != Some(presence_topic) {
+                                return;
+                            }
+                            let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                plist::from_bytes::<plist::Value>(payload)
+                                    .ok()
+                                    .and_then(|v| v.into_dictionary())
+                                    .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                            } else {
+                                None
+                            };
+                            warn!("StatusKit: presence.mode.status update could not be decoded ({}) — signalling decrypt-failure re-pull, sender={:?}", reason, df_sender);
+                            if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                cb.on_status_decrypt_failed(df_sender);
+                            }
+                        }
+                    };
                     match handle_result {
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
@@ -7839,6 +7974,18 @@ pub async fn new_client(
                             continue;
                         }
                         Ok(Ok(None)) => {
+                            // A Notification on the PRESENCE topic (Shared Channels
+                            // path) that handle() couldn't turn into a StatusChanged is
+                            // a presence update we failed to decode — almost always a
+                            // peer who rotated their StatusKit channel key, leaving the
+                            // copy we pulled from CloudKit stale. Signal the Go side to
+                            // force a rate-limited CloudKit re-pull for the fresh key.
+                            // (The personal-status path uses IDS keys, not StatusKit
+                            // channel keys, so a re-pull can't help it — only
+                            // presence.mode.status is the stale-key signal. Over-firing
+                            // is bounded by the Go-side cooldown, so a benign undecoded
+                            // notification at worst costs one rate-limited pull.)
+                            signal_presence_decrypt_failed("likely stale peer key").await;
                             // Not a StatusKit presence update — but check whether it
                             // was a key-sharing message. Only fire on_keys_received
                             // if state.keys gained a new channel id.
@@ -7958,12 +8105,15 @@ pub async fn new_client(
                         }
                         Ok(Err(rustpush::PushError::VerificationFailed)) => {
                             warn!("StatusKit signature verification failed (c={:?} topic={}) — key ratchet mismatch, will resolve on next keysharing message", diag_cmd, topic_label);
+                            signal_presence_decrypt_failed("signature verification failed").await;
                         }
                         Ok(Err(e)) => {
                             warn!("StatusKit handle error (c={:?} topic={}): {:?}", diag_cmd, topic_label, e);
+                            signal_presence_decrypt_failed("handle error").await;
                         }
                         Err(_) => {
                             warn!("StatusKit handle panicked (c={:?} topic={}) — channel may lack shared keys", diag_cmd, topic_label);
+                            signal_presence_decrypt_failed("handle panic").await;
                         }
                     }
                 }
@@ -8826,40 +8976,328 @@ impl Client {
 
         let ghost_count = handles.len();
 
-        // Count StatusKit channels per "from" handle from statuskit-state.plist.
-        // request_handles subscribes ALL channels for the handles we pass, and
-        // Apple bounces a single SubscribeToChannels that carries too many channels
-        // ("Subscribe confirmed failed!" from rustpush::aps), which silently kills
-        // ALL inbound presence for a heavily-keyed ("popular") account with
-        // hundreds of Focus-sharing peers. So we bin-pack handles into
-        // channel-budgeted chunks and subscribe each separately. The StatusKit
-        // channel-task accumulates per-channel interest (refcounts), so the union
-        // ends up subscribed; a short pause between chunks lets it drain and emit
-        // each batch as its own small SubscribeToChannels under Apple's ceiling.
-        let mut from_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        const CHANNEL_BUDGET: usize = 15;
+        let mut transient_pruned_keys = Vec::new();
+        let mut transient_pruned_recents = Vec::new();
+
+        // PRUNE over-budget "from" handles before subscribing. A heavy
+        // re-registration churner accumulates dozens of dead StatusKit channels
+        // under ONE "from" handle (observed: 64 on a single handle). Because
+        // request_handles subscribes ALL of a handle's channels and CANNOT split
+        // them, such a handle forms a single SubscribeToChannels that exceeds
+        // Apple's ceiling — Apple bounces it ("Subscribe confirmed failed!") and
+        // that ONE peer's presence dies entirely (all 64 channels stay
+        // last_msg_ns==1 placeholders, never carrying a status), while every
+        // small-channel peer keeps working. request_channels (per-channel) would
+        // let us subscribe a subset, but APSChannelIdentifier lives in rustpush's
+        // private `aps` module and isn't constructible from here. So instead we
+        // prune state.keys down to <= CHANNEL_BUDGET channels per handle, keeping
+        // every LIVE channel (last_msg_ns>1) plus a ROTATING window of dead
+        // placeholders. Before the CloudKit pull records per-channel invite
+        // dates, no per-channel recency exists to identify the churner's current
+        // channel, so we rotate coverage across subscribes until it lands, after
+        // which liveness pins it. Liveness comes from persisted last_msg_ns in
+        // statuskit-state.plist; if that plist lags after a crash, the CloudKit
+        // pull re-establishes keys and the next subscribe repairs coverage. This
+        // also shrinks the bloated statuskit-state.plist.
         {
             let state_path = subsystem_state_path("statuskit-state.plist");
+            let mut chan_by_from: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut chan_live: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
             if let Ok(data) = std::fs::read(&state_path) {
                 if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
-                    if let Some(keys_dict) = value
-                        .as_dictionary()
-                        .and_then(|d| d.get("keys"))
-                        .and_then(|v| v.as_dictionary())
+                    let root = value.as_dictionary();
+                    if let Some(keys_dict) =
+                        root.and_then(|d| d.get("keys")).and_then(|v| v.as_dictionary())
                     {
-                        for (_channel_id, entry) in keys_dict {
+                        for (cid, entry) in keys_dict {
                             if let Some(from_str) = entry
                                 .as_dictionary()
                                 .and_then(|d| d.get("from"))
                                 .and_then(|v| v.as_string())
                             {
-                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
+                                chan_by_from
+                                    .entry(from_str.to_string())
+                                    .or_default()
+                                    .push(cid.clone());
+                            }
+                        }
+                    }
+                    if let Some(recents) = root
+                        .and_then(|d| d.get("recent_channels"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for rc in recents {
+                            let Some(rc) = rc.as_dictionary() else { continue };
+                            let Some(id_bytes) = rc
+                                .get("identifier")
+                                .and_then(|v| v.as_dictionary())
+                                .and_then(|d| d.get("id"))
+                                .and_then(|v| v.as_data())
+                            else {
+                                continue;
+                            };
+                            let live = rc
+                                .get("last_msg_ns")
+                                .and_then(|v| v.as_unsigned_integer())
+                                .unwrap_or(0)
+                                > 1;
+                            chan_live.insert(base64_encode(id_bytes), live);
+                        }
+                    }
+                }
+            }
+
+            // Invite dates (CD_dateInvitationCreated) written by the CloudKit
+            // pull: channel_id -> raw seconds. The MOST-RECENT invite is the
+            // peer's current channel, so when dates are present we keep those
+            // deterministically and converge immediately. Before a dated pull has
+            // run (or for non-CloudKit keys), dates are absent and we fall back to
+            // rotating the placeholder window across subscribes.
+            let mut chan_date: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            {
+                let dates_path = subsystem_state_path("statuskit-channel-dates.plist");
+                if let Ok(data) = std::fs::read(&dates_path) {
+                    if let Ok(plist::Value::Dictionary(d)) =
+                        plist::from_bytes::<plist::Value>(&data)
+                    {
+                        for (cid, v) in d {
+                            if let Some(i) = v.as_signed_integer() {
+                                chan_date.insert(cid, i);
                             }
                         }
                     }
                 }
             }
+
+            static PRUNE_ROTATION_OFFSET: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let mut prune_rotation_offset: Option<usize> = None;
+            let mut persisted_prune: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut transient_prune: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut capped_handles = 0usize;
+            for (from, cids) in &chan_by_from {
+                if cids.len() <= CHANNEL_BUDGET {
+                    continue;
+                }
+                let mut sorted = cids.clone();
+                sorted.sort();
+                let mut live_channels: Vec<&String> = sorted
+                    .iter()
+                    .filter(|c| *chan_live.get(*c).unwrap_or(&false))
+                    .collect();
+                let mut placeholders: Vec<&String> = sorted
+                    .iter()
+                    .filter(|c| !*chan_live.get(*c).unwrap_or(&false))
+                    .collect();
+                let mut keep: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut persist_prune_for_handle = true;
+                let mut selection_diag;
+
+                let live_overflow = live_channels.len() > CHANNEL_BUDGET;
+                if live_overflow {
+                    // More live channels than the budget — must prune live ones
+                    // too. Rank by invite date when all are dated (deterministic,
+                    // converges to the current channel on the next CloudKit pull);
+                    // fall back to a rotating window when any date is missing so
+                    // we never permanently persist a lexicographic cut that may
+                    // exclude the peer's active channel.
+                    let have_complete_live_dates = live_channels
+                        .iter()
+                        .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if have_complete_live_dates {
+                        live_channels.sort_by(|a, b| {
+                            chan_date
+                                .get(*b)
+                                .copied()
+                                .unwrap_or(0)
+                                .cmp(&chan_date.get(*a).copied().unwrap_or(0))
+                        });
+                        for c in live_channels.iter().take(CHANNEL_BUDGET) {
+                            keep.insert((*c).clone());
+                        }
+                        selection_diag = "live-dated".to_string();
+                    } else {
+                        persist_prune_for_handle = false;
+                        let rot = *prune_rotation_offset.get_or_insert_with(|| {
+                            PRUNE_ROTATION_OFFSET
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        });
+                        let start = rot.wrapping_mul(CHANNEL_BUDGET) % live_channels.len();
+                        for i in 0..CHANNEL_BUDGET.min(live_channels.len()) {
+                            keep.insert(
+                                live_channels[(start + i) % live_channels.len()].clone(),
+                            );
+                        }
+                        selection_diag = format!("live-rot={}", rot);
+                    }
+                } else {
+                    // All live channels fit; fill remaining slots with placeholders.
+                    for c in &live_channels {
+                        keep.insert((*c).clone());
+                    }
+                    let have_complete_dates = placeholders
+                        .iter()
+                        .all(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if !placeholders.is_empty() && !have_complete_dates {
+                        persist_prune_for_handle = false;
+                    }
+                    let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
+                    selection_diag = if live_channels.is_empty() {
+                        "placeholder".to_string()
+                    } else {
+                        "live".to_string()
+                    };
+                    if remaining > 0 && !placeholders.is_empty() {
+                        // Prefer the most-recently-invited channels (current
+                        // first) when every placeholder has a date. If dates are
+                        // absent or partial, rotate the window only in memory
+                        // for this subscribe; persisting an undated window would
+                        // delete every other candidate and prevent the next
+                        // rotation.
+                        if have_complete_dates {
+                            placeholders.sort_by(|a, b| {
+                                chan_date
+                                    .get(*b)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .cmp(&chan_date.get(*a).copied().unwrap_or(0))
+                            });
+                            for c in placeholders.iter().take(remaining) {
+                                keep.insert((*c).clone());
+                            }
+                            selection_diag = "dated".to_string();
+                        } else {
+                            let rot = *prune_rotation_offset.get_or_insert_with(|| {
+                                PRUNE_ROTATION_OFFSET
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            });
+                            let start = rot.wrapping_mul(remaining) % placeholders.len();
+                            for i in 0..remaining.min(placeholders.len()) {
+                                keep.insert(
+                                    placeholders[(start + i) % placeholders.len()].clone(),
+                                );
+                            }
+                            selection_diag = format!("rot={}", rot);
+                        }
+                    }
+                }
+                for c in cids {
+                    if !keep.contains(c) {
+                        if persist_prune_for_handle {
+                            persisted_prune.insert(c.clone());
+                        } else {
+                            transient_prune.insert(c.clone());
+                        }
+                    }
+                }
+                capped_handles += 1;
+                let prune_mode = if persist_prune_for_handle {
+                    "persisted"
+                } else {
+                    "transient"
+                };
+                warn!(
+                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — {} pruning {} channel(s) to avoid a SubscribeToChannels bounce (keeping {}, selection={})",
+                    from,
+                    cids.len(),
+                    CHANNEL_BUDGET,
+                    prune_mode,
+                    cids.len() - keep.len(),
+                    keep.len(),
+                    selection_diag,
+                );
+            }
+            if !persisted_prune.is_empty() || !transient_prune.is_empty() {
+                let mut state = sk.state.write().await;
+                if !persisted_prune.is_empty() {
+                    state.keys.retain(|cid, _| !persisted_prune.contains(cid));
+                    state
+                        .recent_channels
+                        .retain(|rc| !persisted_prune.contains(&base64_encode(&rc.identifier.id)));
+                    persist_plist_state(&state_path, &*state);
+                }
+                if !transient_prune.is_empty() {
+                    let old_keys = std::mem::take(&mut state.keys);
+                    let mut kept_keys = std::collections::HashMap::with_capacity(old_keys.len());
+                    for (cid, device) in old_keys {
+                        if transient_prune.contains(&cid) {
+                            transient_pruned_keys.push((cid, device));
+                        } else {
+                            kept_keys.insert(cid, device);
+                        }
+                    }
+                    state.keys = kept_keys;
+
+                    let old_recents = std::mem::take(&mut state.recent_channels);
+                    let mut kept_recents = Vec::with_capacity(old_recents.len());
+                    for rc in old_recents {
+                        if transient_prune.contains(&base64_encode(&rc.identifier.id)) {
+                            transient_pruned_recents.push(rc);
+                        } else {
+                            kept_recents.push(rc);
+                        }
+                    }
+                    state.recent_channels = kept_recents;
+                }
+                let remaining_keys = state.keys.len();
+                drop(state);
+                if !persisted_prune.is_empty() {
+                    info!(
+                        "StatusKit: persisted prune of {} dead channel(s) from {} over-budget handle(s)",
+                        persisted_prune.len(),
+                        capped_handles,
+                    );
+                }
+                if !transient_prune.is_empty() {
+                    info!(
+                        "StatusKit: transiently pruned {} dead channel(s) from {} over-budget handle(s) for this subscribe; state.keys now {} channel(s)",
+                        transient_prune.len(),
+                        capped_handles,
+                        remaining_keys,
+                    );
+                }
+            }
         }
+
+        // Count StatusKit channels per "from" handle from the current in-memory
+        // state. This includes transient undated pruning that must affect the
+        // request_handles call below, but must not be persisted to disk.
+        // request_handles subscribes ALL channels for the
+        // handles we pass, and Apple bounces a single SubscribeToChannels that
+        // carries too many channels ("Subscribe confirmed failed!" from
+        // rustpush::aps), which silently kills ALL inbound presence for a
+        // heavily-keyed account. So we bin-pack handles into channel-budgeted
+        // chunks and subscribe each separately. The StatusKit channel-task
+        // accumulates per-channel interest (refcounts), so the union ends up
+        // subscribed; a short pause between chunks lets it drain and emit each
+        // batch as its own small SubscribeToChannels under Apple's ceiling.
+        let mut from_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        if let Ok(value) = plist::to_value(&*sk.state.read().await) {
+            if let Some(keys_dict) = value
+                .as_dictionary()
+                .and_then(|d| d.get("keys"))
+                .and_then(|v| v.as_dictionary())
+            {
+                for (_channel_id, entry) in keys_dict {
+                    if let Some(from_str) = entry
+                        .as_dictionary()
+                        .and_then(|d| d.get("from"))
+                        .and_then(|v| v.as_string())
+                    {
+                        *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
         // Make sure every requested ghost handle is represented even if it has no
         // key yet (so a future reshare for it still lands); it contributes 0
         // channels and is therefore "free" in the budget.
@@ -8872,7 +9310,15 @@ impl Client {
         // single handle whose channel count exceeds the budget unavoidably forms
         // its own (over-budget) chunk — request_handles cannot split one handle's
         // channels — but that is rare and isolates the risk to that one peer.
-        const CHANNEL_BUDGET: usize = 30;
+        //
+        // 15: the first cut at 30 cleared a 244-channel account, but an even more
+        // heavily-keyed account still got bounced ("Subscribe confirmed failed!")
+        // at 30, so Apple's per-SubscribeToChannels ceiling is lower than first
+        // estimated. Halving to 15 keeps each subscribe well under it. The cost is
+        // more chunks per subscribe (each paced 250ms apart) — acceptable because
+        // subscribe_to_status only runs on first-ready and on key arrival, not on
+        // a timer. If a user is STILL bounced, drop this further. (CHANNEL_BUDGET
+        // is declared above, shared with the over-budget prune.)
         let mut chunks: Vec<Vec<String>> = Vec::new();
         let mut cur: Vec<String> = Vec::new();
         let mut cur_count = 0usize;
@@ -8910,6 +9356,24 @@ impl Client {
             *tokens = new_tokens;
         }
         drop(old_tokens);
+
+        if !transient_pruned_keys.is_empty() || !transient_pruned_recents.is_empty() {
+            let mut state = sk.state.write().await;
+            for (cid, device) in transient_pruned_keys {
+                state.keys.entry(cid).or_insert(device);
+            }
+            let mut existing_recent_ids: std::collections::HashSet<String> = state
+                .recent_channels
+                .iter()
+                .map(|rc| base64_encode(&rc.identifier.id))
+                .collect();
+            for rc in transient_pruned_recents {
+                if existing_recent_ids.insert(base64_encode(&rc.identifier.id)) {
+                    state.recent_channels.push(rc);
+                }
+            }
+            info!("StatusKit: restored transiently-pruned undated channels after subscribe");
+        }
 
         info!(
             "Requested presence subscription in {} channel-budgeted chunk(s) ({} ghost handles, {} distinct from-handles)",
@@ -11157,6 +11621,10 @@ impl Client {
 
                     let has_body = msg.msg_proto.attributed_body.is_some();
 
+                    let (reply_guid, reply_part) = parse_cloud_reply(
+                        msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                    );
+
                     WrappedCloudSyncMessage {
                         record_name: rn,
                         guid,
@@ -11177,6 +11645,8 @@ impl Client {
                         date_read_ms,
                         msg_type: msg.r#type,
                         has_body,
+                        reply_guid,
+                        reply_part,
                     }
                 }));
 
@@ -11216,6 +11686,8 @@ impl Client {
                     date_read_ms: 0,
                     msg_type: 0,
                     has_body: false,
+                    reply_guid: None,
+                    reply_part: None,
                 });
             }
         }
@@ -11227,9 +11699,14 @@ impl Client {
             );
         }
 
+        // reply_count surfaces whether CloudKit records actually carry the
+        // msgProto2.reply field (the upstream struct comments it "always empty
+        // afaict??"). A non-zero count on a thread with known replies confirms
+        // backfill reply chains have real data to resolve.
+        let reply_count = normalized.iter().filter(|m| m.reply_guid.is_some()).count();
         info!(
-            "CloudKit message sync page: {} messages normalized, {} skipped",
-            normalized.len(), skipped_messages
+            "CloudKit message sync page: {} messages normalized, {} skipped, {} with reply",
+            normalized.len(), skipped_messages, reply_count
         );
 
         Ok(WrappedCloudSyncMessagesPage {
@@ -12597,6 +13074,10 @@ impl Client {
                     .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                     .unwrap_or(0);
 
+                let (reply_guid, reply_part) = parse_cloud_reply(
+                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                );
+
                 // Extract attachment GUIDs from attributedBody + messageSummaryInfo
                 let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
                     .as_ref()
@@ -12637,6 +13118,8 @@ impl Client {
                         date_read_ms,
                         msg_type: msg.r#type,
                         has_body: msg.msg_proto.attributed_body.is_some(),
+                        reply_guid,
+                        reply_part,
                     },
                 );
 

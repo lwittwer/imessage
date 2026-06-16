@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -273,8 +274,97 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		return overridden
 	}
 
-	log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
-	recoverableChats, chatErr := c.client.ListRecoverableChats()
+	// Skip the (expensive, full 256-page-per-zone) recycle-bin scan if it ran
+	// recently. Known deletions are already PERSISTED: insertDeletedChatTombstone +
+	// deleteLocalChatByPortalID soft-delete the cloud_chat rows, which survive
+	// restarts, so createPortalsFromCloudSync already honours them WITHOUT a fresh
+	// scan. Re-scanning on every startup is what makes a heavily-deleted account
+	// (James: huge recycle bin) take minutes to become send-ready —
+	// ListRecoverableChats + ListRecoverableMessageGuids each walk up to 256
+	// CloudKit pages per zone every time (the FFI resets its continuation token to
+	// None each call). The cooldown only bounds how stale a NEW delete/recovery can
+	// be (the next scan picks it up); already-known deletes are never lost.
+	// Incremental sync was rejected on purpose: the recovery pass needs the FULL
+	// recoverable-message snapshot to count per-portal recoverables, so a
+	// continuation token would break recovery.
+	const recycleBinSeedCooldown = 30 * time.Minute
+	// A scan that FAILS (CloudKit/auth error or a panic in either walk) backs off
+	// for a SHORT window rather than the full success cooldown: this retries a
+	// transient failure within minutes to recover newly-deleted chats, while still
+	// bounding re-walks of a large recycle bin during a crash/restart loop (an
+	// expensive walk that errors deep in pagination must not re-run on every boot).
+	// Strictly better than the old pre-fetch stamp, which suppressed BOTH success
+	// and failure for 30 min and, worse, armed the cooldown on a mid-scan crash —
+	// hiding real deletes for half an hour.
+	const recycleBinSeedFailCooldown = 5 * time.Minute
+	// firstRunThisSession is true on the very first call in this process lifetime.
+	// The success cooldown is bypassed for it so that chats deleted on another
+	// Apple device while the bridge was stopped are always caught on restart, even
+	// if the last scan was recent. The failure cooldown still applies to protect
+	// crash loops: if the previous scan failed within recycleBinSeedFailCooldown,
+	// we back off regardless of whether this is the first session call.
+	firstRunThisSession := !c.recycleBinSeededThisSession.Swap(true)
+	seedKey := database.Key("recyclebin.seed.last")
+	failKey := database.Key("recyclebin.seed.lastfail")
+	if !firstRunThisSession {
+		if raw := c.Main.Bridge.DB.KV.Get(ctx, seedKey); raw != "" {
+			if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedCooldown {
+				log.Info().Time("last_seed", last).Dur("cooldown", recycleBinSeedCooldown).
+					Msg("DELETE-SEED: skipping recycle-bin scan — ran recently; persisted soft-deletes already cover known deletions (unblocks rapid restarts)")
+				return
+			}
+		}
+	}
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, failKey); raw != "" {
+		if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedFailCooldown {
+			log.Info().Time("last_fail", last).Dur("fail_cooldown", recycleBinSeedFailCooldown).
+				Msg("DELETE-SEED: skipping recycle-bin scan — a recent scan failed; backing off briefly before retry (persisted soft-deletes still cover known deletions)")
+			return
+		}
+	}
+	// Keep the two recycle-bin FFI walks serial. They share the same Rust
+	// CloudMessagesClient instance, and this startup path is more sensitive to
+	// correctness than shaving wall-clock time. The per-call recover wrappers let
+	// one failing walk fall back to the other data source without crashing or
+	// relying on concurrent FFI re-entrancy.
+	var (
+		recoverableChats []rustpushgo.WrappedCloudSyncChat
+		chatErr          error
+		guids            []string
+		guidErr          error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				chatErr = fmt.Errorf("ListRecoverableChats panicked: %v", r)
+				log.Error().Interface("panic", r).Msg("DELETE-SEED: ListRecoverableChats panicked")
+			}
+		}()
+		log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
+		recoverableChats, chatErr = c.client.ListRecoverableChats()
+	}()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				guidErr = fmt.Errorf("ListRecoverableMessageGuids panicked: %v", r)
+				log.Error().Interface("panic", r).Msg("DELETE-SEED: ListRecoverableMessageGuids panicked")
+			}
+		}()
+		log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
+		guids, guidErr = c.client.ListRecoverableMessageGuids()
+	}()
+
+	// Arm the cooldown based on outcome: the full 30-min window on a clean scan,
+	// a short failure backoff otherwise so a transient CloudKit/auth error retries
+	// soon without re-walking a large recycle bin on every restart. A clean scan
+	// clears any prior failure marker (empty value reads as "no marker").
+	if chatErr == nil && guidErr == nil {
+		c.Main.Bridge.DB.KV.Set(ctx, seedKey, time.Now().Format(time.RFC3339))
+		c.Main.Bridge.DB.KV.Set(ctx, failKey, "")
+	} else {
+		c.Main.Bridge.DB.KV.Set(ctx, failKey, time.Now().Format(time.RFC3339))
+	}
+
 	if chatErr != nil {
 		log.Warn().Err(chatErr).Msg("DELETE-SEED: failed to read recoverable chats")
 	} else {
@@ -414,10 +504,8 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		}
 	}
 
-	log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
-	guids, err := c.client.ListRecoverableMessageGuids()
-	if err != nil {
-		log.Warn().Err(err).Msg("DELETE-SEED: failed to read recoverable message GUIDs")
+	if guidErr != nil {
+		log.Warn().Err(guidErr).Msg("DELETE-SEED: failed to read recoverable message GUIDs")
 	} else if len(guids) == 0 {
 		log.Info().Msg("DELETE-SEED: no recoverable messages found, nothing to seed")
 	} else {
@@ -791,6 +879,63 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	if firstTime {
 		go c.subscribeToContactPresence(log)
 	}
+}
+
+const (
+	// presenceSubscribeDebounce is the quiet window after the LAST key-sharing
+	// message in a burst before a coalesced re-subscribe fires. Trailing-edge:
+	// the subscribe reads the fully-settled state.keys snapshot, so it never
+	// misses a channel (a prior LEADING-edge debounce swallowed the follow-up
+	// that carried the new channel — see subscribeToContactPresence).
+	presenceSubscribeDebounce = 3 * time.Second
+	// presenceSubscribeMaxWait caps the total delay from the FIRST key in a
+	// burst, so a continuous key stream (a heavily-keyed account whose reshares
+	// trickle in without a 3s gap) can't starve presence indefinitely.
+	presenceSubscribeMaxWait = 30 * time.Second
+)
+
+// schedulePresenceSubscribe coalesces a burst of OnKeysReceived events into a
+// single subscribeToContactPresence call. Each key-sharing message re-arms a
+// trailing-edge timer; the subscribe runs once, presenceSubscribeDebounce after
+// the last key (or presenceSubscribeMaxWait after the first, whichever comes
+// first). This is the pounding fix for heavily-keyed accounts: instead of one
+// full chunked SubscribeToStatus per key (dozens, back-to-back, each larger the
+// more keys the user has), the whole startup burst becomes ONE re-subscribe.
+//
+// A monotonically-increasing generation stamps each arm; only the timer whose
+// generation is still current fires the subscribe, so re-arming is race-free
+// without holding a timer handle. Keys that arrive DURING a running subscribe
+// re-arm a fresh generation, so the tail is always picked up by a follow-up
+// (subscribeToContactPresence serializes via lastPresenceSubscribeLock).
+func (c *IMClient) schedulePresenceSubscribe(log zerolog.Logger) {
+	c.presenceSubscribeLock.Lock()
+	now := time.Now()
+	if !c.presenceSubscribePending {
+		c.presenceSubscribePending = true
+		c.presenceSubscribeFirstAt = now
+	}
+	c.presenceSubscribeGen++
+	gen := c.presenceSubscribeGen
+	delay := presenceSubscribeDebounce
+	if remaining := presenceSubscribeMaxWait - now.Sub(c.presenceSubscribeFirstAt); remaining < delay {
+		if remaining < 0 {
+			remaining = 0
+		}
+		delay = remaining
+	}
+	c.presenceSubscribeLock.Unlock()
+
+	time.AfterFunc(delay, func() {
+		c.presenceSubscribeLock.Lock()
+		if c.presenceSubscribeGen != gen {
+			// A newer key re-armed the timer; this generation is stale.
+			c.presenceSubscribeLock.Unlock()
+			return
+		}
+		c.presenceSubscribePending = false
+		c.presenceSubscribeLock.Unlock()
+		c.subscribeToContactPresence(log)
+	})
 }
 
 // subscribeToContactPresence subscribes to iMessage presence updates for all
@@ -1530,7 +1675,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		log.Err(err).Msg("Ghost ID row iteration error")
 	}
 
-	updated := 0
+	reconciled := 0
 	for _, g := range ghosts {
 		contact, localID, err := c.lookupContactForDisplay(string(g.id))
 		if localID == "" {
@@ -1554,38 +1699,38 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 					continue
 				}
 				ghost.UpdateInfo(ctx, info)
-				updated++
+				reconciled++
 			}
 			continue
 		}
-		// Diff-gate: compute the expected displayname and skip if it matches
-		// the stored name. This prevents unnecessary Matrix profile update API
-		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
-		// UpdateInfo always makes an API call; diffing here is our only guard).
-		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		if g.name == expectedName {
-			continue
-		}
+		// Reconcile the FULL profile (name + avatar + identifiers) every cycle —
+		// NOT just when the name changed. UpdateInfo self-gates: prepareName /
+		// prepareAvatar / prepareContactInfo each compare against the stored
+		// value (prepareName at ghost.go:152 returns false when equal+NameSet),
+		// and pushProfileChanges early-returns when nothing differs. So an
+		// unchanged ghost costs a cached lookup and ZERO Matrix API calls — the
+		// old "AggressiveUpdateInfo always makes an API call" rationale for the
+		// name diff-gate was stale.
+		//
+		// Gating on name alone left identifier/avatar drift unhealed forever for
+		// already-named contacts: a malformed "tel:(845) 536-4690" baked in by an
+		// earlier bug, or a photo that finished downloading on a later sync, would
+		// only recover on the contact's next inbound message (UpdateInfoIfNecessary)
+		// or a full client re-login. Reconciling unconditionally makes both
+		// self-heal on the next contact tick, with no manual logout required.
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
 		if err != nil || ghost == nil {
-			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for profile reconcile")
 			continue
 		}
-		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
-		// to ensure name, avatar, and identifiers are all propagated to Matrix.
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
 		}
 		ghost.UpdateInfo(ctx, info)
-		updated++
+		reconciled++
 	}
-	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("reconciled", reconciled).Int("total", len(ghosts)).Msg("Reconciled ghost profiles from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
@@ -1686,12 +1831,17 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		// Only touch DMs we should: silenced (apply 🌙) or already owned
-		// (NameIsCustom — maintain it or clear the moon). Leave pristine,
-		// never-silenced DMs on implicit naming — portal.Name may be empty for
-		// them, so stamping would mass-seize NameIsCustom (and freeze ghost
-		// avatars) across every DM on the first tick.
-		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom {
+		// Only touch DMs we should: silenced (apply 🌙), already owned
+		// (NameIsCustom — maintain it or clear the moon), or BROKEN — a DM the
+		// moon path previously blanked (name was set, but to ""). A blanked DM
+		// renders with no contact name at all (the "lost name" regression from
+		// releasing the moon via DefaultChatName under private_chat_portal_meta=
+		// false); dmFocusName now re-stamps the contact name, healing it.
+		// Leave pristine, never-named DMs (NameSet=false) on implicit naming —
+		// stamping those would mass-seize NameIsCustom (and freeze ghost avatars)
+		// across every DM on the first tick.
+		broken := portal.NameSet && portal.Name == ""
+		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom && !broken {
 			continue
 		}
 		// Recompute the title (contact name + 🌙 when silenced) or, when
@@ -1701,6 +1851,10 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		// check go hand in hand. Skip no-op moon-title rewrites; DefaultChatName
 		// must proceed so it releases ownership and restores name + avatar.
 		nameField := c.dmFocusName(ctx, portal)
+		if nameField == nil {
+			// Contact name not resolved yet — leave it for a later tick.
+			continue
+		}
 		if nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name) {
 			continue
 		}
@@ -1925,7 +2079,29 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// creation. This populates attachmentContentCache so that FetchMessages
 	// (which runs inside the portal event loop goroutine) gets instant cache
 	// hits instead of blocking on CloudKit for 30+ minutes.
-	c.preUploadCloudAttachments(ctx)
+	//
+	// Run it CONCURRENTLY with the recycle-bin seed + portal-ID normalization
+	// below. Pre-upload is network-bound (CloudKit downloads -> Matrix uploads)
+	// and shares no decision state with the seed: it already ran BEFORE the seed
+	// in the old serial order, so it never depended on the seed's tombstones. We
+	// join (preUploadWG.Wait) before createPortalsFromCloudSync so the attachment
+	// cache is fully warm AND — the load-bearing delete-safety invariant — the
+	// seed has finished tombstoning every deleted chat before any portal is
+	// created. The recover() guards the goroutine: a panic here must not crash
+	// the controller (which would leave setCloudSyncDone uncalled and wedge the
+	// APNs buffer).
+	var preUploadWG sync.WaitGroup
+	preUploadWG.Add(1)
+	go func() {
+		defer preUploadWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Interface("panic", r).
+					Msg("preUploadCloudAttachments panicked — attachments will fall back to on-demand fetch")
+			}
+		}()
+		c.preUploadCloudAttachments(ctx)
+	}()
 
 	// Seed delete knowledge from Apple's recycle bin BEFORE creating portals.
 	// Must run after runCloudSyncOnce (PCS keys needed) but before
@@ -1935,6 +2111,18 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// which would make portalHasChat match live CloudKit rows for chats
 	// that are actually in the recycle bin.
 	c.seedDeletedChatsFromRecycleBin(log)
+
+	// Join the concurrent pre-upload now, right after the seed. Step 1 shrank the
+	// message-portal normalize below to ~tens of ms, so the only work worth
+	// overlapping preUpload with is the ~41s seed above — joining here instead of
+	// before createPortals costs no wall-clock (preUpload finishes inside the
+	// seed's window) and keeps preUpload's parallel DB writes from running
+	// alongside the `ANALYZE cloud_chat` inside the message normalize (which bumps
+	// the schema cookie and briefly takes the write lock). Delete-safety is
+	// unchanged: the seed has fully completed before this Wait, and
+	// createPortalsFromCloudSync still runs strictly after both the join and the
+	// normalizes.
+	preUploadWG.Wait()
 
 	// Normalize inconsistent group portal IDs in cloud_chat: unify all
 	// rows for the same group to use gid:<group_id> as the canonical portal_id.
@@ -3302,6 +3490,15 @@ func (c *IMClient) ingestCloudMessages(
 			tapbackEmoji = *msg.TapbackEmoji
 		}
 
+		replyToGUID := ""
+		if msg.ReplyGuid != nil {
+			replyToGUID = *msg.ReplyGuid
+		}
+		replyToPart := ""
+		if msg.ReplyPart != nil {
+			replyToPart = *msg.ReplyPart
+		}
+
 		// Enrich and serialize attachment metadata.
 		//
 		// Merge two sources of attachment GUIDs so we don't silently drop
@@ -3420,6 +3617,8 @@ func (c *IMClient) ingestCloudMessages(
 			AttachmentsJSON:   attachmentsJSON,
 			DateReadMS:        msg.DateReadMs,
 			HasBody:           msg.HasBody,
+			ReplyToGUID:       replyToGUID,
+			ReplyToPart:       replyToPart,
 		})
 
 		if existingSet[msg.Guid] {

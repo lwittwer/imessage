@@ -369,6 +369,12 @@ type IMClient struct {
 	// rows and double the CKKS round-trips. Released in a defer.
 	statusKitPassInFlight atomic.Bool
 
+	// lastDecryptFailureRepull is the unix-millisecond time of the last CloudKit
+	// re-pull forced by a presence decrypt failure (a stale peer key). Cooldown-
+	// gates onPresenceDecryptFailed so a burst of undecryptable presence updates
+	// can't hammer CKKS and re-trigger the clique-kick. Accessed atomically.
+	lastDecryptFailureRepull int64
+
 	// statusKitShareMu serializes the cooldown-check / publish /
 	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
 	// Without it two concurrent callers can both pass the cooldown check
@@ -382,6 +388,17 @@ type IMClient struct {
 	// storms.
 	lastPresenceSubscribe     time.Time
 	lastPresenceSubscribeLock sync.Mutex
+
+	// Trailing-edge coalescing for OnKeysReceived. A key-sharing burst (a
+	// heavily-keyed account at startup fires OnKeysReceived dozens of times in
+	// seconds) would otherwise trigger a full chunked SubscribeToStatus per
+	// event — a storm against Apple that gets worse the more keys a user has.
+	// schedulePresenceSubscribe collapses a burst into ONE re-subscribe that
+	// runs after the burst settles. See schedulePresenceSubscribe.
+	presenceSubscribeLock    sync.Mutex
+	presenceSubscribeGen     uint64
+	presenceSubscribePending bool
+	presenceSubscribeFirstAt time.Time
 
 	// statusKitInviteMu / statusKitNextInviteAt enforce a GLOBAL minimum
 	// interval between StatusKit invite dispatches, shared across every caller:
@@ -511,6 +528,14 @@ type IMClient struct {
 	// dropped, fresh UUIDs are allowed through for new conversations.
 	recentlyDeletedPortals   map[string]deletedPortalEntry
 	recentlyDeletedPortalsMu sync.RWMutex
+
+	// recycleBinSeededThisSession is set true after seedDeletedChatsFromRecycleBin
+	// completes its first attempt this process lifetime. The success cooldown is
+	// bypassed on the first call so offline deletes (chats deleted on another
+	// Apple device while the bridge was stopped) are always caught on restart,
+	// even if the last successful scan was recent. The failure cooldown still
+	// applies on first run to protect crash loops.
+	recycleBinSeededThisSession atomic.Bool
 
 	// recycleBinCandidates stores portal IDs found in Apple's recycle bin
 	// during bootstrap. NOT auto-deleted — shown to the user via bridgebot
@@ -1974,6 +1999,7 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 		log.Debug().Str("portal_id", string(portal.ID)).Str("mode", modeKey).Time("observed_at", observedAt).Time("latest_observed_at", latest).Msg("StatusKit: stale presence ignored")
 		return false
 	}
+	c.touchPresenceAt(ctx, portal.ID)
 
 	previousMode, _ := c.statusKitPresenceByPortal.Load(portal.ID)
 	previousModeStr, _ := previousMode.(string)
@@ -2061,6 +2087,48 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 	return true
 }
 
+// presenceMoonTTL is how long a silenced (Focus/DND) state survives without
+// being re-confirmed by a freshly-decrypted presence event before isPortalSilenced
+// treats it as STALE and clears the 🌙. This self-heals "stuck moons": when a peer
+// rotates their StatusKit key and we can no longer decrypt their "now available"
+// update, the persisted focus mode would otherwise pin the moon forever. 16h is
+// comfortably longer than any normal Focus (Sleep ~8–10h, Work ~9h) so a genuine
+// DND is never prematurely cleared — only a state we've stopped hearing about.
+const presenceMoonTTL = 16 * time.Hour
+
+// presenceAtRefreshThrottle bounds how often touchPresenceAt writes the freshness
+// timestamp to KV, so a single presence change fanned across a peer's N aliases
+// doesn't write N times.
+const presenceAtRefreshThrottle = 5 * time.Minute
+
+// presenceAtKey is the KV key holding the unix-millis timestamp of the last
+// successfully-processed presence event for a portal — the freshness clock the
+// moon-TTL reads.
+func presenceAtKey(portalID networkid.PortalID) database.Key {
+	return database.Key("statuskit.presence.portal." + string(portalID) + ".at")
+}
+
+// touchPresenceAt refreshes the moon-TTL freshness clock for this portal. It
+// fires when a presence event reaches portal-level processing — i.e. a state
+// CHANGE (the handle-level dedup at the top of OnStatusUpdate, ~line 1829, lets
+// changes through) — so the clock tracks "time of last state change we processed"
+// for this peer. Same-state re-deliveries caught by that earlier handle dedup do
+// NOT reach here, so the TTL measures time-since-last-change, not time-since-last-
+// heard. That's the right signal for the bug we're fixing: a stuck moon is a
+// missed "now available" transition, which leaves the clock frozen at the DND-on
+// change and clears at TTL. Known tradeoff: a genuinely continuous Focus lasting
+// >presenceMoonTTL also clears (rare; self-corrects on the peer's next change).
+// Throttled to avoid KV churn on alias fan-out.
+func (c *IMClient) touchPresenceAt(ctx context.Context, portalID networkid.PortalID) {
+	key := presenceAtKey(portalID)
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, key); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && time.Since(time.UnixMilli(ms)) < presenceAtRefreshThrottle {
+			return
+		}
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, key, strconv.FormatInt(time.Now().UnixMilli(), 10))
+}
+
 // isPortalSilenced reports whether the peer of the given DM portal currently
 // has iMessage Focus/DND on. Map-first (statusKitPresenceByPortal), KV-fallback:
 // the in-memory map is cold after a restart, but the per-portal presence state
@@ -2068,16 +2136,41 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 // across restarts instead of stripping it until the next live toggle. A stored
 // value of "available" (or absent) = not silenced; any focus mode = silenced.
 //
+// Silenced states are additionally gated on presenceMoonTTL: a focus mode whose
+// last-state-change is older than the TTL is treated as stale (not silenced) so a
+// stuck moon self-clears on the next title refresh (which runs every ~15min via
+// setContactsReady, regardless of contact changes). A pre-TTL row with no
+// freshness timestamp is stamped now, giving already-stuck moons a TTL window to
+// clear instead of sticking forever.
+//
 // Note: depends on StatusKitNotifications being enabled — when it's off,
 // OnStatusUpdate early-returns before recording presence, so this is always
 // false and no moon appears (intended).
 func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
+	silenced := false
 	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
 		s, _ := v.(string)
-		return statusKitModeSilenced(s)
+		silenced = statusKitModeSilenced(s)
+	} else {
+		s := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portalID)))
+		silenced = statusKitModeSilenced(s)
 	}
-	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
-	return statusKitModeSilenced(s)
+	if !silenced {
+		return false
+	}
+	raw := c.Main.Bridge.DB.KV.Get(ctx, presenceAtKey(portalID))
+	if raw == "" {
+		// Pre-TTL row (set before this code shipped, or never timestamped). Stamp
+		// it now so a genuinely-stuck moon gets a TTL window and self-clears later
+		// instead of persisting forever.
+		c.Main.Bridge.DB.KV.Set(ctx, presenceAtKey(portalID), strconv.FormatInt(time.Now().UnixMilli(), 10))
+		return true
+	}
+	ms, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return true
+	}
+	return time.Since(time.UnixMilli(ms)) < presenceMoonTTL
 }
 
 // dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the
@@ -2120,27 +2213,51 @@ func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) 
 // dmFocusName returns the ChatInfo.Name to set for a DM given the peer's focus
 // state:
 //   - silenced  → the moon title ("<name> 🌙"), which we own (NameIsCustom=true).
-//   - available, regular DM → bridgev2.DefaultChatName, which RELEASES ownership
-//     (NameIsCustom=false) so the framework restores the bare ghost name AND
-//     re-enables ghost name+avatar sync. (Re-stamping the bare name would keep
-//     NameIsCustom=true forever and freeze the ghost avatar.)
+//   - available, regular DM → see the release-path comment below; depends on
+//     private_chat_portal_meta.
 //   - available, self-chat → the bare connector name. The connector permanently
 //     owns the self-chat name (NameIsCustom is always set by GetChatInfo), so
 //     releasing would just fight GetChatInfo and flip; restore the same bare
 //     name dmBaseName uses, keeping it stable.
 //
-// Returns the DefaultChatName package sentinel by identity (the framework
-// matches it by pointer at portal.go:4983) — never a copy of "".
+// Returns nil when the contact name hasn't resolved yet, meaning "leave the name
+// alone" — never stamp an empty/lone-🌙 title (that blanks the DM).
 func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *string {
 	if c.isPortalSilenced(ctx, portal.ID) {
 		title := c.computeDMTitle(ctx, portal)
+		// computeDMTitle returns "" when the contact name isn't resolved yet
+		// (e.g. contacts not loaded). Don't stamp that — it would blank the DM
+		// or, with the moon appended, leave a nameless "🌙". Leave the name as-is.
+		if title == "" {
+			return nil
+		}
 		return &title
 	}
 	if c.isMyHandle(string(portal.ID)) {
 		base := c.dmBaseName(ctx, portal)
 		return &base
 	}
-	return bridgev2.DefaultChatName
+	// Releasing the moon (peer available again): the title must return to the
+	// plain contact name. HOW depends on private_chat_portal_meta:
+	//   - true:  hand the title back with DefaultChatName, which RELEASES ownership
+	//     (NameIsCustom=false) so the framework restores the bare ghost name AND
+	//     re-enables ghost name+avatar sync. (Re-stamping would keep NameIsCustom
+	//     true forever and freeze the ghost avatar — which matters only here.)
+	//   - false: the framework will NOT restore the name — UpdateInfoFromGhost
+	//     early-returns at portal.go:4960 when PrivateChatPortalMeta is off — so
+	//     DefaultChatName leaves an explicit empty m.room.name and the DM renders
+	//     blank (the "lost contact name" bug). Re-stamp the bare contact name
+	//     ourselves. NameIsCustom stays true, but under PCPM=false the framework
+	//     never syncs DM name/avatar from the ghost anyway (ghost.go:320), so
+	//     nothing is frozen that wasn't already manual.
+	if c.Main.Bridge.Config.PrivateChatPortalMeta {
+		return bridgev2.DefaultChatName
+	}
+	base := c.dmBaseName(ctx, portal)
+	if base == "" {
+		return nil
+	}
+	return &base
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so
@@ -2318,8 +2435,29 @@ func (c *IMClient) OnKeysReceived() {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Logger()
-	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
-	go c.subscribeToContactPresence(log)
+	log.Info().Msg("StatusKit: key-sharing message received — scheduling presence re-subscribe")
+	c.schedulePresenceSubscribe(log)
+}
+
+// OnStatusDecryptFailed is called by StatusKit when a presence update on the
+// presence.mode.status topic could not be decoded — almost always a peer who
+// rotated their StatusKit channel key, leaving the copy we pulled from CloudKit
+// stale. We force a rate-limited CloudKit peer-key re-pull to fetch the fresh key
+// right away (instead of waiting for the steady-state pull floor), which then
+// re-subscribes and lets the peer's real presence flow again — clearing a moon
+// that would otherwise be stuck. sender is best-effort (the peer handle when the
+// envelope exposes it) and used only for logging.
+func (c *IMClient) OnStatusDecryptFailed(sender *string) {
+	if !c.Main.Config.StatusKitNotifications {
+		return
+	}
+	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
+	s := ""
+	if sender != nil {
+		s = *sender
+	}
+	log.Info().Str("sender", s).Msg("StatusKit: presence decrypt failed (likely stale peer key) — forcing rate-limited CloudKit re-pull")
+	c.onPresenceDecryptFailed(log)
 }
 
 // OnReshareSender is called once per reshare with the peer handle that sent
@@ -7257,6 +7395,19 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		IsBot:       &isBot,
 		Identifiers: []string{identifier},
 	}
+	addContactIdentifiers := func(contact *imessage.Contact) {
+		seen := make(map[string]bool, len(ui.Identifiers))
+		for _, id := range ui.Identifiers {
+			seen[id] = true
+		}
+		for _, id := range contactPortalIDs(contact) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			ui.Identifiers = append(ui.Identifiers, id)
+		}
+	}
 
 	displayContact, localID, displayErr := c.lookupContactForDisplay(identifier)
 	if displayErr != nil {
@@ -7264,12 +7415,7 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	}
 
 	if displayContact != nil {
-		for _, phone := range displayContact.Phones {
-			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-		}
-		for _, email := range displayContact.Emails {
-			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
-		}
+		addContactIdentifiers(displayContact)
 		if displayContact.HasName() {
 			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: displayContact.FirstName,
@@ -7313,19 +7459,30 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		return ui, nil
 	}
 
-	if nativeContact != nil && nativeContact.HasName() {
-		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: nativeContact.FirstName,
-			LastName:  nativeContact.LastName,
-			Nickname:  nativeContact.Nickname,
-			ID:        localID,
-		})
-		ui.Name = &name
-		return ui, nil
-	}
 	if nativeContact != nil {
-		name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
-		ui.Name = &name
+		addContactIdentifiers(nativeContact)
+		if nativeContact.HasName() {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: nativeContact.FirstName,
+				LastName:  nativeContact.LastName,
+				Nickname:  nativeContact.Nickname,
+				ID:        localID,
+			})
+			ui.Name = &name
+		} else {
+			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
+			ui.Name = &name
+		}
+		if ui.Avatar == nil && len(nativeContact.Avatar) > 0 {
+			avatarHash := sha256.Sum256(nativeContact.Avatar)
+			avatarData := nativeContact.Avatar // capture for closure
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					return avatarData, nil
+				},
+			}
+		}
 		return ui, nil
 	}
 
@@ -8127,6 +8284,24 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 				}},
 			},
 		})
+	}
+
+	// Reply: apply the same target to every part this row produced (text,
+	// attachment(s), notice placeholder), mirroring the live convertMessage
+	// path. ConvertedMessagePart.Content is always *event.MessageEventContent;
+	// bridgev2's send/backfill emitters attach m.relates_to in applyRelationMeta
+	// before sending each part, so media msgtypes and notice placeholders handle
+	// replies the same way as text. Reactions/tapbacks already returned above,
+	// so they're unaffected. bridgev2 resolves the target via deterministic event
+	// IDs during backfill, so a same-batch reply target renders even before its
+	// DB row is inserted.
+	if row.ReplyToGUID != "" {
+		replyTo := chatDBReplyTarget(row.ReplyToGUID, parseBalloonPart(row.ReplyToPart, "%d:"))
+		for _, m := range messages {
+			if m.ConvertedMessage != nil {
+				m.ConvertedMessage.ReplyTo = replyTo
+			}
+		}
 	}
 
 	return messages

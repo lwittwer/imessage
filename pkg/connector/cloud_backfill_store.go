@@ -49,6 +49,13 @@ type cloudMessageRow struct {
 	// participant changes) do not.
 	HasBody bool
 
+	// Reply target, mirroring the live-receive WrappedMessage.reply_guid/part.
+	// ReplyToGUID is the GUID of the message this one replies to (empty when not
+	// a reply); ReplyToPart is the raw balloon-part string parsed by
+	// parseBalloonPart at conversion time (chatDBReplyTarget maps it to _attN).
+	ReplyToGUID string
+	ReplyToPart string
+
 	// True once the body has been scrubbed because the message was bridged
 	// to Matrix. Identifiers (guid, timestamps, record_name) are kept for
 	// echo dedup and routing; text/subject/sender/attachments_json are NULL.
@@ -199,6 +206,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		// was bridged to Matrix. Set by scrubBridgedBodies and preserved
 		// across CloudKit re-syncs by the upsert ON CONFLICT clause.
 		{"body_scrubbed", "BOOLEAN NOT NULL DEFAULT FALSE"},
+		// Reply target (from msgProto2.reply). reply_to_part is the raw balloon
+		// part string; conversion maps part>=1 to the {guid}_attN target ID.
+		{"reply_to_guid", "TEXT"},
+		{"reply_to_part", "TEXT"},
 	} {
 		var exists int
 		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
@@ -298,6 +309,30 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
 		ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
 		return fmt.Errorf("failed to create group_id index: %w", err)
+	}
+
+	// Expression indexes for normalizeGroupMessagePortalIDs' correlated subquery,
+	// which matches cloud_message.portal_id suffixes against cloud_chat via
+	// LOWER(group_id) / LOWER(cloud_chat_id). A plain (login_id, group_id) index
+	// cannot serve a LOWER(col) predicate, so without these the normalize falls
+	// back to a full cloud_chat scan PER group message — ~41s on every startup of
+	// a heavily-grouped account even when it changes zero rows. With them the
+	// correlated lookup becomes an index seek (measured 9.8s -> 14ms on a
+	// 1500-chat / 20k-message no-op profile). Purely additive: the UPDATE's
+	// results are unchanged, only its access path. Valid on both SQLite (>=3.9)
+	// and Postgres; LOWER() is deterministic/immutable on both.
+	//
+	// NOTE: these indexes are INERT without query-planner stats — on a fresh DB
+	// with no sqlite_stat1 SQLite ignores them and still full-scans. The required
+	// `ANALYZE cloud_chat` is run by normalizeGroupMessagePortalIDs right before
+	// its UPDATE (the table is populated by then); see that function.
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_lower_group_id_idx
+		ON cloud_chat (login_id, LOWER(group_id))`); err != nil {
+		return fmt.Errorf("failed to create lower(group_id) index: %w", err)
+	}
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_lower_chat_id_idx
+		ON cloud_chat (login_id, LOWER(cloud_chat_id))`); err != nil {
+		return fmt.Errorf("failed to create lower(cloud_chat_id) index: %w", err)
 	}
 
 	return nil
@@ -551,8 +586,9 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			sender, is_from_me, text, subject, service, deleted,
 			tapback_type, tapback_target_guid, tapback_emoji,
 			attachments_json, date_read_ms, has_body,
+			reply_to_guid, reply_to_part,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -570,6 +606,13 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			attachments_json=excluded.attachments_json,
 			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
 			has_body=excluded.has_body,
+			-- Preserve a previously-captured reply if a later re-sync returns no
+			-- reply (msgProto2 is "always empty afaict??" upstream, so it may be
+			-- intermittently present). Gate on the GUID: reply_to_part can be a
+			-- legitimate "0"/empty for a text reply, so the GUID is the
+			-- authoritative "this is a reply" signal.
+			reply_to_guid=CASE WHEN excluded.reply_to_guid <> '' THEN excluded.reply_to_guid ELSE cloud_message.reply_to_guid END,
+			reply_to_part=CASE WHEN excluded.reply_to_guid <> '' THEN excluded.reply_to_part ELSE cloud_message.reply_to_part END,
 			updated_ts=excluded.updated_ts
 	`)
 	if err != nil {
@@ -585,6 +628,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
 			row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
 			row.AttachmentsJSON, row.DateReadMS, row.HasBody,
+			row.ReplyToGUID, row.ReplyToPart,
 			nowMS, nowMS,
 		)
 		if err != nil {
@@ -1905,6 +1949,26 @@ func (s *cloudBackfillStore) normalizeGroupChatPortalIDs(ctx context.Context) (i
 // UUID (before the getChatPortalID-first fix) instead of the group_id UUID.
 // Returns the number of rows updated.
 func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context) (int64, error) {
+	// The correlated UPDATE below seeks cloud_chat via the expression indexes
+	// cloud_chat_lower_group_id_idx / cloud_chat_lower_chat_id_idx. SQLite only
+	// picks the MULTI-INDEX OR plan (both LOWER() branches index-seeked) when it
+	// has stats for those indexes — with no sqlite_stat1 it falls back to a full
+	// cloud_chat scan PER group message (~40s on a heavily-grouped account, even
+	// when the UPDATE changes zero rows). The bridge runs no global ANALYZE, so
+	// refresh stats for this one small table (bounded by chat count, not message
+	// count) immediately before the query. ANALYZE bumps the schema cookie, so
+	// pooled connections pick up the new stats on their next statement. Measured:
+	// 9.8s -> 14ms with stats present. Guarded on non-empty so we never persist
+	// degenerate "0-row" stats (the empty-table-then-fill trap), and skipped work
+	// is harmless because an empty table makes the UPDATE a fast no-op anyway.
+	// ANALYZE failure is non-fatal: the UPDATE is still correct, just slower.
+	var hasChats bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1)`, s.loginID,
+	).Scan(&hasChats); err == nil && hasChats {
+		_, _ = s.db.Exec(ctx, `ANALYZE cloud_chat`)
+	}
+
 	// Find cloud_message rows with gid: portal_ids where the UUID matches
 	// a cloud_chat row's group_id but the portal_id doesn't match.
 	// Update them to use the canonical portal_id from cloud_chat.
@@ -2624,6 +2688,7 @@ const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestam
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
 	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
+	COALESCE(reply_to_guid, ''), COALESCE(reply_to_part, ''),
 	COALESCE(body_scrubbed, FALSE)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
@@ -2737,6 +2802,8 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.AttachmentsJSON,
 			&row.DateReadMS,
 			&row.HasBody,
+			&row.ReplyToGUID,
+			&row.ReplyToPart,
 			&row.BodyScrubbed,
 		); err != nil {
 			return nil, err
