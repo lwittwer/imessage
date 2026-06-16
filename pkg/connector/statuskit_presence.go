@@ -48,6 +48,17 @@ func statusKitRoomNameRepairValue(name string) string {
 	return statusKitRoomNameRepairValuePrefix + name
 }
 
+func needsAvailableStatusKitDMRoomNameRepair(portal *bridgev2.Portal) bool {
+	if portal == nil || portal.Portal == nil || portal.RoomType != database.RoomTypeDM || portal.NameIsCustom {
+		return false
+	}
+	// Only repair DMs that were actually blanked by an older available-state
+	// release. Pristine implicit DMs intentionally have no m.room.name state;
+	// stamping those on every StatusKit startup replay makes Element surface
+	// avoidable per-room alerts.
+	return portal.NameSet && portal.Name == ""
+}
+
 func encodeStatusKitPendingPresence(modeKey string, observedAt time.Time) string {
 	raw, _ := json.Marshal(statusKitPendingPresence{
 		Mode:       modeKey,
@@ -257,6 +268,9 @@ func (c *IMClient) repairAvailableStatusKitDMRoomNames(ctx context.Context, log 
 	repaired := 0
 	for _, portalID := range portalIDs {
 		portal := c.findPortalByID(ctx, portalID)
+		if !needsAvailableStatusKitDMRoomNameRepair(portal) {
+			continue
+		}
 		if name, ok := c.forceStampAvailableStatusKitDMRoomName(ctx, log, portal); ok {
 			c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), statusKitRoomNameRepairValue(name))
 			repaired++

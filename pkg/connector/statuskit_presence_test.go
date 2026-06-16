@@ -4,6 +4,9 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 )
 
 func TestStatusKitModeKey(t *testing.T) {
@@ -48,6 +51,79 @@ func TestStatusKitRoomNameRepairValueIncludesName(t *testing.T) {
 	}
 	if first != statusKitRoomNameRepairValuePrefix+"Lauren Thomas" {
 		t.Fatalf("unexpected repair marker %q", first)
+	}
+}
+
+func TestNeedsAvailableStatusKitDMRoomNameRepair(t *testing.T) {
+	tests := []struct {
+		name   string
+		portal *bridgev2.Portal
+		want   bool
+	}{
+		{
+			name: "nil portal",
+		},
+		{
+			name:   "nil embedded portal",
+			portal: &bridgev2.Portal{},
+		},
+		{
+			name: "implicit DM does not need repair",
+			portal: &bridgev2.Portal{
+				Portal: &database.Portal{
+					RoomType: database.RoomTypeDM,
+				},
+			},
+		},
+		{
+			name: "blanked DM needs repair",
+			portal: &bridgev2.Portal{
+				Portal: &database.Portal{
+					RoomType: database.RoomTypeDM,
+					NameSet:  true,
+					Name:     "",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "healthy named DM does not need repair",
+			portal: &bridgev2.Portal{
+				Portal: &database.Portal{
+					RoomType: database.RoomTypeDM,
+					NameSet:  true,
+					Name:     "Lauren Thomas",
+				},
+			},
+		},
+		{
+			name: "custom DM is owned by the normal title path",
+			portal: &bridgev2.Portal{
+				Portal: &database.Portal{
+					RoomType:     database.RoomTypeDM,
+					NameSet:      true,
+					NameIsCustom: true,
+					Name:         "",
+				},
+			},
+		},
+		{
+			name: "group does not need DM repair",
+			portal: &bridgev2.Portal{
+				Portal: &database.Portal{
+					RoomType: database.RoomTypeDefault,
+					NameSet:  true,
+					Name:     "",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsAvailableStatusKitDMRoomNameRepair(tt.portal); got != tt.want {
+				t.Fatalf("needsAvailableStatusKitDMRoomNameRepair() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

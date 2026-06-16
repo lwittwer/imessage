@@ -2075,7 +2075,7 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 	if portal.RoomType == database.RoomTypeDM {
 		if silenced {
 			c.Main.Bridge.DB.KV.Set(ctx, statusKitRoomNameRepairKey(portal.ID), "")
-		} else if !portal.NameIsCustom {
+		} else if needsAvailableStatusKitDMRoomNameRepair(portal) {
 			name := c.dmBaseName(ctx, portal)
 			if name != "" && c.Main.Bridge.DB.KV.Get(ctx, statusKitRoomNameRepairKey(portal.ID)) != statusKitRoomNameRepairValue(name) {
 				if stampedName, ok := c.forceStampAvailableStatusKitDMRoomName(ctx, log, portal); ok {
