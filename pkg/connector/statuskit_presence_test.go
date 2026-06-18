@@ -43,6 +43,36 @@ func TestStatusKitModeSilenced(t *testing.T) {
 	}
 }
 
+func TestStatusKitPresenceClockValue(t *testing.T) {
+	initial := time.Date(2026, 6, 17, 12, 0, 0, 123000000, time.UTC)
+	replay := initial.Add(30 * time.Minute)
+	available := initial.Add(2 * time.Hour)
+
+	stored, ok := statusKitPresenceClockValue("available", "Sleep", initial)
+	if !ok {
+		t.Fatal("available→Sleep transition did not request a clock write")
+	}
+	if want := "1781697600123"; stored != want {
+		t.Fatalf("initial clock value = %q, want %q", stored, want)
+	}
+
+	if value, ok := statusKitPresenceClockValue("Sleep", "Sleep", replay); ok {
+		stored = value
+	}
+	if want := "1781697600123"; stored != want {
+		t.Fatalf("same-mode replay changed stored clock to %q, want unchanged %q", stored, want)
+	}
+
+	if value, ok := statusKitPresenceClockValue("Sleep", "available", available); ok {
+		stored = value
+	} else {
+		t.Fatal("Sleep→available transition did not request a clock write")
+	}
+	if want := "1781704800123"; stored != want {
+		t.Fatalf("available transition clock value = %q, want %q", stored, want)
+	}
+}
+
 func TestStatusKitRoomNameRepairValueIncludesName(t *testing.T) {
 	first := statusKitRoomNameRepairValue("Lauren Thomas")
 	second := statusKitRoomNameRepairValue("Lauren T.")
