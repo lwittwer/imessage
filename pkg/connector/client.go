@@ -1999,14 +1999,15 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 		log.Debug().Str("portal_id", string(portal.ID)).Str("mode", modeKey).Time("observed_at", observedAt).Time("latest_observed_at", latest).Msg("StatusKit: stale presence ignored")
 		return false
 	}
-	c.touchPresenceAt(ctx, portal.ID)
-
 	previousMode, _ := c.statusKitPresenceByPortal.Load(portal.ID)
 	previousModeStr, _ := previousMode.(string)
 	if previousModeStr == "" {
 		previousModeStr = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitPresencePortalKeyPrefix+string(portal.ID)))
 	}
 	sameMode := previousModeStr == modeKey
+	if clockValue, ok := statusKitPresenceClockValue(previousModeStr, modeKey, observedAt); ok {
+		c.touchPresenceAt(ctx, portal.ID, clockValue)
+	}
 
 	c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
 	c.statusKitPresenceSeenByPortal.Store(portal.ID, observedAt)
@@ -2087,46 +2088,43 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 	return true
 }
 
-// presenceMoonTTL is how long a silenced (Focus/DND) state survives without
-// being re-confirmed by a freshly-decrypted presence event before isPortalSilenced
-// treats it as STALE and clears the 🌙. This self-heals "stuck moons": when a peer
-// rotates their StatusKit key and we can no longer decrypt their "now available"
-// update, the persisted focus mode would otherwise pin the moon forever. 16h is
-// comfortably longer than any normal Focus (Sleep ~8–10h, Work ~9h) so a genuine
-// DND is never prematurely cleared — only a state we've stopped hearing about.
+// presenceMoonTTL is how long a silenced (Focus/DND) state survives after the
+// last processed mode transition before isPortalSilenced treats it as STALE and
+// clears the 🌙. This self-heals "stuck moons": when a peer rotates their
+// StatusKit key and we can no longer decrypt their "now available" update, the
+// persisted focus mode would otherwise pin the moon forever. 16h is comfortably
+// longer than any normal Focus (Sleep ~8–10h, Work ~9h) so a genuine DND is
+// rarely cleared prematurely — only a state that has not transitioned.
 const presenceMoonTTL = 16 * time.Hour
 
-// presenceAtRefreshThrottle bounds how often touchPresenceAt writes the freshness
-// timestamp to KV, so a single presence change fanned across a peer's N aliases
-// doesn't write N times.
-const presenceAtRefreshThrottle = 5 * time.Minute
-
 // presenceAtKey is the KV key holding the unix-millis timestamp of the last
-// successfully-processed presence event for a portal — the freshness clock the
-// moon-TTL reads.
+// successfully-processed presence mode transition for a portal — the freshness
+// clock the moon-TTL reads.
 func presenceAtKey(portalID networkid.PortalID) database.Key {
 	return database.Key("statuskit.presence.portal." + string(portalID) + ".at")
 }
 
-// touchPresenceAt refreshes the moon-TTL freshness clock for this portal. It
-// fires when a presence event reaches portal-level processing — i.e. a state
-// CHANGE (the handle-level dedup at the top of OnStatusUpdate, ~line 1829, lets
-// changes through) — so the clock tracks "time of last state change we processed"
-// for this peer. Same-state re-deliveries caught by that earlier handle dedup do
-// NOT reach here, so the TTL measures time-since-last-change, not time-since-last-
-// heard. That's the right signal for the bug we're fixing: a stuck moon is a
-// missed "now available" transition, which leaves the clock frozen at the DND-on
-// change and clears at TTL. Known tradeoff: a genuinely continuous Focus lasting
-// >presenceMoonTTL also clears (rare; self-corrects on the peer's next change).
-// Throttled to avoid KV churn on alias fan-out.
-func (c *IMClient) touchPresenceAt(ctx context.Context, portalID networkid.PortalID) {
-	key := presenceAtKey(portalID)
-	if raw := c.Main.Bridge.DB.KV.Get(ctx, key); raw != "" {
-		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && time.Since(time.UnixMilli(ms)) < presenceAtRefreshThrottle {
-			return
-		}
+// statusKitPresenceClockValue returns the KV value to write for the moon-TTL
+// freshness clock on a mode transition. Same-mode StatusKit replays must not
+// extend the clock: if the bridge missed the later "available" transition,
+// replayed stale "silenced" events would otherwise keep a stuck moon alive
+// indefinitely.
+func statusKitPresenceClockValue(previousMode, modeKey string, observedAt time.Time) (string, bool) {
+	if previousMode == modeKey {
+		return "", false
 	}
-	c.Main.Bridge.DB.KV.Set(ctx, key, strconv.FormatInt(time.Now().UnixMilli(), 10))
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	return strconv.FormatInt(observedAt.UnixMilli(), 10), true
+}
+
+// touchPresenceAt refreshes the moon-TTL freshness clock for this portal with
+// a transition timestamp. Same-mode StatusKit replays must not call this:
+// if the bridge missed the later "available" transition, replayed stale
+// "silenced" events would otherwise keep a stuck moon alive indefinitely.
+func (c *IMClient) touchPresenceAt(ctx context.Context, portalID networkid.PortalID, clockValue string) {
+	c.Main.Bridge.DB.KV.Set(ctx, presenceAtKey(portalID), clockValue)
 }
 
 // isPortalSilenced reports whether the peer of the given DM portal currently
