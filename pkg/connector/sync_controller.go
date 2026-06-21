@@ -1697,7 +1697,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		// name diff-gate was stale.
 		//
 		// Gating on name alone left identifier/avatar drift unhealed forever for
-		// already-named contacts: a malformed "tel:(845) 536-4690" baked in by an
+		// already-named contacts: a malformed "tel:(XXX) XXX-XXXX" baked in by an
 		// earlier bug, or a photo that finished downloading on a later sync, would
 		// only recover on the contact's next inbound message (UpdateInfoIfNecessary)
 		// or a full client re-login. Reconciling unconditionally makes both

@@ -7416,8 +7416,8 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 		// Emit normalized, deduped identifiers. The raw vCard phone strings
 		// carry display formatting straight from the address book (e.g.
-		// "(845) 536-4690"); concatenating "tel:"+phone ships a malformed
-		// "tel:(845) 536-4690" URI (spaces + parens) that the client can't
+		// "(XXX) XXX-XXXX"); concatenating "tel:"+phone ships a malformed
+		// "tel:(XXX) XXX-XXXX" URI (spaces + parens) that the client can't
 		// parse as a phone number, so the contact renders with no number.
 		// contactPortalIDs() already produces clean E.164 tel: / lowercased
 		// mailto: IDs and dedupes them — reuse it instead of re-deriving here.
