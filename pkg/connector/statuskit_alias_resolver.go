@@ -456,7 +456,19 @@ func (c *IMClient) forgetAliasPortal(ctx context.Context, alias string) {
 		return
 	}
 	c.statusKitPortalCache.Delete(alias)
-	c.Main.Bridge.DB.KV.Set(ctx, statusKitAliasPortalKey(alias), "")
+	c.deleteStatusKitAliasPortal(ctx, statusKitAliasPortalKey(alias))
+}
+
+func (c *IMClient) deleteStatusKitAliasPortal(ctx context.Context, key database.Key) {
+	_, err := c.Main.Bridge.DB.Exec(
+		ctx,
+		"DELETE FROM kv_store WHERE bridge_id=$1 AND key=$2",
+		c.Main.Bridge.DB.BridgeID,
+		key,
+	)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("key", string(key)).Msg("Failed to delete StatusKit alias portal cache entry")
+	}
 }
 
 func (c *IMClient) aliasPortalCacheChanged(alias string, portalID networkid.PortalID) bool {
@@ -482,8 +494,8 @@ func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolo
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration query failed")
 		return
 	}
-	defer rows.Close()
 	loaded := 0
+	var deleteKeys []database.Key
 	for rows.Next() {
 		var key, value string
 		if err := rows.Scan(&key, &value); err != nil {
@@ -494,11 +506,17 @@ func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolo
 		}
 		alias := strings.TrimPrefix(key, statusKitAliasPortalKeyPrefix)
 		if c.isStatusKitSelfAlias(alias) || c.isStatusKitSelfAlias(value) {
-			c.Main.Bridge.DB.KV.Set(ctx, database.Key(key), "")
+			deleteKeys = append(deleteKeys, database.Key(key))
 			continue
 		}
 		c.statusKitPortalCache.Store(alias, networkid.PortalID(value))
 		loaded++
+	}
+	if err := rows.Close(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration close failed")
+	}
+	for _, key := range deleteKeys {
+		c.deleteStatusKitAliasPortal(ctx, key)
 	}
 	if err := rows.Err(); err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration row iteration error")
