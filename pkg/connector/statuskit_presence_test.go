@@ -191,3 +191,30 @@ func TestStatusKitAliasVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusKitSelfAliasUsesNormalizedRegisteredHandles(t *testing.T) {
+	client := &IMClient{
+		allHandles: []string{
+			"mailto:LucasWittwer@iCloud.com",
+			"+17082801739",
+		},
+	}
+
+	selfAliases := []string{
+		"mailto:lucaswittwer@icloud.com",
+		"LucasWittwer@iCloud.com",
+		"tel:+17082801739",
+		"+17082801739",
+	}
+	for _, alias := range selfAliases {
+		if !client.isStatusKitSelfAlias(alias) {
+			t.Fatalf("expected %q to be treated as a StatusKit self alias", alias)
+		}
+	}
+
+	for _, alias := range []string{"mailto:friend@example.com", "tel:+15551234567"} {
+		if client.isStatusKitSelfAlias(alias) {
+			t.Fatalf("did not expect %q to be treated as a StatusKit self alias", alias)
+		}
+	}
+}
