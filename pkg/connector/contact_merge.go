@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,7 +23,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // resolveContactPortalID checks if the given DM identifier belongs to a contact

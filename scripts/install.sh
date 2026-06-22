@@ -46,11 +46,11 @@ else
 
     if [ "$DB_CHOICE" = "1" ]; then
         DB_TYPE="postgres"
-        read -p "PostgreSQL URI [postgres://localhost/mautrix_imessage?sslmode=disable]: " DB_URI
-        DB_URI="${DB_URI:-postgres://localhost/mautrix_imessage?sslmode=disable}"
+        read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
+        DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
         DB_TYPE="sqlite3-fk-wal"
-        DB_URI="file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate"
+        DB_URI="file:$DATA_DIR/corten-matrix.db?_txlock=immediate"
     fi
 
     echo ""
@@ -489,7 +489,7 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
 # Trust-circle only applies to CloudKit backfill — chatdb never creates
@@ -540,62 +540,8 @@ _SHORTCUT_DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 _SHORTCUT_LOG_OUT="$_SHORTCUT_DATA_ABS/bridge.stdout.log"
 
 echo ""
-echo "Want easy commands you can type from any terminal to control the bridge?"
-echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
-read -r -p "Add them? [y/N]: " _shortcut_ans
-case "$_shortcut_ans" in
-    [yY]|[yY][eE][sS])
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
-        else
-            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-                awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                    $0 == s { skip = 1; next }
-                    $0 == e { skip = 0; next }
-                    !skip   { print }
-                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            fi
-            cat >> "$RC_FILE" <<EOF
-$MARKER_START
-alias start-imessage='launchctl bootstrap gui/\$(id -u) $PLIST'
-alias stop-imessage='launchctl bootout gui/\$(id -u)/$BUNDLE_ID'
-alias restart-imessage='launchctl kickstart -k gui/\$(id -u)/$BUNDLE_ID'
-alias imessage-log='tail -f $_SHORTCUT_LOG_OUT'
-$MARKER_END
-EOF
-            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
-            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
-        fi
-        ;;
-    *)
-        # User declined. If a previous run installed shortcuts, treat the
-        # decline as "remove them" so the rc file matches the user's choice.
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-            awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                $0 == s { skip = 1; next }
-                $0 == e { skip = 0; next }
-                !skip   { print }
-            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            echo "  Removed previously-installed shortcuts from $RC_FILE."
-        else
-            echo "  Skipped — re-run this installer to add them later."
-        fi
-        ;;
-esac
+echo ""
+echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
 echo ""
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
@@ -967,3 +913,15 @@ echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
 echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
 echo ""
 
+
+# ── Add to PATH (optional; symlink only, no shell-rc edits) ────
+if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
+    printf "\nAdd 'corten-matrix' to your PATH (symlink in /usr/local/bin)? [Y/n]: "
+    read ADD_PATH
+    case "$ADD_PATH" in
+        [nN]*) ;;
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+             && echo "OK - corten-matrix added to PATH" \
+             || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
+    esac
+fi

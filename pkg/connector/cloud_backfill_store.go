@@ -92,7 +92,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	// DB and would block writes for the duration on a large backlog).
 	// secure_delete is a PER-CONNECTION setting that is NOT persisted in the
 	// DB file, so it is set via the _secure_delete DSN param in
-	// ensureSecureDeleteDSN (cmd/mautrix-imessage/main.go) — that applies it
+	// ensureSecureDeleteDSN (cmd/corten-matrix/main.go) — that applies it
 	// on every pooled connection, which a one-shot PRAGMA here could not do
 	// (the pool hands scrub writes to arbitrary connections). Self-hosters who
 	// want immediate page reclamation can run `sqlite3 bridge.db "VACUUM;"`
@@ -309,30 +309,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
 		ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
 		return fmt.Errorf("failed to create group_id index: %w", err)
-	}
-
-	// Expression indexes for normalizeGroupMessagePortalIDs' correlated subquery,
-	// which matches cloud_message.portal_id suffixes against cloud_chat via
-	// LOWER(group_id) / LOWER(cloud_chat_id). A plain (login_id, group_id) index
-	// cannot serve a LOWER(col) predicate, so without these the normalize falls
-	// back to a full cloud_chat scan PER group message — ~41s on every startup of
-	// a heavily-grouped account even when it changes zero rows. With them the
-	// correlated lookup becomes an index seek (measured 9.8s -> 14ms on a
-	// 1500-chat / 20k-message no-op profile). Purely additive: the UPDATE's
-	// results are unchanged, only its access path. Valid on both SQLite (>=3.9)
-	// and Postgres; LOWER() is deterministic/immutable on both.
-	//
-	// NOTE: these indexes are INERT without query-planner stats — on a fresh DB
-	// with no sqlite_stat1 SQLite ignores them and still full-scans. The required
-	// `ANALYZE cloud_chat` is run by normalizeGroupMessagePortalIDs right before
-	// its UPDATE (the table is populated by then); see that function.
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_lower_group_id_idx
-		ON cloud_chat (login_id, LOWER(group_id))`); err != nil {
-		return fmt.Errorf("failed to create lower(group_id) index: %w", err)
-	}
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_lower_chat_id_idx
-		ON cloud_chat (login_id, LOWER(cloud_chat_id))`); err != nil {
-		return fmt.Errorf("failed to create lower(cloud_chat_id) index: %w", err)
 	}
 
 	return nil
@@ -1862,26 +1838,6 @@ func (s *cloudBackfillStore) normalizeGroupChatPortalIDs(ctx context.Context) (i
 // UUID (before the getChatPortalID-first fix) instead of the group_id UUID.
 // Returns the number of rows updated.
 func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context) (int64, error) {
-	// The correlated UPDATE below seeks cloud_chat via the expression indexes
-	// cloud_chat_lower_group_id_idx / cloud_chat_lower_chat_id_idx. SQLite only
-	// picks the MULTI-INDEX OR plan (both LOWER() branches index-seeked) when it
-	// has stats for those indexes — with no sqlite_stat1 it falls back to a full
-	// cloud_chat scan PER group message (~40s on a heavily-grouped account, even
-	// when the UPDATE changes zero rows). The bridge runs no global ANALYZE, so
-	// refresh stats for this one small table (bounded by chat count, not message
-	// count) immediately before the query. ANALYZE bumps the schema cookie, so
-	// pooled connections pick up the new stats on their next statement. Measured:
-	// 9.8s -> 14ms with stats present. Guarded on non-empty so we never persist
-	// degenerate "0-row" stats (the empty-table-then-fill trap), and skipped work
-	// is harmless because an empty table makes the UPDATE a fast no-op anyway.
-	// ANALYZE failure is non-fatal: the UPDATE is still correct, just slower.
-	var hasChats bool
-	if err := s.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1)`, s.loginID,
-	).Scan(&hasChats); err == nil && hasChats {
-		_, _ = s.db.Exec(ctx, `ANALYZE cloud_chat`)
-	}
-
 	// Find cloud_message rows with gid: portal_ids where the UUID matches
 	// a cloud_chat row's group_id but the portal_id doesn't match.
 	// Update them to use the canonical portal_id from cloud_chat.

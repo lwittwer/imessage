@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.lrhodin.mautrix-imessage</string>
+    <string>com.lrhodin.corten-matrix</string>
     <key>CFBundleName</key>
-    <string>mautrix-imessage</string>
+    <string>corten-matrix</string>
     <key>CFBundleDisplayName</key>
     <string>iMessage Bridge</string>
     <key>CFBundleExecutable</key>
-    <string>mautrix-imessage-v2</string>
+    <string>corten-matrix</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -23,6 +23,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSContactsUsageDescription</key>
-    <string>mautrix-imessage needs access to your contacts to display names for bridged iMessage conversations.</string>
+    <string>corten-matrix needs access to your contacts to display names for bridged iMessage conversations.</string>
 </dict>
 </plist>

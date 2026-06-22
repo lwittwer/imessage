@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // Cloud-based contact sync via Apple's CardDAV (iCloud Contacts).
@@ -21,8 +21,8 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/lrhodin/imessage/imessage"
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // contactSource is the interface for contact name resolution.

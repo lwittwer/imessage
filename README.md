@@ -1,6 +1,6 @@
-# Corten-Matrix
+# Rustpush-Matrix
 
-A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
+A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix client.
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
 
@@ -15,9 +15,9 @@ macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the b
 ### With Beeper
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
-make install-beeper
+corten-matrix setup-beeper
 ```
 
 The installer handles everything: Homebrew, dependencies, building, Beeper login, iMessage login, config, and LaunchAgent setup.
@@ -25,12 +25,12 @@ The installer handles everything: Homebrew, dependencies, building, Beeper login
 ### With a Self-Hosted Homeserver
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
-make install
+corten-matrix setup
 ```
 
-The installer auto-installs Homebrew and dependencies if needed, walks you through homeserver URL / domain / Matrix ID / database choice and a few feature toggles (CloudKit backfill, FaceTime Bridge, StatusKit notifications, external CardDAV, HEIC conversion, video transcoding), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge. You can re-run `make install` any time to flip these toggles without wiping your data — see [Reconfiguring without editing YAML](#reconfiguring-without-editing-yaml).
+The installer auto-installs Homebrew and dependencies if needed, walks you through homeserver URL / domain / Matrix ID / database choice and a few feature toggles (CloudKit backfill, FaceTime Bridge, StatusKit notifications, external CardDAV, HEIC conversion, video transcoding), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge. You can re-run `corten-matrix setup` any time to flip these toggles without wiping your data — see [Reconfiguring without editing YAML](#reconfiguring-without-editing-yaml).
 
 ## Quick Start (Linux)
 
@@ -54,10 +54,10 @@ Pick one extraction option:
 
 **Option A: GUI app (recommended, macOS 10.15+ Catalina)**
 
-Download the pre-built `ExtractKey.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build it yourself on any Mac (Intel or Apple Silicon):
+Download the pre-built `ExtractKey.app.zip` from the [1.0.0 release](https://github.com/lrhodin/corten-matrix/releases/tag/1.0.0), or build it yourself on any Mac (Intel or Apple Silicon):
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage/tools/extract-key-app
 ./build.sh
 ```
@@ -73,7 +73,7 @@ Either way, copy `ExtractKey.app` to the Intel Mac and double-click it. The app 
 **Option B: CLI (macOS 13+ with Go)**
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
 go run tools/extract-key/main.go
 ```
@@ -84,7 +84,7 @@ The CLI extractor uses CGO with macOS frameworks (Foundation, IOKit, DiskArbitra
 
 ```bash
 # On the older Mac:
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage/tools/extract-key
 ./build.sh
 ./extract-key
@@ -117,7 +117,7 @@ Run the NAC relay — a small HTTP server on the Mac that generates Apple valida
 
 **Option 1: GUI app (recommended)**
 
-Download the pre-built `NACRelay.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build the menubar app yourself — it bundles the relay, key extraction, and status monitoring in one place:
+Download the pre-built `NACRelay.app.zip` from the [1.0.0 release](https://github.com/lrhodin/corten-matrix/releases/tag/1.0.0), or build the menubar app yourself — it bundles the relay, key extraction, and status monitoring in one place:
 
 ```bash
 cd tools/nac-relay-app
@@ -160,24 +160,24 @@ If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to y
 #### With Beeper
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
-make install-beeper
+corten-matrix setup-beeper
 ```
 
 #### With a Self-Hosted Homeserver
 
 ```bash
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
-make install
+corten-matrix setup
 ```
 
 On first run expect ~3 minutes for the Rust library to compile.
 
 ### Step 3: Login
 
-`make install` / `make install-beeper` detects that no login exists and runs the bridge's `login` subcommand inline at the end of Step 2. You're prompted right there in the terminal for:
+`corten-matrix setup` / `corten-matrix setup-beeper` detects that no login exists and runs the bridge's `login` subcommand inline at the end of Step 2. You're prompted right there in the terminal for:
 
 1. Your hardware key (paste the base64 from Step 1)
 2. Your Apple ID and password
@@ -189,19 +189,19 @@ When the script finishes you're already logged in and the bridge is up.
 
 ## Quick Start (Docker, Linux only)
 
-> **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
+> **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `corten-matrix setup` / `corten-matrix setup-beeper`.
 
-The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/imessage` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`) — install via Docker's official docs at <https://get.docker.com> if you don't have it yet. Plus a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/corten-matrix` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/corten-matrix` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`) — install via Docker's official docs at <https://get.docker.com> if you don't have it yet. Plus a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
 
 ### Install
 
 ```bash
 # 1. Install the host CLI (drops `imessage` at /usr/local/bin, on PATH by default).
-curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/lrhodin/corten-matrix/master/scripts/install-imessage.sh | sudo bash
 
 # 2. Pick a directory you'll keep docker-compose.yml in (~/docker/imessage/, /srv/imessage/, etc.).
 #    From inside it, drop in the example compose file:
-curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/lrhodin/corten-matrix/master/docker-compose.example.yml -o docker-compose.yml
 
 # 3. Edit it (see "Configuring docker-compose.yml" below).
 
@@ -217,7 +217,7 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 
 > **Want to read the installer before running it?** Sensible — `curl | bash` is a trust call. Download and inspect first:
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh -o install-imessage.sh
+> curl -fsSL https://raw.githubusercontent.com/lrhodin/corten-matrix/master/scripts/install-imessage.sh -o install-imessage.sh
 > less install-imessage.sh
 > sudo bash install-imessage.sh
 > ```
@@ -225,13 +225,13 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 > **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` — forces a fresh edge fetch:
 > ```bash
 > # The installer (Step 1 command, cache-busted):
-> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh?nocache=$(date +%s)" | bash
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/corten-matrix/master/scripts/install-imessage.sh?nocache=$(date +%s)" | bash
 >
 > # The imessage wrapper directly, skipping install-imessage.sh:
-> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage?nocache=$(date +%s)" -o /usr/local/bin/imessage && chmod +x /usr/local/bin/imessage
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/corten-matrix/master/scripts/imessage?nocache=$(date +%s)" -o /usr/local/bin/imessage && chmod +x /usr/local/bin/imessage
 >
 > # The compose example (Step 2 command, cache-busted):
-> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml?nocache=$(date +%s)" -o docker-compose.yml
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/corten-matrix/master/docker-compose.example.yml?nocache=$(date +%s)" -o docker-compose.yml
 > ```
 > Same trick works for any `raw.githubusercontent.com` URL: append `?nocache=$(date +%s)`.
 
@@ -240,11 +240,11 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 One required edit, one platform-dependent, one optional:
 
 1. **`BEEPER` env var** *(required)* — `"true"` for Beeper, `"false"` for self-hosted.
-2. **The bind mounts under `volumes:`** *(only if you're not on standard Linux)*. Defaults to `${HOME}/.local/share/mautrix-imessage` → `/data` (bridge state — `config.yaml`, DB, session, trustedpeers) and `${HOME}/.config/bbctl` → `/home/bridge/.config/bbctl` (bbctl Beeper auth). The bridge-state path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migration is no-copy.
+2. **The bind mounts under `volumes:`** *(only if you're not on standard Linux)*. Defaults to `${HOME}/.local/share/corten-matrix` → `/data` (bridge state — `config.yaml`, DB, session, trustedpeers) and `${HOME}/.config/bbctl` → `/home/bridge/.config/bbctl` (bbctl Beeper auth). The bridge-state path matches bare-Linux's `~/.local/share/corten-matrix/`, so migration is no-copy.
 
    | Platform | Bridge state path | bbctl path |
    |---|---|---|
-   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bbctl` |
+   | Standard Linux | `~/.local/share/corten-matrix` | `~/.config/bbctl` |
    | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
@@ -278,7 +278,7 @@ The `imessage` CLI is a thin wrapper — every subcommand maps to a small `docke
 The image's `USER` is unset — PID 1 enters the entrypoint as root. A small root prelude runs, all steps conditional on detection (so subsequent starts are no-ops):
 
 1. **Chowns bind-mount targets to `PUID:PGID`** — only if `find -quit` spots a mismatched file.
-2. **Creates a host-path symlink** from the bind mount's host source path inside the container → `/data`. Lets absolute paths from a bare-Linux install (e.g. `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db` baked into `config.yaml`) resolve when running in Docker. Skipped if the symlink already points where it should.
+2. **Creates a host-path symlink** from the bind mount's host source path inside the container → `/data`. Lets absolute paths from a bare-Linux install (e.g. `uri: file:/root/.local/share/corten-matrix/corten-matrix.db` baked into `config.yaml`) resolve when running in Docker. Skipped if the symlink already points where it should.
 3. **Adds `o+x` to each ancestor of the symlink** so `PUID` can traverse them — `/root` ships at `0700` in the base image, so without this the kernel denies the path walk before SQLite ever opens the file.
 4. **`setpriv`s to `PUID:PGID`** and re-execs itself. From there, the bridge runs as the configured non-root user.
 
@@ -291,8 +291,8 @@ The bind-mount layout matches the bare-Linux paths, so migration in either direc
 **Bare-Linux → Docker:**
 
 ```bash
-systemctl --user stop mautrix-imessage
-systemctl --user disable mautrix-imessage    # optional: don't restart on reboot
+systemctl --user stop corten-matrix
+systemctl --user disable corten-matrix    # optional: don't restart on reboot
 ```
 
 Then follow the Docker setup above keeping the default bind-mount source. **Skip `imessage setup`** — your existing `config.yaml` is already in place. `imessage start` is enough: the entrypoint chowns the existing files, symlinks the host path to `/data` so the absolute DB URI in `config.yaml` resolves unchanged, and opens traversal on the ancestors. No config edits, no re-login.
@@ -302,9 +302,9 @@ Then follow the Docker setup above keeping the default bind-mount source. **Skip
 ```bash
 imessage stop
 docker compose down
-git clone https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/corten-matrix.git
 cd imessage
-make install          # or make install-beeper
+corten-matrix setup          # or corten-matrix setup-beeper
 ```
 
 Run the install **as the user that owns the bind-mount files**. The installer detects the existing `config.yaml` + DB, skips the iMessage login step, writes the systemd unit, and starts the bridge against the same state.
@@ -313,15 +313,15 @@ If the bare-Linux user's `$HOME` differs from the one Docker ran under (e.g. Doc
 
 ```bash
 # Move the state dir to match the new $HOME:
-sudo mv /root/.local/share/mautrix-imessage ~/.local/share/
-sudo chown -R $(id -u):$(id -g) ~/.local/share/mautrix-imessage
+sudo mv /root/.local/share/corten-matrix ~/.local/share/
+sudo chown -R $(id -u):$(id -g) ~/.local/share/corten-matrix
 ```
 
 …or rewrite the DB `uri:` lines to relative paths so they resolve against the data dir regardless of host:
 
 ```bash
-sed -i 's|file:/root/.local/share/mautrix-imessage/|file:|g; s|sqlite:/root/.local/share/mautrix-imessage/|sqlite:|g' \
-    ~/.local/share/mautrix-imessage/config.yaml
+sed -i 's|file:/root/.local/share/corten-matrix/|file:|g; s|sqlite:/root/.local/share/corten-matrix/|sqlite:|g' \
+    ~/.local/share/corten-matrix/config.yaml
 ```
 
 ### Apple Silicon NAC relay (Docker)
@@ -335,7 +335,7 @@ If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches
 - **Container restarts in a loop** — `imessage logs` shows the actual error. The entrypoint chowns and symlinks on every start where they're not already right, so persistent permission errors usually mean either (a) the bind mount itself isn't writable by root (read-only fs, immutable bits, SELinux/AppArmor) or (b) the bridge is failing for unrelated reasons.
 - **`unable to open database file: permission denied`** — config.yaml URI path doesn't match your bind-mount source. The entrypoint handles the common case (host bind source = path baked into config). You only need to edit `config.yaml` if you copied state from another machine. The fix is to make each `uri:` line relative:
   ```yaml
-  uri: file:mautrix-imessage.db
+  uri: file:corten-matrix.db
   ```
   The bridge resolves relative paths against its working directory (`/data`). Stop the container, edit, start again — state files don't need to move.
 - **Bridge starts but doesn't show up in your homeserver** — `imessage logs` should show the appservice connecting. If it doesn't: on Beeper, re-run `imessage setup`. Self-hosted, confirm the bridge's `as_token`/`hs_token` and namespace from `<bind-mount>/registration.yaml` are loaded by your homeserver and that the homeserver URL in `config.yaml` is reachable from inside the container.
@@ -345,7 +345,7 @@ If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches
 
 There are two ways to log in:
 
-- **Through the install script (default).** `make install` and `make install-beeper` detect a missing login and run `mautrix-imessage-v2 login` inline at the end of the install. This is the path almost everyone uses — answer the prompts in the terminal and you're done.
+- **Through the install script (default).** `corten-matrix setup` and `corten-matrix setup-beeper` detect a missing login and run `corten-matrix login` inline at the end of the install. This is the path almost everyone uses — answer the prompts in the terminal and you're done.
 - **Through the bridge bot (alternative).** DM the bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow. Useful if you skipped the script's login step, want to switch handles, or are re-logging without re-running install.
 
 Either path follows the same prompts: Apple ID → password → 2FA (if needed) → handle selection. On macOS, if the Mac is signed into iCloud with the same Apple ID, login completes without 2FA.
@@ -447,7 +447,7 @@ A full list lives under `!im help` in the **FaceTime** section.
 
 ### Display name on join links
 
-The name pre-filled on the FaceTime web join page comes from your Apple Account. To override it, set `facetime_display_name` in `~/.local/share/mautrix-imessage/config.yaml`.
+The name pre-filled on the FaceTime web join page comes from your Apple Account. To override it, set `facetime_display_name` in `~/.local/share/corten-matrix/config.yaml`.
 
 ### Caller identity on the recipient's screen (the `temp:` UUID)
 
@@ -461,7 +461,7 @@ Removing the `temp:<uuid>` entirely would mean replacing or pruning the browser 
 
 ### Opting out
 
-If you have a Mac or iPhone signed into the same Apple ID, FaceTime rings there natively — the bridge's web-join wrapper adds nothing, so you should disable it. The `make install` / `make install-beeper` scripts ask "Disable FaceTime Bridge?" both on first install and on every subsequent re-run, so you can flip this at any time without editing YAML by hand. (You can also set `disable_facetime: true` in `~/.local/share/mautrix-imessage/config.yaml` directly.) Disabling skips every `facetime-*` command and suppresses all inbound FaceTime notices in your Matrix portals.
+If you have a Mac or iPhone signed into the same Apple ID, FaceTime rings there natively — the bridge's web-join wrapper adds nothing, so you should disable it. The `corten-matrix setup` / `corten-matrix setup-beeper` scripts ask "Disable FaceTime Bridge?" both on first install and on every subsequent re-run, so you can flip this at any time without editing YAML by hand. (You can also set `disable_facetime: true` in `~/.local/share/corten-matrix/config.yaml` directly.) Disabling skips every `facetime-*` command and suppresses all inbound FaceTime notices in your Matrix portals.
 
 ## Focus & Do Not Disturb
 
@@ -474,7 +474,7 @@ When a contact toggles a Focus mode (Do Not Disturb, Sleep, Work, etc.) on iOS 1
 
 This is the closest analog to the moon Apple shows next to a name. The bridge announces itself as "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their subsequent presence updates — leave `statuskit_share_on_startup: true` for the best chance of seeing contacts' Focus state.
 
-If you'd rather not see the indicator (or you already track Focus on another Apple device), the install scripts ask "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/mautrix-imessage/config.yaml`.) Disabling suppresses the 🌙 indicator and presence updates while keeping the underlying StatusKit registration intact.
+If you'd rather not see the indicator (or you already track Focus on another Apple device), the install scripts ask "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/corten-matrix/config.yaml`.) Disabling suppresses the 🌙 indicator and presence updates while keeping the underlying StatusKit registration intact.
 
 ## Shared Albums
 
@@ -533,12 +533,12 @@ On Linux, NAC validation uses one of two paths:
 ```mermaid
 flowchart TB
     subgraph macos["macOS"]
-        HS1[Homeserver] -- appservice --> Bridge1[mautrix-imessage]
+        HS1[Homeserver] -- appservice --> Bridge1[corten-matrix]
         Bridge1 -- FFI --> RP1[rustpush]
         RP1 -- IOKit/AAAbsinthe --> NAC1[Local NAC]
     end
     subgraph linux["Linux"]
-        HS2[Homeserver] -- appservice --> Bridge2[mautrix-imessage]
+        HS2[Homeserver] -- appservice --> Bridge2[corten-matrix]
         Bridge2 -- FFI --> RP2[rustpush]
         RP2 -- unicorn-engine --> NAC2[open-absinthe]
         RP2 -. "Apple Silicon key (HTTPS + token)" .-> Relay[NAC Relay on Mac]
@@ -560,14 +560,14 @@ flowchart TB
 
 **Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
 
-**CloudKit backfill** (optional, off by default) syncs your iMessage history from iCloud on first login. Enable it during `make install` or by setting `cloudkit_backfill: true` in config. When enabled, the login flow will ask for your device PIN to join the iCloud Keychain trust circle, which grants access to Messages in iCloud.
+**CloudKit backfill** (optional, off by default) syncs your iMessage history from iCloud on first login. Enable it during `corten-matrix setup` or by setting `cloudkit_backfill: true` in config. When enabled, the login flow will ask for your device PIN to join the iCloud Keychain trust circle, which grants access to Messages in iCloud.
 
 On the **first** install (before the bridge database exists), the install script asks whether you want to cap messages per chat:
 
 - Answer **no** and every available message is backfilled.
 - Answer **yes** and pick a per-chat limit (minimum 100).
 
-The cap can't be changed on later re-runs once the database is in place — edit `~/.local/share/mautrix-imessage/config.yaml` directly to change it.
+The cap can't be changed on later re-runs once the database is in place — edit `~/.local/share/corten-matrix/config.yaml` directly to change it.
 
 ## Privacy
 
@@ -616,22 +616,22 @@ At the end of every install run, the installer offers to drop four aliases into 
 | `restart-imessage` | Restart the bridge |
 | `imessage-log` | Tail the live bridge log |
 
-The prompt defaults to **no** — answer `y` to install. The aliases are wrapped in a marker comment block (`# >>> mautrix-imessage shortcuts (managed) >>>` … `# <<< mautrix-imessage shortcuts (managed) <<<`), so re-running an installer and answering `y` replaces (rather than duplicates) the entries. If you skipped them on first install, just re-run and say `y`. To remove them later, delete the marker block from your `~/.zshrc` or `~/.bashrc` by hand — the installer doesn't have an "uninstall aliases" path. Bash and Zsh are auto-detected from `$SHELL`; other shells get a clean skip message. After install, open a new terminal — or `source ~/.zshrc` (or `~/.bashrc`) in your current one — to pick the aliases up.
+The prompt defaults to **no** — answer `y` to install. The aliases are wrapped in a marker comment block (`# >>> corten-matrix shortcuts (managed) >>>` … `# <<< corten-matrix shortcuts (managed) <<<`), so re-running an installer and answering `y` replaces (rather than duplicates) the entries. If you skipped them on first install, just re-run and say `y`. To remove them later, delete the marker block from your `~/.zshrc` or `~/.bashrc` by hand — the installer doesn't have an "uninstall aliases" path. Bash and Zsh are auto-detected from `$SHELL`; other shells get a clean skip message. After install, open a new terminal — or `source ~/.zshrc` (or `~/.bashrc`) in your current one — to pick the aliases up.
 
 **Adding them by hand.** The installer auto-detects your shell and the systemd scope, which can misfire in containers — e.g. an LXC / Proxmox guest entered via `pct enter`, where `$SHELL` is unset and there's no per-user systemd session. If the prompt skips you, or the installed aliases don't control the service, paste the lines into your `~/.bashrc` or `~/.zshrc` yourself. Use the `--user` form for a user service, or the `sudo` form when the bridge runs as a **system** service (the usual case in an LXC container, or any install done as root):
 
 ```bash
 # User service (systemctl --user) — typical desktop / VM install
-alias start-imessage='systemctl --user start mautrix-imessage'
-alias stop-imessage='systemctl --user stop mautrix-imessage'
-alias restart-imessage='systemctl --user restart mautrix-imessage'
-alias imessage-log='journalctl --user -u mautrix-imessage -f'
+alias start-imessage='systemctl --user start corten-matrix'
+alias stop-imessage='systemctl --user stop corten-matrix'
+alias restart-imessage='systemctl --user restart corten-matrix'
+alias imessage-log='journalctl --user -u corten-matrix -f'
 
 # System service — LXC container or root install
-alias start-imessage='sudo systemctl start mautrix-imessage'
-alias stop-imessage='sudo systemctl stop mautrix-imessage'
-alias restart-imessage='sudo systemctl restart mautrix-imessage'
-alias imessage-log='sudo journalctl -u mautrix-imessage -f'
+alias start-imessage='sudo systemctl start corten-matrix'
+alias stop-imessage='sudo systemctl stop corten-matrix'
+alias restart-imessage='sudo systemctl restart corten-matrix'
+alias imessage-log='sudo journalctl -u corten-matrix -f'
 ```
 
 Pick one block (not both). Re-`source` the file or open a new terminal to pick the aliases up.
@@ -642,13 +642,13 @@ The raw equivalents (and other knobs) are below if you'd rather wire your own th
 
 ```bash
 # View logs
-tail -f ~/.local/share/mautrix-imessage/bridge.stdout.log
+tail -f ~/.local/share/corten-matrix/bridge.stdout.log
 
 # Restart (auto-restarts via KeepAlive)
-launchctl kickstart -k gui/$(id -u)/com.lrhodin.mautrix-imessage
+launchctl kickstart -k gui/$(id -u)/com.lrhodin.corten-matrix
 
 # Stop until next login
-launchctl bootout gui/$(id -u)/com.lrhodin.mautrix-imessage
+launchctl bootout gui/$(id -u)/com.lrhodin.corten-matrix
 
 # Uninstall
 make uninstall
@@ -657,13 +657,13 @@ make uninstall
 ### Linux
 
 ```bash
-# If using systemd (from make install / make install-beeper)
-systemctl --user status mautrix-imessage
-journalctl --user -u mautrix-imessage -f
-systemctl --user restart mautrix-imessage
+# If using systemd (from corten-matrix setup / corten-matrix setup-beeper)
+systemctl --user status corten-matrix
+journalctl --user -u corten-matrix -f
+systemctl --user restart corten-matrix
 
 # If running directly (debugging or non-systemd hosts)
-./mautrix-imessage-v2 -c ~/.local/share/mautrix-imessage/config.yaml
+./corten-matrix -c ~/.local/share/corten-matrix/config.yaml
 ```
 
 ### NAC Relay (macOS)
@@ -683,11 +683,11 @@ launchctl bootout gui/$(id -u)/com.imessage.nac-relay
 
 ## Configuration
 
-Config lives in `~/.local/share/mautrix-imessage/config.yaml` (generated during install). The default path is set by the Makefile's `DATA_DIR` variable; override it on the command line if you want a different location (e.g. `make install DATA_DIR=/srv/imessage`).
+Config lives in `~/.local/share/corten-matrix/config.yaml` (generated during install). The default path is set by the Makefile's `DATA_DIR` variable; override it on the command line if you want a different location (e.g. `corten-matrix setup DATA_DIR=/srv/imessage`).
 
 ### Reconfiguring without editing YAML
 
-The install scripts (`make install` and `make install-beeper`) are idempotent — re-run them any time and they detect the existing config, then walk you through interactive prompts to flip individual settings. Nothing is wiped. You can use a re-run to change:
+The install scripts (`corten-matrix setup` and `corten-matrix setup-beeper`) are idempotent — re-run them any time and they detect the existing config, then walk you through interactive prompts to flip individual settings. Nothing is wiped. You can use a re-run to change:
 
 - **Preferred handle** — pick a different `tel:` / `mailto:` from the registered list
 - **External CardDAV** — change email / server / app password
@@ -698,11 +698,11 @@ The install scripts (`make install` and `make install-beeper`) are idempotent �
 - **Shell shortcuts** — add the `start-imessage` / `stop-imessage` / `restart-imessage` / `imessage-log` aliases on the next re-run if you skipped them initially (see [Shell shortcuts](#shell-shortcuts))
 
 ```bash
-make install              # self-hosted homeserver
-make install-beeper       # Beeper
+corten-matrix setup              # self-hosted homeserver
+corten-matrix setup-beeper       # Beeper
 ```
 
-The per-chat backfill cap (`backfill.max_initial_messages`) is asked only on the **first** install, before the bridge database exists. To change it later, edit `~/.local/share/mautrix-imessage/config.yaml` directly.
+The per-chat backfill cap (`backfill.max_initial_messages`) is asked only on the **first** install, before the bridge database exists. To change it later, edit `~/.local/share/corten-matrix/config.yaml` directly.
 
 > **Warning:** the next snippet deletes your bridge state. Only run it if you mean to start over.
 
@@ -710,16 +710,16 @@ To start completely from scratch (new homeserver, new login, blank database), te
 
 ```bash
 # Bridge
-launchctl bootout gui/$(id -u)/com.lrhodin.mautrix-imessage 2>/dev/null
-rm -f ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist
-rm -rf ~/.local/share/mautrix-imessage
+launchctl bootout gui/$(id -u)/com.lrhodin.corten-matrix 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.lrhodin.corten-matrix.plist
+rm -rf ~/.local/share/corten-matrix
 
 # NAC relay (Apple Silicon Mac users only)
 launchctl bootout gui/$(id -u)/com.imessage.nac-relay 2>/dev/null
 rm -f ~/Library/LaunchAgents/com.imessage.nac-relay.plist
 rm -rf ~/Library/Application\ Support/nac-relay ~/Applications/nac-relay.app
 
-make install
+corten-matrix setup
 ```
 
 ### Key options
@@ -760,7 +760,7 @@ make clean      # Remove build artifacts
 
 ```
 cmd/
-  ├── mautrix-imessage/                     # Bridge entrypoint
+  ├── corten-matrix/                     # Bridge entrypoint
   │     ├── main.go                         #   process bootstrap, config load, command registration
   │     ├── login_cli.go                    #   interactive iMessage CLI login (stdin → bridgev2 LoginProcess)
   │     ├── carddav_setup.go                #   install-script helper — CardDAV URL discovery + password encryption
@@ -926,7 +926,7 @@ dev/
 
 ## Chat With Us
 
-**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#corten-matrix:beeper.com)
+**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#rustpush-matrix:beeper.com)
 
 ## License
 

@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -56,8 +56,8 @@ import (
 	"maunium.net/go/mautrix/id"
 	"maunium.net/go/mautrix/pushrules"
 
-	"github.com/lrhodin/imessage/imessage"
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // IMClient implements bridgev2.NetworkAPI using the rustpush iMessage protocol
@@ -2519,14 +2519,23 @@ func (c *IMClient) OnKeysReceived() {
 	c.schedulePresenceSubscribe(log)
 }
 
+// OnReshareSender is called once per reshare with the peer handle that sent
+// it. Peer iOS fans a reshare across every alias of our account (tel: + each
+// mailto:) with the same channel id but a different `from` handle on each
+// copy. Upstream state keys by channel, so every reshare overwrites the
+// previous `from` — only the last sender survives in state.keys. Without this
+// hook the bridge learns just one alias per peer and presence updates on the
+// others have no portal mapping. Eagerly resolving the sender's portal here
+// and stamping it into statusKitPortalCache preserves the mapping across
+// overwrites so OnStatusUpdate's cache lookup always hits regardless of which
+// alias Apple routes the next presence message to.
 // OnStatusDecryptFailed is called by StatusKit when a presence update on the
 // presence.mode.status topic could not be decoded — almost always a peer who
 // rotated their StatusKit channel key, leaving the copy we pulled from CloudKit
 // stale. We force a rate-limited CloudKit peer-key re-pull to fetch the fresh key
 // right away (instead of waiting for the steady-state pull floor), which then
 // re-subscribes and lets the peer's real presence flow again — clearing a moon
-// that would otherwise be stuck. sender is best-effort (the peer handle when the
-// envelope exposes it) and used only for logging.
+// that would otherwise be stuck. sender is best-effort and used only for logging.
 func (c *IMClient) OnStatusDecryptFailed(sender *string) {
 	if !c.Main.Config.StatusKitNotifications {
 		return
@@ -2540,16 +2549,6 @@ func (c *IMClient) OnStatusDecryptFailed(sender *string) {
 	c.onPresenceDecryptFailed(log)
 }
 
-// OnReshareSender is called once per reshare with the peer handle that sent
-// it. Peer iOS fans a reshare across every alias of our account (tel: + each
-// mailto:) with the same channel id but a different `from` handle on each
-// copy. Upstream state keys by channel, so every reshare overwrites the
-// previous `from` — only the last sender survives in state.keys. Without this
-// hook the bridge learns just one alias per peer and presence updates on the
-// others have no portal mapping. Eagerly resolving the sender's portal here
-// and stamping it into statusKitPortalCache preserves the mapping across
-// overwrites so OnStatusUpdate's cache lookup always hits regardless of which
-// alias Apple routes the next presence message to.
 func (c *IMClient) OnReshareSender(sender string, channelId string) {
 	if sender == "" {
 		return
