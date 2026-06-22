@@ -1145,21 +1145,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 	c.client = client
 
-	// Hydrate the persistent alias→portal cache and pre-warm from the ghost
-	// table so the first StatusKit presence update after a restart can
-	// resolve previously-known aliases without IDS round-trips. Both
-	// helpers are read-only and safe to run before StatusKit init.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Warn().Interface("panic", r).Msg("StatusKit alias-resolver init panicked")
-			}
-		}()
-		bgCtx := context.Background()
-		c.hydrateAliasPortalCacheFromKV(bgCtx, log)
-		c.prewarmAliasPortalCache(bgCtx, log)
-	}()
-
 	// GSA /circle "Apple Device" announce intentionally DISABLED.
 	//
 	// update_postdata("Apple Device", ["icloud","imessage","facetime"]) posts
@@ -1221,6 +1206,23 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 
 	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
+
+	// Hydrate the persistent alias→portal cache and pre-warm from the ghost
+	// table so the first StatusKit presence update after a restart can
+	// resolve previously-known aliases without IDS round-trips. This must run
+	// after c.allHandles is populated so stale self-handle mappings are
+	// recognized and cleared instead of being loaded back into memory.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn().Interface("panic", r).Msg("StatusKit alias-resolver init panicked")
+			}
+		}()
+		bgCtx := context.Background()
+		c.hydrateAliasPortalCacheFromKV(bgCtx, log)
+		c.prewarmAliasPortalCache(bgCtx, log)
+	}()
+
 	c.migrateStatusKitPresenceState(context.Background(), log)
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
@@ -1885,6 +1887,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		log.Debug().Msg("StatusKit notifications disabled in config — dropping update")
 		return
 	}
+	if c.isStatusKitSelfAlias(user) {
+		c.forgetAliasPortal(context.Background(), user)
+		log.Debug().Msg("StatusKit self presence update ignored")
+		return
+	}
 
 	modeKey := statusKitModeKey(mode, available)
 
@@ -1917,6 +1924,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 
 func (c *IMClient) resolveStatusKitPortal(ctx context.Context, log zerolog.Logger, alias string) *bridgev2.Portal {
 	normalizedUser := normalizeIdentifierForPortalID(alias)
+	if normalizedUser == "" || c.isStatusKitSelfAlias(normalizedUser) {
+		return nil
+	}
 	for _, key := range [2]string{alias, normalizedUser} {
 		if key == "" {
 			continue
@@ -2332,7 +2342,7 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 // Results are memoized in statusKitPortalCache so we only pay the IDS round
 // trip once per unresolved handle per session.
 func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Logger, user string) *bridgev2.Portal {
-	if c.client == nil {
+	if c.client == nil || c.isStatusKitSelfAlias(user) {
 		return nil
 	}
 	if cached, ok := c.statusKitPortalCache.Load(user); ok {
@@ -2357,6 +2367,9 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 			continue
 		}
 		if id == user {
+			continue
+		}
+		if c.isStatusKitSelfAlias(id) {
 			continue
 		}
 		knownHandles = append(knownHandles, id)
@@ -2398,6 +2411,9 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 	for _, preferTel := range []bool{true, false} {
 		for _, alias := range aliases {
 			if alias == user {
+				continue
+			}
+			if c.isStatusKitSelfAlias(alias) {
 				continue
 			}
 			if preferTel != strings.HasPrefix(alias, "tel:") {
@@ -2479,6 +2495,10 @@ func (c *IMClient) OnReshareSender(sender string, channelId string) {
 	// (TTL'd latch — re-invite after statusKitInvitedOkTTL).
 	normalized := normalizeIdentifierForPortalID(sender)
 	ctx := context.Background()
+	if c.isStatusKitSelfAlias(normalized) {
+		c.forgetAliasPortal(ctx, normalized)
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+sender), now)
 	if normalized != sender {
@@ -2517,6 +2537,11 @@ func (c *IMClient) OnReshareSender(sender string, channelId string) {
 // cache hit. Runs in a goroutine to avoid blocking the Rust FFI caller.
 func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log zerolog.Logger) {
 	ctx := context.Background()
+	if c.isStatusKitSelfAlias(sender) || c.isStatusKitSelfAlias(normalizedUser) {
+		c.forgetAliasPortal(ctx, sender)
+		log.Debug().Msg("StatusKit: ignored self reshare sender")
+		return
+	}
 
 	findPortal := func(id networkid.PortalID) *bridgev2.Portal {
 		p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
@@ -2964,7 +2989,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// CardDAV-based resolver often fails for peers missing from contacts. By
 	// stamping the cache on every inbound 1:1 message, we ensure any peer
 	// who's ever messaged bridge has a direct lookup path for presence.
-	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) {
+	if msg.Sender != nil && *msg.Sender != "" && !c.isMyHandle(*msg.Sender) && !isGroupPortalID(string(portalKey.ID)) {
 		replayPending := c.aliasPortalCacheChanged(*msg.Sender, portalKey.ID)
 		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID, replayPending)
 	}

@@ -1,12 +1,18 @@
 package connector
 
 import (
+	"context"
+	"database/sql"
 	"reflect"
 	"testing"
 	"time"
 
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestStatusKitModeKey(t *testing.T) {
@@ -190,4 +196,130 @@ func TestStatusKitAliasVariants(t *testing.T) {
 			t.Fatalf("variants for %q: got %#v, want %#v", input, got, want)
 		}
 	}
+}
+
+func TestStatusKitSelfAliasUsesNormalizedRegisteredHandles(t *testing.T) {
+	client := &IMClient{
+		allHandles: []string{
+			"mailto:LucasWittwer@iCloud.com",
+			"+17082801739",
+		},
+	}
+
+	selfAliases := []string{
+		"mailto:lucaswittwer@icloud.com",
+		"LucasWittwer@iCloud.com",
+		"tel:+17082801739",
+		"+17082801739",
+	}
+	for _, alias := range selfAliases {
+		if !client.isStatusKitSelfAlias(alias) {
+			t.Fatalf("expected %q to be treated as a StatusKit self alias", alias)
+		}
+	}
+
+	for _, alias := range []string{"mailto:friend@example.com", "tel:+15551234567"} {
+		if client.isStatusKitSelfAlias(alias) {
+			t.Fatalf("did not expect %q to be treated as a StatusKit self alias", alias)
+		}
+	}
+}
+
+func TestStatusKitForgetAliasPortalDeletesKVRow(t *testing.T) {
+	ctx := context.Background()
+	client := makeStatusKitKVTestClient(t)
+
+	client.Main.Bridge.DB.KV.Set(ctx, statusKitAliasPortalKey("mailto:self@example.com"), "tel:+15551234567")
+	client.statusKitPortalCache.Store("mailto:self@example.com", networkid.PortalID("tel:+15551234567"))
+
+	client.forgetAliasPortal(ctx, "self@example.com")
+
+	if got := client.Main.Bridge.DB.KV.Get(ctx, statusKitAliasPortalKey("mailto:self@example.com")); got != "" {
+		t.Fatalf("expected alias portal KV row to be absent, got value %q", got)
+	}
+	if rowExists := statusKitKVRowExists(t, client, statusKitAliasPortalKey("mailto:self@example.com")); rowExists {
+		t.Fatal("expected forgetAliasPortal to delete the KV row instead of tombstoning it")
+	}
+	if _, ok := client.statusKitPortalCache.Load("mailto:self@example.com"); ok {
+		t.Fatal("expected forgetAliasPortal to remove the in-memory cache entry")
+	}
+}
+
+func TestStatusKitHydrateDeletesSelfAliasPortalRows(t *testing.T) {
+	ctx := context.Background()
+	client := makeStatusKitKVTestClient(t)
+	client.allHandles = []string{"mailto:self@example.com", "tel:+15550001111"}
+
+	selfAliasKey := statusKitAliasPortalKey("mailto:self@example.com")
+	selfValueKey := statusKitAliasPortalKey("mailto:peer@example.com")
+	peerKey := statusKitAliasPortalKey("mailto:friend@example.com")
+	client.Main.Bridge.DB.KV.Set(ctx, selfAliasKey, "tel:+15551234567")
+	client.Main.Bridge.DB.KV.Set(ctx, selfValueKey, "tel:+15550001111")
+	client.Main.Bridge.DB.KV.Set(ctx, peerKey, "tel:+15552223333")
+
+	client.hydrateAliasPortalCacheFromKV(ctx, client.UserLogin.Log)
+
+	for _, key := range []database.Key{selfAliasKey, selfValueKey} {
+		if rowExists := statusKitKVRowExists(t, client, key); rowExists {
+			t.Fatalf("expected hydrateAliasPortalCacheFromKV to delete self mapping row %q", key)
+		}
+	}
+	if got := client.Main.Bridge.DB.KV.Get(ctx, peerKey); got != "tel:+15552223333" {
+		t.Fatalf("expected peer mapping to survive hydration, got %q", got)
+	}
+	if _, ok := client.statusKitPortalCache.Load("mailto:friend@example.com"); !ok {
+		t.Fatal("expected peer mapping to be loaded into memory")
+	}
+}
+
+func makeStatusKitKVTestClient(t *testing.T) *IMClient {
+	t.Helper()
+
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	rawDB.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		_ = rawDB.Close()
+	})
+	if _, err = rawDB.Exec(`CREATE TABLE kv_store (
+		bridge_id TEXT NOT NULL,
+		key TEXT NOT NULL,
+		value TEXT NOT NULL,
+		PRIMARY KEY (bridge_id, key)
+	)`); err != nil {
+		t.Fatalf("create kv_store: %v", err)
+	}
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatalf("wrap sqlite: %v", err)
+	}
+	bridgeDB := database.New(networkid.BridgeID("test-bridge"), database.MetaTypes{}, db)
+	return &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{
+				ID: networkid.BridgeID("test-bridge"),
+				DB: bridgeDB,
+			},
+		},
+		UserLogin: &bridgev2.UserLogin{},
+	}
+}
+
+func statusKitKVRowExists(t *testing.T, client *IMClient, key database.Key) bool {
+	t.Helper()
+
+	var exists bool
+	err := client.Main.Bridge.DB.QueryRow(
+		context.Background(),
+		"SELECT EXISTS(SELECT 1 FROM kv_store WHERE bridge_id=$1 AND key=$2)",
+		client.Main.Bridge.DB.BridgeID,
+		key,
+	).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query kv row %q: %v", key, err)
+	}
+	return exists
 }

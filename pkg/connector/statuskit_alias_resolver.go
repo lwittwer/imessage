@@ -109,6 +109,14 @@ const (
 	statusKitIDSMaxBackoffMult = 8
 )
 
+func statusKitAliasPortalKey(alias string) database.Key {
+	return database.Key(statusKitAliasPortalKeyPrefix + normalizeIdentifierForPortalID(alias))
+}
+
+func (c *IMClient) isStatusKitSelfAlias(alias string) bool {
+	return c != nil && c.isMyHandle(alias)
+}
+
 // idsRateGate is a fair, monotonic-time slot reservation system for
 // outbound IDS batch calls. Reserving a slot atomically advances the
 // next-allowed timestamp by the current effective interval, so callers
@@ -233,6 +241,9 @@ func (c *IMClient) eagerLinkClusterToPortal(ctx context.Context, log zerolog.Log
 	var portal *bridgev2.Portal
 	var via string
 	for _, sibling := range cluster {
+		if c.isStatusKitSelfAlias(sibling) {
+			continue
+		}
 		if p := c.lookupAliasPortal(ctx, sibling); p != nil {
 			portal = p
 			via = sibling
@@ -241,6 +252,9 @@ func (c *IMClient) eagerLinkClusterToPortal(ctx context.Context, log zerolog.Log
 	}
 	if portal == nil {
 		for _, sibling := range cluster {
+			if c.isStatusKitSelfAlias(sibling) {
+				continue
+			}
 			if p := c.resolveSiblingHandleLive(ctx, log, sibling); p != nil {
 				portal = p
 				via = sibling
@@ -253,6 +267,10 @@ func (c *IMClient) eagerLinkClusterToPortal(ctx context.Context, log zerolog.Log
 		return
 	}
 	for _, sibling := range cluster {
+		if c.isStatusKitSelfAlias(sibling) {
+			c.forgetAliasPortal(ctx, sibling)
+			continue
+		}
 		if c.lookupAliasPortal(ctx, sibling) != nil {
 			continue
 		}
@@ -277,7 +295,7 @@ func (c *IMClient) resolveViaCluster(ctx context.Context, log zerolog.Logger, un
 		return nil
 	}
 	unknown = normalizeIdentifierForPortalID(unknown)
-	if unknown == "" {
+	if unknown == "" || c.isStatusKitSelfAlias(unknown) {
 		return nil
 	}
 	channels := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitAliasChannelsKeyPrefix+unknown)))
@@ -293,6 +311,10 @@ func (c *IMClient) resolveViaCluster(ctx context.Context, log zerolog.Logger, un
 				continue
 			}
 			visited[sibling] = struct{}{}
+			if c.isStatusKitSelfAlias(sibling) {
+				c.forgetAliasPortal(ctx, sibling)
+				continue
+			}
 
 			if portal := c.lookupAliasPortal(ctx, sibling); portal != nil {
 				log.Info().
@@ -329,6 +351,10 @@ func (c *IMClient) lookupAliasPortal(ctx context.Context, alias string) *bridgev
 	if alias == "" {
 		return nil
 	}
+	if c.isStatusKitSelfAlias(alias) {
+		c.forgetAliasPortal(ctx, alias)
+		return nil
+	}
 	if cached, ok := c.statusKitPortalCache.Load(alias); ok {
 		if p := c.findPortalByID(ctx, cached.(networkid.PortalID)); p != nil {
 			return p
@@ -339,6 +365,10 @@ func (c *IMClient) lookupAliasPortal(ctx context.Context, alias string) *bridgev
 		return nil
 	}
 	pid := networkid.PortalID(raw)
+	if c.isStatusKitSelfAlias(string(pid)) {
+		c.forgetAliasPortal(ctx, alias)
+		return nil
+	}
 	c.statusKitPortalCache.Store(alias, pid)
 	return c.findPortalByID(ctx, pid)
 }
@@ -352,6 +382,9 @@ func (c *IMClient) lookupAliasPortal(ctx context.Context, alias string) *bridgev
 // cheap matters.
 func (c *IMClient) resolveSiblingHandleLive(ctx context.Context, log zerolog.Logger, sibling string) *bridgev2.Portal {
 	normalized := normalizeIdentifierForPortalID(sibling)
+	if normalized == "" || c.isStatusKitSelfAlias(normalized) {
+		return nil
+	}
 
 	// Address book: a sibling listed as a contact resolves through the
 	// contact store's portal IDs.
@@ -406,10 +439,35 @@ func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portal
 	if alias == "" {
 		return
 	}
+	if c.isStatusKitSelfAlias(alias) || c.isStatusKitSelfAlias(string(portalID)) {
+		c.forgetAliasPortal(ctx, alias)
+		return
+	}
 	c.statusKitPortalCache.Store(alias, portalID)
-	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitAliasPortalKeyPrefix+alias), string(portalID))
+	c.Main.Bridge.DB.KV.Set(ctx, statusKitAliasPortalKey(alias), string(portalID))
 	if replayPending {
 		c.replayPendingStatusKitPresence(ctx, c.UserLogin.Log.With().Str("component", "statuskit").Logger(), alias, portalID)
+	}
+}
+
+func (c *IMClient) forgetAliasPortal(ctx context.Context, alias string) {
+	alias = normalizeIdentifierForPortalID(alias)
+	if alias == "" || c == nil || c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.DB == nil {
+		return
+	}
+	c.statusKitPortalCache.Delete(alias)
+	c.deleteStatusKitAliasPortal(ctx, statusKitAliasPortalKey(alias))
+}
+
+func (c *IMClient) deleteStatusKitAliasPortal(ctx context.Context, key database.Key) {
+	_, err := c.Main.Bridge.DB.Exec(
+		ctx,
+		"DELETE FROM kv_store WHERE bridge_id=$1 AND key=$2",
+		c.Main.Bridge.DB.BridgeID,
+		key,
+	)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("key", string(key)).Msg("Failed to delete StatusKit alias portal cache entry")
 	}
 }
 
@@ -436,16 +494,29 @@ func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolo
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration query failed")
 		return
 	}
-	defer rows.Close()
 	loaded := 0
+	var deleteKeys []database.Key
 	for rows.Next() {
 		var key, value string
 		if err := rows.Scan(&key, &value); err != nil {
 			continue
 		}
+		if value == "" {
+			continue
+		}
 		alias := strings.TrimPrefix(key, statusKitAliasPortalKeyPrefix)
+		if c.isStatusKitSelfAlias(alias) || c.isStatusKitSelfAlias(value) {
+			deleteKeys = append(deleteKeys, database.Key(key))
+			continue
+		}
 		c.statusKitPortalCache.Store(alias, networkid.PortalID(value))
 		loaded++
+	}
+	if err := rows.Close(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration close failed")
+	}
+	for _, key := range deleteKeys {
+		c.deleteStatusKitAliasPortal(ctx, key)
 	}
 	if err := rows.Err(); err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration row iteration error")
@@ -472,6 +543,9 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 			continue
 		}
 		if !strings.HasPrefix(ghostID, "mailto:") && !strings.HasPrefix(ghostID, "tel:") {
+			continue
+		}
+		if c.isStatusKitSelfAlias(ghostID) {
 			continue
 		}
 		if _, ok := c.statusKitPortalCache.Load(ghostID); ok {
@@ -508,7 +582,7 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 // the attempt timestamp so we don't re-query for the cooldown window.
 func (c *IMClient) resolveStatusPortalViaIDSCached(ctx context.Context, log zerolog.Logger, user string) *bridgev2.Portal {
 	canonical := normalizeIdentifierForPortalID(user)
-	if canonical == "" {
+	if canonical == "" || c.isStatusKitSelfAlias(canonical) {
 		return nil
 	}
 	if portal := c.lookupAliasPortal(ctx, canonical); portal != nil {
@@ -599,6 +673,10 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 	for _, raw := range rawHandles {
 		h := normalizeIdentifierForPortalID(raw)
 		if h == "" {
+			continue
+		}
+		if c.isStatusKitSelfAlias(h) {
+			c.forgetAliasPortal(ctx, h)
 			continue
 		}
 		if _, dup := seen[h]; dup {
@@ -741,6 +819,9 @@ func (c *IMClient) collectKnownPortalHandles(ctx context.Context, log zerolog.Lo
 			continue
 		}
 		if !strings.HasPrefix(id, "tel:") && !strings.HasPrefix(id, "mailto:") {
+			continue
+		}
+		if c.isStatusKitSelfAlias(id) {
 			continue
 		}
 		out = append(out, id)
