@@ -1617,7 +1617,23 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		}
 		contact, _ := c.contacts.GetContactInfo(localID)
 		if contact == nil || !contact.HasName() {
-			continue
+			// No address-book name for this ghost. Normally skip for efficiency
+			// — don't load every group participant's ghost just to confirm it
+			// isn't in the address book. BUT a ghost whose stored name is EMPTY
+			// renders as its bare Matrix ID (@...tel=3a+1555...) in clients and
+			// push notifications: it's the sender shown on incoming tapbacks and
+			// the title of DMs with an unsaved number. Heal those here — fall
+			// through to GetUserInfo, whose final fallback formats the phone/
+			// email from the identifier, so the ghost gets a human-readable name
+			// instead of a raw MXID. Once healed (name != "") it matches on the
+			// next tick and is skipped again, so this costs exactly one reconcile
+			// per damaged ghost. Mirrors the avatar self-heal pattern in
+			// refreshDMPortalNamesFromContacts. Because this runs immediately
+			// before the DM-title refresh, dmBaseName then reads the freshly
+			// healed ghost.Name instead of falling back to a bare number too.
+			if g.name != "" {
+				continue
+			}
 		}
 		// Reconcile the FULL profile (name + avatar + identifiers) every cycle —
 		// NOT just when the name changed. UpdateInfo self-gates: prepareName /
