@@ -125,6 +125,19 @@ func main() {
 			m.Init()
 			fmt.Fprintln(os.Stderr, "Database initialized successfully")
 			os.Exit(0)
+		case "fda-check":
+			// Probe the local Messages chat.db. The access ATTEMPT (even when it
+			// fails) registers this binary in macOS Full Disk Access (TCC), so it
+			// appears in the Full Disk Access list during setup for the user to
+			// toggle on — rather than only registering once the bridge runs later.
+			// Exits 0 if chat.db is readable, 1 otherwise. See scripts/install.sh.
+			home, _ := os.UserHomeDir()
+			f, err := os.Open(filepath.Join(home, "Library", "Messages", "chat.db"))
+			if err != nil {
+				os.Exit(1)
+			}
+			_ = f.Close()
+			os.Exit(0)
 		default:
 			// A first argument that is neither a known subcommand nor a flag is
 			// a typo/unknown command. Without this, it silently fell through to
