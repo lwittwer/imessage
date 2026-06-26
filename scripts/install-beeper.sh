@@ -288,16 +288,10 @@ if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
         if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
-            echo ""
-            echo "  Opening System Settings → Privacy & Security → Full Disk Access."
-            echo "  macOS does NOT list the bridge automatically — add it by hand:"
-            echo "    1. Click the + button (click the padlock to unlock first if needed)."
-            echo "    2. Press Cmd+Shift+G, paste this path, then press Return:"
-            echo "         $BINARY"
-            echo "    3. Select 'corten-matrix', click Open, then turn its toggle ON."
-            echo ""
+            echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
+            echo "  Grant access to the bridge binary, then press Enter to continue."
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-            read -p "Press Enter once you've added and enabled corten-matrix..."
+            read -p "Press Enter when Full Disk Access has been granted..."
             if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else
@@ -1090,7 +1084,11 @@ GUI_DOMAIN="gui/$(id -u)"
 DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
 DOMAIN="${DOMAIN:-beeper.local}"
 
-# ── Install the background service (LaunchAgent) — optional ───
+# ── Install the LaunchAgent (optional; default Yes) ───────────
+# Setup needs the bridge running to finish login and to trigger the macOS
+# Contacts + Full Disk Access permission prompts, so this defaults to Yes.
+# Decline only if you'll start it yourself; the block below is otherwise the
+# same unconditional bridge-start as before.
 if [ -t 0 ]; then
     printf "\nInstall and start the background service now? [Y/n]: "
     read INSTALL_SVC
@@ -1176,7 +1174,16 @@ echo "Waiting for bridge to start..."
 for i in $(seq 1 15); do
     if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
         echo "✓ Bridge is running"
-        break
+        echo ""
+        echo "═══════════════════════════════════════════════"
+        echo "  Setup Complete"
+        echo "═══════════════════════════════════════════════"
+        echo ""
+        echo "  Logs:    tail -f $LOG_OUT"
+        echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
+        echo "  Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
+        echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
+        exit 0
     fi
     sleep 1
 done
@@ -1195,7 +1202,7 @@ if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
     read ADD_PATH
     case "$ADD_PATH" in
         [nN]*) ;;
-        *) sudo mkdir -p /usr/local/bin && sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
              && echo "OK - corten-matrix added to PATH" \
              || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
     esac

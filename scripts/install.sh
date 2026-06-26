@@ -185,16 +185,10 @@ if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
         if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
-            echo ""
-            echo "  Opening System Settings → Privacy & Security → Full Disk Access."
-            echo "  macOS does NOT list the bridge automatically — add it by hand:"
-            echo "    1. Click the + button (click the padlock to unlock first if needed)."
-            echo "    2. Press Cmd+Shift+G, paste this path, then press Return:"
-            echo "         $BINARY"
-            echo "    3. Select 'corten-matrix', click Open, then turn its toggle ON."
-            echo ""
+            echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
+            echo "  Grant access to the bridge binary, then press Enter to continue."
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-            read -p "Press Enter once you've added and enabled corten-matrix..."
+            read -p "Press Enter when Full Disk Access has been granted..."
             if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else
@@ -860,7 +854,10 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
-# ── Install the background service (LaunchAgent) — optional ───
+# ── Install the LaunchAgent (optional; default Yes) ───────────
+# Setup needs the bridge running to finish login and to trigger the macOS
+# Contacts + Full Disk Access permission prompts, so this defaults to Yes.
+# Decline only if you'll start it yourself.
 if [ -t 0 ]; then
     printf "\nInstall and start the background service now? [Y/n]: "
     read INSTALL_SVC
@@ -950,7 +947,7 @@ if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
     read ADD_PATH
     case "$ADD_PATH" in
         [nN]*) ;;
-        *) sudo mkdir -p /usr/local/bin && sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
              && echo "OK - corten-matrix added to PATH" \
              || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
     esac

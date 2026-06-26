@@ -228,14 +228,19 @@ bindings: $(RUST_LIB)
 # Build
 # ===========================================================================
 
-# A single self-contained `corten-matrix` binary; host ops are its own
-# subcommands (see pkg/cli) — run `./corten-matrix help`.
+# A single self-contained `corten-matrix` binary. The host-side ops
+# (setup/start/stop/status/reset/install-service/…) are built into the binary as
+# subcommands (see pkg/cli) — run `./corten-matrix help`. No .app bundle, no
+# separate bbctl, no install scripts to wire up here.
 build: check-deps $(RUST_LIB) $(BINARY)
 	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT)) — run './$(BINARY) help' for setup/ops"
 
 $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
+	@# Sign with a STABLE identifier so macOS/TCC can track this binary across
+	@# rebuilds (the arm64 linker otherwise leaves it as 'a.out', untrackable) —
+	@# needed for the Full Disk Access probe to register it for chat.db backfill.
 	codesign --force --sign - --identifier com.lrhodin.corten-matrix $(BINARY)
 
 clean:
