@@ -1,0 +1,30 @@
+[package]
+name = "open-absinthe"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+log = "0.4"
+
+# Optional: native NAC via AAAbsintheContext (macOS 13+).
+# When the `native-nac` feature is enabled AND the build target is macOS,
+# `ValidationCtx` delegates the NAC steps to Apple's AppleAccount.framework
+# (`AAAbsintheContext`) through the `nac-validation` crate.
+#
+# nac-validation is a standalone workspace member (libc + thiserror + cc only —
+# no rustpush, no open-absinthe), so this dep direction does NOT create a cycle.
+# The path reaches the repo-root `nac-validation/` from the built copy of this
+# crate at `third_party/rustpush-upstream/open-absinthe/`.
+[target.'cfg(target_os = "macos")'.dependencies]
+nac-validation = { path = "../../../nac-validation", optional = true }
+
+[features]
+serde = []
+# Native AAAbsintheContext NAC (real Mac). This is the FOSS macOS path.
+native-nac = ["dep:nac-validation"]
+# Placeholder so the bridge's `rustpushgo` crate — whose `cleanroom-registration`
+# feature references `open-absinthe/native-nac-rust` — still resolves against
+# this open-absinthe. Here it is a no-op; this build never enables it (it does
+# NAC via `native-nac`, i.e. Apple's native AAAbsintheContext on a Mac).
+native-nac-rust = []

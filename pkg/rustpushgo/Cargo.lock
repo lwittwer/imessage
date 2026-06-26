@@ -459,7 +459,6 @@ dependencies = [
 name = "clearadi"
 version = "1.0.0"
 dependencies = [
- "cc",
  "serde",
 ]
 
@@ -2098,19 +2097,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "open-absinthe"
 version = "1.0.0"
 dependencies = [
- "base64 0.21.7",
- "deku",
- "der 0.7.10",
- "hmac",
  "log",
  "nac-validation",
- "num-bigint",
- "rand 0.8.5",
  "serde",
- "serde_json",
- "sha1",
- "sha2",
- "x509-cert",
 ]
 
 [[package]]
@@ -3095,7 +3084,6 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
- "indexmap",
  "itoa",
  "memchr",
  "serde",
