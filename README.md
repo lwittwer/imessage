@@ -67,7 +67,7 @@ Run the extractor on **any** Mac — Intel or Apple Silicon, it's the same tool 
 
 > **Download the extractor:** **TODO — link the current hardware-key extractor release here.** Use the tool from the binary releases; extractors from before the binary switch are not compatible.
 
-**Option A — GUI app (recommended).** Download the hardware-key [extractor app](ghlinkplaceholder), copy it to the Mac, and launch it. It reads the hardware identifiers, displays them, and lets you **Copy** or **Save** the base64 key.
+**Option A — GUI app (recommended).** Download the hardware-key [extractor app](https://github.com/lrhodin/corten-matrix/raw/refs/heads/beta/tools/ExtractKey.app.zip), copy it to the Mac, and launch it. It reads the hardware identifiers, displays them, and lets you **Copy** or **Save** the base64 key.
 
 > **Gatekeeper**: The app is ad-hoc signed (not notarized — just a fact of macOS), so a downloaded copy is blocked on first launch:
 >
@@ -75,7 +75,7 @@ Run the extractor on **any** Mac — Intel or Apple Silicon, it's the same tool 
 > - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu, then **Open** in the dialog.
 > - **Terminal**: Run `xattr -cr <AppName>.app` to strip the quarantine flag, then double-click normally.
 
-**Option B — CLI (fallback).** If you'd rather not use the GUI, download the [command-line extractor](ghlinkplaceholder), run it on the Mac, and copy the base64 key it prints:
+**Option B — CLI (fallback).** If you'd rather not use the GUI, download the [command-line extractor](https://github.com/lrhodin/corten-matrix/raw/refs/heads/beta/tools/extract-key-cli.zip), run it on the Mac, and copy the base64 key it prints:
 
 ```bash
 chmod +x extract-key
