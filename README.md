@@ -14,7 +14,7 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 Corten-Matrix ships as a **prebuilt, self-contained binary** called `corten-matrix`, downloaded from the [Releases page](https://github.com/lrhodin/corten-matrix/releases). The binary *is* the bridge **and** its management CLI — there is **nothing to compile** and no first-run build step. The native pieces the bridge needs are already baked into the release, so you download one file, mark it executable, and run it.
 
-**Building from this source tree is not supported.** Corten-Matrix depends on components that are supplied at build time and are not part of this public repository, so a working bridge cannot be produced from these sources alone. That's why we publish binaries: the released artifact is the only complete, runnable form of the bridge. The repository is here for transparency and review of the bridge-side logic, not as a `make && run` target.
+**Building from source is supported on macOS.** On a Mac the bridge generates its own validation data through Apple's native `AAAbsintheContext` framework, so it builds and runs entirely from this repository — see [Build from source (macOS)](#build-from-source-macos). The prebuilt binary releases remain the easy path (no toolchain to set up) and are the only way to run on **Linux**.
 
 > **Docker is deprecated for the time being.** While we move to binary distribution there is no maintained Docker image; run the native binary directly via `corten-matrix setup` / `setup-beeper`. Docker support may return in a later release.
 
@@ -487,6 +487,39 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
 | `database.type` | `postgres` | bridgev2 framework option. `postgres` or `sqlite3-fk-wal`; setup asks during first run and defaults to `postgres`. |
 | `debug_disable_privacy` | `false` | **Development only — leave `false` in any real deployment.** Turns off log anonymization and the message-body scrubber, and re-fills previously-scrubbed plaintext on the next CloudKit sync. See [Privacy](#privacy). Does not undo deletes/unsends and does not re-deliver anything to Matrix. |
+
+## Build from source (macOS)
+
+Instead of downloading a release you can build the bridge yourself on a Mac. This path is **macOS-only**: NAC validation data is produced by Apple's native `AAAbsintheContext` framework, which exists only on macOS, so the bridge is built and run on the same Mac. There is no Linux build-from-source path — for Linux, use the prebuilt releases.
+
+**Requirements**
+
+- macOS 13+ (Ventura or later) — `AAAbsintheContext` requires it.
+- Signed into iCloud on the Mac (so Apple recognizes the device and login works without 2FA prompts).
+- Xcode Command Line Tools (`xcode-select --install`).
+- A checkout path **without spaces** — CGO and the linker can't handle spaces in library paths.
+
+Everything else (Homebrew, Go, Rust, protobuf, libolm, libheif, tmux) is installed for you on the first build.
+
+**Build**
+
+```bash
+git clone https://github.com/lrhodin/corten-matrix.git
+cd corten-matrix
+make
+```
+
+`make` (the default target) installs any missing Homebrew dependencies, clones OpenBubbles `rustpush` at the SHA pinned in `third_party/rustpush-upstream.sha`, applies the bridge's source overlays, builds the Rust core (`librustpushgo.a`) with native NAC, then builds the Go bridge. The result is a single self-contained `corten-matrix` binary in the repository root.
+
+From there it behaves exactly like a downloaded release — the binary is both the bridge and its management CLI:
+
+```bash
+./corten-matrix setup          # self-hosted homeserver
+./corten-matrix setup-beeper   # Beeper
+./corten-matrix help           # full command list
+```
+
+Other targets: `make clean` (remove the binary and Rust build artifacts), and `make rust` / `make bindings` to build just the Rust static library or the UniFFI Go bindings.
 
 ## Source layout
 
