@@ -375,7 +375,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		log.Info().Int("recoverable_chats", len(recoverableChats)).
 			Msg("DELETE-SEED: read recoverable chats, matching against local portal IDs")
 		for _, chat := range recoverableChats {
-			portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 			if portalID == "" {
 				log.Debug().
 					Str("record_name", chat.RecordName).
@@ -2153,6 +2153,16 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
 	}
 
+	// Consolidate carrier group chats that CloudKit recorded under multiple unstable
+	// gid: encodings (plain UUID / sha1-hex / hex-encoded UUID) into one room per
+	// participant set. Carrier groups have no stable group GUID, so the old gid: key
+	// shards one conversation across many rooms. This re-keys their cloud_chat/
+	// cloud_message rows to the canonical participant key and merges the existing
+	// rooms. Must run before createPortalsFromCloudSync so the canonical portal is
+	// the one created and (re-)backfilled. New splits are prevented at ingest by
+	// resolvePortalIDForCloudChat keying carrier groups by participants.
+	c.consolidateCarrierGroupPortals(ctx, log)
+
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
@@ -2952,7 +2962,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 		if portalID == "" {
 			counts.Skipped++
 			continue
@@ -3640,7 +3650,7 @@ func (c *IMClient) ingestCloudMessages(
 	return nil
 }
 
-func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string, style int64) string {
+func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string, style int64, service string) string {
 	normalizedParticipants := make([]string, 0, len(participants))
 	for _, participant := range participants {
 		normalized := normalizeIdentifierForPortalID(participant)
@@ -3658,6 +3668,22 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	// field is set for ALL CloudKit chats, even DMs, so we can't use its
 	// presence alone.
 	isGroup := style == 43
+
+	// Carrier group chats (SMS/RCS/MMS) have no stable Apple group GUID: CloudKit
+	// hands the same conversation back under several group_id encodings (plain
+	// UUID, sha1-hex, hex-encoded UUID) and even across services, so keying by
+	// gid: shards one group across many rooms. Key them by their participant set
+	// instead — the exact key the live message path uses (makePortalKey's
+	// no-senderGuid branch) — so backfill and live converge on one room.
+	// consolidateCarrierGroupPortals heals groups that already split under the
+	// old gid: scheme.
+	// Gate on >=2 non-self members so this matches makePortalKey's live group
+	// test exactly (same predicate). A degenerate carrier chat that reduces to
+	// just us — or a single remote handle — falls through to the DM/self-chat
+	// handling below instead of emitting a bogus self-only comma key.
+	if isGroup && isCarrierService(service) && c.countNonSelfMembers(participants, nil) >= 2 {
+		return strings.Join(c.buildCanonicalParticipantList(participants), ",")
+	}
 
 	// For groups with a persistent group UUID, use gid:<UUID> as portal ID
 	if isGroup && groupID != "" {
@@ -3702,6 +3728,193 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	}
 	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr)
 	return string(portalKey.ID)
+}
+
+// carrierConsolidationEntry pairs a carrier group portal with the canonical participant
+// key its conversation should live under.
+type carrierConsolidationEntry struct {
+	portalID  string
+	canonical string
+}
+
+// carrierConsolidationGroup is a set of carrier group portals that resolve to the same
+// canonical participant key and therefore need to be merged into one room.
+type carrierConsolidationGroup struct {
+	canonical string
+	members   []string // distinct portal IDs sharing this canonical key, sorted
+}
+
+// planCarrierGroupConsolidation groups carrier group portals by canonical participant
+// key and returns the groups that need consolidation: those with more than one
+// distinct portal, or a single portal whose ID differs from the canonical key
+// (so it gets re-keyed to the participant form). Pure logic with no DB/room
+// access — the testable core of consolidateCarrierGroupPortals.
+func planCarrierGroupConsolidation(entries []carrierConsolidationEntry) []carrierConsolidationGroup {
+	byKey := make(map[string]map[string]bool)
+	for _, e := range entries {
+		if e.canonical == "" || e.portalID == "" {
+			continue
+		}
+		if byKey[e.canonical] == nil {
+			byKey[e.canonical] = make(map[string]bool)
+		}
+		byKey[e.canonical][e.portalID] = true
+	}
+
+	var out []carrierConsolidationGroup
+	for canonical, set := range byKey {
+		members := make([]string, 0, len(set))
+		for id := range set {
+			members = append(members, id)
+		}
+		sort.Strings(members)
+		needs := len(members) > 1 || members[0] != canonical
+		if needs {
+			out = append(out, carrierConsolidationGroup{canonical: canonical, members: members})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].canonical < out[j].canonical })
+	return out
+}
+
+// consolidateCarrierGroupPortals collapses carrier group conversations that were sharded
+// across multiple gid: rooms (CloudKit hands the same carrier group back under
+// several unstable group_id encodings) into one room per participant set. It
+// re-keys each duplicate's cloud_chat/cloud_message rows to the canonical
+// participant key, renames the room with the most history onto that key, and
+// tombstones the rest into it. The re-keyed messages re-backfill into the
+// survivor via the normal ChatResync forward/backward backfill (GUID-deduped),
+// so no history is lost.
+//
+// Runs inline at startup before createPortalsFromCloudSync. New splits are
+// prevented at ingest by resolvePortalIDForCloudChat.
+func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	log = log.With().Str("component", "carrier_group_consolidation").Logger()
+
+	chats, err := c.cloudStore.listCarrierGroupChats(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to list carrier group chats for consolidation")
+		return
+	}
+	if len(chats) == 0 {
+		return
+	}
+
+	entries := make([]carrierConsolidationEntry, 0, len(chats))
+	for _, chat := range chats {
+		// Use the same >=2 non-self group rule as ingest/live so we only
+		// canonicalize genuine groups; a degenerate roster is left untouched.
+		if c.countNonSelfMembers(chat.participants, nil) < 2 {
+			continue
+		}
+		canonical := strings.Join(c.buildCanonicalParticipantList(chat.participants), ",")
+		entries = append(entries, carrierConsolidationEntry{portalID: chat.portalID, canonical: canonical})
+	}
+
+	groups := planCarrierGroupConsolidation(entries)
+	if len(groups) == 0 {
+		return
+	}
+
+	consolidated := 0
+	for _, g := range groups {
+		if c.consolidateOneCarrierGroup(ctx, log, g) {
+			consolidated++
+		}
+	}
+	if consolidated > 0 {
+		log.Info().Int("groups", consolidated).
+			Msg("Consolidated split carrier group portals by participant set")
+	}
+}
+
+// consolidateOneCarrierGroup performs the data + room moves for a single carrier group.
+// Returns true if it took any action.
+func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) bool {
+	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
+
+	// Survivor = the existing member room with the most bridged Matrix messages
+	// (most history to keep, least to re-insert). May be empty if none have rooms.
+	survivor := ""
+	survivorMsgs := -1
+	for _, m := range g.members {
+		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, mk)
+		if err != nil || p == nil || p.MXID == "" {
+			continue
+		}
+		if n := c.countBridgedMessages(ctx, m); n > survivorMsgs {
+			survivorMsgs = n
+			survivor = m
+		}
+	}
+
+	// Re-key all members' cloud data to the canonical participant key so the
+	// consolidated room re-backfills the union of their messages.
+	for _, m := range g.members {
+		if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
+			log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
+				Msg("Failed to re-key carrier group cloud data")
+		}
+	}
+	if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
+		log.Warn().Err(err).Str("canonical", g.canonical).
+			Msg("Failed to reset backfill state for canonical carrier portal")
+	}
+
+	// Move the rooms onto the canonical key: rename the survivor (carrying its
+	// history via the message FK ON UPDATE CASCADE), tombstone the rest into it.
+	// Members with no room are left for createPortalsFromCloudSync to create from
+	// the re-keyed cloud_chat.
+	//
+	// Edge: if a portal with the canonical key already exists (e.g. a live comma
+	// room) and a different member has more history, the re-ID below tombstones
+	// the larger room into the smaller canonical one. No data is lost — the
+	// re-keyed cloud_message rows re-backfill into the survivor — it just keeps
+	// the canonical-keyed room rather than the largest. Rare and self-correcting.
+	if survivor != "" && survivor != g.canonical {
+		survivorKey := networkid.PortalKey{ID: networkid.PortalID(survivor), Receiver: c.UserLogin.ID}
+		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, survivorKey, canonicalKey); err != nil {
+			log.Warn().Err(err).Str("survivor", survivor).Str("canonical", g.canonical).
+				Msg("Failed to rename survivor carrier portal to canonical key")
+			return false
+		}
+	}
+	for _, m := range g.members {
+		if m == survivor || m == g.canonical {
+			continue
+		}
+		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, mk, canonicalKey); err != nil {
+			log.Warn().Err(err).Str("duplicate", m).Str("canonical", g.canonical).
+				Msg("Failed to merge duplicate carrier portal into canonical room")
+		}
+	}
+
+	log.Info().
+		Str("canonical", g.canonical).
+		Int("members", len(g.members)).
+		Str("survivor", survivor).
+		Int("survivor_msgs", survivorMsgs).
+		Msg("Consolidated carrier group portals")
+	return true
+}
+
+// countBridgedMessages returns how many Matrix messages are bridged into the
+// given portal's room. Best-effort: returns 0 on error.
+func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) int {
+	var n int
+	err := c.Main.Bridge.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM message WHERE bridge_id=$1 AND room_id=$2 AND room_receiver=$3`,
+		string(c.Main.Bridge.ID), portalID, string(c.UserLogin.ID),
+	).Scan(&n)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {

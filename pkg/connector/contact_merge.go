@@ -139,38 +139,37 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	return nil
 }
 
-// getUniqueParticipantCount counts the number of unique *people* in a
-// participant list by collapsing multiple self-handles into one and merging
-// handles that belong to the same contact.
-func (c *IMClient) getUniqueParticipantCount(participants []string) int {
+// countNonSelfMembers counts the unique non-self members of a conversation,
+// drawn from both the participant list and the sender. A contact's alternate
+// handles are collapsed so a multi-number contact isn't counted twice.
+//
+// This is the group/DM signal for inbound routing: self is always an implicit
+// member, so a conversation is a group when there are >=2 other members. Relayed
+// carrier-group messages (SMS/RCS/MMS) list only the OTHER members and omit
+// self, so a 3-person group arrives with 2 participants — counting raw
+// participants against ">2" misclassifies it as a DM and mis-delivers the reply
+// into a 1:1 with one of the members.
+func (c *IMClient) countNonSelfMembers(participants []string, sender *string) int {
 	seen := make(map[string]bool)
-	selfSeen := false
 	count := 0
-	for _, p := range participants {
-		normalized := normalizeIdentifierForPortalID(p)
-		if normalized == "" {
-			count++
-			continue
+	add := func(raw string) {
+		n := normalizeIdentifierForPortalID(raw)
+		if n == "" || c.isMyHandle(n) || seen[n] {
+			return
 		}
-		if c.isMyHandle(normalized) {
-			if !selfSeen {
-				selfSeen = true
-				count++
-			}
-			continue
-		}
-		if seen[normalized] {
-			continue
-		}
+		seen[n] = true
 		count++
-		seen[normalized] = true
-		contact := c.lookupContact(normalized)
-		if contact == nil {
-			continue
+		if contact := c.lookupContact(n); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				seen[altID] = true
+			}
 		}
-		for _, altID := range contactPortalIDs(contact) {
-			seen[altID] = true
-		}
+	}
+	for _, p := range participants {
+		add(p)
+	}
+	if sender != nil {
+		add(*sender)
 	}
 	return count
 }

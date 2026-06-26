@@ -9984,6 +9984,9 @@ func (c *IMClient) indexGroupPortalLocked(portalID string) {
 	if c.groupPortalIndex == nil {
 		return
 	}
+	if !strings.Contains(portalID, ",") {
+		return // gid:/DM portals are not member-indexed (see ensureGroupPortalIndex)
+	}
 	for _, member := range strings.Split(portalID, ",") {
 		if c.groupPortalIndex[member] == nil {
 			c.groupPortalIndex[member] = make(map[string]bool)
@@ -10508,7 +10511,13 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
+	// A conversation is a group when it has >=2 members besides us. Self is an
+	// implicit member on inbound, and relayed carrier-group messages omit self
+	// from the participant list (a 3-person group arrives with 2 participants),
+	// so count non-self members from participants AND sender rather than testing
+	// the raw participant count against ">2" — otherwise a group reply that omits
+	// self mis-routes into a 1:1 DM with one member.
+	isGroup := c.countNonSelfMembers(participants, sender) >= 2 || (groupName != nil && *groupName != "")
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
