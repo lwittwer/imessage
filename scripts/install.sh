@@ -854,6 +854,18 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
+# ── Install the background service (LaunchAgent) — optional ───
+if [ -t 0 ]; then
+    printf "\nInstall and start the background service now? [Y/n]: "
+    read INSTALL_SVC
+else
+    INSTALL_SVC=""
+fi
+case "${INSTALL_SVC}" in
+[nN]*)
+    echo "Skipped — start it any time with: corten-matrix install-service"
+    ;;
+*)
 mkdir -p "$(dirname "$PLIST")"
 launchctl unload "$PLIST" 2>/dev/null || true
 
@@ -912,6 +924,8 @@ for i in $(seq 1 15); do
     fi
     sleep 1
 done
+    ;;
+esac
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -930,7 +944,7 @@ if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
     read ADD_PATH
     case "$ADD_PATH" in
         [nN]*) ;;
-        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+        *) sudo mkdir -p /usr/local/bin && sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
              && echo "OK - corten-matrix added to PATH" \
              || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
     esac

@@ -967,7 +967,7 @@ if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
     read ADD_PATH
     case "$ADD_PATH" in
         [nN]*) ;;
-        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+        *) sudo mkdir -p /usr/local/bin && sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
              && echo "OK - corten-matrix added to PATH" \
              || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
     esac

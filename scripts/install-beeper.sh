@@ -1080,8 +1080,23 @@ exec "$BINARY" -n -c "$CONFIG"
 BODY_EOF
 chmod +x "$DATA_ABS/start.sh"
 
-mkdir -p "$(dirname "$PLIST")"
 GUI_DOMAIN="gui/$(id -u)"
+DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
+DOMAIN="${DOMAIN:-beeper.local}"
+
+# ── Install the background service (LaunchAgent) — optional ───
+if [ -t 0 ]; then
+    printf "\nInstall and start the background service now? [Y/n]: "
+    read INSTALL_SVC
+else
+    INSTALL_SVC=""
+fi
+case "${INSTALL_SVC}" in
+[nN]*)
+    echo "Skipped — start it any time with: corten-matrix install-service"
+    ;;
+*)
+mkdir -p "$(dirname "$PLIST")"
 launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
 
@@ -1151,26 +1166,16 @@ echo "✓ Bridge started (LaunchAgent installed)"
 echo ""
 
 # ── Wait for bridge to connect ────────────────────────────────
-DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
-DOMAIN="${DOMAIN:-beeper.local}"
-
 echo "Waiting for bridge to start..."
 for i in $(seq 1 15); do
     if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
         echo "✓ Bridge is running"
-        echo ""
-        echo "═══════════════════════════════════════════════"
-        echo "  Setup Complete"
-        echo "═══════════════════════════════════════════════"
-        echo ""
-        echo "  Logs:    tail -f $LOG_OUT"
-        echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-        echo "  Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
-        echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
-        exit 0
+        break
     fi
     sleep 1
 done
+    ;;
+esac
 
 echo ""
 echo "Bridge is starting up (check logs for status):"
@@ -1184,7 +1189,7 @@ if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
     read ADD_PATH
     case "$ADD_PATH" in
         [nN]*) ;;
-        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+        *) sudo mkdir -p /usr/local/bin && sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
              && echo "OK - corten-matrix added to PATH" \
              || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
     esac
