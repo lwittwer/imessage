@@ -2,53 +2,65 @@
 
 package main
 
-/*
-#include <spawn.h>
-#include <stdlib.h>
-#include <sys/wait.h>
-
-// Private libSystem API (no public header): makes a spawned child its own TCC
-// "responsible" process rather than inheriting ours. Without this, a CLI probe
-// launched from Terminal is attributed to Terminal, so the bridge binary itself
-// never gets evaluated for Full Disk Access and never appears in the list.
-extern int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *, int);
-
-static int spawn_disclaimed(const char *path, char *const argv[]) {
-    posix_spawnattr_t attr;
-    if (posix_spawnattr_init(&attr) != 0) return 127;
-    responsibility_spawnattrs_setdisclaim(&attr, 1);
-    pid_t pid;
-    int rc = posix_spawn(&pid, path, NULL, &attr, argv, NULL);
-    posix_spawnattr_destroy(&attr);
-    if (rc != 0) return 127;
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return 1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-}
-*/
-import "C"
-
 import (
 	"os"
-	"unsafe"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"time"
 )
 
-// fdaCheck re-spawns this binary as `corten-matrix fda-probe` with TCC
-// responsibility disclaimed, so the probe runs as the bridge binary's own
-// responsible process (not Terminal). The disclaimed child's attempt to open
-// chat.db is what registers this binary under Full Disk Access. Returns the
-// child's exit code (0 = chat.db readable, 1 = not).
+// fdaCheck probes chat.db from a transient launchd job, so the bridge binary
+// itself is the process macOS TCC evaluates — the same context the installed
+// service runs in. A probe run straight from Terminal is attributed to Terminal
+// (which usually already has Full Disk Access), so the bridge never gets denied
+// and never appears in the Full Disk Access list. Running it under launchd makes
+// it its own responsible process, so the denied access registers it in the list
+// for the user to grant. Returns 0 if chat.db is readable, 1 otherwise.
 func fdaCheck() int {
 	self, err := os.Executable()
 	if err != nil {
 		return 1
 	}
-	cpath := C.CString(self)
-	defer C.free(unsafe.Pointer(cpath))
-	arg0 := C.CString(self)
-	defer C.free(unsafe.Pointer(arg0))
-	arg1 := C.CString("fda-probe")
-	defer C.free(unsafe.Pointer(arg1))
-	argv := []*C.char{arg0, arg1, nil}
-	return int(C.spawn_disclaimed(cpath, &argv[0]))
+	uid := strconv.Itoa(os.Getuid())
+	const label = "com.lrhodin.corten-matrix.fdaprobe"
+	result := filepath.Join(os.TempDir(), label+"."+strconv.Itoa(os.Getpid()))
+	_ = os.Remove(result)
+
+	laDir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
+	if err := os.MkdirAll(laDir, 0o755); err != nil {
+		return 1
+	}
+	plistPath := filepath.Join(laDir, label+".plist")
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>` + label + `</string>
+  <key>ProgramArguments</key><array><string>` + self + `</string><string>fda-probe</string><string>` + result + `</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>`
+	if os.WriteFile(plistPath, []byte(plist), 0o644) != nil {
+		return 1
+	}
+	defer os.Remove(plistPath)
+
+	_ = exec.Command("launchctl", "bootout", "gui/"+uid+"/"+label).Run()
+	if err := exec.Command("launchctl", "bootstrap", "gui/"+uid, plistPath).Run(); err != nil {
+		_ = exec.Command("launchctl", "load", plistPath).Run()
+	}
+
+	code := 1
+	for i := 0; i < 60; i++ { // up to ~6s for the probe to write its result
+		if b, err := os.ReadFile(result); err == nil && len(b) > 0 {
+			if b[0] == '0' {
+				code = 0
+			}
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = exec.Command("launchctl", "bootout", "gui/"+uid+"/"+label).Run()
+	_ = os.Remove(result)
+	return code
 }

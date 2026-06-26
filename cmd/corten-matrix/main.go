@@ -133,14 +133,18 @@ func main() {
 			// readable, 1 otherwise. See scripts/install.sh + fda_darwin.go.
 			os.Exit(fdaCheck())
 		case "fda-probe":
-			// Internal: the disclaimed child spawned by fda-check. The attempt to
-			// open chat.db is what registers this binary with TCC / Full Disk Access.
+			// Internal: spawned under launchd by fda-check. Attempting chat.db as
+			// our own responsible process is what registers the binary with TCC /
+			// Full Disk Access. Writes "0" (readable) / "1" (denied) to argv[2].
+			res := []byte("1")
 			home, _ := os.UserHomeDir()
-			f, err := os.Open(filepath.Join(home, "Library", "Messages", "chat.db"))
-			if err != nil {
-				os.Exit(1)
+			if f, err := os.Open(filepath.Join(home, "Library", "Messages", "chat.db")); err == nil {
+				_ = f.Close()
+				res = []byte("0")
 			}
-			_ = f.Close()
+			if len(os.Args) > 2 {
+				_ = os.WriteFile(os.Args[2], res, 0o644)
+			}
 			os.Exit(0)
 		default:
 			// A first argument that is neither a known subcommand nor a flag is
