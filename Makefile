@@ -238,6 +238,9 @@ build: check-deps $(RUST_LIB) $(BINARY)
 $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
+	# Stable ad-hoc identity — the linker's default "a.out" can't be tracked by
+	# TCC, so the bridge never appears in Full Disk Access (chat.db backfill).
+	codesign --force --sign - --identifier com.lrhodin.corten-matrix $(BINARY)
 
 clean:
 	rm -f $(APP_NAME) $(RUST_LIB)
