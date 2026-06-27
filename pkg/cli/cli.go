@@ -73,7 +73,6 @@ func serviceLabel(idx int) string {
 	return base + "-1"
 }
 
-
 // selfPath returns the absolute path of this binary (resolving symlinks).
 func selfPath() string {
 	p, err := os.Executable()
@@ -147,8 +146,29 @@ func serviceCtl(action string) {
 	os.Exit(0)
 }
 
+// linuxSystemctl picks the systemctl mode: --user when a user session bus is
+// reachable (a normal login), else system. Containers (LXC) and SSH-without-
+// lingering have no user bus — `systemctl --user` there dies with "Failed to
+// connect to bus", and the install scripts fall back to a SYSTEM unit
+// (SYSTEMD_MODE=system) in that case, which this drives instead.
+func linuxSystemctl() (base []string, system bool) {
+	if exec.Command("systemctl", "--user", "show-environment").Run() == nil {
+		return []string{"systemctl", "--user"}, false
+	}
+	if os.Geteuid() == 0 {
+		return []string{"systemctl"}, true // root in a container: system bus directly
+	}
+	return []string{"sudo", "systemctl"}, true
+}
+
+// sysctl streams a systemctl command in whichever mode (user|system) has a bus.
+func sysctl(args ...string) error {
+	b, _ := linuxSystemctl()
+	return streamRun(b[0], append(append([]string{}, b[1:]...), args...)...)
+}
+
 // serviceCtlOne runs one action against a single account's service label
-// (launchd label on macOS, systemd --user unit base name on Linux).
+// (launchd label on macOS, systemd unit base name on Linux).
 func serviceCtlOne(action, label string) error {
 	if runtime.GOOS == "darwin" {
 		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", label+".plist")
@@ -164,17 +184,12 @@ func serviceCtlOne(action, label string) error {
 		}
 		return nil
 	}
-	// Linux: systemd --user unit installed by the install scripts.
+	// Linux: drive the systemd unit the install scripts created, in whichever mode
+	// has a bus — user normally, system in LXC/containers (see linuxSystemctl).
 	unit := label + ".service"
 	switch action {
-	case "start":
-		return streamRun("systemctl", "--user", "start", unit)
-	case "stop":
-		return streamRun("systemctl", "--user", "stop", unit)
-	case "restart":
-		return streamRun("systemctl", "--user", "restart", unit)
-	case "status":
-		return streamRun("systemctl", "--user", "status", unit)
+	case "start", "stop", "restart", "status":
+		return sysctl(action, unit)
 	}
 	return nil
 }
@@ -346,7 +361,7 @@ func startOneNow(idx int) {
 		_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
 		return
 	}
-	_ = exec.Command("systemctl", "--user", "start", label+".service").Run()
+	_ = sysctl("start", label+".service")
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`
@@ -408,9 +423,15 @@ func serviceInstall() {
 		_ = exec.Command("launchctl", "unload", plist).Run()
 		exitWith("launchctl", "load", "-w", plist)
 	}
-	// Linux: systemd --user unit.
+	// Linux: systemd unit — a user unit normally, a system unit in LXC/containers
+	// (no user bus), matching the install scripts' SYSTEMD_MODE fallback.
+	_, system := linuxSystemctl()
 	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
-	_ = os.MkdirAll(dir, 0o755)
+	wantedBy := "default.target"
+	if system {
+		dir = "/etc/systemd/system"
+		wantedBy = "multi-user.target"
+	}
 	unit := filepath.Join(dir, "corten-matrix.service")
 	body := fmt.Sprintf(`[Unit]
 Description=corten-matrix iMessage bridge
@@ -424,13 +445,28 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=default.target
-`, self, data)
-	if err := os.WriteFile(unit, []byte(body), 0o644); err != nil {
-		die("write systemd unit: %v", err)
+WantedBy=%s
+`, self, data, wantedBy)
+	if system && os.Geteuid() != 0 {
+		// system unit needs root: write it via sudo tee.
+		_ = exec.Command("sudo", "mkdir", "-p", dir).Run()
+		w := exec.Command("sudo", "tee", unit)
+		w.Stdin = strings.NewReader(body)
+		w.Stderr = os.Stderr
+		if err := w.Run(); err != nil {
+			die("write systemd unit (sudo): %v", err)
+		}
+	} else {
+		_ = os.MkdirAll(dir, 0o755)
+		if err := os.WriteFile(unit, []byte(body), 0o644); err != nil {
+			die("write systemd unit: %v", err)
+		}
 	}
-	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
-	exitWith("systemctl", "--user", "enable", "--now", "corten-matrix.service")
+	_ = sysctl("daemon-reload")
+	if err := sysctl("enable", "--now", "corten-matrix.service"); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // serviceUninstall stops and removes the bridge service unit.
@@ -442,9 +478,19 @@ func serviceUninstall() {
 		fmt.Println("corten-matrix service removed.")
 		os.Exit(0)
 	}
-	_ = exec.Command("systemctl", "--user", "disable", "--now", "corten-matrix.service").Run()
-	_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "corten-matrix.service"))
-	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	_, system := linuxSystemctl()
+	_ = sysctl("disable", "--now", "corten-matrix.service")
+	if system {
+		unit := "/etc/systemd/system/corten-matrix.service"
+		if os.Geteuid() != 0 {
+			_ = exec.Command("sudo", "rm", "-f", unit).Run()
+		} else {
+			_ = os.Remove(unit)
+		}
+	} else {
+		_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "corten-matrix.service"))
+	}
+	_ = sysctl("daemon-reload")
 	fmt.Println("corten-matrix service removed.")
 	os.Exit(0)
 }
