@@ -123,7 +123,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix setup 1` / `setup-beeper 1` | Add a **second** iMessage account (a different Apple ID), or reconfigure an existing one later — the same prompts as `setup`, scoped to the second bridge. |
 | `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
-| `corten-matrix logs` / `logs 1` | Tail the live bridge log. `logs` = primary account (`~/.local/share/corten-matrix/logs/bridge.log`); `logs 1` = the second account (`~/.local/share/corten-matrix-1/logs/bridge.log`). |
+| `corten-matrix logs [1]` | Tail the live bridge log; add `1` for the second account. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup. |
 | `corten-matrix reset` | Reset bridge state (with prompts) — see the warning under [Configuration](#configuration). |
