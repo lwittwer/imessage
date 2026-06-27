@@ -2059,6 +2059,18 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 		titleDiffers := nameField != nil && portal.Name != *nameField
 		releaseCustomName := nameField == nil && portal.NameIsCustom
 		if !sameMode || titleDiffers || releaseCustomName {
+			chatInfo := &bridgev2.ChatInfo{
+				Name:                       nameField,
+				ExcludeChangesFromTimeline: true,
+			}
+			// Re-supply the room avatar whenever we stamp an explicit title (the
+			// moon). NameIsCustom=true otherwise freezes the ghost avatar out of
+			// the DM, so the photo vanishes for the duration of the focus. The
+			// release path (DefaultChatName) hands naming back to the framework,
+			// which restores the avatar itself — leave it nil there.
+			if nameField != nil && nameField != bridgev2.DefaultChatName {
+				chatInfo.Avatar = c.dmFocusContactAvatar(ctx, portal)
+			}
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
 					Type: bridgev2.RemoteEventChatInfoChange,
@@ -2073,10 +2085,7 @@ func (c *IMClient) applyStatusKitPresenceToPortal(ctx context.Context, log zerol
 					},
 				},
 				ChatInfoChange: &bridgev2.ChatInfoChange{
-					ChatInfo: &bridgev2.ChatInfo{
-						Name:                       nameField,
-						ExcludeChangesFromTimeline: true,
-					},
+					ChatInfo: chatInfo,
 				},
 			})
 			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
@@ -2266,6 +2275,33 @@ func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *st
 		return nil
 	}
 	return &base
+}
+
+// dmFocusContactAvatar returns the DM peer's contact photo as a ChatInfo avatar,
+// or nil when no contact/photo is available. Stamping an explicit DM title (the
+// moon) sets NameIsCustom=true, which makes the framework stop syncing the
+// ghost's avatar to the room (UpdateInfoFromGhost early-returns when
+// NameIsCustom is set) — so a mooned DM silently loses its contact photo. The
+// self-chat path at GetChatInfo already re-supplies the avatar for the same
+// reason; the moon stamp sites must do the same. Mirrors GetUserInfo's
+// contact-avatar block (same AvatarID format → idempotent with the ghost's).
+func (c *IMClient) dmFocusContactAvatar(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Avatar {
+	if c.contacts == nil {
+		return nil
+	}
+	portalID := string(portal.ID)
+	contact, _ := c.contacts.GetContactInfo(stripIdentifierPrefix(portalID))
+	if contact == nil || len(contact.Avatar) == 0 {
+		return nil
+	}
+	avatarHash := sha256.Sum256(contact.Avatar)
+	avatarData := contact.Avatar
+	return &bridgev2.Avatar{
+		ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+		Get: func(ctx context.Context) ([]byte, error) {
+			return avatarData, nil
+		},
+	}
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so
@@ -7418,6 +7454,8 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		IsBot:       &isBot,
 		Identifiers: []string{identifier},
 	}
+	// Emit normalized, deduped identifiers. Raw vCard phone strings may carry
+	// display formatting; contactPortalIDs returns clean tel:/mailto: IDs.
 	addContactIdentifiers := func(contact *imessage.Contact) {
 		seen := make(map[string]bool, len(ui.Identifiers))
 		for _, id := range ui.Identifiers {
