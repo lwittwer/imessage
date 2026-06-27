@@ -1627,22 +1627,31 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	if c.client != nil {
-		c.client.Stop()
-		c.client.Destroy()
-		c.client = nil
-	}
-	// Tear down the APNs connection too (stop its ResourceManager + free the
-	// courier socket). A reconnect/relogin opens a NEW connection on the SAME
-	// device token; if the old one lingered, Apple drops the duplicate
-	// ("Failed to read message from APS ... early eof") and rustpush's
-	// no-backoff reconnect loop turns that into the self-sustaining
-	// receive-stall storm. Closing here guarantees the next connect starts
-	// clean. Close() only stops the underlying connection — it does NOT destroy
-	// the WrappedApsConnection Go object — so the receive-wedge watchdog
-	// polling it is never left holding a freed handle.
+	// Close the APNs ResourceManager BEFORE stopping the Client: its death signal
+	// aborts any in-flight generate() reconnect, freeing Tokio workers so Stop()
+	// can be scheduled. With the reverse ordering a prolonged reconnect storm can
+	// exhaust all workers and make Stop() block forever. Don't nil c.connection —
+	// the watchdog may still poll it; Close() signals stop without freeing the Go object.
 	if c.connection != nil {
 		c.connection.Close()
+	}
+	if c.client != nil {
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a wedged
+		// Tokio runtime can't block the reconnect path forever. Destroy() runs
+		// regardless — UniFFI refcounting defers the free until any in-flight Stop()
+		// returns, so the leaked goroutine never touches freed memory.
+		stopDone := make(chan struct{})
+		go func() {
+			c.client.Stop()
+			close(stopDone)
+		}()
+		select {
+		case <-stopDone:
+		case <-time.After(10 * time.Second):
+			c.UserLogin.Log.Warn().Msg("client.Stop() timed out during disconnect; proceeding to destroy")
+		}
+		c.client.Destroy()
+		c.client = nil
 	}
 	if c.chatDB != nil {
 		c.chatDB.Close()
