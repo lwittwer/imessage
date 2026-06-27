@@ -16,6 +16,13 @@ ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
+# sudo prefix for SYSTEM-mode systemd calls. Root (e.g. LXC, where sudo often
+# isn't even installed) drives the system manager directly; a non-root sudo user
+# needs sudo to touch root-owned /etc/systemd/system and the system manager bus.
+# Mirrors the Go linuxSystemctl(): empty when uid 0, else "sudo". User-mode
+# (`systemctl --user`) calls never use this — they run as the logged-in user.
+if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 
 echo ""
@@ -32,7 +39,7 @@ if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
     systemctl --user stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
 elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-    sudo systemctl stop "$SERVICE_NAME"
+    $SUDO systemctl stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
 fi
 
@@ -609,7 +616,7 @@ fi
 if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
     systemctl --user stop "$SERVICE_NAME"
 elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-    sudo systemctl stop "$SERVICE_NAME"
+    $SUDO systemctl stop "$SERVICE_NAME"
 fi
 
 # ── Check for existing login / prompt if needed ──────────────
@@ -1025,7 +1032,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
         systemctl --user stop "$SERVICE_NAME"
     elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-        sudo systemctl stop "$SERVICE_NAME"
+        $SUDO systemctl stop "$SERVICE_NAME"
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -1054,7 +1061,7 @@ fi
 if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
     systemctl --user stop "$SERVICE_NAME"
 elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-    sudo systemctl stop "$SERVICE_NAME"
+    $SUDO systemctl stop "$SERVICE_NAME"
 fi
 
 if [ -z "${IN_DOCKER:-}" ]; then
@@ -1069,8 +1076,8 @@ if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
 elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    _SHORTCUT_SYSCTL="sudo systemctl"
-    _SHORTCUT_JCTL="sudo journalctl"
+    _SHORTCUT_SYSCTL="${SUDO:+$SUDO }systemctl"
+    _SHORTCUT_JCTL="${SUDO:+$SUDO }journalctl"
 else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
@@ -1211,7 +1218,10 @@ EOF
 }
 
 install_systemd_system() {
-    cat > "$SYSTEM_SERVICE_FILE" << EOF
+    # $SUDO (defined near the top) is empty for root/LXC, "sudo" otherwise. This
+    # is the path that failed for a non-root sudo user with "Permission denied"
+    # on the heredoc redirect into root-owned /etc/systemd/system.
+    $SUDO tee "$SYSTEM_SERVICE_FILE" >/dev/null << EOF
 [Unit]
 Description=corten-matrix bridge (Beeper)
 After=network.target
@@ -1231,8 +1241,8 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable "$SERVICE_NAME"
 }
 
 if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
@@ -1263,7 +1273,7 @@ elif [ "$SYSTEMD_MODE" = "user" ]; then
 elif [ "$SYSTEMD_MODE" = "system" ]; then
     if [ -f "$SYSTEM_SERVICE_FILE" ]; then
         install_systemd_system
-        systemctl restart "$SERVICE_NAME"
+        $SUDO systemctl restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -1272,7 +1282,7 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_system
-                   systemctl start "$SERVICE_NAME"
+                   $SUDO systemctl start "$SERVICE_NAME"
                    echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
