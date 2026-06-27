@@ -164,9 +164,9 @@ How you update depends on how you're running corten-matrix:
 - **Official prebuilt binaries (macOS & Linux)** — run `corten-matrix update`. It pulls the latest [release](https://github.com/lrhodin/corten-matrix/releases) for your platform (macOS universal, Linux amd64, or Linux arm64), replaces the installed binary in place, prints the release notes, and restarts the bridge. Your config, login, and data are untouched.
 
   ```bash
-  corten-matrix update            # update & restart
-  corten-matrix update --check    # show what's available + release notes, change nothing
-  corten-matrix update --force    # re-download & reinstall the current release
+  corten-matrix update          # update & restart
+  corten-matrix update check    # show what's available + release notes, change nothing
+  corten-matrix update force    # re-download & reinstall the current release
   ```
 
   **The service must be installed first.** `update` doesn't take a path or guess where your binary lives — it locates it through the `corten-matrix` entry on your `PATH`. That entry is a symlink into `/usr/local/bin` that `corten-matrix setup` (and `install-service`) creates, pointing at wherever you actually keep the binary; `update` follows the symlink to that real file and replaces it in place, leaving the symlink intact. So you must have run `setup` / `install-service` (and added it to `PATH` when prompted) before `update` will work. If `corten-matrix` isn't on your `PATH`, `update` stops and tells you to install the service first rather than guessing. (If the binary lives somewhere only root can write, it uses `sudo` for the swap.)
