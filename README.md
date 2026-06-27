@@ -120,9 +120,10 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 |---|---|
 | `corten-matrix setup` | Configure and start the bridge against a self-hosted homeserver. Idempotent — re-run to flip feature toggles. |
 | `corten-matrix setup-beeper` | Same, but configured for Beeper. |
-| `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). |
+| `corten-matrix setup 1` / `setup-beeper 1` | Add a **second** iMessage account (a different Apple ID), or reconfigure an existing one later — the same prompts as `setup`, scoped to the second bridge. |
+| `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
-| `corten-matrix logs` | Tail the live bridge log (`~/.local/share/corten-matrix/logs/bridge.log`). |
+| `corten-matrix logs` / `logs 1` | Tail the live bridge log. `logs` = primary account (`~/.local/share/corten-matrix/logs/bridge.log`); `logs 1` = the second account (`~/.local/share/corten-matrix-1/logs/bridge.log`). |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup. |
 | `corten-matrix reset` | Reset bridge state (with prompts) — see the warning under [Configuration](#configuration). |
@@ -131,6 +132,15 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix help` | Show the command list. |
 
 The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.
+
+### A second iMessage account
+
+corten-matrix can bridge a **second Apple ID** on the same machine (max two). It's an explicit, one-line command — there's no mid-setup prompt:
+
+- **Add it any time** with `corten-matrix setup 1` (self-hosted) or `corten-matrix setup-beeper 1` (Beeper). You'll get the same configuration prompts and iMessage login, scoped to the second bridge.
+- **Reconfigure it later** by re-running the same command — e.g. to flip a toggle like CloudKit backfill.
+
+Both accounts run under a **single** background service (one launchd agent / systemd unit), so `start` / `stop` / `restart` / `status` act on both at once. The second account's data lives in `~/.local/share/corten-matrix-1`, and `corten-matrix logs 1` tails its log.
 
 ## Login
 
