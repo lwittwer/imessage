@@ -553,7 +553,7 @@ func PrintHelp() {
 		{"stop", "stop the bridge"},
 		{"restart", "restart the bridge"},
 		{"status", "show service status"},
-		{"logs [1]", "tail a bridge log (1 = second account)"},
+		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
 		{"reset", "reset bridge state"},
