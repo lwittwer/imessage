@@ -3623,6 +3623,32 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 		finalPortalKey = newPortalKey
 	}
 
+	// Record the service type on the (possibly re-keyed) portal. Carrier groups
+	// re-key on membership change, and reIDPortalWithCacheUpdate only carries the
+	// SMS flag forward if the old portal already had one in memory — a group whose
+	// flag was never set this session would lose it, sending outbound replies over
+	// iMessage. Set it explicitly from msg.IsSms (this path doesn't go through
+	// handleMessage's updatePortalSMS) and persist on change so it survives a
+	// restart (loadSenderGuidsFromDB only hydrates IsSms=true entries).
+	if c.updatePortalSMS(string(finalPortalKey.ID), msg.IsSms) {
+		ctx := context.Background()
+		if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, finalPortalKey); err == nil && p != nil {
+			meta, ok := p.Metadata.(*PortalMetadata)
+			if !ok {
+				meta = &PortalMetadata{}
+			}
+			if meta.IsSms != msg.IsSms {
+				meta.IsSms = msg.IsSms
+				p.Metadata = meta
+				if err := p.Save(ctx); err != nil {
+					log.Warn().Err(err).Str("portal_id", string(finalPortalKey.ID)).
+						Bool("is_sms", msg.IsSms).
+						Msg("Failed to persist IsSms after participant change")
+				}
+			}
+		}
+	}
+
 	// Cache sender_guid and group_name under the (possibly new) portal ID.
 	// For comma-based portals and gid: portals, cache the sender_guid so
 	// future messages can be resolved to this portal. This is skipped for
