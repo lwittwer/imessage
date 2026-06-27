@@ -2220,7 +2220,7 @@ type carrierGroupChatRow struct {
 func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carrierGroupChatRow, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
-		 WHERE login_id=$1 AND UPPER(service) IN ('SMS','RCS','MMS') AND deleted=FALSE
+		 WHERE login_id=$1 AND UPPER(TRIM(service)) IN ('SMS','RCS','MMS') AND deleted=FALSE
 		   AND portal_id <> '' AND participants_json IS NOT NULL AND participants_json <> ''
 		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')`,
 		s.loginID,

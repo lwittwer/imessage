@@ -3714,7 +3714,7 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	if isGroup && groupID != "" {
 		senderGuidPtr = &groupID
 	}
-	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr)
+	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr, isCarrierService(service))
 	return string(portalKey.ID)
 }
 
