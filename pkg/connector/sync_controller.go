@@ -2153,14 +2153,8 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
 	}
 
-	// Consolidate carrier group chats that CloudKit recorded under multiple unstable
-	// gid: encodings (plain UUID / sha1-hex / hex-encoded UUID) into one room per
-	// participant set. Carrier groups have no stable group GUID, so the old gid: key
-	// shards one conversation across many rooms. This re-keys their cloud_chat/
-	// cloud_message rows to the canonical participant key and merges the existing
-	// rooms. Must run before createPortalsFromCloudSync so the canonical portal is
-	// the one created and (re-)backfilled. New splits are prevented at ingest by
-	// resolvePortalIDForCloudChat keying carrier groups by participants.
+	// Heal carrier groups that the old gid: key sharded across many rooms, before
+	// createPortalsFromCloudSync so the canonical portal is the one (re-)backfilled.
 	c.consolidateCarrierGroupPortals(ctx, log)
 
 	// Create portals and queue forward backfill for all of them.
@@ -3669,18 +3663,12 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	// presence alone.
 	isGroup := style == 43
 
-	// Carrier group chats (SMS/RCS/MMS) have no stable Apple group GUID: CloudKit
-	// hands the same conversation back under several group_id encodings (plain
-	// UUID, sha1-hex, hex-encoded UUID) and even across services, so keying by
-	// gid: shards one group across many rooms. Key them by their participant set
-	// instead — the exact key the live message path uses (makePortalKey's
-	// no-senderGuid branch) — so backfill and live converge on one room.
-	// consolidateCarrierGroupPortals heals groups that already split under the
-	// old gid: scheme.
-	// Gate on >=2 non-self members so this matches makePortalKey's live group
-	// test exactly (same predicate). A degenerate carrier chat that reduces to
-	// just us — or a single remote handle — falls through to the DM/self-chat
-	// handling below instead of emitting a bogus self-only comma key.
+	// Carrier groups (SMS/RCS/MMS) have no stable Apple group GUID, so keying by
+	// gid: shards one group across many rooms. Key them by participant set — the
+	// same key makePortalKey's no-senderGuid branch uses — so backfill and live
+	// converge on one room (consolidateCarrierGroupPortals heals old gid: splits).
+	// The >=2 non-self gate matches makePortalKey's group test; a degenerate chat
+	// (just us, or one remote handle) falls through to DM/self-chat handling.
 	if isGroup && isCarrierService(service) && c.countNonSelfMembers(participants, nil) >= 2 {
 		return strings.Join(c.buildCanonicalParticipantList(participants), ",")
 	}
@@ -3730,25 +3718,23 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	return string(portalKey.ID)
 }
 
-// carrierConsolidationEntry pairs a carrier group portal with the canonical participant
-// key its conversation should live under.
+// carrierConsolidationEntry pairs a carrier group portal with the canonical
+// participant key its conversation should live under.
 type carrierConsolidationEntry struct {
 	portalID  string
 	canonical string
 }
 
-// carrierConsolidationGroup is a set of carrier group portals that resolve to the same
-// canonical participant key and therefore need to be merged into one room.
+// carrierConsolidationGroup is the set of carrier group portals that resolve to
+// one canonical participant key and must be merged into a single room.
 type carrierConsolidationGroup struct {
 	canonical string
 	members   []string // distinct portal IDs sharing this canonical key, sorted
 }
 
-// planCarrierGroupConsolidation groups carrier group portals by canonical participant
-// key and returns the groups that need consolidation: those with more than one
-// distinct portal, or a single portal whose ID differs from the canonical key
-// (so it gets re-keyed to the participant form). Pure logic with no DB/room
-// access — the testable core of consolidateCarrierGroupPortals.
+// planCarrierGroupConsolidation groups portals by canonical key and returns those
+// needing consolidation: more than one portal, or a single portal whose ID isn't
+// already the canonical key. Pure logic — the testable core of the migration.
 func planCarrierGroupConsolidation(entries []carrierConsolidationEntry) []carrierConsolidationGroup {
 	byKey := make(map[string]map[string]bool)
 	for _, e := range entries {
@@ -3777,17 +3763,11 @@ func planCarrierGroupConsolidation(entries []carrierConsolidationEntry) []carrie
 	return out
 }
 
-// consolidateCarrierGroupPortals collapses carrier group conversations that were sharded
-// across multiple gid: rooms (CloudKit hands the same carrier group back under
-// several unstable group_id encodings) into one room per participant set. It
-// re-keys each duplicate's cloud_chat/cloud_message rows to the canonical
-// participant key, renames the room with the most history onto that key, and
-// tombstones the rest into it. The re-keyed messages re-backfill into the
-// survivor via the normal ChatResync forward/backward backfill (GUID-deduped),
-// so no history is lost.
-//
-// Runs inline at startup before createPortalsFromCloudSync. New splits are
-// prevented at ingest by resolvePortalIDForCloudChat.
+// consolidateCarrierGroupPortals collapses carrier groups sharded across multiple
+// gid: rooms into one room per participant set: re-keys each duplicate's cloud
+// rows to the canonical participant key, merges the rooms, and lets ChatResync
+// re-backfill (GUID-deduped, so no history is lost). Runs at startup before
+// createPortalsFromCloudSync; new splits are prevented at ingest.
 func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerolog.Logger) {
 	if c.cloudStore == nil {
 		return
@@ -3831,29 +3811,41 @@ func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerol
 	}
 }
 
-// consolidateOneCarrierGroup performs the data + room moves for a single carrier group.
-// Returns true if it took any action.
+// consolidateOneCarrierGroup performs the data + room moves for a single carrier
+// group. Returns true if it took any action.
 func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) bool {
 	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
 
-	// Survivor = the existing member room with the most bridged Matrix messages
-	// (most history to keep, least to re-insert). May be empty if none have rooms.
+	// Pick the survivor — the live room the others are tombstoned into.
+	// reIDPortalWithCacheUpdate (ReIDPortal) can't merge two existing rooms; given
+	// (source, target) where target already has a room it tombstones the SOURCE.
+	// So if a room already holds the canonical key it MUST be the survivor —
+	// re-ID'ing a larger member onto it would tombstone that larger room, not
+	// keep it. Otherwise keep the member with the most bridged history and rename
+	// it onto the canonical key. Empty survivor = no member has a room yet;
+	// createPortalsFromCloudSync builds it from the re-keyed cloud_chat.
 	survivor := ""
-	survivorMsgs := -1
-	for _, m := range g.members {
-		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
-		p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, mk)
-		if err != nil || p == nil || p.MXID == "" {
-			continue
-		}
-		if n := c.countBridgedMessages(ctx, m); n > survivorMsgs {
-			survivorMsgs = n
-			survivor = m
+	if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, canonicalKey); err == nil && p != nil && p.MXID != "" {
+		survivor = g.canonical
+	} else {
+		survivorMsgs := -1
+		for _, m := range g.members {
+			if m == g.canonical {
+				continue
+			}
+			mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+			if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, mk); err != nil || p == nil || p.MXID == "" {
+				continue
+			}
+			if n := c.countBridgedMessages(ctx, m); n > survivorMsgs {
+				survivorMsgs = n
+				survivor = m
+			}
 		}
 	}
 
-	// Re-key all members' cloud data to the canonical participant key so the
-	// consolidated room re-backfills the union of their messages.
+	// Re-key all members' cloud data to the canonical key so the survivor
+	// re-backfills the union of their messages.
 	for _, m := range g.members {
 		if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
 			log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
@@ -3865,16 +3857,9 @@ func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.L
 			Msg("Failed to reset backfill state for canonical carrier portal")
 	}
 
-	// Move the rooms onto the canonical key: rename the survivor (carrying its
-	// history via the message FK ON UPDATE CASCADE), tombstone the rest into it.
-	// Members with no room are left for createPortalsFromCloudSync to create from
-	// the re-keyed cloud_chat.
-	//
-	// Edge: if a portal with the canonical key already exists (e.g. a live comma
-	// room) and a different member has more history, the re-ID below tombstones
-	// the larger room into the smaller canonical one. No data is lost — the
-	// re-keyed cloud_message rows re-backfill into the survivor — it just keeps
-	// the canonical-keyed room rather than the largest. Rare and self-correcting.
+	// Rename the survivor onto the canonical key (no-op if it already holds it),
+	// then tombstone every other member room into it. Members with no room are
+	// left for createPortalsFromCloudSync to build from the re-keyed cloud_chat.
 	if survivor != "" && survivor != g.canonical {
 		survivorKey := networkid.PortalKey{ID: networkid.PortalID(survivor), Receiver: c.UserLogin.ID}
 		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, survivorKey, canonicalKey); err != nil {
@@ -3898,7 +3883,6 @@ func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.L
 		Str("canonical", g.canonical).
 		Int("members", len(g.members)).
 		Str("survivor", survivor).
-		Int("survivor_msgs", survivorMsgs).
 		Msg("Consolidated carrier group portals")
 	return true
 }

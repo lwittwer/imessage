@@ -139,16 +139,11 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	return nil
 }
 
-// countNonSelfMembers counts the unique non-self members of a conversation,
-// drawn from both the participant list and the sender. A contact's alternate
-// handles are collapsed so a multi-number contact isn't counted twice.
-//
-// This is the group/DM signal for inbound routing: self is always an implicit
-// member, so a conversation is a group when there are >=2 other members. Relayed
-// carrier-group messages (SMS/RCS/MMS) list only the OTHER members and omit
-// self, so a 3-person group arrives with 2 participants — counting raw
-// participants against ">2" misclassifies it as a DM and mis-delivers the reply
-// into a 1:1 with one of the members.
+// countNonSelfMembers counts the unique non-self members of a conversation
+// across the participant list and the sender, collapsing a contact's alternate
+// handles so a multi-number contact isn't double-counted. The group/DM signal
+// for inbound routing: self is implicit, so >=2 other members means a group.
+// Sender is included because relayed carrier groups omit self from participants.
 func (c *IMClient) countNonSelfMembers(participants []string, sender *string) int {
 	seen := make(map[string]bool)
 	count := 0

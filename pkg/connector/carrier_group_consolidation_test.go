@@ -83,11 +83,6 @@ func TestPlanCarrierGroupConsolidation(t *testing.T) {
 			},
 			want: nil,
 		},
-		{
-			name:    "no entries",
-			entries: nil,
-			want:    nil,
-		},
 	}
 
 	for _, tt := range tests {

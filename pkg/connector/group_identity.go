@@ -6,12 +6,10 @@ func isGroupPortalID(portalID string) bool {
 	return strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 }
 
-// isCarrierService reports whether a CloudKit chat service is a carrier
-// messaging service (SMS / RCS / MMS) rather than iMessage. Carrier group
-// conversations have no stable Apple group GUID — CloudKit hands the same group
-// back under several unstable group_id encodings — so they must be keyed by
-// participant set, not gid:. iMessage groups (and unknown/empty services) keep
-// their gid: key.
+// isCarrierService reports whether a CloudKit chat service is SMS/RCS/MMS rather
+// than iMessage. Carrier groups have no stable Apple group GUID (CloudKit returns
+// them under several unstable group_id encodings), so they're keyed by participant
+// set, not gid:. iMessage and unknown/empty services keep their gid: key.
 func isCarrierService(service string) bool {
 	switch strings.ToUpper(strings.TrimSpace(service)) {
 	case "SMS", "RCS", "MMS":

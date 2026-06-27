@@ -2215,11 +2215,8 @@ type carrierGroupChatRow struct {
 }
 
 // listCarrierGroupChats returns the distinct group portals (gid: or comma) for
-// non-deleted carrier-service (SMS/RCS/MMS) chats, each with its normalized
-// participant roster. Used by consolidateCarrierGroupPortals to collapse the
-// same conversation recorded under multiple unstable gid: encodings (and across
-// services). DM portals (single remote handle) are excluded. Rows with an empty
-// roster are skipped — they can't be grouped.
+// non-deleted SMS/RCS/MMS chats, each with its normalized participant roster, for
+// consolidateCarrierGroupPortals. DM portals and empty-roster rows are excluded.
 func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carrierGroupChatRow, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
@@ -2263,10 +2260,10 @@ func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carri
 }
 
 // reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
-// to newPortalID and resets forward-backfill state so the re-keyed messages get
-// re-backfilled into the new portal's room. updated_ts is bumped so the portal
-// is not skipped by the "fully backfilled, no new content" startup filter.
-// Mirrors the existing normalizeGroup*PortalIDs migrations. No-op-safe.
+// to newPortalID and resets forward-backfill state so the re-keyed messages
+// re-backfill into the new portal's room. updated_ts is bumped so the portal
+// isn't skipped by the "fully backfilled, no new content" startup filter.
+// Mirrors the normalizeGroup*PortalIDs migrations. No-op-safe.
 func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
 	if oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
 		return nil

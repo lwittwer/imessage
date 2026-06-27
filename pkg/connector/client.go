@@ -10511,12 +10511,9 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	// A conversation is a group when it has >=2 members besides us. Self is an
-	// implicit member on inbound, and relayed carrier-group messages omit self
-	// from the participant list (a 3-person group arrives with 2 participants),
-	// so count non-self members from participants AND sender rather than testing
-	// the raw participant count against ">2" — otherwise a group reply that omits
-	// self mis-routes into a 1:1 DM with one member.
+	// Group = >=2 members besides us. Relayed carrier groups omit self, so a
+	// 3-person group arrives with 2 participants; count non-self members across
+	// participants AND sender so such a reply isn't mis-routed into a 1:1 DM.
 	isGroup := c.countNonSelfMembers(participants, sender) >= 2 || (groupName != nil && *groupName != "")
 
 	if isGroup {
