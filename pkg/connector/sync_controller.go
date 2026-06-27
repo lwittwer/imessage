@@ -3811,38 +3811,81 @@ func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerol
 	}
 }
 
+// carrierMemberRoom is one member portal's Matrix-room state, gathered for the
+// room-move decision in planCarrierRoomMoves.
+type carrierMemberRoom struct {
+	portalID string
+	hasRoom  bool
+	msgCount int // bridged messages; only meaningful when hasRoom
+}
+
+// carrierRoomMovePlan is the decided set of room moves for one carrier group:
+// the survivor room kept as the live conversation, and the member portals whose
+// rooms are re-ID'd onto the canonical key (applied in order, survivor first).
+type carrierRoomMovePlan struct {
+	survivor string   // portal ID of the room kept; "" when no member has a room yet
+	reIDs    []string // portals to re-ID onto the canonical key, in apply order
+}
+
+// planCarrierRoomMoves decides which member room survives and which are merged
+// into it. reIDPortalWithCacheUpdate (ReIDPortal) tombstones the SOURCE when the
+// target room already exists, so a room already holding the canonical key must
+// be the survivor — re-ID'ing a larger member onto it would tombstone that
+// larger room. Otherwise the member with the most bridged history wins and is
+// renamed onto the canonical key (emitted first so it claims the key before the
+// rest tombstone into it). Members without a room are skipped — they're left for
+// createPortalsFromCloudSync to build from the re-keyed cloud_chat. Pure logic:
+// the tested core of consolidateOneCarrierGroup's room moves.
+func planCarrierRoomMoves(canonical string, canonicalHasRoom bool, members []carrierMemberRoom) carrierRoomMovePlan {
+	survivor := ""
+	if canonicalHasRoom {
+		survivor = canonical
+	} else {
+		best := -1
+		for _, m := range members {
+			if m.portalID == canonical || !m.hasRoom {
+				continue
+			}
+			if m.msgCount > best {
+				best = m.msgCount
+				survivor = m.portalID
+			}
+		}
+	}
+
+	plan := carrierRoomMovePlan{survivor: survivor}
+	if survivor != "" && survivor != canonical {
+		plan.reIDs = append(plan.reIDs, survivor)
+	}
+	for _, m := range members {
+		if !m.hasRoom || m.portalID == survivor || m.portalID == canonical {
+			continue
+		}
+		plan.reIDs = append(plan.reIDs, m.portalID)
+	}
+	return plan
+}
+
 // consolidateOneCarrierGroup performs the data + room moves for a single carrier
 // group. Returns true if it took any action.
 func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) bool {
 	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
 
-	// Pick the survivor — the live room the others are tombstoned into.
-	// reIDPortalWithCacheUpdate (ReIDPortal) can't merge two existing rooms; given
-	// (source, target) where target already has a room it tombstones the SOURCE.
-	// So if a room already holds the canonical key it MUST be the survivor —
-	// re-ID'ing a larger member onto it would tombstone that larger room, not
-	// keep it. Otherwise keep the member with the most bridged history and rename
-	// it onto the canonical key. Empty survivor = no member has a room yet;
-	// createPortalsFromCloudSync builds it from the re-keyed cloud_chat.
-	survivor := ""
-	if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, canonicalKey); err == nil && p != nil && p.MXID != "" {
-		survivor = g.canonical
-	} else {
-		survivorMsgs := -1
-		for _, m := range g.members {
-			if m == g.canonical {
-				continue
-			}
-			mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
-			if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, mk); err != nil || p == nil || p.MXID == "" {
-				continue
-			}
-			if n := c.countBridgedMessages(ctx, m); n > survivorMsgs {
-				survivorMsgs = n
-				survivor = m
-			}
+	// Gather room state, then let planCarrierRoomMoves decide the survivor and the
+	// re-ID order (the irreversible part, kept pure and unit-tested).
+	members := make([]carrierMemberRoom, 0, len(g.members))
+	for _, m := range g.members {
+		if m == g.canonical {
+			continue
 		}
+		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		room := carrierMemberRoom{portalID: m, hasRoom: c.portalHasRoom(ctx, mk)}
+		if room.hasRoom {
+			room.msgCount = c.countBridgedMessages(ctx, m)
+		}
+		members = append(members, room)
 	}
+	plan := planCarrierRoomMoves(g.canonical, c.portalHasRoom(ctx, canonicalKey), members)
 
 	// Re-key all members' cloud data to the canonical key so the survivor
 	// re-backfills the union of their messages.
@@ -3857,34 +3900,32 @@ func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.L
 			Msg("Failed to reset backfill state for canonical carrier portal")
 	}
 
-	// Rename the survivor onto the canonical key (no-op if it already holds it),
-	// then tombstone every other member room into it. Members with no room are
-	// left for createPortalsFromCloudSync to build from the re-keyed cloud_chat.
-	if survivor != "" && survivor != g.canonical {
-		survivorKey := networkid.PortalKey{ID: networkid.PortalID(survivor), Receiver: c.UserLogin.ID}
-		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, survivorKey, canonicalKey); err != nil {
-			log.Warn().Err(err).Str("survivor", survivor).Str("canonical", g.canonical).
-				Msg("Failed to rename survivor carrier portal to canonical key")
-			return false
-		}
-	}
-	for _, m := range g.members {
-		if m == survivor || m == g.canonical {
-			continue
-		}
+	// Apply the room moves. The survivor rename (when present) is reIDs[0] and
+	// must claim the canonical key before the rest tombstone into it, so a failure
+	// there aborts rather than merging rooms into a non-canonical survivor.
+	for _, m := range plan.reIDs {
 		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
 		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, mk, canonicalKey); err != nil {
-			log.Warn().Err(err).Str("duplicate", m).Str("canonical", g.canonical).
-				Msg("Failed to merge duplicate carrier portal into canonical room")
+			log.Warn().Err(err).Str("portal", m).Str("canonical", g.canonical).
+				Msg("Failed to re-ID carrier portal onto canonical key")
+			if m == plan.survivor {
+				return false
+			}
 		}
 	}
 
 	log.Info().
 		Str("canonical", g.canonical).
 		Int("members", len(g.members)).
-		Str("survivor", survivor).
+		Str("survivor", plan.survivor).
 		Msg("Consolidated carrier group portals")
 	return true
+}
+
+// portalHasRoom reports whether a portal exists and has a Matrix room.
+func (c *IMClient) portalHasRoom(ctx context.Context, key networkid.PortalKey) bool {
+	p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, key)
+	return err == nil && p != nil && p.MXID != ""
 }
 
 // countBridgedMessages returns how many Matrix messages are bridged into the
