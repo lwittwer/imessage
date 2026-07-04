@@ -128,9 +128,20 @@ const recentChatsQuery = `
 SELECT chat.guid, chat.group_id FROM message
 JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
 JOIN chat              ON chat_message_join.chat_id = chat.ROWID
+LEFT JOIN handle sender_handle ON message.handle_id = sender_handle.ROWID
 WHERE message.date>$1
   AND message.item_type = 0
   AND COALESCE(message.associated_message_guid, '') = ''
+  AND (message.is_from_me = 1 OR COALESCE(sender_handle.id, '') <> '')
+  AND (
+    TRIM(REPLACE(COALESCE(message.text, ''), char(65532), ''), ' ' || char(9) || char(10) || char(13)) <> ''
+    OR TRIM(COALESCE(message.subject, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+    OR length(message.attributedBody) > 0
+    OR EXISTS (
+      SELECT 1 FROM message_attachment_join maj
+      WHERE maj.message_id = message.ROWID
+    )
+  )
 GROUP BY chat.guid, chat.group_id
 ORDER BY MAX(message.date) DESC
 `

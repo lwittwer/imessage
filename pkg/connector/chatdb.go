@@ -195,19 +195,13 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	for _, msg := range messages {
-		if msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+		if !chatDBMessageCanBackfill(msg) {
 			continue
 		}
 		sender := chatDBMakeEventSender(msg, c)
-		if sender.Sender == "" && !sender.IsFromMe {
-			continue
-		}
 		sender = c.canonicalizeDMSender(params.Portal.PortalKey, sender)
 
-		// Strip U+FFFC (object replacement character) — inline attachment
-		// placeholders from NSAttributedString that render as blank
-		msg.Text = strings.ReplaceAll(msg.Text, "\uFFFC", "")
-		msg.Text = strings.TrimSpace(msg.Text)
+		normalizeChatDBMessageText(msg)
 
 		// Only create a text part if there's actual text content
 		if msg.Text != "" || msg.Subject != "" {
@@ -324,7 +318,45 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 }
 
+func normalizeChatDBMessageText(msg *imessage.Message) {
+	msg.Text = strings.TrimSpace(strings.ReplaceAll(msg.Text, "\uFFFC", ""))
+	msg.Subject = strings.TrimSpace(msg.Subject)
+}
+
+func chatDBMessageCanBackfill(msg *imessage.Message) bool {
+	if msg == nil || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+		return false
+	}
+	if !msg.IsFromMe && msg.Sender.LocalID == "" {
+		return false
+	}
+	normalizeChatDBMessageText(msg)
+	if msg.Text != "" || msg.Subject != "" {
+		return true
+	}
+	for _, att := range msg.Attachments {
+		if att != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *chatDB) hasBackfillableMessages(chatGUID string) (bool, error) {
+	messages, err := db.api.GetMessagesSinceDate(chatGUID, time.Time{}, "")
+	if err != nil {
+		return false, err
+	}
+	for _, msg := range messages {
+		if chatDBMessageCanBackfill(msg) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, urlPreviewsInBackfill bool) (*bridgev2.ConvertedMessage, error) {
+	normalizeChatDBMessageText(msg)
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    msg.Text,
@@ -369,7 +401,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 
 	data, err := att.Read()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read attachment %s: %w", att.PathOnDisk, err)
+		return chatDBAttachmentNotice(fileName, "read"), nil
 	}
 
 	// Convert CAF Opus voice messages to OGG Opus for Matrix/Beeper clients
@@ -456,7 +488,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	if intent != nil {
 		url, encFile, err := intent.UploadMedia(ctx, "", data, fileName, mimeType)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload attachment: %w", err)
+			return chatDBAttachmentNotice(fileName, "uploaded"), nil
 		}
 		if encFile != nil {
 			content.File = encFile
@@ -489,4 +521,19 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			Content: content,
 		}},
 	}, nil
+}
+
+func chatDBAttachmentNotice(fileName, action string) *bridgev2.ConvertedMessage {
+	if strings.TrimSpace(fileName) == "" {
+		fileName = "attachment"
+	}
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type: event.EventMessage,
+			Content: &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:    fmt.Sprintf("Attachment could not be %s (%s).", action, fileName),
+			},
+		}},
+	}
 }

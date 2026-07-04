@@ -1,6 +1,194 @@
 package connector
 
-import "testing"
+import (
+	"context"
+	"database/sql"
+	"testing"
+
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
+	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/util/dbutil"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+)
+
+func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := int64(1000)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, display_name, created_ts, updated_ts, deleted, is_filtered)
+		VALUES
+			($1, 'chat-only', 'tel:+15550000001', NULL, $2, $2, FALSE, 0),
+			($1, 'with-message', 'tel:+15550000002', NULL, $2, $2, FALSE, 0),
+			($1, 'reaction-only', 'tel:+15550000003', NULL, $2, $2, FALSE, 0),
+			($1, 'scrubbed', 'tel:+15550000004', NULL, $2, $2, FALSE, 0),
+			($1, 'senderless', 'tel:+15550000005', NULL, $2, $2, FALSE, 0),
+			($1, 'senderless-group', 'gid:senderless', NULL, $2, $2, FALSE, 0),
+			($1, 'rename', 'gid:rename', 'Renamed Group', $2, $2, FALSE, 0),
+			($1, 'filtered', 'tel:+15550000006', NULL, $2, $2, FALSE, 1)
+	`, store.loginID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			tapback_type, tapback_target_guid, attachments_json, has_body, body_scrubbed, created_ts, updated_ts
+		)
+		VALUES
+			($1, 'msg-1', 'tel:+15550000002', 2000, 'tel:+15551111111', FALSE, 'hello', 'record-1', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'whitespace-1', 'tel:+15550000002', 8000, 'tel:+15551111111', FALSE, '  ' || char(10), 'record-1b', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'subject-whitespace-1', 'tel:+15550000002', 9000, 'tel:+15551111111', FALSE, '', 'record-1c', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'reaction-1', 'tel:+15550000003', 3000, 'tel:+15551111111', FALSE, '', 'record-2', 2000, 'msg-1', '', TRUE, FALSE, $2, $2),
+			($1, 'scrubbed-1', 'tel:+15550000004', 4000, 'tel:+15551111111', FALSE, '', 'record-3', NULL, NULL, '', TRUE, TRUE, $2, $2),
+			($1, 'senderless-1', 'tel:+15550000005', 5000, '', FALSE, 'senderless', 'record-4', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'senderless-group-1', 'gid:senderless', 5500, '', FALSE, 'senderless group', 'record-4b', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'rename-1', 'gid:rename', 6000, 'tel:+15551111111', FALSE, 'Renamed Group', 'record-5', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'filtered-1', 'tel:+15550000006', 7000, 'tel:+15551111111', FALSE, 'filtered', 'record-6', NULL, NULL, '', TRUE, FALSE, $2, $2)
+	`, store.loginID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		UPDATE cloud_message
+		SET subject = ' ' || char(10)
+		WHERE login_id=$1 AND guid='subject-whitespace-1'
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d portals (%#v), want 2", len(got), got)
+	}
+	if got[0].PortalID != "tel:+15550000005" || got[0].NewestTS != 5000 || got[0].MessageCount != 1 {
+		t.Fatalf("got first portal %#v, want senderless DM fallback message", got[0])
+	}
+	if got[1].PortalID != "tel:+15550000002" || got[1].NewestTS != 2000 || got[1].MessageCount != 1 {
+		t.Fatalf("got second portal %#v, want portal with backfillable message", got[1])
+	}
+	count, err := store.countBackfillableMessages(ctx, "tel:+15550000002", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("countBackfillableMessages(contentful) = %d, want 1", count)
+	}
+	newest, err := store.getNewestBackfillableMessageTimestamp(ctx, "tel:+15550000002", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newest != 2000 {
+		t.Fatalf("getNewestBackfillableMessageTimestamp(contentful) = %d, want 2000", newest)
+	}
+	for _, portalID := range []string{"tel:+15550000001", "tel:+15550000003", "tel:+15550000004", "gid:senderless", "gid:rename", "tel:+15550000006"} {
+		hasMessages, err := store.hasContentfulMessages(ctx, portalID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasMessages {
+			t.Fatalf("hasContentfulMessages(%q) = true, want false", portalID)
+		}
+	}
+}
+
+func TestLiveMessageHasTextMatchesConversionInputs(t *testing.T) {
+	text := func(s string) *string { return &s }
+	tests := []struct {
+		name string
+		msg  rustpushgo.WrappedMessage
+		want bool
+	}{
+		{
+			name: "plain text",
+			msg:  rustpushgo.WrappedMessage{Text: text("hello")},
+			want: true,
+		},
+		{
+			name: "object placeholder only",
+			msg:  rustpushgo.WrappedMessage{Text: text("\ufffc\n ")},
+			want: false,
+		},
+		{
+			name: "tab only",
+			msg:  rustpushgo.WrappedMessage{Text: text("\t")},
+			want: false,
+		},
+		{
+			name: "subject only",
+			msg:  rustpushgo.WrappedMessage{Subject: text("subject")},
+			want: true,
+		},
+		{
+			name: "whitespace subject",
+			msg:  rustpushgo.WrappedMessage{Subject: text(" \n\t")},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := liveMessageHasText(tt.msg); got != tt.want {
+				t.Fatalf("liveMessageHasText() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizedBackfillText(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "plain", text: "hello", want: "hello"},
+		{name: "object placeholder only", text: "\uFFFC \n\t", want: ""},
+		{name: "tabs trimmed", text: "\tmessage\t", want: "message"},
+		{name: "placeholder inside", text: "a\uFFFCb", want: "ab"},
+		{name: "non ascii whitespace preserved", text: "\u00A0", want: "\u00A0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizedBackfillText(tt.text); got != tt.want {
+				t.Fatalf("normalizedBackfillText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizedBackfillSubject(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		want    string
+	}{
+		{name: "plain", subject: "subject", want: "subject"},
+		{name: "ascii whitespace trimmed", subject: " \t\nsubject\r", want: "subject"},
+		{name: "ascii whitespace only", subject: " \t\n\r", want: ""},
+		{name: "non ascii whitespace preserved", subject: "\u00A0", want: "\u00A0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizedBackfillSubject(tt.subject); got != tt.want {
+				t.Fatalf("normalizedBackfillSubject() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestParticipantSetsMatch(t *testing.T) {
 	self := "tel:+15551234567"

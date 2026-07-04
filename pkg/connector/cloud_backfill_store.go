@@ -2500,12 +2500,7 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		// body_scrubbed rows had content at bridge time; treat them as contentful
-		// so a fully-bridged-then-scrubbed portal's newest timestamp survives
-		// (used by queueRecoveredPortalResync to gate ChatResync events).
-		// tapback_type < 2000 (or NULL) keeps regular messages and excludes
-		// scrubbed reactions (>= 2000), which aren't "content" in the same sense.
-		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
+		baseQuery += " AND " + cloudBackfillableEventWhere("cloud_message")
 	}
 	var ts sql.NullInt64
 	err := s.db.QueryRow(ctx, baseQuery, s.loginID, portalID).Scan(&ts)
@@ -2596,16 +2591,16 @@ func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID str
 	return count > 0, nil
 }
 
-// hasContentfulMessages checks if a portal has at least one non-deleted message
-// with actual content (text or attachments). Seeded placeholder rows from the
-// recycle bin have record_name but empty text/attachments — they don't count.
+// hasContentfulMessages checks if a portal has at least one non-deleted row
+// that can produce a Matrix backfill message. Seeded placeholder rows from the
+// recycle bin have record_name but empty text/attachments, and don't count.
 func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*)
-		FROM cloud_message
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))
+		FROM cloud_message cm
+		WHERE `+cloudBackfillableEventWhere("cm")+`
+		  AND cm.portal_id=$2
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
@@ -2623,7 +2618,7 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
+		query += " AND " + cloudBackfillableEventWhere("cloud_message")
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count); err != nil {
@@ -2772,35 +2767,16 @@ type portalWithNewestMessage struct {
 	MessageCount int
 }
 
-// listPortalIDsWithNewestTimestamp returns all portal IDs from both messages
-// and chat records, ordered by newest message timestamp descending (most
-// recent activity first). Chat-only portals (no messages) are included with
-// their updated_ts from the cloud_chat table so they still get portals created.
+// listPortalIDsWithNewestTimestamp returns portal IDs that have backfillable
+// message rows, ordered by newest message timestamp descending (most recent
+// activity first). Chat-only metadata rows are intentionally excluded: a portal
+// should not be created unless FetchMessages can actually serve messages for it.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT sub.portal_id, MAX(sub.newest_ts) AS newest_ts, SUM(sub.msg_count) AS msg_count FROM (
-			SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
-			FROM cloud_message
-			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE AND record_name <> ''
-			GROUP BY portal_id
-
-			UNION ALL
-
-			SELECT cc.portal_id, COALESCE(cc.updated_ts, 0) AS newest_ts, 0 AS msg_count
-			FROM cloud_chat cc
-			WHERE cc.login_id=$1 AND cc.portal_id IS NOT NULL AND cc.portal_id <> ''
-			AND COALESCE(cc.is_filtered, 0) = 0
-			AND cc.deleted = FALSE
-			AND cc.portal_id NOT IN (
-				SELECT DISTINCT cm.portal_id FROM cloud_message cm
-				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
-			)
-		) sub
-		WHERE NOT EXISTS (
-			SELECT 1 FROM cloud_chat fc
-			WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
-		)
-		GROUP BY sub.portal_id
+		SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+		FROM cloud_message cm
+		WHERE `+cloudBackfillableEventWhere("cm")+`
+		GROUP BY cm.portal_id
 		ORDER BY newest_ts DESC
 	`, s.loginID)
 	if err != nil {
@@ -2817,6 +2793,44 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// cloudBackfillableEventWhere matches rows that can create at least one
+// BackfillMessage through cloudRowToBackfillMessages. This is stricter than the
+// FetchMessages read filter: readable reaction-only, system, scrubbed, or empty
+// rows should not create portals by themselves.
+func cloudBackfillableEventWhere(alias string) string {
+	col := func(name string) string { return alias + "." + name }
+	return fmt.Sprintf(`
+		%s=$1
+		AND %s IS NOT NULL AND %s <> ''
+		AND %s=FALSE
+		AND %s <> ''
+		AND COALESCE(%s, FALSE)=FALSE
+		AND (%s IS NULL OR %s < 2000)
+		AND (%s=TRUE OR COALESCE(%s, '') <> '' OR (%s NOT LIKE 'gid:%%' AND INSTR(%s, ',') = 0))
+		AND (
+			TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), ' ' || char(9) || char(10) || char(13)) <> ''
+			OR TRIM(COALESCE(%s, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+			OR COALESCE(%s, '') <> ''
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM cloud_chat fc
+			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM cloud_chat sc
+			WHERE sc.login_id=$1
+			  AND sc.portal_id=%s
+			  AND COALESCE(sc.display_name, '') <> ''
+			  AND COALESCE(%s, '') = sc.display_name
+			  AND COALESCE(%s, '') = ''
+			  AND %s IS NULL
+		)
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"),
+		col("body_scrubbed"), col("tapback_type"), col("tapback_type"), col("is_from_me"), col("sender"), col("portal_id"), col("portal_id"),
+		col("text"), col("subject"), col("attachments_json"), col("portal_id"), col("portal_id"),
+		col("text"), col("attachments_json"), col("tapback_type"))
 }
 
 // msgDebugPortalStat is one row returned by debugMessageStats.

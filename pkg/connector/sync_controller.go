@@ -3891,10 +3891,8 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 
 	// Get portal IDs sorted by newest message timestamp (most recent first).
-	// This includes both portals that have messages AND chat-only portals
-	// from cloud_chat (with 0 messages). Chat-only portals are included so
-	// conversations synced from CloudKit without any resolved messages still
-	// get bridge portals created.
+	// Only portals with backfillable messages are returned; cloud_chat metadata
+	// without messages must not create empty Matrix rooms.
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
@@ -3914,18 +3912,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// from the map by handleChatRecover between now and when we check it below,
 	// the portal won't be skipped.
 
-	// Count how many portals have messages vs chat-only (diagnostic).
-	chatOnlyPortals := 0
-	for _, p := range portalInfos {
-		if p.MessageCount == 0 {
-			chatOnlyPortals++
-		}
-	}
 	log.Info().
 		Int("total_portals", len(portalInfos)).
-		Int("with_messages", len(portalInfos)-chatOnlyPortals).
-		Int("chat_only", chatOnlyPortals).
-		Msg("Portal candidates from cloud sync (messages + chat-only)")
+		Msg("Portal candidates from cloud sync with backfillable messages")
 
 	// Skip portals already queued this session with the same newest timestamp.
 	// If CloudKit has newer messages, the timestamp changes and we re-queue.
@@ -4054,15 +4043,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// early completions rather than reaching 0. Setting it up-front ensures
 	// every decrement is counted correctly.
 	//
-	// Count ONLY portals that actually have message history. Chat-only portals
-	// still get ChatResync events so rooms are created, but GetChatInfo sets
-	// CanBackfill=false for them, so bridgev2 never calls FetchMessages(Forward)
-	// and they must not hold the APNs buffer open.
+	// Count portals that need an initial forward backfill. Portal candidates
+	// without backfillable messages are filtered out before this point, and
+	// existing Matrix rooms do not hold the APNs buffer open.
 	if !c.isCloudSyncDone() {
 		atomic.StoreInt64(&c.pendingInitialBackfills, int64(forwardBackfillPortals))
 		log.Debug().
 			Int("count", forwardBackfillPortals).
-			Int("chat_only_or_existing", len(ordered)-forwardBackfillPortals).
+			Int("existing_or_skipped", len(ordered)-forwardBackfillPortals).
 			Msg("Set pendingInitialBackfills for APNs buffer hold")
 	}
 

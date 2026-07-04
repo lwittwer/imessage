@@ -3243,7 +3243,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Msg("Portal creation decision for message")
 	}
 
-	hasText := msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != ""
+	hasText := liveMessageHasText(msg)
 	if hasText {
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
@@ -3314,6 +3314,14 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			},
 		})
 	}
+}
+
+func liveMessageHasText(msg rustpushgo.WrappedMessage) bool {
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
+	if text != "" {
+		return true
+	}
+	return strings.TrimSpace(ptrStringOr(msg.Subject, "")) != ""
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -4644,9 +4652,8 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		Logger()
 
 	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
-		log.Warn().Msg("Restore pipeline started without CloudKit backfill; queueing plain ChatResync")
-		c.refreshRecoveredPortalAfterCloudSync(log, portalKey, opts.Source)
-		c.notifyRestoreStatus(opts, "Restore of **%s** queued.", displayName)
+		log.Warn().Msg("Restore pipeline started without CloudKit backfill; portal not recreated")
+		c.notifyRestoreStatus(opts, "Restore of **%s** could not run because CloudKit backfill is unavailable, so no empty chat room was created.", displayName)
 		return
 	}
 
@@ -4697,7 +4704,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		log.Info().Int("cleared", cleared).Msg("Cleared body_scrubbed flag for restore (will re-scrub after re-bridge)")
 	}
 	needsRecoverMessages := false
-	if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err != nil {
+	if hasMessages, err := c.cloudStore.hasContentfulMessages(ctx, portalID); err != nil {
 		log.Warn().Err(err).Msg("Failed to check portal messages during restore")
 	} else if !hasMessages {
 		needsRecoverMessages = true
@@ -4821,39 +4828,20 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		return
 	}
 
-	// Always recreate the portal regardless of whether we found history.
-	// The old code always did this — without it, a failed/delayed fetch means
-	// the portal never comes back at all. The normal CloudKit sync will
-	// backfill history when messages become available in the main zone.
-	//
-	// When no history was imported, send a bot notice into the restored room
-	// so the user sees the chat in Beeper (empty rooms may be hidden) and
-	// understands why there's no message history.
-	var postCreate func(context.Context, *bridgev2.Portal)
-	if !historyImported {
-		postCreate = func(ctx context.Context, portal *bridgev2.Portal) {
-			if portal == nil || portal.MXID == "" {
-				return
-			}
-			notice := "Chat restored from iCloud. No message history was available — messages may have expired from Apple's recycle bin."
-			_, err := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-				Parsed: &event.MessageEventContent{
-					MsgType: event.MsgNotice,
-					Body:    notice,
-				},
-			}, nil)
-			if err != nil {
-				log.Warn().Err(err).Str("portal_id", string(portal.ID)).
-					Msg("Failed to send empty-restore notice to room")
-			}
-		}
+	hasRestorableMessages, hasRestorableErr := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
+	if hasRestorableErr != nil {
+		log.Warn().Err(hasRestorableErr).Msg("Failed to check contentful messages before portal recreation")
 	}
-	c.queueRecoveredPortalResync(log, portalKey, opts.Source, postCreate)
+	if !hasRestorableMessages {
+		log.Warn().Int("attempts", maxRestoreAttempts).Msg("Restore pipeline: no CloudKit history found after all attempts; portal not recreated")
+		c.notifyRestoreStatus(opts, "Restore of **%s** — no message history was available yet, so no empty chat room was created. Try restoring again after iCloud finishes syncing.", displayName)
+		return
+	}
+	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil)
 	if historyImported {
 		c.notifyRestoreStatus(opts, "Restore of **%s** complete — history backfill is running.", displayName)
 	} else {
-		log.Warn().Int("attempts", maxRestoreAttempts).Msg("Restore pipeline: no CloudKit history found after all attempts; portal recreated anyway")
-		c.notifyRestoreStatus(opts, "Restore of **%s** — chat recreated. Message history may appear once iCloud finishes syncing.", displayName)
+		c.notifyRestoreStatus(opts, "Restore of **%s** complete — existing message history is being backfilled.", displayName)
 	}
 }
 
@@ -5541,6 +5529,17 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 	// still backfill zero messages.
 	var latestMessageTS time.Time
 	if c.cloudStore != nil {
+		hasMessages, err := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
+		if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+				Msg("Failed to check recovered chat messages before portal resync")
+			return
+		}
+		if !hasMessages {
+			log.Warn().Str("portal_id", portalID).Str("source", source).
+				Msg("Skipping recovered chat resync because no contentful messages are available")
+			return
+		}
 		if newestTS, err := c.cloudStore.getNewestBackfillableMessageTimestamp(context.Background(), portalID, true); err == nil && newestTS > 0 {
 			latestMessageTS = time.UnixMilli(newestTS)
 		}
@@ -5552,10 +5551,11 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 		Time("latest_message_ts", latestMessageTS).
 		Msg("Queueing ChatResync for recovered chat")
 
-	// Always CreatePortal=true for recovery. The portal room may have been
-	// deleted (com.beeper.delete_chat or ChatDelete) but the portal DB row
-	// can linger with a stale MXID. Without CreatePortal=true, bridgev2
-	// treats the resync as a metadata update and skips forward backfill.
+	// Recovery resyncs use CreatePortal=true after the contentful-message guard
+	// above. The portal room may have been deleted (com.beeper.delete_chat or
+	// ChatDelete) while the portal DB row lingers with a stale MXID. Without
+	// CreatePortal=true, bridgev2 treats the resync as a metadata update and
+	// skips forward backfill.
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -8161,7 +8161,18 @@ func isCloudReactionRow(tapbackType *uint32) bool {
 	return tapbackType != nil && *tapbackType >= cloudReactionMinType
 }
 
+func normalizedBackfillText(text string) string {
+	return strings.Trim(strings.ReplaceAll(text, "\uFFFC", ""), " \t\n\r")
+}
+
+func normalizedBackfillSubject(subject string) string {
+	return strings.Trim(subject, " \t\n\r")
+}
+
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
+	rowText := normalizedBackfillText(row.Text)
+	rowSubject := normalizedBackfillSubject(row.Subject)
+
 	// Privacy: a body_scrubbed regular message was already bridged to Matrix
 	// (the scrubber requires a bridgev2 `message` row for the same GUID before
 	// clearing text/subject/sender). Emitting here would produce empty-body
@@ -8193,7 +8204,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	// (HasBody=TRUE, not a reaction) but empty body+attachments after a
 	// supposed restore re-population.
 	if row.HasBody && !isCloudReactionRow(row.TapbackType) &&
-		strings.TrimSpace(row.Text) == "" && row.Subject == "" && row.AttachmentsJSON == "" {
+		rowText == "" && rowSubject == "" && row.AttachmentsJSON == "" {
 		return nil
 	}
 
@@ -8220,8 +8231,8 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	//     TRUE, the rename-notification text exactly matches the group name.
 	// The startup DB cleanup (ensureSchema) hard-deletes matching rows so
 	// this filter is a second line of defence for any that slipped through.
-	isSystemByHasBody := !row.HasBody && strings.TrimSpace(row.Text) == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
-	isSystemByName := row.Text != "" && groupDisplayName != "" && row.Text == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
+	isSystemByHasBody := !row.HasBody && rowText == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
+	isSystemByName := rowText != "" && groupDisplayName != "" && rowText == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
 	if isSystemByHasBody || isSystemByName {
 		return nil
 	}
@@ -8234,14 +8245,14 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	var messages []*bridgev2.BackfillMessage
 
 	// Text message — trim OBJ placeholders before building body.
-	body := strings.Trim(row.Text, "\ufffc \n")
+	body := rowText
 	var formattedBody string
-	if row.Subject != "" {
+	if rowSubject != "" {
 		if body != "" {
-			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(row.Subject), html.EscapeString(body))
-			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
+			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(rowSubject), html.EscapeString(body))
+			body = fmt.Sprintf("**%s**\n%s", rowSubject, body)
 		} else {
-			body = row.Subject
+			body = rowSubject
 		}
 	}
 	hasText := strings.TrimSpace(body) != ""
@@ -9112,7 +9123,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		}
 		sender := c.makeCloudSender(row)
 		ts := time.UnixMilli(row.TimestampMS)
-		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
+		hasText := normalizedBackfillText(row.Text) != "" || normalizedBackfillSubject(row.Subject) != ""
 		for i, att := range atts {
 			if att.RecordName == "" {
 				continue
@@ -9264,7 +9275,7 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		}
 		sender := c.makeCloudSender(row)
 		ts := time.UnixMilli(row.TimestampMS)
-		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
+		hasText := normalizedBackfillText(row.Text) != "" || normalizedBackfillSubject(row.Subject) != ""
 		for i, att := range atts {
 			if att.RecordName == "" {
 				continue
@@ -11068,11 +11079,13 @@ func convertStickerTapback(ctx context.Context, intent bridgev2.MatrixAPI, data 
 	if intent != nil {
 		url, encFile, err := intent.UploadMedia(ctx, "", data.ImageData, "sticker.png", data.MimeType)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload sticker: %w", err)
+			content.MsgType = event.MsgNotice
+			content.Body = "Sticker could not be uploaded."
+			content.Info = nil
 		}
-		if encFile != nil {
+		if err == nil && encFile != nil {
 			content.File = encFile
-		} else {
+		} else if err == nil {
 			content.URL = url
 		}
 	}
@@ -11185,17 +11198,18 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
 	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
+	subject := strings.TrimSpace(ptrStringOr(msg.Subject, ""))
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    text,
 	}
-	if msg.Subject != nil && *msg.Subject != "" {
+	if subject != "" {
 		if text != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", *msg.Subject, text)
+			content.Body = fmt.Sprintf("**%s**\n%s", subject, text)
 			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", *msg.Subject, text)
+			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", subject, text)
 		} else {
-			content.Body = *msg.Subject
+			content.Body = subject
 		}
 	}
 
@@ -11570,16 +11584,22 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	if inlineData != nil && intent != nil {
 		url, encFile, err := intent.UploadMedia(ctx, "", inlineData, fileName, mimeType)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload attachment: %w", err)
-		}
-		if encFile != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).
+				Str("file", fileName).
+				Str("mime", mimeType).
+				Msg("Failed to upload live attachment; emitting notice placeholder")
+			content = &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:    fmt.Sprintf("Attachment could not be uploaded (%s).", fileName),
+			}
+		} else if encFile != nil {
 			content.File = encFile
 		} else {
 			content.URL = url
 		}
 
 		// Upload image thumbnail
-		if thumbData != nil {
+		if err == nil && thumbData != nil {
 			thumbURL, thumbEnc, err := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
 			if err == nil {
 				if thumbEnc != nil {
@@ -12190,6 +12210,15 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	}
 	var entries []chatEntry
 	for _, chat := range chats {
+		hasMessages, err := c.chatDB.hasBackfillableMessages(chat.ChatGUID)
+		if err != nil {
+			log.Warn().Err(err).Str("chat_guid", chat.ChatGUID).Msg("Skipping chat.db initial sync candidate with unreadable messages")
+			continue
+		}
+		if !hasMessages {
+			log.Debug().Str("chat_guid", chat.ChatGUID).Msg("Skipping chat.db initial sync candidate with no backfillable messages")
+			continue
+		}
 		info, err := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
 		if err != nil || info == nil {
 			continue

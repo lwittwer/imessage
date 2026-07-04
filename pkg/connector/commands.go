@@ -647,6 +647,10 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 		if existing != nil && existing.MXID != "" {
 			continue // room already exists
 		}
+		hasMessages, err := client.chatDB.hasBackfillableMessages(chat.ChatGUID)
+		if err != nil || !hasMessages {
+			continue
+		}
 
 		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
 		candidates = append(candidates, chatDBEntry{portalID: portalID, name: name})
@@ -1157,6 +1161,31 @@ func (c *IMClient) restorePortalByID(_ context.Context, portalID string) error {
 			RecoverOnApple: true,
 		})
 	} else {
+		if c.chatDB == nil {
+			return fmt.Errorf("no backfill source available for portal %s", portalID)
+		}
+		chatGUIDs := portalIDToChatGUIDs(portalID)
+		if strings.Contains(portalID, ",") {
+			chatGUIDs = []string{c.chatDB.findGroupChatGUID(portalID, c)}
+		}
+		hasMessages := false
+		for _, chatGUID := range chatGUIDs {
+			if chatGUID == "" {
+				continue
+			}
+			ok, err := c.chatDB.hasBackfillableMessages(chatGUID)
+			if err != nil {
+				continue
+			}
+			if ok {
+				hasMessages = true
+				break
+			}
+		}
+		if !hasMessages {
+			return fmt.Errorf("no backfillable chat.db messages found for portal %s", portalID)
+		}
+
 		// chatdb backend — use existing local data.
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
