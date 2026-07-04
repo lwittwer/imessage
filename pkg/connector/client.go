@@ -390,6 +390,8 @@ type IMClient struct {
 
 	// Background goroutine lifecycle
 	stopChan chan struct{}
+	// Serializes Disconnect — see the comment there.
+	disconnectMu sync.Mutex
 
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
@@ -1620,6 +1622,13 @@ Run ` + "`help`" + ` any time for the full command list.
 `
 
 func (c *IMClient) Disconnect() {
+	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
+	// LogoutRemote invokes this method directly, so two teardowns can run
+	// concurrently: double-close of stopChan, or one frame nil-ing c.client
+	// while the other's Stop() goroutine still reads it. Serialize here; the
+	// second caller then no-ops on the already-nil'd fields.
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
@@ -1627,19 +1636,22 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	// Close the APNs ResourceManager BEFORE stopping the Client: its death signal
-	// aborts any in-flight generate() reconnect, freeing Tokio workers so Stop()
-	// can be scheduled. With the reverse ordering a prolonged reconnect storm can
-	// exhaust all workers and make Stop() block forever. Don't nil c.connection —
-	// the watchdog may still poll it; Close() signals stop without freeing the Go object.
+	// Close the APNs ResourceManager BEFORE stopping the Client: its death
+	// signal (a non-blocking try_send) aborts any in-flight reconnect so
+	// nothing is still generating traffic while the client shuts down.
+	// Don't nil c.connection — the watchdog may still poll it; Close()
+	// signals stop without freeing the Go object.
 	if c.connection != nil {
 		c.connection.Close()
 	}
 	if c.client != nil {
-		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a wedged
-		// Tokio runtime can't block the reconnect path forever. Destroy() runs
-		// regardless — UniFFI refcounting defers the free until any in-flight Stop()
-		// returns, so the leaked goroutine never touches freed memory.
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout as
+		// insurance so a wedge can't hang Disconnect (never observed in
+		// production — the #56 hang was the nil-channel send in
+		// macOSDatabase.Stop(), fixed in imessage/mac). Destroy() runs
+		// regardless — UniFFI refcounting defers the free until any
+		// in-flight Stop() returns, so the leaked goroutine never touches
+		// freed memory.
 		stopDone := make(chan struct{})
 		go func() {
 			c.client.Stop()
