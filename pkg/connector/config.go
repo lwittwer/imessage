@@ -129,9 +129,10 @@ type IMConfig struct {
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
 
-	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the
-	// bridge's privacy protections so plaintext is observable for debugging.
-	// MUST be false in any real deployment. Default false. When true:
+	// DebugDisablePrivacy reverts the bridge's runtime privacy protections so
+	// plaintext is observable for debugging on a trusted personal machine. Set
+	// false for a privacy-preserving deployment. Default true in this personal
+	// fork branch. When true:
 	//
 	//   1. Logs are no longer anonymized — raw iMessage handles
 	//      (phone numbers / emails) and full URLs appear verbatim in logs
