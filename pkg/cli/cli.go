@@ -19,7 +19,9 @@
 package cli
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -28,6 +30,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/rs/zerolog"
 
 	"github.com/lrhodin/corten-matrix/pkg/bbctl"
 	"github.com/lrhodin/corten-matrix/scripts"
@@ -378,8 +382,26 @@ func RunAllBridges() {
 		if i > 0 {
 			c.Env = setEnv(c.Env, "XDG_DATA_HOME", d) // 2nd account's own session dir
 		}
+		// Run each bridge in its own data dir. The generated config's only
+		// relative path — the JSON file writer's ./logs/bridge.log — then
+		// resolves to THIS account's logs dir; with bridge-all's inherited cwd
+		// (the primary data dir) the 2nd account's JSON log landed in the
+		// PRIMARY's bridge.log. DB URIs are absolutized by the install
+		// scripts, so nothing else is cwd-sensitive.
+		c.Dir = d
 		_ = os.MkdirAll(filepath.Join(d, "logs"), 0o755)
-		if f, err := os.OpenFile(filepath.Join(d, "logs", "bridge.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		// Capture the child's stdout/stderr — the config's pretty-colored
+		// terminal writer plus any crash output — in a separate file, NOT in
+		// bridge.log: that file is the JSON file writer's target, and dumping
+		// stdout there too duplicated every line and filled the log that
+		// `corten-matrix logs` tails with ANSI color codes. Truncate the
+		// capture once it gets large; bridge.log is the rotated real log.
+		soPath := filepath.Join(d, "logs", "bridge.stdout.log")
+		soMode := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		if st, err := os.Stat(soPath); err == nil && st.Size() > 50<<20 {
+			soMode |= os.O_TRUNC
+		}
+		if f, err := os.OpenFile(soPath, soMode, 0o644); err == nil {
 			c.Stdout, c.Stderr = f, f
 		} else {
 			c.Stdout, c.Stderr = os.Stdout, os.Stderr
@@ -571,7 +593,52 @@ func tailLogs(args []string) {
 	if len(args) > 0 && args[0] == "1" {
 		dir = secondDataDir()
 	}
-	exitWith("tail", "-F", filepath.Join(dir, "logs", "bridge.log"))
+	c := exec.Command("tail", "-F", filepath.Join(dir, "logs", "bridge.log"))
+	c.Stdin = os.Stdin
+	c.Stderr = os.Stderr
+	pipe, err := c.StdoutPipe()
+	if err != nil {
+		die("tail: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		die("tail: %v", err)
+	}
+	prettyTail(pipe, os.Stdout, cReset == "") // cReset empty ⇒ non-TTY/NO_COLOR
+	if err := c.Wait(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// prettyTail renders a bridge log stream for the terminal: JSON log lines
+// (bridge.log is the config's JSON file writer's target) are rendered through
+// zerolog's console writer — the same pretty format a foreground bridge run
+// prints — and anything else (older pretty/colored lines written before
+// RunAllBridges kept stdout out of bridge.log) passes through unchanged.
+func prettyTail(r io.Reader, w io.Writer, noColor bool) {
+	cw := zerolog.ConsoleWriter{
+		Out:     w,
+		NoColor: noColor,
+		// zeroconfig's default pretty timestamp format, so the output matches
+		// the bridge's own pretty writer.
+		TimeFormat: "2006-01-02T15:04:05.999Z07:00",
+	}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) > 0 && line[0] == '{' {
+			if _, err := cw.Write(line); err == nil {
+				continue
+			}
+		}
+		_, _ = w.Write(append(line, '\n'))
+	}
+	// Scanner stopped early (line over 1MB, read error): raw passthrough.
+	_, _ = io.Copy(w, r)
 }
 
 func runBbctl(args []string) {
