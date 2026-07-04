@@ -38,6 +38,15 @@ reserved); email `user@example.com`; name `Jane Doe`; IDs/GUIDs obviously fake
 through the existing sanitizers — `logSafeHandle`, `logSafeURL` (`pkg/connector/`)
 — which is why those helpers exist.
 
+**Personal fork runtime debugging:** on non-main personal branches in this fork,
+local runtime investigation may inspect raw logs, config, database rows, Apple
+handles, URLs, and other machine-local values when needed to debug the bridge on
+the owner's machine. This does **not** relax commit hygiene: do not commit real
+PII, secrets, raw runtime artifacts, copied logs, or examples derived from a real
+account. Keep raw runtime evidence local and uncommitted; redact or replace it
+with synthetic placeholders before writing code comments, tests, docs, commit
+messages, or handoff notes.
+
 **Before every commit:** scan the diff for real PII — `git diff` and grep for
 phone patterns (`\([0-9]{3}\)`, `[0-9]{3}-[0-9]{4}`), `@` emails, serial/MLB/UDID,
 real names. If you used real data to debug, keep it **local and uncommitted**;
