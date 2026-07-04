@@ -45,7 +45,10 @@ the owner's machine. This does **not** relax commit hygiene: do not commit real
 PII, secrets, raw runtime artifacts, copied logs, or examples derived from a real
 account. Keep raw runtime evidence local and uncommitted; redact or replace it
 with synthetic placeholders before writing code comments, tests, docs, commit
-messages, or handoff notes.
+messages, or handoff notes. Do not weaken source-level privacy behavior,
+shipped defaults, log sanitizers, or scrubbers solely because this
+local-debugging allowance exists; make those code/config changes only when the
+user explicitly asks for that runtime behavior.
 
 **Before every commit:** scan the diff for real PII — `git diff` and grep for
 phone patterns (`\([0-9]{3}\)`, `[0-9]{3}-[0-9]{4}`), `@` emails, serial/MLB/UDID,
