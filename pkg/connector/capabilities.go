@@ -107,5 +107,5 @@ func (c *IMConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 }
 
 func (c *IMConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 1
+	return 2, 1
 }
