@@ -59,7 +59,7 @@ force-push and may persist in GitHub caches/forks regardless.
 
 ## What this repo is
 
-`mautrix-imessage` v2 is a Matrix-iMessage bridge. The top-level Go app hosts the bridge and bridgev2 integration, while Rust handles the Apple protocol stack through `rustpush`.
+`mautrix-imessage` v2 is a Matrix-iMessage bridge. The top-level Go app hosts the bridge and bridgev2 integration, while Rust handles the Apple protocol stack through `rustpush`. It connects directly to Apple's IDS/APNs services with local NAC validation; Contact Key Verification must be disabled on the Apple account for the bridge to work.
 
 The stack is:
 
@@ -68,6 +68,7 @@ The stack is:
 ## Primary entrypoints
 
 - `cmd/mautrix-imessage/main.go`: bridge startup, CLI subcommands, permission repair, `PostInit` command registration.
+- `cmd/bbctl/`: Beeper bridge-manager companion CLI, built alongside the bridge.
 - `pkg/connector/`: most bridge behavior lives here.
 - `pkg/rustpushgo/src/lib.rs`: Rust objects and exported FFI surface consumed by Go.
 - `third_party/rustpush-upstream/`: vendored Rust protocol stack used by the FFI layer.
@@ -137,13 +138,13 @@ The one-time winget installs needed for the dev-env script are documented at the
 ### Generated and derived artifacts
 
 - `pkg/rustpushgo/rustpushgo.go` and `pkg/rustpushgo/rustpushgo.h` are generated.
-- `pkg/rustpushgo/target/` is build output.
+- `pkg/rustpushgo/target/`, `rustpush/target/`, the top-level `mautrix-imessage-v2` binary/app, and `bbctl` are build output.
 - `data/config.yaml` and `data/registration.yaml` are generated runtime artifacts when using repo-local development state, not source-of-truth defaults. Installed runs usually use `~/.local/share/mautrix-imessage/config.yaml` instead.
 
 ### Path and toolchain constraints
 
 - The repo path must not contain spaces. The `Makefile` hard-fails because CGO and linker paths break.
-- Top-level Go module targets Go `1.25.x` (`go.mod` uses `go 1.25.0` and `toolchain go1.25.9`).
+- Top-level Go module targets Go `1.25.x` (`go.mod` uses `go 1.25.0` and `toolchain go1.25.11`).
 - `tools/extract-key/` is its own Go module pinned to Go `1.20` so it can still build on older macOS systems.
 - Linux dependency bootstrapping is handled by `scripts/bootstrap-linux.sh`.
 
@@ -161,6 +162,10 @@ To add or change a network option, edit all three in lockstep:
 3. `pkg/connector/config.go` `upgradeConfig` — add a `helper.Copy(...)` line so the option survives a config upgrade.
 
 `pkg/imconfig/imconfig_test.go` guards that the embedded YAML stays valid YAML.
+
+### Privacy/runtime debug config
+
+The shipped privacy default is intentional: `debug_disable_privacy` stays `false` unless the user explicitly asks for runtime behavior that keeps plaintext/log values visible. On personal branches, agents may inspect local runtime data per the note above, but that is an investigation allowance, not a reason to flip defaults, bypass `logSafeHandle`/`logSafeURL`, or weaken the scrubber.
 
 ### Bridge (base/appservice) config — the `bridge:` section
 
@@ -200,8 +205,9 @@ This is the main area for bridge behavior:
 - `connector.go`: connector lifecycle, startup behavior, backfill defaults, auto-restore.
 - `client.go`: message send/receive, reactions, edits, typing, backfill behavior.
 - `login.go`: Apple ID and external-key login flows.
+- `commands.go` and command-specific files: Matrix-side bridge commands such as `start-chat`, `restore-chat`, `contacts`, StatusKit, FaceTime, and shared albums.
 - `chatdb*.go`: macOS chat.db access and backfill.
-- `config.go` + `example-config.yaml`: bridge-specific config schema and defaults.
+- `config.go` + `pkg/imconfig/example-config.yaml`: bridge-specific config schema and defaults.
 - `ids.go`: portal/identifier conversion. Changes here can require DB resets.
 - `cloud_contacts.go`, `external_carddav.go`, `contact_merge.go`: contact resolution.
 - `permissions_darwin.go`: Full Disk Access checks and prompts.
@@ -231,7 +237,7 @@ Several behaviors are duplicated across Go code and shell installers. If you cha
 - Backfill defaults and behavior:
   - `pkg/connector/connector.go`
   - `pkg/connector/config.go`
-  - `pkg/connector/example-config.yaml`
+  - `pkg/imconfig/example-config.yaml`
   - `scripts/install.sh`
   - `scripts/install-linux.sh`
   - `scripts/install-beeper.sh`
