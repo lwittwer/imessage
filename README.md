@@ -2,6 +2,9 @@
 
 > **Beta** This branch has breaking changes! Corten-Matrix now ships as **prebuilt binaries**, and moving onto them requires a clean reinstall and a fresh backfill (and, on Linux, a new key extraction) — see [Upgrading to binary releases](#upgrading-to-binary-releases) before you update.
 
+
+**Please Note: Prebuilt binaries are currently in BETA and will require a new key extraction. If you would like to try these releases please read the [README](https://github.com/lrhodin/corten-matrix/blob/beta/README.md) and use the new extraction tool.**
+
 A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
