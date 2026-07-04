@@ -77,9 +77,9 @@ statuskit_share_on_startup: true
 # identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
 
-# DEVELOPMENT ONLY — leave this false in any real deployment.
-# Reverts the bridge's privacy protections so plaintext is observable for
-# debugging. When true:
+# PERSONAL FORK DEFAULT — set this false for a privacy-preserving deployment.
+# Reverts the bridge's runtime privacy protections so plaintext is observable
+# for debugging on a trusted personal machine. When true:
 #   1. Logs are NOT anonymized — raw iMessage handles (phone/email) and full
 #      URLs appear verbatim instead of opaque tokens / scheme+host forms.
 #   2. The periodic body scrubber is disabled — plaintext message bodies
@@ -91,7 +91,7 @@ statuskit_notifications: true
 # Only the CloudKit backfill source caches plaintext locally, so effects 2
 # and 3 are CloudKit-specific. Does NOT undo deletes/unsends, and does NOT
 # re-deliver anything to Matrix.
-debug_disable_privacy: false
+debug_disable_privacy: true
 
 # Send read receipts to iMessage contacts when you read their messages in
 # Matrix. Set to false to stop iMessage contacts seeing when you have read

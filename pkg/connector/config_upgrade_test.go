@@ -24,7 +24,7 @@ func TestConfigUpgradeAddsDebugDisablePrivacy(t *testing.T) {
 	}
 
 	// Simulate an older user config that predates the key.
-	oldCfg := strings.ReplaceAll(ExampleConfig, "debug_disable_privacy: false", "")
+	oldCfg := strings.ReplaceAll(ExampleConfig, "debug_disable_privacy: true", "")
 	if strings.Contains(oldCfg, "debug_disable_privacy:") {
 		t.Fatal("failed to strip key from simulated old config")
 	}
