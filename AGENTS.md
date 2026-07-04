@@ -1,5 +1,16 @@
 # Dev notes
 
+## Personal fork runtime debugging
+
+On non-main personal branches in this fork, local runtime investigation may
+inspect raw logs, config, database rows, Apple handles, URLs, and other
+machine-local values when needed to debug the bridge on the owner's machine.
+This does **not** relax commit hygiene: do not commit real PII, secrets, raw
+runtime artifacts, copied logs, or examples derived from a real account. Keep
+raw runtime evidence local and uncommitted; redact or replace it with synthetic
+placeholders before writing code comments, tests, docs, commit messages, or
+handoff notes.
+
 ## FFI boundary (Go ↔ Rust)
 
 **Never hand-edit** `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h`. Always regenerate.
