@@ -39,6 +39,8 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 			($1, 'senderless', 'tel:+15550000005', NULL, $2, $2, FALSE, 0),
 			($1, 'senderless-group', 'gid:senderless', NULL, $2, $2, FALSE, 0),
 			($1, 'rename', 'gid:rename', 'Renamed Group', $2, $2, FALSE, 0),
+			($1, 'rename-trimmed', 'gid:rename-trimmed', 'Renamed Trim', $2, $2, FALSE, 0),
+			($1, 'unicode-whitespace', 'tel:+15550000007', NULL, $2, $2, FALSE, 0),
 			($1, 'filtered', 'tel:+15550000006', NULL, $2, $2, FALSE, 1)
 	`, store.loginID, now); err != nil {
 		t.Fatal(err)
@@ -57,6 +59,8 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 			($1, 'senderless-1', 'tel:+15550000005', 5000, '', FALSE, 'senderless', 'record-4', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'senderless-group-1', 'gid:senderless', 5500, '', FALSE, 'senderless group', 'record-4b', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'rename-1', 'gid:rename', 6000, 'tel:+15551111111', FALSE, 'Renamed Group', 'record-5', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'rename-trimmed-1', 'gid:rename-trimmed', 6500, 'tel:+15551111111', FALSE, 'Renamed Trim' || char(10), 'record-5b', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'unicode-whitespace-1', 'tel:+15550000007', 6750, 'tel:+15551111111', FALSE, char(160), 'record-5c', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'filtered-1', 'tel:+15550000006', 7000, 'tel:+15551111111', FALSE, 'filtered', 'record-6', NULL, NULL, '', TRUE, FALSE, $2, $2)
 	`, store.loginID, now); err != nil {
 		t.Fatal(err)
@@ -69,7 +73,7 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := store.listPortalIDsWithNewestTimestamp(ctx)
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +100,7 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 	if newest != 2000 {
 		t.Fatalf("getNewestBackfillableMessageTimestamp(contentful) = %d, want 2000", newest)
 	}
-	for _, portalID := range []string{"tel:+15550000001", "tel:+15550000003", "tel:+15550000004", "gid:senderless", "gid:rename", "tel:+15550000006"} {
+	for _, portalID := range []string{"tel:+15550000001", "tel:+15550000003", "tel:+15550000004", "gid:senderless", "gid:rename", "gid:rename-trimmed", "tel:+15550000007", "tel:+15550000006"} {
 		hasMessages, err := store.hasContentfulMessages(ctx, portalID)
 		if err != nil {
 			t.Fatal(err)
@@ -104,6 +108,62 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 		if hasMessages {
 			t.Fatalf("hasContentfulMessages(%q) = true, want false", portalID)
 		}
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := int64(1000)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			tapback_type, tapback_target_guid, attachments_json, has_body, body_scrubbed, created_ts, updated_ts
+		)
+		VALUES
+			($1, 'old-content', 'tel:+15550000010', 1000, 'tel:+15551111111', FALSE, 'old but real', 'record-old', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'new-empty', 'tel:+15550000010', 2000, 'tel:+15551111111', FALSE, '', 'record-empty', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'new-reaction', 'tel:+15550000010', 3000, 'tel:+15551111111', FALSE, '', 'record-reaction', 2000, 'old-content', '', TRUE, FALSE, $2, $2),
+			($1, 'window-content', 'tel:+15550000011', 2500, 'tel:+15551111111', FALSE, 'inside window', 'record-window', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'window-empty', 'tel:+15550000011', 3500, 'tel:+15551111111', FALSE, '', 'record-window-empty', NULL, NULL, '', TRUE, FALSE, $2, $2)
+	`, store.loginID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d portals (%#v), want only the portal with content inside capped window", len(got), got)
+	}
+	if got[0].PortalID != "tel:+15550000011" || got[0].NewestTS != 2500 || got[0].MessageCount != 1 {
+		t.Fatalf("got portal %#v, want capped-window content portal", got[0])
+	}
+
+	got, err = store.listPortalIDsWithNewestTimestamp(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d portals (%#v), want both portals once older content is inside capped window", len(got), got)
+	}
+	if got[0].PortalID != "tel:+15550000011" || got[1].PortalID != "tel:+15550000010" {
+		t.Fatalf("got portals %#v, want ordered capped-window portals", got)
 	}
 }
 
@@ -159,7 +219,7 @@ func TestNormalizedBackfillText(t *testing.T) {
 		{name: "object placeholder only", text: "\uFFFC \n\t", want: ""},
 		{name: "tabs trimmed", text: "\tmessage\t", want: "message"},
 		{name: "placeholder inside", text: "a\uFFFCb", want: "ab"},
-		{name: "non ascii whitespace preserved", text: "\u00A0", want: "\u00A0"},
+		{name: "non ascii whitespace trimmed", text: "\u00A0", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -179,7 +239,7 @@ func TestNormalizedBackfillSubject(t *testing.T) {
 		{name: "plain", subject: "subject", want: "subject"},
 		{name: "ascii whitespace trimmed", subject: " \t\nsubject\r", want: "subject"},
 		{name: "ascii whitespace only", subject: " \t\n\r", want: ""},
-		{name: "non ascii whitespace preserved", subject: "\u00A0", want: "\u00A0"},
+		{name: "non ascii whitespace trimmed", subject: "\u00A0", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -3893,7 +3893,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// Get portal IDs sorted by newest message timestamp (most recent first).
 	// Only portals with backfillable messages are returned; cloud_chat metadata
 	// without messages must not create empty Matrix rooms.
-	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
+	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return

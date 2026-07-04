@@ -40,6 +40,7 @@ type macOSDatabase struct {
 	messagesAfterQuery           *sql.Stmt
 	messagesBetweenQuery         *sql.Stmt
 	messagesBeforeWithLimitQuery *sql.Stmt
+	messagesBeforeCursorQuery    *sql.Stmt
 	singleMessageQuery           *sql.Stmt
 	limitedMessagesQuery         *sql.Stmt
 	newMessagesQuery             *sql.Stmt
@@ -49,6 +50,8 @@ type macOSDatabase struct {
 	chatGUIDQuery                *sql.Stmt
 	groupActionQuery             *sql.Stmt
 	recentChatsQuery             *sql.Stmt
+	hasAnyBackfillableQuery      *sql.Stmt
+	hasInitialBackfillableQuery  *sql.Stmt
 	messageGUIDsSinceQuery       *sql.Stmt
 	groupMemberQuery             *sql.Stmt
 	Messages                     chan *imessage.Message

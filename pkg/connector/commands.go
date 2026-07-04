@@ -619,6 +619,7 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 		name     string
 	}
 	var candidates []chatDBEntry
+	maxInitialMessages := client.Main.Bridge.Config.Backfill.MaxInitialMessages
 
 	for _, chat := range chats {
 		parsed := imessage.ParseIdentifier(chat.ChatGUID)
@@ -647,7 +648,7 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 		if existing != nil && existing.MXID != "" {
 			continue // room already exists
 		}
-		hasMessages, err := client.chatDB.hasBackfillableMessages(chat.ChatGUID)
+		hasMessages, err := client.chatDB.hasBackfillableMessages(chat.ChatGUID, maxInitialMessages)
 		if err != nil || !hasMessages {
 			continue
 		}
@@ -1173,7 +1174,7 @@ func (c *IMClient) restorePortalByID(_ context.Context, portalID string) error {
 			if chatGUID == "" {
 				continue
 			}
-			ok, err := c.chatDB.hasBackfillableMessages(chatGUID)
+			ok, err := c.chatDB.hasBackfillableMessages(chatGUID, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 			if err != nil {
 				continue
 			}

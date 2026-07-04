@@ -34,6 +34,10 @@ type chatDB struct {
 	api imessage.API
 }
 
+type chatDBBackfillableProber interface {
+	HasBackfillableMessagesBefore(chatID string, before time.Time, limit int) (bool, error)
+}
+
 // openChatDB attempts to open the local iMessage chat.db database.
 // Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
 func openChatDB(log zerolog.Logger) *chatDB {
@@ -342,8 +346,22 @@ func chatDBMessageCanBackfill(msg *imessage.Message) bool {
 	return false
 }
 
-func (db *chatDB) hasBackfillableMessages(chatGUID string) (bool, error) {
-	messages, err := db.api.GetMessagesSinceDate(chatGUID, time.Time{}, "")
+func (db *chatDB) hasBackfillableMessages(chatGUID string, maxMessages int) (bool, error) {
+	before := time.Now().Add(time.Minute)
+	if prober, ok := db.api.(chatDBBackfillableProber); ok {
+		return prober.HasBackfillableMessagesBefore(chatGUID, before, maxMessages)
+	}
+
+	const uncappedInitialBackfill = 1<<31 - 1
+	var (
+		messages []*imessage.Message
+		err      error
+	)
+	if maxMessages > 0 && maxMessages < uncappedInitialBackfill {
+		messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, before, maxMessages)
+	} else {
+		messages, err = db.api.GetMessagesSinceDate(chatGUID, time.Time{}, "")
+	}
 	if err != nil {
 		return false, err
 	}

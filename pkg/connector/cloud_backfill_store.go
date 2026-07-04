@@ -2771,14 +2771,40 @@ type portalWithNewestMessage struct {
 // message rows, ordered by newest message timestamp descending (most recent
 // activity first). Chat-only metadata rows are intentionally excluded: a portal
 // should not be created unless FetchMessages can actually serve messages for it.
-func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
-	rows, err := s.db.Query(ctx, `
+func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
+	query := `
 		SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
 		FROM cloud_message cm
-		WHERE `+cloudBackfillableEventWhere("cm")+`
+		WHERE ` + cloudBackfillableEventWhere("cm") + `
 		GROUP BY cm.portal_id
 		ORDER BY newest_ts DESC
-	`, s.loginID)
+	`
+	args := []any{s.loginID}
+	const uncappedInitialBackfill = 1<<31 - 1
+	if maxInitialMessages > 0 && maxInitialMessages < uncappedInitialBackfill {
+		query = `
+			WITH ranked AS (
+				SELECT cm.*,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY cm.portal_id
+				           ORDER BY cm.timestamp_ms DESC, cm.guid DESC
+				       ) AS rn
+				FROM cloud_message cm
+				WHERE cm.login_id=$1
+				  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
+				  AND cm.deleted=FALSE
+				  AND cm.record_name <> ''
+			)
+			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+			FROM ranked cm
+			WHERE cm.rn <= $2
+			  AND ` + cloudBackfillableEventWhere("cm") + `
+			GROUP BY cm.portal_id
+			ORDER BY newest_ts DESC
+		`
+		args = append(args, maxInitialMessages)
+	}
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2801,6 +2827,9 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 // rows should not create portals by themselves.
 func cloudBackfillableEventWhere(alias string) string {
 	col := func(name string) string { return alias + "." + name }
+	trimChars := "' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288)"
+	normalizedText := fmt.Sprintf("TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), %s)", col("text"), trimChars)
+	normalizedSubject := fmt.Sprintf("TRIM(COALESCE(%s, ''), %s)", col("subject"), trimChars)
 	return fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
@@ -2810,8 +2839,8 @@ func cloudBackfillableEventWhere(alias string) string {
 		AND (%s IS NULL OR %s < 2000)
 		AND (%s=TRUE OR COALESCE(%s, '') <> '' OR (%s NOT LIKE 'gid:%%' AND INSTR(%s, ',') = 0))
 		AND (
-			TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), ' ' || char(9) || char(10) || char(13)) <> ''
-			OR TRIM(COALESCE(%s, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+			%s <> ''
+			OR %s <> ''
 			OR COALESCE(%s, '') <> ''
 		)
 		AND NOT EXISTS (
@@ -2823,14 +2852,14 @@ func cloudBackfillableEventWhere(alias string) string {
 			WHERE sc.login_id=$1
 			  AND sc.portal_id=%s
 			  AND COALESCE(sc.display_name, '') <> ''
-			  AND COALESCE(%s, '') = sc.display_name
+			  AND %s = sc.display_name
 			  AND COALESCE(%s, '') = ''
 			  AND %s IS NULL
 		)
 	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"),
 		col("body_scrubbed"), col("tapback_type"), col("tapback_type"), col("is_from_me"), col("sender"), col("portal_id"), col("portal_id"),
-		col("text"), col("subject"), col("attachments_json"), col("portal_id"), col("portal_id"),
-		col("text"), col("attachments_json"), col("tapback_type"))
+		normalizedText, normalizedSubject, col("attachments_json"), col("portal_id"), col("portal_id"),
+		normalizedText, col("attachments_json"), col("tapback_type"))
 }
 
 // msgDebugPortalStat is one row returned by debugMessageStats.

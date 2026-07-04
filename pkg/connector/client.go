@@ -8162,11 +8162,11 @@ func isCloudReactionRow(tapbackType *uint32) bool {
 }
 
 func normalizedBackfillText(text string) string {
-	return strings.Trim(strings.ReplaceAll(text, "\uFFFC", ""), " \t\n\r")
+	return strings.TrimSpace(strings.ReplaceAll(text, "\uFFFC", ""))
 }
 
 func normalizedBackfillSubject(subject string) string {
-	return strings.Trim(subject, " \t\n\r")
+	return strings.TrimSpace(subject)
 }
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
@@ -12209,8 +12209,9 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		isSms     bool
 	}
 	var entries []chatEntry
+	maxInitialMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
 	for _, chat := range chats {
-		hasMessages, err := c.chatDB.hasBackfillableMessages(chat.ChatGUID)
+		hasMessages, err := c.chatDB.hasBackfillableMessages(chat.ChatGUID, maxInitialMessages)
 		if err != nil {
 			log.Warn().Err(err).Str("chat_guid", chat.ChatGUID).Msg("Skipping chat.db initial sync candidate with unreadable messages")
 			continue

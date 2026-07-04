@@ -77,8 +77,15 @@ ORDER BY message.date DESC
 
 var messagesBeforeWithLimitQuery = baseMessagesQuery + `
 WHERE (chat.guid=$1 OR $1='') AND message.date<$2
-ORDER BY message.date DESC
+ORDER BY message.date DESC, message.ROWID DESC
 LIMIT $3
+`
+
+var messagesBeforeCursorQuery = baseMessagesQuery + `
+WHERE (chat.guid=$1 OR $1='')
+  AND (message.date<$2 OR (message.date=$2 AND message.ROWID<$3))
+ORDER BY message.date DESC, message.ROWID DESC
+LIMIT $4
 `
 
 var limitedMessagesQuery = baseMessagesQuery + `
@@ -146,6 +153,61 @@ GROUP BY chat.guid, chat.group_id
 ORDER BY MAX(message.date) DESC
 `
 
+const hasAnyBackfillableQuery = `
+SELECT EXISTS (
+  SELECT 1 FROM message
+  JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+  JOIN chat              ON chat_message_join.chat_id = chat.ROWID
+  LEFT JOIN handle sender_handle ON message.handle_id = sender_handle.ROWID
+  WHERE (chat.guid=$1 OR $1='')
+    AND message.date<$2
+    AND message.item_type = 0
+    AND COALESCE(message.associated_message_guid, '') = ''
+    AND (message.is_from_me = 1 OR COALESCE(sender_handle.id, '') <> '')
+    AND (
+      TRIM(REPLACE(COALESCE(message.text, ''), char(65532), ''), ' ' || char(9) || char(10) || char(13)) <> ''
+      OR TRIM(COALESCE(message.subject, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+      OR length(message.attributedBody) > 0
+      OR EXISTS (
+        SELECT 1 FROM message_attachment_join maj
+        WHERE maj.message_id = message.ROWID
+      )
+    )
+  LIMIT 1
+)
+`
+
+const hasInitialBackfillableQuery = `
+SELECT EXISTS (
+  SELECT 1 FROM (
+    SELECT message.ROWID, COALESCE(message.text, '') AS text,
+           COALESCE(message.subject, '') AS subject, message.attributedBody,
+           message.item_type, COALESCE(message.associated_message_guid, '') AS associated_message_guid,
+           message.is_from_me, COALESCE(sender_handle.id, '') AS sender_id
+    FROM message
+    JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+    JOIN chat              ON chat_message_join.chat_id = chat.ROWID
+    LEFT JOIN handle sender_handle ON message.handle_id = sender_handle.ROWID
+    WHERE (chat.guid=$1 OR $1='')
+      AND message.date<$2
+    ORDER BY message.date DESC, message.ROWID DESC
+    LIMIT $3
+  ) candidate
+  WHERE candidate.item_type = 0
+    AND candidate.associated_message_guid = ''
+    AND (candidate.is_from_me = 1 OR candidate.sender_id <> '')
+    AND (
+      TRIM(REPLACE(COALESCE(candidate.text, ''), char(65532), ''), ' ' || char(9) || char(10) || char(13)) <> ''
+      OR TRIM(COALESCE(candidate.subject, ''), ' ' || char(9) || char(10) || char(13)) <> ''
+      OR length(candidate.attributedBody) > 0
+      OR EXISTS (
+        SELECT 1 FROM message_attachment_join maj
+        WHERE maj.message_id = candidate.ROWID
+      )
+    )
+)
+`
+
 const newReceiptsQuery = `
 SELECT chat.guid, message.guid, message.is_from_me, message.date_read
 FROM message
@@ -189,6 +251,8 @@ func (mac *macOSDatabase) prepareMessages() error {
 		messagesAfterQuery = strings.ReplaceAll(messagesAfterQuery, "COALESCE(message.thread_originator_guid, '')", "''")
 		messagesBetweenQuery = strings.ReplaceAll(messagesBetweenQuery, "COALESCE(message.thread_originator_guid, '')", "''")
 		limitedMessagesQuery = strings.ReplaceAll(limitedMessagesQuery, "COALESCE(message.thread_originator_guid, '')", "''")
+		messagesBeforeWithLimitQuery = strings.ReplaceAll(messagesBeforeWithLimitQuery, "COALESCE(message.thread_originator_guid, '')", "''")
+		messagesBeforeCursorQuery = strings.ReplaceAll(messagesBeforeCursorQuery, "COALESCE(message.thread_originator_guid, '')", "''")
 		newMessagesQuery = strings.ReplaceAll(newMessagesQuery, "COALESCE(message.thread_originator_guid, '')", "''")
 		singleMessageQuery = strings.ReplaceAll(singleMessageQuery, "COALESCE(message.thread_originator_guid, '')", "''")
 	}
@@ -196,6 +260,8 @@ func (mac *macOSDatabase) prepareMessages() error {
 		messagesAfterQuery = strings.ReplaceAll(messagesAfterQuery, "COALESCE(message.thread_originator_part, '')", "''")
 		messagesBetweenQuery = strings.ReplaceAll(messagesBetweenQuery, "COALESCE(message.thread_originator_part, '')", "''")
 		limitedMessagesQuery = strings.ReplaceAll(limitedMessagesQuery, "COALESCE(message.thread_originator_part, '')", "''")
+		messagesBeforeWithLimitQuery = strings.ReplaceAll(messagesBeforeWithLimitQuery, "COALESCE(message.thread_originator_part, '')", "''")
+		messagesBeforeCursorQuery = strings.ReplaceAll(messagesBeforeCursorQuery, "COALESCE(message.thread_originator_part, '')", "''")
 		newMessagesQuery = strings.ReplaceAll(newMessagesQuery, "COALESCE(message.thread_originator_part, '')", "''")
 		singleMessageQuery = strings.ReplaceAll(singleMessageQuery, "COALESCE(message.thread_originator_part, '')", "''")
 	}
@@ -203,6 +269,8 @@ func (mac *macOSDatabase) prepareMessages() error {
 		messagesAfterQuery = strings.ReplaceAll(messagesAfterQuery, "message.group_action_type", "0")
 		messagesBetweenQuery = strings.ReplaceAll(messagesBetweenQuery, "message.group_action_type", "0")
 		limitedMessagesQuery = strings.ReplaceAll(limitedMessagesQuery, "message.group_action_type", "0")
+		messagesBeforeWithLimitQuery = strings.ReplaceAll(messagesBeforeWithLimitQuery, "message.group_action_type", "0")
+		messagesBeforeCursorQuery = strings.ReplaceAll(messagesBeforeCursorQuery, "message.group_action_type", "0")
 		newMessagesQuery = strings.ReplaceAll(newMessagesQuery, "message.group_action_type", "0")
 		singleMessageQuery = strings.ReplaceAll(singleMessageQuery, "message.group_action_type", "0")
 	}
@@ -217,6 +285,10 @@ func (mac *macOSDatabase) prepareMessages() error {
 	mac.messagesBeforeWithLimitQuery, err = mac.chatDB.Prepare(messagesBeforeWithLimitQuery)
 	if err != nil {
 		return fmt.Errorf("failed to prepare message query: %w", err)
+	}
+	mac.messagesBeforeCursorQuery, err = mac.chatDB.Prepare(messagesBeforeCursorQuery)
+	if err != nil {
+		return fmt.Errorf("failed to prepare message cursor query: %w", err)
 	}
 	mac.singleMessageQuery, err = mac.chatDB.Prepare(singleMessageQuery)
 	if err != nil {
@@ -254,6 +326,14 @@ func (mac *macOSDatabase) prepareMessages() error {
 	mac.recentChatsQuery, err = mac.chatDB.Prepare(recentChatsQuery)
 	if err != nil {
 		return fmt.Errorf("failed to prepare recent chats query: %w", err)
+	}
+	mac.hasAnyBackfillableQuery, err = mac.chatDB.Prepare(hasAnyBackfillableQuery)
+	if err != nil {
+		return fmt.Errorf("failed to prepare chat.db backfillable message query: %w", err)
+	}
+	mac.hasInitialBackfillableQuery, err = mac.chatDB.Prepare(hasInitialBackfillableQuery)
+	if err != nil {
+		return fmt.Errorf("failed to prepare chat.db initial backfillable message query: %w", err)
 	}
 	mac.messageGUIDsSinceQuery, err = mac.chatDB.Prepare(messageGUIDsSinceQuery)
 	if err != nil {
@@ -404,6 +484,14 @@ func (mac *macOSDatabase) GetMessagesBeforeWithLimit(chatID string, before time.
 	return mac.scanMessages(res)
 }
 
+func (mac *macOSDatabase) getMessagesBeforeCursor(chatID string, before time.Time, beforeRowID int, limit int) ([]*imessage.Message, error) {
+	res, err := mac.messagesBeforeCursorQuery.Query(chatID, before.UnixNano()-imessage.AppleEpoch.UnixNano(), beforeRowID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("error querying messages before cursor with limit: %w", err)
+	}
+	return mac.scanMessages(res)
+}
+
 func (mac *macOSDatabase) GetMessage(guid string) (*imessage.Message, error) {
 	res, err := mac.singleMessageQuery.Query(guid)
 	if err != nil {
@@ -504,6 +592,94 @@ func (mac *macOSDatabase) GetChatsWithMessagesAfter(minDate time.Time) ([]imessa
 		chats = append(chats, imessage.ChatIdentifier{ChatGUID: chatID, ThreadID: groupID})
 	}
 	return chats, nil
+}
+
+func (mac *macOSDatabase) HasBackfillableMessagesBefore(chatID string, before time.Time, limit int) (bool, error) {
+	maybeHasMessages, err := mac.hasBackfillableMessageCandidateBefore(chatID, before, limit)
+	if err != nil || !maybeHasMessages {
+		return maybeHasMessages, err
+	}
+	return mac.hasDecodedBackfillableMessagesBefore(chatID, before, limit)
+}
+
+func (mac *macOSDatabase) hasBackfillableMessageCandidateBefore(chatID string, before time.Time, limit int) (bool, error) {
+	beforeAppleEpoch := before.UnixNano() - imessage.AppleEpoch.UnixNano()
+	const uncappedInitialBackfill = 1<<31 - 1
+	var hasMessages bool
+	var err error
+	if limit > 0 && limit < uncappedInitialBackfill {
+		err = mac.hasInitialBackfillableQuery.QueryRow(chatID, beforeAppleEpoch, limit).Scan(&hasMessages)
+	} else {
+		err = mac.hasAnyBackfillableQuery.QueryRow(chatID, beforeAppleEpoch).Scan(&hasMessages)
+	}
+	if err != nil {
+		return false, fmt.Errorf("error querying chat.db backfillable messages: %w", err)
+	}
+	return hasMessages, nil
+}
+
+func (mac *macOSDatabase) hasDecodedBackfillableMessagesBefore(chatID string, before time.Time, limit int) (bool, error) {
+	const (
+		uncappedInitialBackfill = 1<<31 - 1
+		probePageSize           = 500
+	)
+	if limit > 0 && limit < uncappedInitialBackfill {
+		return mac.hasDecodedBackfillableMessagePage(chatID, before, limit)
+	}
+
+	beforeRowID := int(^uint(0) >> 1)
+	for {
+		messages, err := mac.getMessagesBeforeCursor(chatID, before, beforeRowID, probePageSize)
+		if err != nil {
+			return false, err
+		}
+		if hasBackfillableMessage(messages) {
+			return true, nil
+		}
+		if len(messages) < probePageSize {
+			return false, nil
+		}
+		oldest := messages[len(messages)-1]
+		before = oldest.Time
+		beforeRowID = oldest.RowID
+	}
+}
+
+func (mac *macOSDatabase) hasDecodedBackfillableMessagePage(chatID string, before time.Time, limit int) (bool, error) {
+	messages, err := mac.GetMessagesBeforeWithLimit(chatID, before, limit)
+	if err != nil {
+		return false, err
+	}
+	return hasBackfillableMessage(messages), nil
+}
+
+func hasBackfillableMessage(messages []*imessage.Message) bool {
+	for _, msg := range messages {
+		if macMessageCanBackfill(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+func macMessageCanBackfill(msg *imessage.Message) bool {
+	if msg == nil || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+		return false
+	}
+	if !msg.IsFromMe && msg.Sender.LocalID == "" {
+		return false
+	}
+	text := strings.TrimSpace(strings.ReplaceAll(msg.Text, "\uFFFC", ""))
+	subject := strings.TrimSpace(msg.Subject)
+	if text != "" || subject != "" {
+		return true
+	}
+	for _, att := range msg.Attachments {
+		if att != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (mac *macOSDatabase) GetChatInfo(chatID, _ string) (*imessage.ChatInfo, error) {
