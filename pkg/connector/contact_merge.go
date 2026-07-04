@@ -90,54 +90,48 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 		}
 	}()
 
-	candidates := make([]string, 0, len(altIDs)+1)
-	seen := make(map[string]struct{}, len(altIDs)+1)
-	addCandidate := func(id string) {
-		if id == "" {
-			return
-		}
-		if _, ok := seen[id]; ok {
-			return
-		}
-		seen[id] = struct{}{}
-		candidates = append(candidates, id)
-	}
-	addCandidate(portalID)
-	for _, altID := range altIDs {
-		addCandidate(altID)
+	// Validate the portal's own handle alone first. In the common case it is
+	// reachable and this stays a single-handle IDS query; including the
+	// alternates here would fetch keys for every handle of the contact on the
+	// send path (unregistered handles are only cached for EMPTY_REFRESH = 1h
+	// rust-side, so dead alternates would be re-fetched from Apple hourly),
+	// and it would couple the portal handle's validation to the alternates'
+	// failure domain — one erroring batch would blank out everything.
+	if valid := c.client.ValidateTargets([]string{portalID}, c.handle); len(valid) > 0 {
+		return portalID
 	}
 
-	valid := c.client.ValidateTargets(candidates, c.handle)
+	alternates := make([]string, 0, len(altIDs))
+	for _, altID := range altIDs {
+		if altID != portalID {
+			alternates = append(alternates, altID)
+		}
+	}
+
+	c.UserLogin.Log.Info().
+		Str("portal_id", portalID).
+		Int("alternates", len(alternates)).
+		Msg("Portal ID not reachable on iMessage, trying alternate contact numbers")
+
+	valid := c.client.ValidateTargets(alternates, c.handle)
 	validSet := make(map[string]struct{}, len(valid))
 	for _, id := range valid {
 		validSet[id] = struct{}{}
 	}
-	if picked, ok := pickSendTarget(portalID, altIDs, validSet); ok {
-		if picked == portalID {
-			return portalID
-		}
+	if picked, ok := pickSendTarget(portalID, alternates, validSet); ok {
 		c.UserLogin.Log.Info().
 			Str("portal_id", portalID).
 			Str("send_target", picked).
-			Int("candidates", len(candidates)).
+			Int("alternates", len(alternates)).
 			Int("valid", len(valid)).
 			Msg("Resolved send target to alternate contact number")
 		return picked
 	}
 
-	if len(valid) == 0 {
-		c.UserLogin.Log.Warn().
-			Str("portal_id", portalID).
-			Int("candidates", len(candidates)).
-			Int("valid", len(valid)).
-			Msg("Contact send-target IDS lookup returned no valid handles; falling back to original portal ID")
-		return portalID
-	}
-	c.UserLogin.Log.Info().
+	c.UserLogin.Log.Warn().
 		Str("portal_id", portalID).
-		Int("candidates", len(candidates)).
-		Int("valid", len(valid)).
-		Msg("No reachable contact alias matched send target candidates; falling back to original portal ID")
+		Int("alternates", len(alternates)).
+		Msg("No reachable number found for contact; falling back to original portal ID")
 	return portalID
 }
 
