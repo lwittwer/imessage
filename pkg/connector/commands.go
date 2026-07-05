@@ -1403,7 +1403,7 @@ func fnMsgDebug(ce *commands.Event) {
 				idsTargets = append(idsTargets, altID)
 			}
 		}
-		valid := client.client.ValidateTargets(idsTargets, client.handle)
+		valid := client.validateTargetsSafe(idsTargets)
 		validSet := make(map[string]bool, len(valid))
 		for _, v := range valid {
 			validSet[v] = true
