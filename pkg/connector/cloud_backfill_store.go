@@ -2764,38 +2764,42 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 type portalWithNewestMessage struct {
 	PortalID        string
 	NewestTS        int64
+	ActivityTS      int64
 	MessageCount    int
 	ContentfulCount int
 }
 
 // listPortalIDsWithNewestTimestamp returns portal IDs that have readable message
 // rows or live chat metadata, ordered by newest activity timestamp descending.
+// NewestTS is the newest readable message timestamp only, so chat metadata
+// updates do not advance the message backfill dedupe watermark.
 // ContentfulCount is stricter and only counts rows that can create a message
 // event by themselves; callers use it to prevent creating new empty rooms while
 // still allowing existing rooms to catch up metadata-only or reaction-only rows.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
 	query := `
 		WITH message_stats AS (
-			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
 			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 			FROM cloud_message cm
 			WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
 			GROUP BY cm.portal_id
 		),
 		chat_stats AS (
-			SELECT cc.portal_id, MAX(cc.updated_ts) AS newest_ts, 0 AS msg_count, 0 AS contentful_count
+			SELECT cc.portal_id, 0 AS newest_ts, COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 			FROM cloud_chat cc
 			WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
 			GROUP BY cc.portal_id
 		)
-		SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
+		SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
+		       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
 		FROM (
 			SELECT * FROM message_stats
 			UNION ALL
 			SELECT * FROM chat_stats
 		)
 		GROUP BY portal_id
-		ORDER BY newest_ts DESC
+		ORDER BY activity_ts DESC
 	`
 	args := []any{s.loginID}
 	const uncappedInitialBackfill = 1<<31 - 1
@@ -2814,7 +2818,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				  AND cm.record_name <> ''
 			),
 			message_stats AS (
-				SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+				SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
 				       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 				FROM ranked cm
 				WHERE cm.rn <= $2
@@ -2822,19 +2826,20 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				GROUP BY cm.portal_id
 			),
 			chat_stats AS (
-				SELECT cc.portal_id, MAX(cc.updated_ts) AS newest_ts, 0 AS msg_count, 0 AS contentful_count
+				SELECT cc.portal_id, 0 AS newest_ts, COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 				FROM cloud_chat cc
 				WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
 				GROUP BY cc.portal_id
 			)
-			SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
+			SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
+			       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
 			FROM (
 				SELECT * FROM message_stats
 				UNION ALL
 				SELECT * FROM chat_stats
 			)
 			GROUP BY portal_id
-			ORDER BY newest_ts DESC
+			ORDER BY activity_ts DESC
 		`
 		args = append(args, maxInitialMessages)
 	}
@@ -2847,7 +2852,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 	var out []portalWithNewestMessage
 	for rows.Next() {
 		var p portalWithNewestMessage
-		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.MessageCount, &p.ContentfulCount); err != nil {
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.ActivityTS, &p.MessageCount, &p.ContentfulCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

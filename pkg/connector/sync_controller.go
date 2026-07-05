@@ -3894,6 +3894,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// first). Chat metadata and reaction-only rows are included so existing Matrix
 	// rooms can catch up. New Matrix rooms still require contentful messages
 	// below, so metadata-only or reaction-only rows do not create empty rooms.
+	// The message timestamp stays separate from chat metadata activity so
+	// queuedPortals does not skip later delayed message imports behind a newer
+	// chat metadata update.
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
@@ -3924,6 +3927,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 	ordered := make([]string, 0, len(portalInfos))
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
+	queueTSByPortal := make(map[string]int64, len(portalInfos))
 	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
@@ -3931,6 +3935,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
 		newestTSByPortal[p.PortalID] = p.NewestTS
+		queueTS := p.NewestTS
+		if queueTS == 0 {
+			queueTS = p.ActivityTS
+		}
+		queueTSByPortal[p.PortalID] = queueTS
 		// Skip portals that are recently deleted this session.
 		// Checked live (not from a static snapshot) so that mid-sync
 		// recoveries via handleChatRecover are respected immediately.
@@ -3992,7 +4001,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			}
 			seenGroupKeys[key] = p.PortalID
 		}
-		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= p.NewestTS {
+		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= queueTS {
 			alreadyQueued++
 			continue
 		}
@@ -4097,7 +4106,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			GetChatInfoFunc: c.GetChatInfo,
 			LatestMessageTS: latestMessageTS,
 		})
-		c.queuedPortals[portalID] = newestTS
+		c.queuedPortals[portalID] = queueTSByPortal[portalID]
 		created++
 		if (i+1)%25 == 0 {
 			log.Info().

@@ -72,6 +72,13 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	`, store.loginID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = db.Exec(ctx, `
+		UPDATE cloud_chat
+		SET updated_ts=10000
+		WHERE login_id=$1 AND portal_id='tel:+15550000002'
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
 	if err != nil {
@@ -80,17 +87,14 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	if len(got) != 9 {
 		t.Fatalf("got %d portals (%#v), want readable-message plus metadata-only portals", len(got), got)
 	}
-	if got[0].PortalID != "tel:+15550000005" || got[0].NewestTS != 5000 || got[0].MessageCount != 1 {
-		t.Fatalf("got first portal %#v, want senderless DM fallback message", got[0])
+	if got[0].PortalID != "tel:+15550000002" || got[0].ActivityTS != 10000 || got[0].NewestTS != 2000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 1 {
+		t.Fatalf("got first portal %#v, want portal ordered by newer chat metadata without advancing message timestamp", got[0])
 	}
-	if got[0].ContentfulCount != 1 {
-		t.Fatalf("got first portal contentful count %d, want 1", got[0].ContentfulCount)
+	if got[1].PortalID != "tel:+15550000005" || got[1].ActivityTS != 5000 || got[1].NewestTS != 5000 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
+		t.Fatalf("got second portal %#v, want senderless DM fallback message", got[1])
 	}
-	if got[1].PortalID != "tel:+15550000003" || got[1].NewestTS != 3000 || got[1].MessageCount != 1 || got[1].ContentfulCount != 0 {
-		t.Fatalf("got second portal %#v, want reaction-only readable candidate with no contentful messages", got[1])
-	}
-	if got[2].PortalID != "tel:+15550000002" || got[2].NewestTS != 2000 || got[2].MessageCount != 1 || got[2].ContentfulCount != 1 {
-		t.Fatalf("got third portal %#v, want portal with backfillable message", got[2])
+	if got[2].PortalID != "tel:+15550000003" || got[2].ActivityTS != 3000 || got[2].NewestTS != 3000 || got[2].MessageCount != 1 || got[2].ContentfulCount != 0 {
+		t.Fatalf("got third portal %#v, want reaction-only readable candidate with no contentful messages", got[2])
 	}
 	byPortal := make(map[string]portalWithNewestMessage, len(got))
 	for _, p := range got {
@@ -108,7 +112,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 		if !ok {
 			t.Fatalf("metadata-only portal %q missing from candidates: %#v", portalID, got)
 		}
-		if p.NewestTS != now || p.MessageCount != 0 || p.ContentfulCount != 0 {
+		if p.ActivityTS != now || p.NewestTS != 0 || p.MessageCount != 0 || p.ContentfulCount != 0 {
 			t.Fatalf("metadata-only portal %q = %#v, want chat timestamp with no message/contentful count", portalID, p)
 		}
 	}
@@ -180,10 +184,10 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	if len(got) != 2 {
 		t.Fatalf("got %d portals (%#v), want both portals with readable rows in capped window", len(got), got)
 	}
-	if got[0].PortalID != "tel:+15550000010" || got[0].NewestTS != 3000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
+	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 3000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
 		t.Fatalf("got portal %#v, want capped-window reaction-only portal with no contentful messages", got[0])
 	}
-	if got[1].PortalID != "tel:+15550000011" || got[1].NewestTS != 2500 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
+	if got[1].PortalID != "tel:+15550000011" || got[1].ActivityTS != 2500 || got[1].NewestTS != 2500 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
 		t.Fatalf("got portal %#v, want capped-window content portal", got[1])
 	}
 
