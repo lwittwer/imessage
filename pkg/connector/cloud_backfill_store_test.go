@@ -11,7 +11,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
-func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
+func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	ctx := context.Background()
 	rawDB, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -77,8 +77,8 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("got %d portals (%#v), want 3", len(got), got)
+	if len(got) != 9 {
+		t.Fatalf("got %d portals (%#v), want readable-message plus metadata-only portals", len(got), got)
 	}
 	if got[0].PortalID != "tel:+15550000005" || got[0].NewestTS != 5000 || got[0].MessageCount != 1 {
 		t.Fatalf("got first portal %#v, want senderless DM fallback message", got[0])
@@ -91,6 +91,29 @@ func TestListPortalIDsWithNewestTimestampSkipsChatOnlyPortals(t *testing.T) {
 	}
 	if got[2].PortalID != "tel:+15550000002" || got[2].NewestTS != 2000 || got[2].MessageCount != 1 || got[2].ContentfulCount != 1 {
 		t.Fatalf("got third portal %#v, want portal with backfillable message", got[2])
+	}
+	byPortal := make(map[string]portalWithNewestMessage, len(got))
+	for _, p := range got {
+		byPortal[p.PortalID] = p
+	}
+	for _, portalID := range []string{
+		"tel:+15550000001",
+		"tel:+15550000004",
+		"gid:senderless",
+		"gid:rename",
+		"gid:rename-trimmed",
+		"tel:+15550000007",
+	} {
+		p, ok := byPortal[portalID]
+		if !ok {
+			t.Fatalf("metadata-only portal %q missing from candidates: %#v", portalID, got)
+		}
+		if p.NewestTS != now || p.MessageCount != 0 || p.ContentfulCount != 0 {
+			t.Fatalf("metadata-only portal %q = %#v, want chat timestamp with no message/contentful count", portalID, p)
+		}
+	}
+	if _, ok := byPortal["tel:+15550000006"]; ok {
+		t.Fatalf("filtered portal was included: %#v", got)
 	}
 	count, err := store.countBackfillableMessages(ctx, "tel:+15550000002", true)
 	if err != nil {

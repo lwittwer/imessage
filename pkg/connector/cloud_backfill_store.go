@@ -2769,17 +2769,32 @@ type portalWithNewestMessage struct {
 }
 
 // listPortalIDsWithNewestTimestamp returns portal IDs that have readable message
-// rows, ordered by newest message timestamp descending (most recent activity
-// first). ContentfulCount is stricter and only counts rows that can create a
-// message event by themselves; callers use it to prevent creating new empty
-// rooms while still allowing existing rooms to catch up reaction-only rows.
+// rows or live chat metadata, ordered by newest activity timestamp descending.
+// ContentfulCount is stricter and only counts rows that can create a message
+// event by themselves; callers use it to prevent creating new empty rooms while
+// still allowing existing rooms to catch up metadata-only or reaction-only rows.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
 	query := `
-		SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
-		       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
-		FROM cloud_message cm
-		WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
-		GROUP BY cm.portal_id
+		WITH message_stats AS (
+			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
+			FROM cloud_message cm
+			WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
+			GROUP BY cm.portal_id
+		),
+		chat_stats AS (
+			SELECT cc.portal_id, MAX(cc.updated_ts) AS newest_ts, 0 AS msg_count, 0 AS contentful_count
+			FROM cloud_chat cc
+			WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
+			GROUP BY cc.portal_id
+		)
+		SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
+		FROM (
+			SELECT * FROM message_stats
+			UNION ALL
+			SELECT * FROM chat_stats
+		)
+		GROUP BY portal_id
 		ORDER BY newest_ts DESC
 	`
 	args := []any{s.loginID}
@@ -2797,13 +2812,28 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
 				  AND cm.deleted=FALSE
 				  AND cm.record_name <> ''
+			),
+			message_stats AS (
+				SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+				       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
+				FROM ranked cm
+				WHERE cm.rn <= $2
+				  AND ` + cloudPortalSyncCandidateWhere("cm") + `
+				GROUP BY cm.portal_id
+			),
+			chat_stats AS (
+				SELECT cc.portal_id, MAX(cc.updated_ts) AS newest_ts, 0 AS msg_count, 0 AS contentful_count
+				FROM cloud_chat cc
+				WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
+				GROUP BY cc.portal_id
 			)
-			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
-			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
-			FROM ranked cm
-			WHERE cm.rn <= $2
-			  AND ` + cloudPortalSyncCandidateWhere("cm") + `
-			GROUP BY cm.portal_id
+			SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
+			FROM (
+				SELECT * FROM message_stats
+				UNION ALL
+				SELECT * FROM chat_stats
+			)
+			GROUP BY portal_id
 			ORDER BY newest_ts DESC
 		`
 		args = append(args, maxInitialMessages)
@@ -2823,6 +2853,23 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// cloudChatPortalSyncCandidateWhere matches chat metadata rows that should make
+// an existing portal eligible for a ChatResync. ContentfulCount remains zero for
+// these rows, so metadata-only chats cannot create brand-new empty Matrix rooms.
+func cloudChatPortalSyncCandidateWhere(alias string) string {
+	col := func(name string) string { return alias + "." + name }
+	return fmt.Sprintf(`
+		%s=$1
+		AND %s IS NOT NULL AND %s <> ''
+		AND %s=FALSE
+		AND COALESCE(%s, 0) = 0
+		AND NOT EXISTS (
+			SELECT 1 FROM cloud_chat fc
+			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
+		)
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("is_filtered"), col("portal_id"))
 }
 
 // cloudPortalSyncCandidateWhere matches rows that should make a portal eligible

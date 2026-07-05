@@ -3890,10 +3890,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		return
 	}
 
-	// Get portal IDs sorted by newest message timestamp (most recent first).
-	// Reaction-only rows are included so existing Matrix rooms can catch up
-	// offline tapbacks. New Matrix rooms still require contentful messages below,
-	// so cloud_chat metadata or reaction-only rows do not create empty rooms.
+	// Get portal IDs sorted by newest CloudKit activity timestamp (most recent
+	// first). Chat metadata and reaction-only rows are included so existing Matrix
+	// rooms can catch up. New Matrix rooms still require contentful messages
+	// below, so metadata-only or reaction-only rows do not create empty rooms.
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
@@ -3915,7 +3915,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 
 	log.Info().
 		Int("total_portals", len(portalInfos)).
-		Msg("Portal candidates from cloud sync with readable messages")
+		Msg("Portal candidates from cloud sync")
 
 	// Skip portals already queued this session with the same newest timestamp.
 	// If CloudKit has newer messages, the timestamp changes and we re-queue.
