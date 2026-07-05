@@ -144,6 +144,48 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	}
 }
 
+func TestAttachmentGUIDPlaceholdersCountAsContentfulMessages(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	attachmentsJSON := cloudAttachmentGUIDPlaceholdersJSON([]string{"att-guid-1"})
+	if attachmentsJSON == "" {
+		t.Fatal("cloudAttachmentGUIDPlaceholdersJSON returned empty JSON")
+	}
+	now := int64(1000)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, subject, record_name,
+			tapback_type, tapback_target_guid, attachments_json, has_body, body_scrubbed, created_ts, updated_ts
+		)
+		VALUES
+			($1, 'attachment-only', 'tel:+15550000020', 2000, 'tel:+15551111111', FALSE, '', '', 'record-att', NULL, NULL, $2, TRUE, FALSE, $3, $3)
+	`, store.loginID, attachmentsJSON, now); err != nil {
+		t.Fatal(err)
+	}
+
+	hasMessages, err := store.hasContentfulMessages(ctx, "tel:+15550000020")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessages {
+		t.Fatal("hasContentfulMessages = false, want true for attachment GUID placeholder row")
+	}
+}
+
 func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T) {
 	ctx := context.Background()
 	rawDB, err := sql.Open("sqlite3", ":memory:")

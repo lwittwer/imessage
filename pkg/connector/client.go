@@ -5628,6 +5628,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 			TapbackType:       msg.TapbackType,
 			TapbackTargetGUID: tapbackTargetGUID,
 			TapbackEmoji:      tapbackEmoji,
+			AttachmentsJSON:   cloudAttachmentGUIDPlaceholdersJSON(msg.AttachmentGuids),
 			DateReadMS:        msg.DateReadMs,
 			HasBody:           msg.HasBody,
 		})
@@ -5639,6 +5640,32 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 		return 0, diag, fmt.Errorf("failed to import CloudKit messages for recovered chat: %w", err)
 	}
 	return len(rows), diag, nil
+}
+
+func cloudAttachmentGUIDPlaceholdersJSON(guids []string) string {
+	if len(guids) == 0 {
+		return ""
+	}
+	atts := make([]cloudAttachmentRow, 0, len(guids))
+	seen := make(map[string]struct{}, len(guids))
+	for _, guid := range guids {
+		if guid == "" {
+			continue
+		}
+		if _, ok := seen[guid]; ok {
+			continue
+		}
+		seen[guid] = struct{}{}
+		atts = append(atts, cloudAttachmentRow{GUID: guid})
+	}
+	if len(atts) == 0 {
+		return ""
+	}
+	attachmentJSON, err := json.Marshal(atts)
+	if err != nil {
+		return ""
+	}
+	return string(attachmentJSON)
 }
 
 func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, precheckedChatDBMessages *bool, postCreate func(context.Context, *bridgev2.Portal)) {
