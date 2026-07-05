@@ -390,6 +390,8 @@ type IMClient struct {
 
 	// Background goroutine lifecycle
 	stopChan chan struct{}
+	// Serializes Disconnect — see the comment there.
+	disconnectMu sync.Mutex
 
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
@@ -1620,6 +1622,13 @@ Run ` + "`help`" + ` any time for the full command list.
 `
 
 func (c *IMClient) Disconnect() {
+	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
+	// LogoutRemote invokes this method directly, so two teardowns can run
+	// concurrently: double-close of stopChan, or one frame nil-ing c.client
+	// while the other's Stop() goroutine still reads it. Serialize here; the
+	// second caller then no-ops on the already-nil'd fields.
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
@@ -1627,19 +1636,22 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	// Close the APNs ResourceManager BEFORE stopping the Client: its death signal
-	// aborts any in-flight generate() reconnect, freeing Tokio workers so Stop()
-	// can be scheduled. With the reverse ordering a prolonged reconnect storm can
-	// exhaust all workers and make Stop() block forever. Don't nil c.connection —
-	// the watchdog may still poll it; Close() signals stop without freeing the Go object.
+	// Close the APNs ResourceManager BEFORE stopping the Client: its death
+	// signal (a non-blocking try_send) aborts any in-flight reconnect so
+	// nothing is still generating traffic while the client shuts down.
+	// Don't nil c.connection — the watchdog may still poll it; Close()
+	// signals stop without freeing the Go object.
 	if c.connection != nil {
 		c.connection.Close()
 	}
 	if c.client != nil {
-		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a wedged
-		// Tokio runtime can't block the reconnect path forever. Destroy() runs
-		// regardless — UniFFI refcounting defers the free until any in-flight Stop()
-		// returns, so the leaked goroutine never touches freed memory.
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout as
+		// insurance so a wedge can't hang Disconnect (never observed in
+		// production — the #56 hang was the nil-channel send in
+		// macOSDatabase.Stop(), fixed in imessage/mac). Destroy() runs
+		// regardless — UniFFI refcounting defers the free until any
+		// in-flight Stop() returns, so the leaked goroutine never touches
+		// freed memory.
 		stopDone := make(chan struct{})
 		go func() {
 			c.client.Stop()
@@ -1914,12 +1926,42 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		//   (3) mailto: portal itself as absolute last resort
 		var portal *bridgev2.Portal
 
+		// Self-presence first: Apple publishes the account's own Focus changes
+		// on the account's own StatusKit channel, and the sender alias attached
+		// can be ANY registered handle of the account — including "reachable
+		// at" aliases that never appear in any chat (observed live: a
+		// registered number the user didn't recognize). The peer-resolution
+		// chain below can only ever land on a peer DM, so a self alias that
+		// doesn't match the self-chat portal's key was dropped as "no DM
+		// portal" — making the self-chat moon silently depend on WHICH alias
+		// Apple picked after each restart. Route every self handle straight to
+		// the self-chat portal instead.
+		isSelf := c.isMyHandle(user)
+		if isSelf {
+			for _, h := range c.allHandles {
+				pid := c.resolveExistingDMPortalID(normalizeIdentifierForPortalID(h))
+				if p := findPortal(pid); p != nil {
+					portal = p
+					log.Info().Str("portal_id", logSafeHandle(string(p.ID))).
+						Msg("StatusKit: self presence — routed to self-chat portal")
+					break
+				}
+			}
+			if portal == nil {
+				log.Debug().Msg("StatusKit: self presence but no self-chat portal exists — dropping")
+				return
+			}
+		}
+
 		// (0) Fast path: check the learned sender→portal cache first. This
 		// is populated from every inbound message, so any peer who has
 		// messaged bridge has a direct mapping here that doesn't depend on
 		// iCloud CardDAV contact completeness (the common failure mode for
 		// reshare correlation).
 		for _, key := range [2]string{user, normalizedUser} {
+			if portal != nil {
+				break
+			}
 			if key == "" {
 				continue
 			}
@@ -2014,7 +2056,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 
 		if portal == nil || portal.MXID == "" {
 			log.Warn().
-				Str("user", normalizedUser).
+				Str("user", logSafeHandle(normalizedUser)).
 				Msg("StatusKit: no DM portal found for presence notice")
 			return
 		}
@@ -2064,22 +2106,33 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// Fallback: try the original mailto: ghost.
 			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
 			if err != nil || ghost == nil || ghost.Intent == nil {
-				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
-					Msg("StatusKit: no usable ghost found — skipping notice")
-				return
+				// The self-chat has no peer, so the account's own ghost may
+				// legitimately never have materialized. The moon rides the room
+				// TITLE, which needs no ghost — skip only the Matrix presence
+				// set and fall through to the title stamp.
+				if !isSelf {
+					log.Warn().Err(err).Str("portal_handle", logSafeHandle(ghostHandle)).Str("mailto_handle", logSafeHandle(user)).
+						Msg("StatusKit: no usable ghost found — skipping notice")
+					return
+				}
+				ghost = nil
+			} else {
+				log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
 			}
-			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
 		} else {
 			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
 		}
 
-		// Set Matrix presence using whichever ghost we resolved.
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-				Presence:  presence,
-				StatusMsg: statusMsg,
-			}); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+		// Set Matrix presence using whichever ghost we resolved (nil only on
+		// the self path, where the title stamp below is all that matters).
+		if ghost != nil {
+			if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+				if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+					Presence:  presence,
+					StatusMsg: statusMsg,
+				}); err != nil {
+					log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				}
 			}
 		}
 
@@ -9359,18 +9412,42 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	// Snapshot FFI state into locals before touching Metadata: the final
+	// stopChan-triggered save can stall inside connection.State() on a
+	// wedged runtime, and by the time it returns bridgev2 may have replaced
+	// this client (recreateClient after a wedge rebuild). Metadata is shared
+	// with the successor, so a late write would clobber its fresh state both
+	// in memory and, via Save, in the DB.
+	var apsState, idsUsers, idsIdentity, deviceID string
+	var haveAPS, haveUsers, haveIdentity, haveDevice bool
 	if c.connection != nil {
-		meta.APSState = c.connection.State().ToString()
+		apsState, haveAPS = c.connection.State().ToString(), true
 	}
 	if c.users != nil {
-		meta.IDSUsers = c.users.ToString()
+		idsUsers, haveUsers = c.users.ToString(), true
 	}
 	if c.identity != nil {
-		meta.IDSIdentity = c.identity.ToString()
+		idsIdentity, haveIdentity = c.identity.ToString(), true
 	}
 	if c.config != nil {
-		meta.DeviceID = c.config.GetDeviceId()
+		deviceID, haveDevice = c.config.GetDeviceId(), true
+	}
+	if cur, _ := c.UserLogin.Client.(*IMClient); cur != c {
+		log.Debug().Msg("Dropping state save from a replaced client")
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if haveAPS {
+		meta.APSState = apsState
+	}
+	if haveUsers {
+		meta.IDSUsers = idsUsers
+	}
+	if haveIdentity {
+		meta.IDSIdentity = idsIdentity
+	}
+	if haveDevice {
+		meta.DeviceID = deviceID
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
