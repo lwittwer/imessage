@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -111,21 +112,69 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 func TestChatDBBackfillCursorAdvancesPastFilteredPage(t *testing.T) {
 	newerFiltered := &imessage.Message{Time: time.Unix(100, 0)}
 	olderFiltered := &imessage.Message{Time: time.Unix(90, 0)}
-	cursor := encodeChatDBBackfillCursor([]*imessage.Message{olderFiltered, newerFiltered}, 2, false)
+	cursor := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
+		"iMessage;-;+15551234567": {olderFiltered, newerFiltered},
+	}, 2, false)
 	if cursor == "" {
 		t.Fatal("encodeChatDBBackfillCursor returned empty cursor for full raw page")
 	}
-	before, ok := decodeChatDBBackfillCursor(cursor)
+	times := decodeChatDBBackfillCursor(cursor, []string{"iMessage;-;+15551234567"})
+	before, ok := times["iMessage;-;+15551234567"]
 	if !ok {
 		t.Fatalf("decodeChatDBBackfillCursor(%q) failed", cursor)
 	}
 	if !before.Equal(olderFiltered.Time) {
 		t.Fatalf("cursor decoded to %s, want oldest raw message time %s", before, olderFiltered.Time)
 	}
-	if got := encodeChatDBBackfillCursor([]*imessage.Message{olderFiltered}, 2, false); got != "" {
+	if got := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
+		"iMessage;-;+15551234567": {olderFiltered},
+	}, 2, false); got != "" {
 		t.Fatalf("encodeChatDBBackfillCursor on partial page = %q, want empty", got)
 	}
-	if _, ok := decodeChatDBBackfillCursor(networkid.PaginationCursor("not-a-timestamp")); ok {
-		t.Fatal("decodeChatDBBackfillCursor accepted invalid cursor")
+	if got := decodeChatDBBackfillCursor(networkid.PaginationCursor("not-a-timestamp"), []string{"iMessage;-;+15551234567"}); len(got) != 0 {
+		t.Fatalf("decodeChatDBBackfillCursor accepted invalid cursor: %#v", got)
+	}
+}
+
+func TestChatDBBackfillCursorTracksMergedChatGUIDsIndependently(t *testing.T) {
+	chatA := "iMessage;-;+15550000001"
+	chatB := "iMessage;-;+15550000002"
+	aBoundary := time.Unix(100, 0)
+	bBoundary := time.Unix(500, 0)
+
+	cursor := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
+		chatA: {
+			{Time: time.Unix(200, 0)},
+			{Time: aBoundary},
+		},
+		chatB: {
+			{Time: time.Unix(600, 0)},
+			{Time: bBoundary},
+		},
+	}, 2, false)
+	if cursor == "" {
+		t.Fatal("encodeChatDBBackfillCursor returned empty cursor for full merged pages")
+	}
+
+	times := decodeChatDBBackfillCursor(cursor, []string{chatA, chatB})
+	if !times[chatA].Equal(aBoundary) {
+		t.Fatalf("cursor for %s = %s, want %s", chatA, times[chatA], aBoundary)
+	}
+	if !times[chatB].Equal(bBoundary) {
+		t.Fatalf("cursor for %s = %s, want %s", chatB, times[chatB], bBoundary)
+	}
+}
+
+func TestChatDBBackfillCursorAcceptsLegacyGlobalTimestamp(t *testing.T) {
+	chatA := "iMessage;-;+15550000001"
+	chatB := "iMessage;-;+15550000002"
+	before := time.Unix(123, 0)
+
+	times := decodeChatDBBackfillCursor(networkid.PaginationCursor(strconv.FormatInt(before.UnixNano(), 10)), []string{chatA, chatB})
+	if !times[chatA].Equal(before) {
+		t.Fatalf("legacy cursor for %s = %s, want %s", chatA, times[chatA], before)
+	}
+	if !times[chatB].Equal(before) {
+		t.Fatalf("legacy cursor for %s = %s, want %s", chatB, times[chatB], before)
 	}
 }

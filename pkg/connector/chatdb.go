@@ -11,6 +11,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -165,10 +166,12 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// Respect the configured message cap. params.Count comes from the
 	// framework's MaxInitialMessages setting.
 	maxMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+	cursorTimes := decodeChatDBBackfillCursor(params.Cursor, chatGUIDs)
+	messagesByGUID := make(map[string][]*imessage.Message, len(chatGUIDs))
 
 	for _, chatGUID := range chatGUIDs {
 		var msgs []*imessage.Message
-		if before, ok := decodeChatDBBackfillCursor(params.Cursor); ok && !params.Forward {
+		if before, ok := cursorTimes[chatGUID]; ok && !params.Forward {
 			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, before, count)
 		} else if params.AnchorMessage != nil {
 			if params.Forward {
@@ -182,6 +185,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		}
 		if lastErr == nil {
 			messages = append(messages, msgs...)
+			messagesByGUID[chatGUID] = msgs
 		}
 	}
 
@@ -196,7 +200,11 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	})
 
 	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
-	nextCursor := encodeChatDBBackfillCursor(messages, count, params.Forward)
+	nextCursor := encodeChatDBBackfillCursor(messagesByGUID, count, params.Forward)
+	hasMore := len(messages) >= count
+	if !params.Forward {
+		hasMore = nextCursor != ""
+	}
 
 	// Get an intent for uploading media. The bot intent works for all uploads.
 	intent := c.Main.Bridge.Bot
@@ -253,37 +261,66 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	return &bridgev2.FetchMessagesResponse{
 		Messages:                backfillMessages,
 		Cursor:                  nextCursor,
-		HasMore:                 len(messages) >= count,
+		HasMore:                 hasMore,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
 }
 
-func encodeChatDBBackfillCursor(messages []*imessage.Message, count int, forward bool) networkid.PaginationCursor {
-	if forward || count <= 0 || len(messages) < count {
+func encodeChatDBBackfillCursor(messagesByGUID map[string][]*imessage.Message, count int, forward bool) networkid.PaginationCursor {
+	if forward || count <= 0 {
 		return ""
 	}
-	oldest := messages[0]
-	for _, msg := range messages[1:] {
-		if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time)) {
-			oldest = msg
+	cursor := make(map[string]int64, len(messagesByGUID))
+	for chatGUID, messages := range messagesByGUID {
+		if len(messages) < count {
+			continue
 		}
+		oldest := messages[0]
+		for _, msg := range messages[1:] {
+			if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time)) {
+				oldest = msg
+			}
+		}
+		if oldest == nil || oldest.Time.IsZero() {
+			continue
+		}
+		cursor[chatGUID] = oldest.Time.UnixNano()
 	}
-	if oldest == nil || oldest.Time.IsZero() {
+	if len(cursor) == 0 {
 		return ""
 	}
-	return networkid.PaginationCursor(strconv.FormatInt(oldest.Time.UnixNano(), 10))
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return networkid.PaginationCursor(encoded)
 }
 
-func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor) (time.Time, bool) {
+func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor, chatGUIDs []string) map[string]time.Time {
+	times := make(map[string]time.Time, len(chatGUIDs))
 	if cursor == "" {
-		return time.Time{}, false
+		return times
+	}
+	var perGUID map[string]int64
+	if err := json.Unmarshal([]byte(cursor), &perGUID); err == nil {
+		for chatGUID, ns := range perGUID {
+			if ns == 0 {
+				continue
+			}
+			times[chatGUID] = time.Unix(0, ns)
+		}
+		return times
 	}
 	ns, err := strconv.ParseInt(string(cursor), 10, 64)
 	if err != nil {
-		return time.Time{}, false
+		return times
 	}
-	return time.Unix(0, ns), true
+	before := time.Unix(0, ns)
+	for _, chatGUID := range chatGUIDs {
+		times[chatGUID] = before
+	}
+	return times
 }
 
 // ============================================================================
