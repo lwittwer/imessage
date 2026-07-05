@@ -186,6 +186,63 @@ func TestAttachmentGUIDPlaceholdersCountAsContentfulMessages(t *testing.T) {
 	}
 }
 
+func TestPortalsFullyBackfilledNoNewContentChecksChatMetadata(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		CREATE TABLE backfill_task (
+			user_login_id TEXT NOT NULL,
+			portal_id TEXT NOT NULL,
+			is_done INTEGER NOT NULL,
+			completed_at BIGINT NOT NULL
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	completedAtMS := int64(1000)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO backfill_task (user_login_id, portal_id, is_done, completed_at)
+		VALUES
+			($1, 'tel:+15550000031', 1, $2),
+			($1, 'tel:+15550000032', 1, $2)
+	`, store.loginID, completedAtMS*1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, display_name, created_ts, updated_ts, deleted, is_filtered)
+		VALUES
+			($1, 'unchanged-chat', 'tel:+15550000031', 'Old Name', 900, 900, FALSE, 0),
+			($1, 'updated-chat', 'tel:+15550000032', 'New Name', 900, 1500, FALSE, 0)
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
+
+	skip, err := store.portalsFullyBackfilledNoNewContent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !skip["tel:+15550000031"] {
+		t.Fatalf("unchanged portal missing from skip set: %#v", skip)
+	}
+	if skip["tel:+15550000032"] {
+		t.Fatalf("metadata-updated portal included in skip set: %#v", skip)
+	}
+}
+
 func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T) {
 	ctx := context.Background()
 	rawDB, err := sql.Open("sqlite3", ":memory:")

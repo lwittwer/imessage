@@ -3397,7 +3397,7 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 }
 
 // portalsFullyBackfilledNoNewContent returns the set of portal_ids whose
-// backfill task is already done AND have no cloud_message rows written since
+// backfill task is already done AND have no cloud rows written since
 // that backfill completed. On restart these are skipped instead of being reset
 // to is_done=false and re-backfilled — which on a large account (James: 1,480
 // chats) is a ~30-minute startup that re-confirms "no messages to backfill"
@@ -3417,6 +3417,11 @@ func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Cont
 		    SELECT 1 FROM cloud_message cm
 		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
 		      AND MAX(cm.created_ts, cm.updated_ts) > bt.completed_at/1000000
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cloud_chat cc
+		    WHERE cc.login_id=$1 AND cc.portal_id=bt.portal_id AND cc.deleted=FALSE
+		      AND MAX(cc.created_ts, cc.updated_ts) > bt.completed_at/1000000
 		  )
 	`, s.loginID)
 	if err != nil {

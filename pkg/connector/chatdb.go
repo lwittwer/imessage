@@ -40,6 +40,11 @@ type chatDBBackfillableProber interface {
 	HasBackfillableMessagesBefore(chatID string, before time.Time, limit int) (bool, error)
 }
 
+type chatDBBackfillCursorPosition struct {
+	TimeNS int64 `json:"time_ns"`
+	RowID  int   `json:"row_id"`
+}
+
 // openChatDB attempts to open the local iMessage chat.db database.
 // Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
 func openChatDB(log zerolog.Logger) *chatDB {
@@ -171,8 +176,8 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	for _, chatGUID := range chatGUIDs {
 		var msgs []*imessage.Message
-		if before, ok := cursorTimes[chatGUID]; ok && !params.Forward {
-			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, before, count)
+		if cursorPos, ok := cursorTimes[chatGUID]; ok && !params.Forward {
+			msgs, lastErr = db.api.GetMessagesBeforeCursor(chatGUID, time.Unix(0, cursorPos.TimeNS), cursorPos.RowID, count)
 		} else if params.AnchorMessage != nil {
 			if params.Forward {
 				msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
@@ -271,21 +276,24 @@ func encodeChatDBBackfillCursor(messagesByGUID map[string][]*imessage.Message, c
 	if forward || count <= 0 {
 		return ""
 	}
-	cursor := make(map[string]int64, len(messagesByGUID))
+	cursor := make(map[string]chatDBBackfillCursorPosition, len(messagesByGUID))
 	for chatGUID, messages := range messagesByGUID {
 		if len(messages) < count {
 			continue
 		}
 		oldest := messages[0]
 		for _, msg := range messages[1:] {
-			if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time)) {
+			if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time) || (msg.Time.Equal(oldest.Time) && msg.RowID < oldest.RowID)) {
 				oldest = msg
 			}
 		}
 		if oldest == nil || oldest.Time.IsZero() {
 			continue
 		}
-		cursor[chatGUID] = oldest.Time.UnixNano()
+		cursor[chatGUID] = chatDBBackfillCursorPosition{
+			TimeNS: oldest.Time.UnixNano(),
+			RowID:  oldest.RowID,
+		}
 	}
 	if len(cursor) == 0 {
 		return ""
@@ -297,18 +305,28 @@ func encodeChatDBBackfillCursor(messagesByGUID map[string][]*imessage.Message, c
 	return networkid.PaginationCursor(encoded)
 }
 
-func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor, chatGUIDs []string) map[string]time.Time {
-	times := make(map[string]time.Time, len(chatGUIDs))
+func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor, chatGUIDs []string) map[string]chatDBBackfillCursorPosition {
+	times := make(map[string]chatDBBackfillCursorPosition, len(chatGUIDs))
 	if cursor == "" {
 		return times
 	}
-	var perGUID map[string]int64
+	var perGUID map[string]chatDBBackfillCursorPosition
 	if err := json.Unmarshal([]byte(cursor), &perGUID); err == nil {
-		for chatGUID, ns := range perGUID {
+		for chatGUID, pos := range perGUID {
+			if pos.TimeNS == 0 {
+				continue
+			}
+			times[chatGUID] = pos
+		}
+		return times
+	}
+	var legacyPerGUID map[string]int64
+	if err := json.Unmarshal([]byte(cursor), &legacyPerGUID); err == nil {
+		for chatGUID, ns := range legacyPerGUID {
 			if ns == 0 {
 				continue
 			}
-			times[chatGUID] = time.Unix(0, ns)
+			times[chatGUID] = chatDBBackfillCursorPosition{TimeNS: ns}
 		}
 		return times
 	}
@@ -316,9 +334,8 @@ func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor, chatGUIDs []s
 	if err != nil {
 		return times
 	}
-	before := time.Unix(0, ns)
 	for _, chatGUID := range chatGUIDs {
-		times[chatGUID] = before
+		times[chatGUID] = chatDBBackfillCursorPosition{TimeNS: ns}
 	}
 	return times
 }

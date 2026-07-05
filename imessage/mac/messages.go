@@ -484,7 +484,7 @@ func (mac *macOSDatabase) GetMessagesBeforeWithLimit(chatID string, before time.
 	return mac.scanMessages(res)
 }
 
-func (mac *macOSDatabase) getMessagesBeforeCursor(chatID string, before time.Time, beforeRowID int, limit int) ([]*imessage.Message, error) {
+func (mac *macOSDatabase) GetMessagesBeforeCursor(chatID string, before time.Time, beforeRowID int, limit int) ([]*imessage.Message, error) {
 	res, err := mac.messagesBeforeCursorQuery.Query(chatID, before.UnixNano()-imessage.AppleEpoch.UnixNano(), beforeRowID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("error querying messages before cursor with limit: %w", err)
@@ -629,7 +629,7 @@ func (mac *macOSDatabase) hasDecodedBackfillableMessagesBefore(chatID string, be
 
 	beforeRowID := int(^uint(0) >> 1)
 	for {
-		messages, err := mac.getMessagesBeforeCursor(chatID, before, beforeRowID, probePageSize)
+		messages, err := mac.GetMessagesBeforeCursor(chatID, before, beforeRowID, probePageSize)
 		if err != nil {
 			return false, err
 		}

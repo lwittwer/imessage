@@ -58,6 +58,7 @@ type API interface {
 	GetMessagesSinceDate(chatID string, minDate time.Time, backfillID string) ([]*Message, error)
 	GetMessagesBetween(chatID string, minDate, maxDate time.Time) ([]*Message, error)
 	GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) ([]*Message, error)
+	GetMessagesBeforeCursor(chatID string, before time.Time, beforeRowID int, limit int) ([]*Message, error)
 	GetMessagesWithLimit(chatID string, limit int, backfillID string) ([]*Message, error)
 	GetChatsWithMessagesAfter(minDate time.Time) ([]ChatIdentifier, error)
 	GetMessage(guid string) (*Message, error)

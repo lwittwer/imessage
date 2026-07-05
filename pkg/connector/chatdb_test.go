@@ -123,8 +123,8 @@ func TestChatDBBackfillCursorAdvancesPastFilteredPage(t *testing.T) {
 	if !ok {
 		t.Fatalf("decodeChatDBBackfillCursor(%q) failed", cursor)
 	}
-	if !before.Equal(olderFiltered.Time) {
-		t.Fatalf("cursor decoded to %s, want oldest raw message time %s", before, olderFiltered.Time)
+	if before.TimeNS != olderFiltered.Time.UnixNano() {
+		t.Fatalf("cursor decoded to %d, want oldest raw message time %d", before.TimeNS, olderFiltered.Time.UnixNano())
 	}
 	if got := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
 		"iMessage;-;+15551234567": {olderFiltered},
@@ -144,12 +144,12 @@ func TestChatDBBackfillCursorTracksMergedChatGUIDsIndependently(t *testing.T) {
 
 	cursor := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
 		chatA: {
-			{Time: time.Unix(200, 0)},
-			{Time: aBoundary},
+			{Time: time.Unix(200, 0), RowID: 201},
+			{Time: aBoundary, RowID: 101},
 		},
 		chatB: {
-			{Time: time.Unix(600, 0)},
-			{Time: bBoundary},
+			{Time: time.Unix(600, 0), RowID: 601},
+			{Time: bBoundary, RowID: 501},
 		},
 	}, 2, false)
 	if cursor == "" {
@@ -157,11 +157,17 @@ func TestChatDBBackfillCursorTracksMergedChatGUIDsIndependently(t *testing.T) {
 	}
 
 	times := decodeChatDBBackfillCursor(cursor, []string{chatA, chatB})
-	if !times[chatA].Equal(aBoundary) {
-		t.Fatalf("cursor for %s = %s, want %s", chatA, times[chatA], aBoundary)
+	if times[chatA].TimeNS != aBoundary.UnixNano() {
+		t.Fatalf("cursor for %s = %d, want %d", chatA, times[chatA].TimeNS, aBoundary.UnixNano())
 	}
-	if !times[chatB].Equal(bBoundary) {
-		t.Fatalf("cursor for %s = %s, want %s", chatB, times[chatB], bBoundary)
+	if times[chatA].RowID != 101 {
+		t.Fatalf("cursor row id for %s = %d, want 101", chatA, times[chatA].RowID)
+	}
+	if times[chatB].TimeNS != bBoundary.UnixNano() {
+		t.Fatalf("cursor for %s = %d, want %d", chatB, times[chatB].TimeNS, bBoundary.UnixNano())
+	}
+	if times[chatB].RowID != 501 {
+		t.Fatalf("cursor row id for %s = %d, want 501", chatB, times[chatB].RowID)
 	}
 }
 
@@ -171,10 +177,32 @@ func TestChatDBBackfillCursorAcceptsLegacyGlobalTimestamp(t *testing.T) {
 	before := time.Unix(123, 0)
 
 	times := decodeChatDBBackfillCursor(networkid.PaginationCursor(strconv.FormatInt(before.UnixNano(), 10)), []string{chatA, chatB})
-	if !times[chatA].Equal(before) {
-		t.Fatalf("legacy cursor for %s = %s, want %s", chatA, times[chatA], before)
+	if times[chatA].TimeNS != before.UnixNano() {
+		t.Fatalf("legacy cursor for %s = %d, want %d", chatA, times[chatA].TimeNS, before.UnixNano())
 	}
-	if !times[chatB].Equal(before) {
-		t.Fatalf("legacy cursor for %s = %s, want %s", chatB, times[chatB], before)
+	if times[chatB].TimeNS != before.UnixNano() {
+		t.Fatalf("legacy cursor for %s = %d, want %d", chatB, times[chatB].TimeNS, before.UnixNano())
+	}
+}
+
+func TestChatDBBackfillCursorPreservesDuplicateTimestampBoundary(t *testing.T) {
+	chatGUID := "iMessage;-;+15550000001"
+	sharedTime := time.Unix(100, 0)
+
+	cursor := encodeChatDBBackfillCursor(map[string][]*imessage.Message{
+		chatGUID: {
+			{Time: sharedTime, RowID: 12},
+			{Time: sharedTime, RowID: 11},
+		},
+	}, 2, false)
+	if cursor == "" {
+		t.Fatal("encodeChatDBBackfillCursor returned empty cursor for full same-timestamp page")
+	}
+	times := decodeChatDBBackfillCursor(cursor, []string{chatGUID})
+	if times[chatGUID].TimeNS != sharedTime.UnixNano() {
+		t.Fatalf("cursor time = %d, want %d", times[chatGUID].TimeNS, sharedTime.UnixNano())
+	}
+	if times[chatGUID].RowID != 11 {
+		t.Fatalf("cursor row id = %d, want 11", times[chatGUID].RowID)
 	}
 }
