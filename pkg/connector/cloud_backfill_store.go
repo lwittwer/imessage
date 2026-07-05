@@ -2762,20 +2762,23 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 // portalWithNewestMessage pairs a portal ID with its newest message timestamp
 // and message count. Used to prioritize portal creation during initial sync.
 type portalWithNewestMessage struct {
-	PortalID     string
-	NewestTS     int64
-	MessageCount int
+	PortalID        string
+	NewestTS        int64
+	MessageCount    int
+	ContentfulCount int
 }
 
-// listPortalIDsWithNewestTimestamp returns portal IDs that have backfillable
-// message rows, ordered by newest message timestamp descending (most recent
-// activity first). Chat-only metadata rows are intentionally excluded: a portal
-// should not be created unless FetchMessages can actually serve messages for it.
+// listPortalIDsWithNewestTimestamp returns portal IDs that have readable message
+// rows, ordered by newest message timestamp descending (most recent activity
+// first). ContentfulCount is stricter and only counts rows that can create a
+// message event by themselves; callers use it to prevent creating new empty
+// rooms while still allowing existing rooms to catch up reaction-only rows.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
 	query := `
-		SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+		SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+		       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 		FROM cloud_message cm
-		WHERE ` + cloudBackfillableEventWhere("cm") + `
+		WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
 		GROUP BY cm.portal_id
 		ORDER BY newest_ts DESC
 	`
@@ -2795,10 +2798,11 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				  AND cm.deleted=FALSE
 				  AND cm.record_name <> ''
 			)
-			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+			SELECT cm.portal_id, MAX(cm.timestamp_ms) AS newest_ts, COUNT(*) AS msg_count,
+			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 			FROM ranked cm
 			WHERE cm.rn <= $2
-			  AND ` + cloudBackfillableEventWhere("cm") + `
+			  AND ` + cloudPortalSyncCandidateWhere("cm") + `
 			GROUP BY cm.portal_id
 			ORDER BY newest_ts DESC
 		`
@@ -2813,12 +2817,36 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 	var out []portalWithNewestMessage
 	for rows.Next() {
 		var p portalWithNewestMessage
-		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.MessageCount); err != nil {
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.MessageCount, &p.ContentfulCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// cloudPortalSyncCandidateWhere matches rows that should make a portal eligible
+// for a ChatResync. It intentionally includes reaction rows so existing rooms
+// can catch up offline tapbacks; callers must still use ContentfulCount before
+// creating a brand-new room.
+func cloudPortalSyncCandidateWhere(alias string) string {
+	col := func(name string) string { return alias + "." + name }
+	base := fmt.Sprintf(`
+		%s=$1
+		AND %s IS NOT NULL AND %s <> ''
+		AND %s=FALSE
+		AND %s <> ''
+		AND NOT EXISTS (
+			SELECT 1 FROM cloud_chat fc
+			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
+		)
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"), col("portal_id"))
+	return base + fmt.Sprintf(`
+		AND (
+			%s >= 2000
+			OR (%s)
+		)
+	`, col("tapback_type"), cloudBackfillableEventWhere(alias))
 }
 
 // cloudBackfillableEventWhere matches rows that can create at least one

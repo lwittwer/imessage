@@ -3891,8 +3891,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 
 	// Get portal IDs sorted by newest message timestamp (most recent first).
-	// Only portals with backfillable messages are returned; cloud_chat metadata
-	// without messages must not create empty Matrix rooms.
+	// Reaction-only rows are included so existing Matrix rooms can catch up
+	// offline tapbacks. New Matrix rooms still require contentful messages below,
+	// so cloud_chat metadata or reaction-only rows do not create empty rooms.
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
@@ -3914,7 +3915,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 
 	log.Info().
 		Int("total_portals", len(portalInfos)).
-		Msg("Portal candidates from cloud sync with backfillable messages")
+		Msg("Portal candidates from cloud sync with readable messages")
 
 	// Skip portals already queued this session with the same newest timestamp.
 	// If CloudKit has newer messages, the timestamp changes and we re-queue.
@@ -3940,6 +3941,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			pendingDeleteSkipped++
 			continue
 		}
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
+		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
+		if newPortalNeedsContent && p.ContentfulCount == 0 {
+			continue
+		}
 		// Dedup group portals: the same group can appear under multiple
 		// portal_ids (gid:<chat_id> vs gid:<group_id>). Use the group
 		// dedup key to detect duplicates and keep only the portal_id
@@ -3955,11 +3962,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 				// Already have a candidate for this group. Prefer
 				// whichever has an existing bridge portal.
 				existingKey := networkid.PortalKey{ID: networkid.PortalID(existingPortalID), Receiver: c.UserLogin.ID}
-				newKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
-				existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, existingKey)
-				newPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, newKey)
-				existingHasRoom := existingPortal != nil && existingPortal.MXID != ""
-				newHasRoom := newPortal != nil && newPortal.MXID != ""
+				existingGroupPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, existingKey)
+				existingHasRoom := existingGroupPortal != nil && existingGroupPortal.MXID != ""
+				newHasRoom := !newPortalNeedsContent
 				if newHasRoom && !existingHasRoom {
 					// Swap: the new one has the bridge portal, use it instead
 					log.Info().
@@ -3991,9 +3996,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			alreadyQueued++
 			continue
 		}
-		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
-		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
-		if p.MessageCount > 0 && (existingPortal == nil || existingPortal.MXID == "") {
+		if newPortalNeedsContent {
 			forwardBackfillPortals++
 		}
 		ordered = append(ordered, p.PortalID)
