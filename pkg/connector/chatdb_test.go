@@ -2,8 +2,10 @@ package connector
 
 import (
 	"testing"
+	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 func TestChatDBMessageCanBackfill(t *testing.T) {
@@ -103,5 +105,27 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 				t.Fatalf("chatDBMessageCanBackfill() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChatDBBackfillCursorAdvancesPastFilteredPage(t *testing.T) {
+	newerFiltered := &imessage.Message{Time: time.Unix(100, 0)}
+	olderFiltered := &imessage.Message{Time: time.Unix(90, 0)}
+	cursor := encodeChatDBBackfillCursor([]*imessage.Message{olderFiltered, newerFiltered}, 2, false)
+	if cursor == "" {
+		t.Fatal("encodeChatDBBackfillCursor returned empty cursor for full raw page")
+	}
+	before, ok := decodeChatDBBackfillCursor(cursor)
+	if !ok {
+		t.Fatalf("decodeChatDBBackfillCursor(%q) failed", cursor)
+	}
+	if !before.Equal(olderFiltered.Time) {
+		t.Fatalf("cursor decoded to %s, want oldest raw message time %s", before, olderFiltered.Time)
+	}
+	if got := encodeChatDBBackfillCursor([]*imessage.Message{olderFiltered}, 2, false); got != "" {
+		t.Fatalf("encodeChatDBBackfillCursor on partial page = %q, want empty", got)
+	}
+	if _, ok := decodeChatDBBackfillCursor(networkid.PaginationCursor("not-a-timestamp")); ok {
+		t.Fatal("decodeChatDBBackfillCursor accepted invalid cursor")
 	}
 }

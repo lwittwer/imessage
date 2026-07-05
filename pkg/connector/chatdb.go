@@ -16,6 +16,7 @@ import (
 	"image/jpeg"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -167,7 +168,9 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	for _, chatGUID := range chatGUIDs {
 		var msgs []*imessage.Message
-		if params.AnchorMessage != nil {
+		if before, ok := decodeChatDBBackfillCursor(params.Cursor); ok && !params.Forward {
+			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, before, count)
+		} else if params.AnchorMessage != nil {
 			if params.Forward {
 				msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
 			} else {
@@ -193,6 +196,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	})
 
 	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	nextCursor := encodeChatDBBackfillCursor(messages, count, params.Forward)
 
 	// Get an intent for uploading media. The bot intent works for all uploads.
 	intent := c.Main.Bridge.Bot
@@ -248,10 +252,38 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	return &bridgev2.FetchMessagesResponse{
 		Messages:                backfillMessages,
+		Cursor:                  nextCursor,
 		HasMore:                 len(messages) >= count,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
+}
+
+func encodeChatDBBackfillCursor(messages []*imessage.Message, count int, forward bool) networkid.PaginationCursor {
+	if forward || count <= 0 || len(messages) < count {
+		return ""
+	}
+	oldest := messages[0]
+	for _, msg := range messages[1:] {
+		if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time)) {
+			oldest = msg
+		}
+	}
+	if oldest == nil || oldest.Time.IsZero() {
+		return ""
+	}
+	return networkid.PaginationCursor(strconv.FormatInt(oldest.Time.UnixNano(), 10))
+}
+
+func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor) (time.Time, bool) {
+	if cursor == "" {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(string(cursor), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
 }
 
 // ============================================================================

@@ -93,7 +93,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	if got[1].PortalID != "tel:+15550000005" || got[1].ActivityTS != 5000 || got[1].NewestTS != 5000 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
 		t.Fatalf("got second portal %#v, want senderless DM fallback message", got[1])
 	}
-	if got[2].PortalID != "tel:+15550000003" || got[2].ActivityTS != 3000 || got[2].NewestTS != 3000 || got[2].MessageCount != 1 || got[2].ContentfulCount != 0 {
+	if got[2].PortalID != "tel:+15550000003" || got[2].ActivityTS != 3000 || got[2].NewestTS != 0 || got[2].MessageCount != 1 || got[2].ContentfulCount != 0 {
 		t.Fatalf("got third portal %#v, want reaction-only readable candidate with no contentful messages", got[2])
 	}
 	byPortal := make(map[string]portalWithNewestMessage, len(got))
@@ -226,7 +226,7 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	if len(got) != 2 {
 		t.Fatalf("got %d portals (%#v), want both portals with readable rows in capped window", len(got), got)
 	}
-	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 3000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
+	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 0 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
 		t.Fatalf("got portal %#v, want capped-window reaction-only portal with no contentful messages", got[0])
 	}
 	if got[1].PortalID != "tel:+15550000011" || got[1].ActivityTS != 2500 || got[1].NewestTS != 2500 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
@@ -245,6 +245,9 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	}
 	if got[0].ContentfulCount != 1 {
 		t.Fatalf("got first portal contentful count %d, want 1 once older content is inside capped window", got[0].ContentfulCount)
+	}
+	if got[0].ActivityTS != 3000 || got[0].NewestTS != 1000 {
+		t.Fatalf("got first portal activity/newest %#v, want reaction activity with contentful message watermark", got[0])
 	}
 }
 
