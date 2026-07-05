@@ -3904,6 +3904,16 @@ func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPorta
 	return w
 }
 
+func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
+	if p.NewestTS > 0 {
+		return p.NewestTS
+	}
+	if p.MessageCount > 0 {
+		return p.ActivityTS
+	}
+	return 0
+}
+
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
 	if c.cloudStore == nil {
 		return
@@ -3946,16 +3956,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		c.queuedPortals = make(map[string]queuedPortalWatermark)
 	}
 	ordered := make([]string, 0, len(portalInfos))
-	newestTSByPortal := make(map[string]int64, len(portalInfos))
-	activityTSByPortal := make(map[string]int64, len(portalInfos))
+	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
 	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	groupDedupSkipped := 0
 	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
-		newestTSByPortal[p.PortalID] = p.NewestTS
-		activityTSByPortal[p.PortalID] = p.ActivityTS
+		portalInfoByID[p.PortalID] = p
 		// Skip portals that are recently deleted this session.
 		// Checked live (not from a static snapshot) so that mid-sync
 		// recoveries via handleChatRecover are respected immediately.
@@ -4097,16 +4105,19 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Receiver: c.UserLogin.ID,
 		}
 
-		newestTS := newestTSByPortal[portalID]
+		portalInfo := portalInfoByID[portalID]
+		triggerTS := backfillTriggerTimestamp(portalInfo)
 		var latestMessageTS time.Time
-		if newestTS > 0 {
-			latestMessageTS = time.UnixMilli(newestTS)
+		if triggerTS > 0 {
+			latestMessageTS = time.UnixMilli(triggerTS)
 		}
 		log.Debug().
 			Str("portal_id", portalID).
 			Int("index", i).
 			Int("total", len(ordered)).
-			Int64("newest_ts", newestTS).
+			Int64("newest_ts", portalInfo.NewestTS).
+			Int64("activity_ts", portalInfo.ActivityTS).
+			Int64("trigger_ts", triggerTS).
 			Msg("Queuing ChatResync for portal")
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
@@ -4122,10 +4133,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			GetChatInfoFunc: c.GetChatInfo,
 			LatestMessageTS: latestMessageTS,
 		})
-		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalWithNewestMessage{
-			NewestTS:   newestTS,
-			ActivityTS: activityTSByPortal[portalID],
-		})
+		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalInfo)
 		created++
 		if (i+1)%25 == 0 {
 			log.Info().
