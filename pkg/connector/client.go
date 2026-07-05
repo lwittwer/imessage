@@ -450,11 +450,10 @@ type IMClient struct {
 	lastGroupForMember   map[string]networkid.PortalKey
 	lastGroupForMemberMu sync.RWMutex
 
-	// queuedPortals tracks portal_id → message timestamp for portals already
-	// queued this session. Metadata-only candidates use their chat activity
-	// timestamp instead. Prevents re-queuing on periodic syncs unless CloudKit
-	// has newer messages or metadata-only activity.
-	queuedPortals map[string]int64
+	// queuedPortals tracks per-portal sync watermarks already queued this
+	// session. Message and metadata timestamps stay separate so metadata-only
+	// resyncs do not suppress later delayed message imports.
+	queuedPortals map[string]queuedPortalWatermark
 
 	// recentlyDeletedPortals tracks portal IDs that were deleted this
 	// session. Populated by:

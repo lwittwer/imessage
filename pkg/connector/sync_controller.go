@@ -3885,6 +3885,25 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 	return n
 }
 
+type queuedPortalWatermark struct {
+	MessageTS  int64
+	MetadataTS int64
+}
+
+func (w queuedPortalWatermark) covers(p portalWithNewestMessage) bool {
+	return w.MessageTS >= p.NewestTS && w.MetadataTS >= p.ActivityTS
+}
+
+func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPortalWatermark {
+	if p.NewestTS > w.MessageTS {
+		w.MessageTS = p.NewestTS
+	}
+	if p.ActivityTS > w.MetadataTS {
+		w.MetadataTS = p.ActivityTS
+	}
+	return w
+}
+
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
 	if c.cloudStore == nil {
 		return
@@ -3921,13 +3940,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Msg("Portal candidates from cloud sync")
 
 	// Skip portals already queued this session with the same newest timestamp.
-	// If CloudKit has newer messages, the timestamp changes and we re-queue.
+	// If CloudKit has newer messages or chat metadata, the relevant timestamp
+	// changes and we re-queue.
 	if c.queuedPortals == nil {
-		c.queuedPortals = make(map[string]int64)
+		c.queuedPortals = make(map[string]queuedPortalWatermark)
 	}
 	ordered := make([]string, 0, len(portalInfos))
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
-	queueTSByPortal := make(map[string]int64, len(portalInfos))
+	activityTSByPortal := make(map[string]int64, len(portalInfos))
 	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
@@ -3935,11 +3955,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
 		newestTSByPortal[p.PortalID] = p.NewestTS
-		queueTS := p.NewestTS
-		if queueTS == 0 {
-			queueTS = p.ActivityTS
-		}
-		queueTSByPortal[p.PortalID] = queueTS
+		activityTSByPortal[p.PortalID] = p.ActivityTS
 		// Skip portals that are recently deleted this session.
 		// Checked live (not from a static snapshot) so that mid-sync
 		// recoveries via handleChatRecover are respected immediately.
@@ -4001,7 +4017,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			}
 			seenGroupKeys[key] = p.PortalID
 		}
-		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= queueTS {
+		if last, ok := c.queuedPortals[p.PortalID]; ok && last.covers(p) {
 			alreadyQueued++
 			continue
 		}
@@ -4106,7 +4122,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			GetChatInfoFunc: c.GetChatInfo,
 			LatestMessageTS: latestMessageTS,
 		})
-		c.queuedPortals[portalID] = queueTSByPortal[portalID]
+		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalWithNewestMessage{
+			NewestTS:   newestTS,
+			ActivityTS: activityTSByPortal[portalID],
+		})
 		created++
 		if (i+1)%25 == 0 {
 			log.Info().
