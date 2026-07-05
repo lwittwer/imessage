@@ -2608,6 +2608,36 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
+func (s *cloudBackfillStore) hasContentfulMessagesInLatestWindow(ctx context.Context, portalID string, maxInitialMessages int) (bool, error) {
+	const uncappedInitialBackfill = 1<<31 - 1
+	if maxInitialMessages <= 0 || maxInitialMessages >= uncappedInitialBackfill {
+		return s.hasContentfulMessages(ctx, portalID)
+	}
+	var count int
+	err := s.db.QueryRow(ctx, `
+		WITH ranked AS (
+			SELECT cm.*,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY cm.portal_id
+			           ORDER BY cm.timestamp_ms DESC, cm.guid DESC
+			       ) AS rn
+			FROM cloud_message cm
+			WHERE cm.login_id=$1
+			  AND cm.portal_id=$2
+			  AND cm.deleted=FALSE
+			  AND cm.record_name <> ''
+		)
+		SELECT COUNT(*)
+		FROM ranked cm
+		WHERE cm.rn <= $3
+		  AND `+cloudBackfillableEventWhere("cm")+`
+	`, s.loginID, portalID, maxInitialMessages).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // countBackfillableMessages returns the number of rows FetchMessages can read
 // for a portal (deleted=FALSE and record_name <> ”).
 // When requireContentful is true, only rows with text or attachments count.

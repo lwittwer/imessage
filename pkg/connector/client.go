@@ -4904,7 +4904,11 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		return
 	}
 	newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
-	hasRestorableMessages, hasRestorableErr := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
+	hasRestorableMessages, hasRestorableErr := c.cloudStore.hasContentfulMessagesInLatestWindow(
+		context.Background(),
+		portalID,
+		c.Main.Bridge.Config.Backfill.MaxInitialMessages,
+	)
 	if hasRestorableErr != nil {
 		log.Warn().Err(hasRestorableErr).Msg("Failed to check contentful messages before portal recreation")
 		c.notifyRestoreStatus(opts, "Restore of **%s** could not check imported history: %v", displayName, hasRestorableErr)
@@ -5703,7 +5707,11 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 			return
 		}
 	} else if c.cloudStore != nil {
-		hasMessages, err := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
+		hasMessages, err := c.cloudStore.hasContentfulMessagesInLatestWindow(
+			context.Background(),
+			portalID,
+			c.Main.Bridge.Config.Backfill.MaxInitialMessages,
+		)
 		if err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
 				Msg("Failed to check recovered chat messages before portal resync")

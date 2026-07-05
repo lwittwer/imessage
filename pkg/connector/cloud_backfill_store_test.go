@@ -286,8 +286,29 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 0 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
 		t.Fatalf("got portal %#v, want capped-window reaction-only portal with no contentful messages", got[0])
 	}
+	hasAnyContent, err := store.hasContentfulMessages(ctx, "tel:+15550000010")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAnyContent {
+		t.Fatal("hasContentfulMessages = false, want true for older content outside capped window")
+	}
+	hasWindowContent, err := store.hasContentfulMessagesInLatestWindow(ctx, "tel:+15550000010", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasWindowContent {
+		t.Fatal("hasContentfulMessagesInLatestWindow = true, want false when only older content is outside capped window")
+	}
 	if got[1].PortalID != "tel:+15550000011" || got[1].ActivityTS != 2500 || got[1].NewestTS != 2500 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
 		t.Fatalf("got portal %#v, want capped-window content portal", got[1])
+	}
+	hasWindowContent, err = store.hasContentfulMessagesInLatestWindow(ctx, "tel:+15550000011", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWindowContent {
+		t.Fatal("hasContentfulMessagesInLatestWindow = false, want true for content inside capped window")
 	}
 
 	got, err = store.listPortalIDsWithNewestTimestamp(ctx, 3)
