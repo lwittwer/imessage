@@ -1165,23 +1165,9 @@ func (c *IMClient) restorePortalByID(_ context.Context, portalID string) error {
 		if c.chatDB == nil {
 			return fmt.Errorf("no backfill source available for portal %s", portalID)
 		}
-		chatGUIDs := portalIDToChatGUIDs(portalID)
-		if strings.Contains(portalID, ",") {
-			chatGUIDs = []string{c.chatDB.findGroupChatGUID(portalID, c)}
-		}
-		hasMessages := false
-		for _, chatGUID := range chatGUIDs {
-			if chatGUID == "" {
-				continue
-			}
-			ok, err := c.chatDB.hasBackfillableMessages(chatGUID, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
-			if err != nil {
-				continue
-			}
-			if ok {
-				hasMessages = true
-				break
-			}
+		hasMessages, err := c.hasChatDBBackfillableMessages(portalID)
+		if err != nil {
+			return fmt.Errorf("failed to check chat.db messages for portal %s: %w", portalID, err)
 		}
 		if !hasMessages {
 			return fmt.Errorf("no backfillable chat.db messages found for portal %s", portalID)

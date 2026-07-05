@@ -4652,8 +4652,24 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		Logger()
 
 	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
-		log.Warn().Msg("Restore pipeline started without CloudKit backfill; portal not recreated")
-		c.notifyRestoreStatus(opts, "Restore of **%s** could not run because CloudKit backfill is unavailable, so no empty chat room was created.", displayName)
+		if c.Main.Config.UseChatDBBackfill() && c.chatDB != nil {
+			hasMessages, err := c.hasChatDBBackfillableMessages(portalID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Restore pipeline could not check chat.db history")
+				c.notifyRestoreStatus(opts, "Restore of **%s** could not check chat.db history: %v", displayName, err)
+				return
+			}
+			if !hasMessages {
+				log.Warn().Msg("Restore pipeline found no chat.db history; portal not recreated")
+				c.notifyRestoreStatus(opts, "Restore of **%s** — no chat.db message history was available, so no empty chat room was created.", displayName)
+				return
+			}
+			c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil)
+			c.notifyRestoreStatus(opts, "Restore of **%s** complete — chat.db history backfill is running.", displayName)
+			return
+		}
+		log.Warn().Msg("Restore pipeline started without an available backfill source; portal not recreated")
+		c.notifyRestoreStatus(opts, "Restore of **%s** could not run because no backfill source is available, so no empty chat room was created.", displayName)
 		return
 	}
 
@@ -4828,14 +4844,37 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		return
 	}
 
+	existingPortal, existingPortalErr := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
+	if existingPortalErr != nil {
+		log.Warn().Err(existingPortalErr).Msg("Failed to check portal before recreation")
+		c.notifyRestoreStatus(opts, "Restore of **%s** could not check the existing room state: %v", displayName, existingPortalErr)
+		return
+	}
+	newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
 	hasRestorableMessages, hasRestorableErr := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
 	if hasRestorableErr != nil {
 		log.Warn().Err(hasRestorableErr).Msg("Failed to check contentful messages before portal recreation")
+		c.notifyRestoreStatus(opts, "Restore of **%s** could not check imported history: %v", displayName, hasRestorableErr)
+		return
 	}
-	if !hasRestorableMessages {
+	if newPortalNeedsContent && !hasRestorableMessages {
 		log.Warn().Int("attempts", maxRestoreAttempts).Msg("Restore pipeline: no CloudKit history found after all attempts; portal not recreated")
 		c.notifyRestoreStatus(opts, "Restore of **%s** — no message history was available yet, so no empty chat room was created. Try restoring again after iCloud finishes syncing.", displayName)
 		return
+	}
+	if !newPortalNeedsContent && !hasRestorableMessages {
+		hasReadableMessages, err := c.cloudStore.hasPortalMessages(context.Background(), portalID)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to check readable messages before portal resync")
+			c.notifyRestoreStatus(opts, "Restore of **%s** could not check readable history: %v", displayName, err)
+			return
+		}
+		if !hasReadableMessages {
+			log.Warn().Int("attempts", maxRestoreAttempts).Msg("Restore pipeline: no readable CloudKit history found after all attempts")
+			c.notifyRestoreStatus(opts, "Restore of **%s** — no readable message history was available yet.", displayName)
+			return
+		}
+		c.notifyRestoreStatus(opts, "Restore of **%s** found only scrubbed or reaction history, so the existing room will be resynced without creating a replacement room.", displayName)
 	}
 	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil)
 	if historyImported {
@@ -4843,6 +4882,30 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	} else {
 		c.notifyRestoreStatus(opts, "Restore of **%s** complete — existing message history is being backfilled.", displayName)
 	}
+}
+
+func (c *IMClient) hasChatDBBackfillableMessages(portalID string) (bool, error) {
+	if c.chatDB == nil {
+		return false, nil
+	}
+	chatGUIDs := portalIDToChatGUIDs(portalID)
+	if strings.Contains(portalID, ",") {
+		chatGUIDs = []string{c.chatDB.findGroupChatGUID(portalID, c)}
+	}
+	maxInitialMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+	for _, chatGUID := range chatGUIDs {
+		if chatGUID == "" {
+			continue
+		}
+		ok, err := c.chatDB.hasBackfillableMessages(chatGUID, maxInitialMessages)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // refreshRecoveredChatMetadata performs a targeted CloudKit chat scan and
@@ -5523,25 +5586,50 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, postCreate func(context.Context, *bridgev2.Portal)) {
 	portalID := string(portalKey.ID)
 
-	// Use the newest BACKFILLABLE content timestamp. Placeholder rows from
-	// recycle-bin seeding can have GUID/timestamp metadata but no message body;
-	// treating those as "latest message" causes false-success resyncs that
-	// still backfill zero messages.
+	existingPortal, err := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+			Msg("Failed to check recovered chat portal before resync")
+		return
+	}
+	newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
+
+	// New rooms need at least one message that can produce visible history.
+	// Existing rooms may still need a resync when only reaction or scrubbed
+	// readable rows remain: those rows cannot create a useful replacement room,
+	// but they can advance backfill for an already-existing Matrix room.
 	var latestMessageTS time.Time
-	if c.cloudStore != nil {
+	if c.Main.Config.UseChatDBBackfill() && c.chatDB != nil {
+		hasMessages, err := c.hasChatDBBackfillableMessages(portalID)
+		if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+				Msg("Failed to check chat.db messages before recovered chat resync")
+			return
+		}
+		if newPortalNeedsContent && !hasMessages {
+			log.Warn().Str("portal_id", portalID).Str("source", source).
+				Msg("Skipping recovered chat resync because no chat.db messages are available")
+			return
+		}
+	} else if c.cloudStore != nil {
 		hasMessages, err := c.cloudStore.hasContentfulMessages(context.Background(), portalID)
 		if err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
 				Msg("Failed to check recovered chat messages before portal resync")
 			return
 		}
-		if !hasMessages {
+		if newPortalNeedsContent && !hasMessages {
 			log.Warn().Str("portal_id", portalID).Str("source", source).
 				Msg("Skipping recovered chat resync because no contentful messages are available")
 			return
 		}
-		if newestTS, err := c.cloudStore.getNewestBackfillableMessageTimestamp(context.Background(), portalID, true); err == nil && newestTS > 0 {
+		requireContentful := newPortalNeedsContent
+		if newestTS, err := c.cloudStore.getNewestBackfillableMessageTimestamp(context.Background(), portalID, requireContentful); err == nil && newestTS > 0 {
 			latestMessageTS = time.UnixMilli(newestTS)
+		} else if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+				Msg("Failed to get newest recovered chat message timestamp")
+			return
 		}
 	}
 
@@ -5551,9 +5639,9 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 		Time("latest_message_ts", latestMessageTS).
 		Msg("Queueing ChatResync for recovered chat")
 
-	// Recovery resyncs use CreatePortal=true after the contentful-message guard
-	// above. The portal room may have been deleted (com.beeper.delete_chat or
-	// ChatDelete) while the portal DB row lingers with a stale MXID. Without
+	// Recovery resyncs use CreatePortal=true after the source-specific message
+	// guard above. The portal room may have been deleted (com.beeper.delete_chat
+	// or ChatDelete) while the portal DB row lingers with a stale MXID. Without
 	// CreatePortal=true, bridgev2 treats the resync as a metadata update and
 	// skips forward backfill.
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
@@ -8231,7 +8319,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	//     TRUE, the rename-notification text exactly matches the group name.
 	// The startup DB cleanup (ensureSchema) hard-deletes matching rows so
 	// this filter is a second line of defence for any that slipped through.
-	isSystemByHasBody := !row.HasBody && rowText == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
+	isSystemByHasBody := !row.HasBody && rowText == "" && rowSubject == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
 	isSystemByName := rowText != "" && groupDisplayName != "" && rowText == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
 	if isSystemByHasBody || isSystemByName {
 		return nil
