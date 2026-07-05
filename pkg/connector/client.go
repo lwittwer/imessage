@@ -4946,7 +4946,7 @@ func (c *IMClient) hasChatDBBackfillableMessages(portalID string) (bool, error) 
 	if c.chatDB == nil {
 		return false, nil
 	}
-	chatGUIDs := portalIDToChatGUIDs(portalID)
+	chatGUIDs := c.getContactChatGUIDs(portalID)
 	if strings.Contains(portalID, ",") {
 		chatGUIDs = []string{c.chatDB.findGroupChatGUID(portalID, c)}
 	}
