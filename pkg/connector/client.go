@@ -4664,7 +4664,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 				c.notifyRestoreStatus(opts, "Restore of **%s** — no chat.db message history was available, so no empty chat room was created.", displayName)
 				return
 			}
-			c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil)
+			c.queueRecoveredPortalResync(log, portalKey, opts.Source, &hasMessages, nil)
 			c.notifyRestoreStatus(opts, "Restore of **%s** complete — chat.db history backfill is running.", displayName)
 			return
 		}
@@ -4862,6 +4862,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		c.notifyRestoreStatus(opts, "Restore of **%s** — no message history was available yet, so no empty chat room was created. Try restoring again after iCloud finishes syncing.", displayName)
 		return
 	}
+	readableOnlyExistingRoom := false
 	if !newPortalNeedsContent && !hasRestorableMessages {
 		hasReadableMessages, err := c.cloudStore.hasPortalMessages(context.Background(), portalID)
 		if err != nil {
@@ -4874,9 +4875,13 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 			c.notifyRestoreStatus(opts, "Restore of **%s** — no readable message history was available yet.", displayName)
 			return
 		}
+		readableOnlyExistingRoom = true
 		c.notifyRestoreStatus(opts, "Restore of **%s** found only scrubbed or reaction history, so the existing room will be resynced without creating a replacement room.", displayName)
 	}
-	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil)
+	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil, nil)
+	if readableOnlyExistingRoom {
+		return
+	}
 	if historyImported {
 		c.notifyRestoreStatus(opts, "Restore of **%s** complete — history backfill is running.", displayName)
 	} else {
@@ -5583,7 +5588,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	return len(rows), diag, nil
 }
 
-func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, postCreate func(context.Context, *bridgev2.Portal)) {
+func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, precheckedChatDBMessages *bool, postCreate func(context.Context, *bridgev2.Portal)) {
 	portalID := string(portalKey.ID)
 
 	existingPortal, err := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
@@ -5600,11 +5605,17 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 	// but they can advance backfill for an already-existing Matrix room.
 	var latestMessageTS time.Time
 	if c.Main.Config.UseChatDBBackfill() && c.chatDB != nil {
-		hasMessages, err := c.hasChatDBBackfillableMessages(portalID)
-		if err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
-				Msg("Failed to check chat.db messages before recovered chat resync")
-			return
+		hasMessages := false
+		if precheckedChatDBMessages != nil {
+			hasMessages = *precheckedChatDBMessages
+		} else {
+			var err error
+			hasMessages, err = c.hasChatDBBackfillableMessages(portalID)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+					Msg("Failed to check chat.db messages before recovered chat resync")
+				return
+			}
 		}
 		if newPortalNeedsContent && !hasMessages {
 			log.Warn().Str("portal_id", portalID).Str("source", source).
@@ -5661,7 +5672,7 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 }
 
 func (c *IMClient) refreshRecoveredPortalAfterCloudSync(log zerolog.Logger, portalKey networkid.PortalKey, source string) {
-	c.queueRecoveredPortalResync(log, portalKey, source, nil)
+	c.queueRecoveredPortalResync(log, portalKey, source, nil, nil)
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
