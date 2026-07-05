@@ -206,3 +206,24 @@ func TestChatDBBackfillCursorPreservesDuplicateTimestampBoundary(t *testing.T) {
 		t.Fatalf("cursor row id = %d, want 11", times[chatGUID].RowID)
 	}
 }
+
+func TestChatDBCursorStateTreatsMissingGUIDAsExhausted(t *testing.T) {
+	cursorTimes := map[string]chatDBBackfillCursorPosition{
+		"iMessage;-;+15550000001": {TimeNS: time.Unix(100, 0).UnixNano(), RowID: 10},
+	}
+
+	pos, useCursor, exhausted := chatDBCursorStateForGUID(cursorTimes, "iMessage;-;+15550000001", true)
+	if !useCursor || exhausted || pos.RowID != 10 {
+		t.Fatalf("cursor state for active GUID = (%#v, %v, %v), want cursor row 10 and not exhausted", pos, useCursor, exhausted)
+	}
+
+	_, useCursor, exhausted = chatDBCursorStateForGUID(cursorTimes, "iMessage;-;+15550000002", true)
+	if useCursor || !exhausted {
+		t.Fatalf("cursor state for missing GUID with active cursor = useCursor %v exhausted %v, want exhausted", useCursor, exhausted)
+	}
+
+	_, useCursor, exhausted = chatDBCursorStateForGUID(nil, "iMessage;-;+15550000002", false)
+	if useCursor || exhausted {
+		t.Fatalf("cursor state without active cursor = useCursor %v exhausted %v, want initial fetch", useCursor, exhausted)
+	}
+}

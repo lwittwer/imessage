@@ -172,11 +172,17 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// framework's MaxInitialMessages setting.
 	maxMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
 	cursorTimes := decodeChatDBBackfillCursor(params.Cursor, chatGUIDs)
+	hasBackwardCursor := !params.Forward && len(cursorTimes) > 0
 	messagesByGUID := make(map[string][]*imessage.Message, len(chatGUIDs))
 
 	for _, chatGUID := range chatGUIDs {
 		var msgs []*imessage.Message
-		if cursorPos, ok := cursorTimes[chatGUID]; ok && !params.Forward {
+		cursorPos, useCursor, exhausted := chatDBCursorStateForGUID(cursorTimes, chatGUID, hasBackwardCursor)
+		if exhausted {
+			messagesByGUID[chatGUID] = nil
+			continue
+		}
+		if useCursor {
 			msgs, lastErr = db.api.GetMessagesBeforeCursor(chatGUID, time.Unix(0, cursorPos.TimeNS), cursorPos.RowID, count)
 		} else if params.AnchorMessage != nil {
 			if params.Forward {
@@ -270,6 +276,13 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
+}
+
+func chatDBCursorStateForGUID(cursorTimes map[string]chatDBBackfillCursorPosition, chatGUID string, hasBackwardCursor bool) (chatDBBackfillCursorPosition, bool, bool) {
+	if cursorPos, ok := cursorTimes[chatGUID]; ok {
+		return cursorPos, true, false
+	}
+	return chatDBBackfillCursorPosition{}, false, hasBackwardCursor
 }
 
 func encodeChatDBBackfillCursor(messagesByGUID map[string][]*imessage.Message, count int, forward bool) networkid.PaginationCursor {
