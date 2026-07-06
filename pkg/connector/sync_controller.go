@@ -4162,8 +4162,20 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Msg("Queuing ChatResync for portal")
 		var bundledBackfill any
 		if shouldForceCloudBackfill(portalInfo) {
+			afterWriteTS := lastQueuedByID[portalID].MessageWriteActivityTS
+			if afterWriteTS == 0 {
+				var err error
+				afterWriteTS, err = c.cloudStore.completedBackfillWriteWatermark(ctx, portalID)
+				if err != nil {
+					log.Warn().
+						Err(err).
+						Str("portal_id", portalID).
+						Msg("Failed to load completed backfill watermark for cloud catch-up; falling back to full write-activity scan")
+					afterWriteTS = 0
+				}
+			}
 			bundledBackfill = cloudCatchupBackfillBundle{
-				AfterWriteTS: lastQueuedByID[portalID].MessageWriteActivityTS,
+				AfterWriteTS: afterWriteTS,
 			}
 		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{

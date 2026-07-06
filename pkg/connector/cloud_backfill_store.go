@@ -2731,6 +2731,22 @@ func (s *cloudBackfillStore) listForwardMessagesByWriteActivity(
 	return s.queryMessages(ctx, query, s.loginID, portalID, afterWriteTS, afterGUID, count)
 }
 
+func (s *cloudBackfillStore) completedBackfillWriteWatermark(ctx context.Context, portalID string) (int64, error) {
+	var completedAt sql.NullInt64
+	err := s.db.QueryRow(ctx, `
+		SELECT MAX(completed_at)
+		FROM backfill_task
+		WHERE user_login_id=$1 AND portal_id=$2 AND is_done=1 AND completed_at > 0
+	`, s.loginID, portalID).Scan(&completedAt)
+	if err != nil {
+		return 0, err
+	}
+	if !completedAt.Valid {
+		return 0, nil
+	}
+	return completedAt.Int64 / 1_000_000, nil
+}
+
 func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID string, count int) ([]cloudMessageRow, error) {
 	// Filter record_name <> '' to exclude stub rows from persistMessageUUID
 	// which have UUIDs for echo detection but no actual message content.

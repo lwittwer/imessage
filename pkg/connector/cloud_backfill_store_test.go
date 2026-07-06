@@ -403,6 +403,16 @@ func TestListForwardMessagesByWriteActivityFindsLateArrivalsBeforeAnchor(t *test
 	if err = store.ensureSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = db.Exec(ctx, `
+		CREATE TABLE backfill_task (
+			user_login_id TEXT NOT NULL,
+			portal_id TEXT NOT NULL,
+			is_done INTEGER NOT NULL,
+			completed_at BIGINT NOT NULL
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err = db.Exec(ctx, `
 		INSERT INTO cloud_message (
@@ -413,6 +423,43 @@ func TestListForwardMessagesByWriteActivityFindsLateArrivalsBeforeAnchor(t *test
 			($1, 'already-seen', 'tel:+15550000012', 9000, 'tel:+15551111111', FALSE, 'old', 'record-old', NULL, NULL, '', TRUE, FALSE, 1000, 1000),
 			($1, 'late-reaction', 'tel:+15550000012', 2000, 'tel:+15551111111', FALSE, '', 'record-late', 2000, 'already-seen', '', TRUE, FALSE, 9000, 9000)
 	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		WITH RECURSIVE seq(n) AS (
+			SELECT 0
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 599
+		)
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			tapback_type, tapback_target_guid, attachments_json, has_body, body_scrubbed, created_ts, updated_ts
+		)
+		SELECT
+			$1,
+			printf('cached-%03d', n),
+			'tel:+15550000012',
+			100 + n,
+			'tel:+15551111111',
+			FALSE,
+			'cached',
+			printf('record-cached-%03d', n),
+			NULL,
+			NULL,
+			'',
+			TRUE,
+			FALSE,
+			1000,
+			1000
+		FROM seq
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
+	completedAtMS := int64(5000)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO backfill_task (user_login_id, portal_id, is_done, completed_at)
+		VALUES ($1, 'tel:+15550000012', 1, $2)
+	`, store.loginID, completedAtMS*1_000_000); err != nil {
 		t.Fatal(err)
 	}
 
@@ -429,6 +476,27 @@ func TestListForwardMessagesByWriteActivityFindsLateArrivalsBeforeAnchor(t *test
 	}
 	if len(rows) != 1 || rows[0].GUID != "late-reaction" || rows[0].WriteActivityTS != 9000 {
 		t.Fatalf("write-activity forward query returned %#v, want late reaction", rows)
+	}
+	rows, err = store.listForwardMessagesByWriteActivity(ctx, "tel:+15550000012", 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 500 || rows[len(rows)-1].GUID == "late-reaction" {
+		t.Fatalf("unseeded capped write-activity query returned %d rows ending with %q, want cap spent before late reaction", len(rows), rows[len(rows)-1].GUID)
+	}
+	watermark, err := store.completedBackfillWriteWatermark(ctx, "tel:+15550000012")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watermark != completedAtMS {
+		t.Fatalf("completedBackfillWriteWatermark = %d, want %d", watermark, completedAtMS)
+	}
+	rows, err = store.listForwardMessagesByWriteActivity(ctx, "tel:+15550000012", watermark, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "late-reaction" || rows[0].WriteActivityTS != 9000 {
+		t.Fatalf("seeded capped write-activity query returned %#v, want late reaction", rows)
 	}
 }
 
