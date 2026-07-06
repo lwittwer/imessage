@@ -252,6 +252,14 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				continue
 			}
 			partID := chatDBAttachmentMessagePartID(msg.GUID, i, attCm)
+			if !chatDBAttachmentIsNotice(attCm) {
+				noticeID := makeMessageID(fmt.Sprintf("%s_att%d_notice", msg.GUID, i))
+				c.redactBackfillNotice(ctx, params.Portal, noticeID)
+				c.redactTransientBackfillNotice(ctx, params.Portal, makeMessageID(partID))
+				if i == 0 && msg.Text == "" && msg.Subject == "" {
+					c.redactTransientBackfillNotice(ctx, params.Portal, makeMessageID(msg.GUID))
+				}
+			}
 			if msg.ReplyToGUID != "" {
 				attCm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
 			}

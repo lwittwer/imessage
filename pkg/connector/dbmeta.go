@@ -15,14 +15,15 @@ import (
 type PortalMetadata struct {
 	ThreadID   string `json:"thread_id,omitempty"`
 	SenderGuid string `json:"sender_guid,omitempty"` // Persistent iMessage group UUID
-	GroupName  string `json:"group_name,omitempty"`   // iMessage cv_name for outbound routing
-	IsSms      bool   `json:"is_sms,omitempty"`       // True if this portal routes through SMS
+	GroupName  string `json:"group_name,omitempty"`  // iMessage cv_name for outbound routing
+	IsSms      bool   `json:"is_sms,omitempty"`      // True if this portal routes through SMS
 }
 
 type GhostMetadata struct{}
 
 type MessageMetadata struct {
-	HasAttachments bool `json:"has_attachments,omitempty"`
+	HasAttachments            bool `json:"has_attachments,omitempty"`
+	TransientAttachmentNotice bool `json:"transient_attachment_notice,omitempty"`
 
 	// SiblingUUID is set when a Matrix m.image with caption was split into two
 	// iMessages (attachment + follow-up text). Stored on the primary DB row so

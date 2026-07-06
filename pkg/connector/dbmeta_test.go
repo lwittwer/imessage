@@ -42,9 +42,9 @@ func TestGetDBMetaTypes(t *testing.T) {
 
 func TestPortalMetadata_JSON(t *testing.T) {
 	pm := &PortalMetadata{
-		ThreadID:     "thread-123",
-		SenderGuid:   "sender-456",
-		GroupName:    "My Group",
+		ThreadID:   "thread-123",
+		SenderGuid: "sender-456",
+		GroupName:  "My Group",
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestPortalMetadata_JSON(t *testing.T) {
 }
 
 func TestMessageMetadata_JSON(t *testing.T) {
-	mm := &MessageMetadata{HasAttachments: true}
+	mm := &MessageMetadata{HasAttachments: true, TransientAttachmentNotice: true}
 	data, err := json.Marshal(mm)
 	if err != nil {
 		t.Fatalf("Marshal error: %v", err)
@@ -73,6 +73,9 @@ func TestMessageMetadata_JSON(t *testing.T) {
 	}
 	if mm2.HasAttachments != true {
 		t.Error("HasAttachments should be true")
+	}
+	if mm2.TransientAttachmentNotice != true {
+		t.Error("TransientAttachmentNotice should be true")
 	}
 }
 

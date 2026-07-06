@@ -4717,7 +4717,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 				c.notifyRestoreStatus(opts, "Restore of **%s** — no chat.db message history was available, so no empty chat room was created.", displayName)
 				return
 			}
-			c.queueRecoveredPortalResync(log, portalKey, opts.Source, &hasMessages, nil)
+			c.queueRecoveredPortalResync(log, portalKey, opts.Source, &hasMessages, nil, nil)
 			c.notifyRestoreStatus(opts, "Restore of **%s** complete — chat.db history backfill is running.", displayName)
 			return
 		}
@@ -4935,7 +4935,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		readableOnlyExistingRoom = true
 		c.notifyRestoreStatus(opts, "Restore of **%s** found only scrubbed or reaction history, so the existing room will be resynced without creating a replacement room.", displayName)
 	}
-	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil, nil)
+	c.queueRecoveredPortalResync(log, portalKey, opts.Source, nil, &hasRestorableMessages, nil)
 	if readableOnlyExistingRoom {
 		return
 	}
@@ -5672,7 +5672,7 @@ func cloudAttachmentGUIDPlaceholdersJSON(guids []string) string {
 	return string(attachmentJSON)
 }
 
-func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, precheckedChatDBMessages *bool, postCreate func(context.Context, *bridgev2.Portal)) {
+func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, precheckedChatDBMessages, precheckedCloudMessages *bool, postCreate func(context.Context, *bridgev2.Portal)) {
 	portalID := string(portalKey.ID)
 
 	existingPortal, err := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
@@ -5707,15 +5707,21 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 			return
 		}
 	} else if c.cloudStore != nil {
-		hasMessages, err := c.cloudStore.hasContentfulMessagesInLatestWindow(
-			context.Background(),
-			portalID,
-			c.Main.Bridge.Config.Backfill.MaxInitialMessages,
-		)
-		if err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
-				Msg("Failed to check recovered chat messages before portal resync")
-			return
+		hasMessages := false
+		if precheckedCloudMessages != nil {
+			hasMessages = *precheckedCloudMessages
+		} else {
+			var err error
+			hasMessages, err = c.cloudStore.hasContentfulMessagesInLatestWindow(
+				context.Background(),
+				portalID,
+				c.Main.Bridge.Config.Backfill.MaxInitialMessages,
+			)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+					Msg("Failed to check recovered chat messages before portal resync")
+				return
+			}
 		}
 		if newPortalNeedsContent && !hasMessages {
 			log.Warn().Str("portal_id", portalID).Str("source", source).
@@ -5760,7 +5766,7 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 }
 
 func (c *IMClient) refreshRecoveredPortalAfterCloudSync(log zerolog.Logger, portalKey networkid.PortalKey, source string) {
-	c.queueRecoveredPortalResync(log, portalKey, source, nil, nil)
+	c.queueRecoveredPortalResync(log, portalKey, source, nil, nil, nil)
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -7928,7 +7934,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Determine the starting anchor for the internal pagination loop.
 		var cursorTS int64
 		var cursorGUID string
+		var cursorWriteTS int64
 		hasCursor := false
+		catchupBundle, hasCatchupBundle := params.BundledData.(cloudCatchupBackfillBundle)
+		if hasCatchupBundle {
+			cursorWriteTS = catchupBundle.AfterWriteTS
+		}
 		if params.AnchorMessage != nil {
 			cursorTS = params.AnchorMessage.Timestamp.UnixMilli()
 			cursorGUID = string(params.AnchorMessage.ID)
@@ -7938,6 +7949,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				Int64("anchor_ts", cursorTS).
 				Str("anchor_guid", cursorGUID).
 				Msg("Forward backfill: using anchor — fetching only newer messages")
+		}
+		if hasCatchupBundle {
+			cursorGUID = ""
 		}
 
 		var allRows []cloudMessageRow
@@ -7978,7 +7992,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				}
 
 				queryStart := time.Now()
-				rows, queryErr := c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
+				var rows []cloudMessageRow
+				var queryErr error
+				if hasCatchupBundle {
+					rows, queryErr = c.cloudStore.listForwardMessagesByWriteActivity(ctx, portalID, cursorWriteTS, cursorGUID, chunkLimit)
+				} else {
+					rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
+				}
 				if queryErr != nil {
 					log.Err(queryErr).Str("portal_id", portalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
 					return nil, queryErr
@@ -8008,6 +8028,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// Advance cursor to the last row in this chunk for the next iteration.
 				lastRow := rows[len(rows)-1]
 				cursorTS = lastRow.TimestampMS
+				cursorWriteTS = lastRow.WriteActivityTS
 				cursorGUID = lastRow.GUID
 				hasCursor = true
 				remaining -= len(rows)
@@ -8419,7 +8440,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	// The startup DB cleanup (ensureSchema) hard-deletes matching rows so
 	// this filter is a second line of defence for any that slipped through.
 	isSystemByHasBody := !row.HasBody && rowText == "" && rowSubject == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
-	isSystemByName := rowText != "" && groupDisplayName != "" && rowText == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
+	isSystemByName := rowText != "" && normalizedBackfillText(groupDisplayName) != "" && rowText == normalizedBackfillText(groupDisplayName) && row.AttachmentsJSON == "" && row.TapbackType == nil
 	if isSystemByHasBody || isSystemByName {
 		return nil
 	}
@@ -8518,6 +8539,63 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 func cloudAttachmentNoticeMessageID(guid string) networkid.MessageID {
 	return makeMessageID(guid + "_attachment_notice")
+}
+
+func transientAttachmentNoticeMetadata() *MessageMetadata {
+	return &MessageMetadata{TransientAttachmentNotice: true}
+}
+
+func isTransientAttachmentNotice(msg *database.Message) bool {
+	if msg == nil {
+		return false
+	}
+	meta, ok := msg.Metadata.(*MessageMetadata)
+	return ok && meta.TransientAttachmentNotice
+}
+
+func (c *IMClient) redactBackfillNotice(ctx context.Context, portal *bridgev2.Portal, noticeID networkid.MessageID) {
+	if portal == nil || portal.MXID == "" {
+		return
+	}
+	msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, c.UserLogin.ID, noticeID)
+	if err != nil || msg == nil || msg.MXID == "" {
+		return
+	}
+	_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventRedaction, &event.Content{
+		Parsed: &event.RedactionEventContent{Redacts: msg.MXID},
+	}, nil)
+	if err != nil {
+		c.Main.Bridge.Log.Warn().Err(err).Str("notice_id", string(noticeID)).
+			Msg("Failed to redact stale attachment notice after media backfill succeeded")
+		return
+	}
+	if err = c.Main.Bridge.DB.Message.DeleteAllParts(ctx, c.UserLogin.ID, noticeID); err != nil {
+		c.Main.Bridge.Log.Warn().Err(err).Str("notice_id", string(noticeID)).
+			Msg("Failed to remove stale attachment notice from bridge DB")
+	}
+}
+
+func (c *IMClient) redactTransientBackfillNotice(ctx context.Context, portal *bridgev2.Portal, noticeID networkid.MessageID) {
+	if portal == nil || portal.MXID == "" {
+		return
+	}
+	msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, c.UserLogin.ID, noticeID)
+	if err != nil || !isTransientAttachmentNotice(msg) {
+		return
+	}
+	c.redactBackfillNotice(ctx, portal, noticeID)
+}
+
+func (c *IMClient) redactCloudAttachmentNotices(ctx context.Context, row cloudMessageRow, mediaID networkid.MessageID) {
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+		ID:       networkid.PortalID(row.PortalID),
+		Receiver: c.UserLogin.ID,
+	})
+	if err != nil {
+		return
+	}
+	c.redactBackfillNotice(ctx, portal, cloudAttachmentNoticeMessageID(row.GUID))
+	c.redactTransientBackfillNotice(ctx, portal, mediaID)
 }
 
 func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
@@ -8914,15 +8992,17 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
 	// NOTE: Skip cache for non-MP4 videos that need transcoding.
+	mediaID := makeMessageID(attID)
 	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
 			c.attachmentContentCache.Delete(att.RecordName)
 		} else {
+			c.redactCloudAttachmentNotices(ctx, row, mediaID)
 			return []*bridgev2.BackfillMessage{{
 				Sender:    sender,
-				ID:        makeMessageID(attID),
+				ID:        mediaID,
 				Timestamp: ts,
 				ConvertedMessage: &bridgev2.ConvertedMessage{
 					Parts: []*bridgev2.ConvertedMessagePart{{
@@ -9138,6 +9218,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			c.cloudStore.saveAttachmentCacheEntry(ctx, att.RecordName, jsonBytes)
 		}
 	}
+	c.redactCloudAttachmentNotices(ctx, row, mediaID)
 
 	parts := make([]*bridgev2.ConvertedMessagePart, 0, 2)
 	if isVCardAttachment(mimeType, fileName, att.UTIType) {
@@ -11682,8 +11763,9 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			Msg("Attachment has no payload — MMCS download failed; emitting notice placeholder")
 		return &bridgev2.ConvertedMessage{
 			Parts: []*bridgev2.ConvertedMessagePart{{
-				ID:   networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
-				Type: event.EventMessage,
+				ID:         networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+				Type:       event.EventMessage,
+				DBMetadata: transientAttachmentNoticeMetadata(),
 				Content: &event.MessageEventContent{
 					MsgType: event.MsgNotice,
 					Body:    fmt.Sprintf("Attachment could not be downloaded (%s).", fileName),
@@ -11796,6 +11878,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		content.Info.Size = len(inlineData)
 	}
 
+	uploadFailed := false
 	if inlineData != nil && intent != nil {
 		url, encFile, err := intent.UploadMedia(ctx, "", inlineData, fileName, mimeType)
 		if err != nil {
@@ -11803,6 +11886,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 				Str("file", fileName).
 				Str("mime", mimeType).
 				Msg("Failed to upload live attachment; emitting notice placeholder")
+			uploadFailed = true
 			content = &event.MessageEventContent{
 				MsgType: event.MsgNotice,
 				Body:    fmt.Sprintf("Attachment could not be uploaded (%s).", fileName),
@@ -11842,11 +11926,15 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			Content: vcardPreview,
 		})
 	}
-	parts = append(parts, &bridgev2.ConvertedMessagePart{
+	part := &bridgev2.ConvertedMessagePart{
 		ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
 		Type:    event.EventMessage,
 		Content: content,
-	})
+	}
+	if uploadFailed {
+		part.DBMetadata = transientAttachmentNoticeMetadata()
+	}
+	parts = append(parts, part)
 
 	cm := &bridgev2.ConvertedMessage{
 		Parts: parts,
@@ -11879,6 +11967,13 @@ func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.M
 			return suffixedID
 		}
 		// Suffixed ID not found — fall back to bare UUID for old messages.
+	}
+	noticeID := cloudAttachmentNoticeMessageID(targetGUID)
+	msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(
+		context.Background(), c.UserLogin.ID, noticeID,
+	)
+	if err == nil && msg != nil {
+		return noticeID
 	}
 	return makeMessageID(targetGUID)
 }

@@ -40,6 +40,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 			($1, 'senderless-group', 'gid:senderless', NULL, $2, $2, FALSE, 0),
 			($1, 'rename', 'gid:rename', 'Renamed Group', $2, $2, FALSE, 0),
 			($1, 'rename-trimmed', 'gid:rename-trimmed', 'Renamed Trim', $2, $2, FALSE, 0),
+			($1, 'rename-padded-display', 'gid:rename-padded-display', 'Renamed Padded ' || char(65532), $2, $2, FALSE, 0),
 			($1, 'unicode-whitespace', 'tel:+15550000007', NULL, $2, $2, FALSE, 0),
 			($1, 'filtered', 'tel:+15550000006', NULL, $2, $2, FALSE, 1)
 	`, store.loginID, now); err != nil {
@@ -60,6 +61,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 			($1, 'senderless-group-1', 'gid:senderless', 5500, '', FALSE, 'senderless group', 'record-4b', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'rename-1', 'gid:rename', 6000, 'tel:+15551111111', FALSE, 'Renamed Group', 'record-5', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'rename-trimmed-1', 'gid:rename-trimmed', 6500, 'tel:+15551111111', FALSE, 'Renamed Trim' || char(10), 'record-5b', NULL, NULL, '', TRUE, FALSE, $2, $2),
+			($1, 'rename-padded-display-1', 'gid:rename-padded-display', 6600, 'tel:+15551111111', FALSE, 'Renamed Padded', 'record-5d', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'unicode-whitespace-1', 'tel:+15550000007', 6750, 'tel:+15551111111', FALSE, char(160), 'record-5c', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'filtered-1', 'tel:+15550000006', 7000, 'tel:+15551111111', FALSE, 'filtered', 'record-6', NULL, NULL, '', TRUE, FALSE, $2, $2)
 	`, store.loginID, now); err != nil {
@@ -84,7 +86,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 9 {
+	if len(got) != 10 {
 		t.Fatalf("got %d portals (%#v), want readable-message plus metadata-only portals", len(got), got)
 	}
 	if got[0].PortalID != "tel:+15550000002" || got[0].ActivityTS != 10000 || got[0].NewestTS != 2000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 1 {
@@ -115,6 +117,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 		"gid:senderless",
 		"gid:rename",
 		"gid:rename-trimmed",
+		"gid:rename-padded-display",
 		"tel:+15550000007",
 	} {
 		p, ok := byPortal[portalID]
@@ -142,7 +145,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	if newest != 2000 {
 		t.Fatalf("getNewestBackfillableMessageTimestamp(contentful) = %d, want 2000", newest)
 	}
-	for _, portalID := range []string{"tel:+15550000001", "tel:+15550000003", "tel:+15550000004", "gid:senderless", "gid:rename", "gid:rename-trimmed", "tel:+15550000007", "tel:+15550000006"} {
+	for _, portalID := range []string{"tel:+15550000001", "tel:+15550000003", "tel:+15550000004", "gid:senderless", "gid:rename", "gid:rename-trimmed", "gid:rename-padded-display", "tel:+15550000007", "tel:+15550000006"} {
 		hasMessages, err := store.hasContentfulMessages(ctx, portalID)
 		if err != nil {
 			t.Fatal(err)
@@ -217,6 +220,21 @@ func TestAttachmentPlaceholderNoticeUsesNonCollidingMessageID(t *testing.T) {
 	}
 	if rows[0].ID != cloudAttachmentNoticeMessageID("message-guid-1") {
 		t.Fatalf("placeholder notice ID = %q, want %q", rows[0].ID, cloudAttachmentNoticeMessageID("message-guid-1"))
+	}
+}
+
+func TestCloudRowToBackfillMessagesSkipsPaddedRenameNotice(t *testing.T) {
+	client := &IMClient{}
+	rows := client.cloudRowToBackfillMessages(context.Background(), cloudMessageRow{
+		GUID:        "message-guid-rename",
+		PortalID:    "gid:rename",
+		TimestampMS: 2000,
+		Sender:      "tel:+15551111111",
+		Text:        "Family",
+		HasBody:     true,
+	}, "Family \uFFFC")
+	if len(rows) != 0 {
+		t.Fatalf("cloudRowToBackfillMessages returned %d rows for padded rename notice, want 0", len(rows))
 	}
 }
 
@@ -317,8 +335,8 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	if len(got) != 2 {
 		t.Fatalf("got %d portals (%#v), want both portals with readable rows in capped window", len(got), got)
 	}
-	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 0 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
-		t.Fatalf("got portal %#v, want capped-window reaction-only portal with no contentful messages", got[0])
+	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 0 || got[0].MessageCount != 2 || got[0].ContentfulCount != 0 {
+		t.Fatalf("got portal %#v, want unwindowed readable activity with no capped-window content", got[0])
 	}
 	if got[0].MessageActivityTS != 3000 {
 		t.Fatalf("got portal message activity %#v, want reaction timestamp 3000", got[0])
@@ -366,6 +384,51 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	}
 	if got[0].MessageActivityTS != 3000 {
 		t.Fatalf("got first portal message activity %#v, want reaction timestamp 3000", got[0])
+	}
+}
+
+func TestListForwardMessagesByWriteActivityFindsLateArrivalsBeforeAnchor(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			tapback_type, tapback_target_guid, attachments_json, has_body, body_scrubbed, created_ts, updated_ts
+		)
+		VALUES
+			($1, 'already-seen', 'tel:+15550000012', 9000, 'tel:+15551111111', FALSE, 'old', 'record-old', NULL, NULL, '', TRUE, FALSE, 1000, 1000),
+			($1, 'late-reaction', 'tel:+15550000012', 2000, 'tel:+15551111111', FALSE, '', 'record-late', 2000, 'already-seen', '', TRUE, FALSE, 9000, 9000)
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.listForwardMessages(ctx, "tel:+15550000012", 9000, "already-seen", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("timestamp forward query returned %#v, want no rows before anchor", rows)
+	}
+	rows, err = store.listForwardMessagesByWriteActivity(ctx, "tel:+15550000012", 1000, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "late-reaction" || rows[0].WriteActivityTS != 9000 {
+		t.Fatalf("write-activity forward query returned %#v, want late reaction", rows)
 	}
 }
 

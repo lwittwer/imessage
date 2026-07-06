@@ -3886,14 +3886,16 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 }
 
 type queuedPortalWatermark struct {
-	MessageTS         int64
-	MessageActivityTS int64
-	MetadataTS        int64
+	MessageTS              int64
+	MessageActivityTS      int64
+	MessageWriteActivityTS int64
+	MetadataTS             int64
 }
 
 func (w queuedPortalWatermark) covers(p portalWithNewestMessage) bool {
 	return w.MessageTS >= p.NewestTS &&
 		w.MessageActivityTS >= p.MessageActivityTS &&
+		w.MessageWriteActivityTS >= p.MessageWriteActivityTS &&
 		w.MetadataTS >= p.MetadataTS
 }
 
@@ -3903,6 +3905,9 @@ func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPorta
 	}
 	if p.MessageActivityTS > w.MessageActivityTS {
 		w.MessageActivityTS = p.MessageActivityTS
+	}
+	if p.MessageWriteActivityTS > w.MessageWriteActivityTS {
+		w.MessageWriteActivityTS = p.MessageWriteActivityTS
 	}
 	if p.MetadataTS > w.MetadataTS {
 		w.MetadataTS = p.MetadataTS
@@ -3921,7 +3926,12 @@ func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
 }
 
 func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
-	return p.MessageCount > 0 && p.MessageActivityTS > p.NewestTS
+	return p.MessageCount > 0 &&
+		(p.MessageActivityTS > p.NewestTS || p.MessageWriteActivityTS > p.ContentfulWriteActivity)
+}
+
+type cloudCatchupBackfillBundle struct {
+	AfterWriteTS int64
 }
 
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
@@ -3967,9 +3977,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 	ordered := make([]string, 0, len(portalInfos))
 	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
+	lastQueuedByID := make(map[string]queuedPortalWatermark, len(portalInfos))
 	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
+	noContentSkipped := 0
 	groupDedupSkipped := 0
 	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
@@ -3988,6 +4000,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
 		newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
 		if newPortalNeedsContent && p.ContentfulCount == 0 {
+			noContentSkipped++
 			continue
 		}
 		// Dedup group portals: the same group can appear under multiple
@@ -4035,17 +4048,23 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			}
 			seenGroupKeys[key] = p.PortalID
 		}
+		lastQueued := c.queuedPortals[p.PortalID]
+		lastQueuedByID[p.PortalID] = lastQueued
 		if last, ok := c.queuedPortals[p.PortalID]; ok && last.covers(p) {
 			alreadyQueued++
 			continue
 		}
-		if newPortalNeedsContent {
+		if newPortalNeedsContent || shouldForceCloudBackfill(p) {
 			forwardBackfillPortals++
 		}
 		ordered = append(ordered, p.PortalID)
 	}
 	if pendingDeleteSkipped > 0 {
 		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped tombstoned or recently deleted portals")
+	}
+	if noContentSkipped > 0 {
+		log.Info().Int("skipped", noContentSkipped).
+			Msg("Skipped new cloud portal candidates with no contentful messages")
 	}
 	if groupDedupSkipped > 0 {
 		log.Info().Int("skipped", groupDedupSkipped).Msg("Skipped duplicate group portal IDs (same group, different UUID)")
@@ -4055,6 +4074,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	log.Info().
 		Int("total_candidates", len(portalInfos)).
 		Int("already_queued", alreadyQueued).
+		Int("no_content_skipped", noContentSkipped).
 		Int("group_dedup_skipped", groupDedupSkipped).
 		Int("to_process", len(ordered)).
 		Msg("Creating portals from cloud sync")
@@ -4090,8 +4110,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// every decrement is counted correctly.
 	//
 	// Count portals that need an initial forward backfill. Portal candidates
-	// without backfillable messages are filtered out before this point, and
-	// existing Matrix rooms do not hold the APNs buffer open.
+	// without backfillable messages are filtered out before this point; existing
+	// Matrix rooms are counted when we force a catch-up backfill for newer
+	// reaction activity because FetchMessages will still run and decrement this
+	// counter.
 	if !c.isCloudSyncDone() {
 		atomic.StoreInt64(&c.pendingInitialBackfills, int64(forwardBackfillPortals))
 		log.Debug().
@@ -4134,9 +4156,16 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Int64("newest_ts", portalInfo.NewestTS).
 			Int64("activity_ts", portalInfo.ActivityTS).
 			Int64("message_activity_ts", portalInfo.MessageActivityTS).
+			Int64("message_write_activity_ts", portalInfo.MessageWriteActivityTS).
 			Int64("metadata_ts", portalInfo.MetadataTS).
 			Int64("trigger_ts", triggerTS).
 			Msg("Queuing ChatResync for portal")
+		var bundledBackfill any
+		if shouldForceCloudBackfill(portalInfo) {
+			bundledBackfill = cloudCatchupBackfillBundle{
+				AfterWriteTS: lastQueuedByID[portalID].MessageWriteActivityTS,
+			}
+		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
@@ -4151,6 +4180,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			GetChatInfoFunc:        c.GetChatInfo,
 			LatestMessageTS:        latestMessageTS,
 			CheckNeedsBackfillFunc: checkNeedsBackfill,
+			BundledBackfillData:    bundledBackfill,
 		})
 		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalInfo)
 		created++

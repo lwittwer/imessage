@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -178,6 +179,31 @@ func TestChatDBAttachmentNoticeUsesNonCollidingMessageID(t *testing.T) {
 	}
 	if got, want := chatDBAttachmentMessagePartID("message-guid-1", 0, media), "message-guid-1_att0"; got != want {
 		t.Fatalf("media attachment part ID = %q, want %q", got, want)
+	}
+}
+
+func TestLiveAttachmentNoticeMarksTransientMetadata(t *testing.T) {
+	cm, err := convertAttachment(context.Background(), nil, nil, &attachmentMessage{
+		WrappedMessage: &rustpushgo.WrappedMessage{Uuid: "message-guid-1"},
+		Attachment: &rustpushgo.WrappedAttachment{
+			Filename: "photo.jpg",
+			MimeType: "image/jpeg",
+			IsInline: true,
+		},
+		Index: 0,
+	}, false, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm == nil || len(cm.Parts) != 1 {
+		t.Fatalf("convertAttachment returned %#v, want one notice part", cm)
+	}
+	meta, ok := cm.Parts[0].DBMetadata.(*MessageMetadata)
+	if !ok || !meta.TransientAttachmentNotice {
+		t.Fatalf("notice metadata = %#v, want transient attachment notice marker", cm.Parts[0].DBMetadata)
+	}
+	if cm.Parts[0].Content == nil || cm.Parts[0].Content.MsgType != event.MsgNotice {
+		t.Fatalf("notice content = %#v, want m.notice", cm.Parts[0].Content)
 	}
 }
 

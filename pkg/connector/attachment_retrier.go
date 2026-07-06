@@ -292,6 +292,11 @@ func (r *attachmentRetrier) deliverAsEdit(ctx context.Context, row *pendingAttac
 			if target == nil && len(existing) > 0 {
 				target = existing[0]
 			}
+			if meta, ok := target.Metadata.(*MessageMetadata); ok && meta.TransientAttachmentNotice {
+				nextMeta := *meta
+				nextMeta.TransientAttachmentNotice = false
+				target.Metadata = &nextMeta
+			}
 			main := cm.Parts[len(cm.Parts)-1]
 			return &bridgev2.ConvertedEdit{
 				ModifiedParts: []*bridgev2.ConvertedEditPart{{

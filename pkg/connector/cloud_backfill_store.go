@@ -60,6 +60,10 @@ type cloudMessageRow struct {
 	// to Matrix. Identifiers (guid, timestamps, record_name) are kept for
 	// echo dedup and routing; text/subject/sender/attachments_json are NULL.
 	BodyScrubbed bool
+
+	// Local cache write activity, max(created_ts, updated_ts), used for
+	// catch-up rows that arrived after their message timestamp position.
+	WriteActivityTS int64
 }
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
@@ -2662,7 +2666,7 @@ const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestam
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
 	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
 	COALESCE(reply_to_guid, ''), COALESCE(reply_to_part, ''),
-	COALESCE(body_scrubbed, FALSE)`
+	COALESCE(body_scrubbed, FALSE), MAX(created_ts, updated_ts)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -2705,6 +2709,26 @@ func (s *cloudBackfillStore) listForwardMessages(
 		LIMIT $5
 	`
 	return s.queryMessages(ctx, query, s.loginID, portalID, afterTS, afterGUID, count)
+}
+
+func (s *cloudBackfillStore) listForwardMessagesByWriteActivity(
+	ctx context.Context,
+	portalID string,
+	afterWriteTS int64,
+	afterGUID string,
+	count int,
+) ([]cloudMessageRow, error) {
+	query := `SELECT ` + cloudMessageSelectCols + `
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+			AND (
+				MAX(created_ts, updated_ts) > $3
+				OR ($4 <> '' AND MAX(created_ts, updated_ts) = $3 AND guid > $4)
+			)
+		ORDER BY MAX(created_ts, updated_ts) ASC, guid ASC
+		LIMIT $5
+	`
+	return s.queryMessages(ctx, query, s.loginID, portalID, afterWriteTS, afterGUID, count)
 }
 
 func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID string, count int) ([]cloudMessageRow, error) {
@@ -2778,6 +2802,7 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.ReplyToGUID,
 			&row.ReplyToPart,
 			&row.BodyScrubbed,
+			&row.WriteActivityTS,
 		); err != nil {
 			return nil, err
 		}
@@ -2792,13 +2817,15 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 // portalWithNewestMessage pairs a portal ID with its newest message timestamp
 // and message count. Used to prioritize portal creation during initial sync.
 type portalWithNewestMessage struct {
-	PortalID          string
-	NewestTS          int64
-	ActivityTS        int64
-	MessageActivityTS int64
-	MetadataTS        int64
-	MessageCount      int
-	ContentfulCount   int
+	PortalID                string
+	NewestTS                int64
+	ActivityTS              int64
+	MessageActivityTS       int64
+	MessageWriteActivityTS  int64
+	ContentfulWriteActivity int64
+	MetadataTS              int64
+	MessageCount            int
+	ContentfulCount         int
 }
 
 // listPortalIDsWithNewestTimestamp returns portal IDs that have readable message
@@ -2809,18 +2836,62 @@ type portalWithNewestMessage struct {
 // event by themselves; callers use it to prevent creating new empty rooms while
 // still allowing existing rooms to catch up metadata-only or reaction-only rows.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
+	args := []any{s.loginID}
+	rankedCTE := ""
+	contentSource := "cloud_message cm"
+	contentStatsWhere := cloudPortalSyncCandidateWhere("cm")
+	const uncappedInitialBackfill = 1<<31 - 1
+	if maxInitialMessages > 0 && maxInitialMessages < uncappedInitialBackfill {
+		rankedCTE = `
+		ranked AS (
+			SELECT cm.*,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY cm.portal_id
+			           ORDER BY cm.timestamp_ms DESC, cm.guid DESC
+			       ) AS rn
+			FROM cloud_message cm
+			WHERE cm.login_id=$1
+			  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
+			  AND cm.deleted=FALSE
+			  AND cm.record_name <> ''
+		),`
+		contentSource = "ranked cm"
+		contentStatsWhere = "cm.rn <= $2 AND " + cloudPortalSyncCandidateWhere("cm")
+		args = append(args, maxInitialMessages)
+	}
 	query := `
-		WITH message_stats AS (
+		WITH ` + rankedCTE + `
+		message_stats AS (
 			SELECT cm.portal_id,
-			       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
-			       MAX(cm.timestamp_ms) AS message_activity_ts, 0 AS metadata_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
-			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
+			       0 AS newest_ts,
+			       MAX(cm.timestamp_ms) AS message_activity_ts,
+			       COALESCE(MAX(CASE WHEN cm.created_ts > cm.updated_ts THEN cm.created_ts ELSE cm.updated_ts END), 0) AS message_write_activity_ts,
+			       0 AS contentful_write_activity_ts,
+			       0 AS metadata_ts,
+			       MAX(cm.timestamp_ms) AS activity_ts,
+			       COUNT(*) AS msg_count,
+			       0 AS contentful_count
 			FROM cloud_message cm
 			WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
 			GROUP BY cm.portal_id
 		),
+		content_stats AS (
+			SELECT cm.portal_id,
+			       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
+			       0 AS message_activity_ts,
+			       0 AS message_write_activity_ts,
+			       COALESCE(MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN CASE WHEN cm.created_ts > cm.updated_ts THEN cm.created_ts ELSE cm.updated_ts END ELSE 0 END), 0) AS contentful_write_activity_ts,
+			       0 AS metadata_ts,
+			       0 AS activity_ts,
+			       0 AS msg_count,
+			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
+			FROM ` + contentSource + `
+			WHERE ` + contentStatsWhere + `
+			GROUP BY cm.portal_id
+		),
 		chat_stats AS (
 			SELECT cc.portal_id, 0 AS newest_ts, 0 AS message_activity_ts,
+			       0 AS message_write_activity_ts, 0 AS contentful_write_activity_ts,
 			       COALESCE(MAX(cc.updated_ts), 0) AS metadata_ts,
 			       COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 			FROM cloud_chat cc
@@ -2828,63 +2899,21 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			GROUP BY cc.portal_id
 		)
 		SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
-		       MAX(message_activity_ts) AS message_activity_ts, MAX(metadata_ts) AS metadata_ts,
+		       MAX(message_activity_ts) AS message_activity_ts,
+		       MAX(message_write_activity_ts) AS message_write_activity_ts,
+		       MAX(contentful_write_activity_ts) AS contentful_write_activity_ts,
+		       MAX(metadata_ts) AS metadata_ts,
 		       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
 		FROM (
 			SELECT * FROM message_stats
+			UNION ALL
+			SELECT * FROM content_stats
 			UNION ALL
 			SELECT * FROM chat_stats
 		)
 		GROUP BY portal_id
 		ORDER BY activity_ts DESC
 	`
-	args := []any{s.loginID}
-	const uncappedInitialBackfill = 1<<31 - 1
-	if maxInitialMessages > 0 && maxInitialMessages < uncappedInitialBackfill {
-		query = `
-			WITH ranked AS (
-				SELECT cm.*,
-				       ROW_NUMBER() OVER (
-				           PARTITION BY cm.portal_id
-				           ORDER BY cm.timestamp_ms DESC, cm.guid DESC
-				       ) AS rn
-				FROM cloud_message cm
-				WHERE cm.login_id=$1
-				  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
-				  AND cm.deleted=FALSE
-				  AND cm.record_name <> ''
-			),
-			message_stats AS (
-				SELECT cm.portal_id,
-				       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
-				       MAX(cm.timestamp_ms) AS message_activity_ts, 0 AS metadata_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
-				       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
-				FROM ranked cm
-				WHERE cm.rn <= $2
-				  AND ` + cloudPortalSyncCandidateWhere("cm") + `
-				GROUP BY cm.portal_id
-			),
-			chat_stats AS (
-				SELECT cc.portal_id, 0 AS newest_ts, 0 AS message_activity_ts,
-				       COALESCE(MAX(cc.updated_ts), 0) AS metadata_ts,
-				       COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
-				FROM cloud_chat cc
-				WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
-				GROUP BY cc.portal_id
-			)
-			SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
-			       MAX(message_activity_ts) AS message_activity_ts, MAX(metadata_ts) AS metadata_ts,
-			       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
-			FROM (
-				SELECT * FROM message_stats
-				UNION ALL
-				SELECT * FROM chat_stats
-			)
-			GROUP BY portal_id
-			ORDER BY activity_ts DESC
-		`
-		args = append(args, maxInitialMessages)
-	}
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -2894,7 +2923,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 	var out []portalWithNewestMessage
 	for rows.Next() {
 		var p portalWithNewestMessage
-		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.ActivityTS, &p.MessageActivityTS, &p.MetadataTS, &p.MessageCount, &p.ContentfulCount); err != nil {
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.ActivityTS, &p.MessageActivityTS, &p.MessageWriteActivityTS, &p.ContentfulWriteActivity, &p.MetadataTS, &p.MessageCount, &p.ContentfulCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -2952,6 +2981,7 @@ func cloudBackfillableEventWhere(alias string) string {
 	trimChars := "' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288)"
 	normalizedText := fmt.Sprintf("TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), %s)", col("text"), trimChars)
 	normalizedSubject := fmt.Sprintf("TRIM(COALESCE(%s, ''), %s)", col("subject"), trimChars)
+	normalizedDisplayName := fmt.Sprintf("TRIM(REPLACE(COALESCE(sc.display_name, ''), char(65532), ''), %s)", trimChars)
 	return fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
@@ -2974,14 +3004,14 @@ func cloudBackfillableEventWhere(alias string) string {
 			WHERE sc.login_id=$1
 			  AND sc.portal_id=%s
 			  AND COALESCE(sc.display_name, '') <> ''
-			  AND %s = sc.display_name
+			  AND %s = %s
 			  AND COALESCE(%s, '') = ''
 			  AND %s IS NULL
 		)
 	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"),
 		col("body_scrubbed"), col("tapback_type"), col("tapback_type"), col("is_from_me"), col("sender"), col("portal_id"), col("portal_id"),
 		normalizedText, normalizedSubject, col("attachments_json"), col("portal_id"), col("portal_id"),
-		normalizedText, col("attachments_json"), col("tapback_type"))
+		normalizedText, normalizedDisplayName, col("attachments_json"), col("tapback_type"))
 }
 
 // msgDebugPortalStat is one row returned by debugMessageStats.
