@@ -3885,17 +3885,68 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 	return n
 }
 
+type queuedPortalWatermark struct {
+	MessageTS              int64
+	MessageActivityTS      int64
+	MessageWriteActivityTS int64
+	MetadataTS             int64
+}
+
+func (w queuedPortalWatermark) covers(p portalWithNewestMessage) bool {
+	return w.MessageTS >= p.NewestTS &&
+		w.MessageActivityTS >= p.MessageActivityTS &&
+		w.MessageWriteActivityTS >= p.MessageWriteActivityTS &&
+		w.MetadataTS >= p.MetadataTS
+}
+
+func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPortalWatermark {
+	if p.NewestTS > w.MessageTS {
+		w.MessageTS = p.NewestTS
+	}
+	if p.MessageActivityTS > w.MessageActivityTS {
+		w.MessageActivityTS = p.MessageActivityTS
+	}
+	if p.MessageWriteActivityTS > w.MessageWriteActivityTS {
+		w.MessageWriteActivityTS = p.MessageWriteActivityTS
+	}
+	if p.MetadataTS > w.MetadataTS {
+		w.MetadataTS = p.MetadataTS
+	}
+	return w
+}
+
+func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
+	if p.MessageActivityTS > p.NewestTS {
+		return p.MessageActivityTS
+	}
+	if p.NewestTS > 0 {
+		return p.NewestTS
+	}
+	return 0
+}
+
+func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
+	return p.MessageCount > 0 &&
+		(p.MessageActivityTS > p.NewestTS || p.MessageWriteActivityTS > p.ContentfulWriteActivity)
+}
+
+type cloudCatchupBackfillBundle struct {
+	AfterWriteTS int64
+}
+
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
 	if c.cloudStore == nil {
 		return
 	}
 
-	// Get portal IDs sorted by newest message timestamp (most recent first).
-	// This includes both portals that have messages AND chat-only portals
-	// from cloud_chat (with 0 messages). Chat-only portals are included so
-	// conversations synced from CloudKit without any resolved messages still
-	// get bridge portals created.
-	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
+	// Get portal IDs sorted by newest CloudKit activity timestamp (most recent
+	// first). Chat metadata and reaction-only rows are included so existing Matrix
+	// rooms can catch up. New Matrix rooms still require contentful messages
+	// below, so metadata-only or reaction-only rows do not create empty rooms.
+	// The message timestamp stays separate from chat metadata activity so
+	// queuedPortals does not skip later delayed message imports behind a newer
+	// chat metadata update.
+	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return
@@ -3914,33 +3965,27 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// from the map by handleChatRecover between now and when we check it below,
 	// the portal won't be skipped.
 
-	// Count how many portals have messages vs chat-only (diagnostic).
-	chatOnlyPortals := 0
-	for _, p := range portalInfos {
-		if p.MessageCount == 0 {
-			chatOnlyPortals++
-		}
-	}
 	log.Info().
 		Int("total_portals", len(portalInfos)).
-		Int("with_messages", len(portalInfos)-chatOnlyPortals).
-		Int("chat_only", chatOnlyPortals).
-		Msg("Portal candidates from cloud sync (messages + chat-only)")
+		Msg("Portal candidates from cloud sync")
 
 	// Skip portals already queued this session with the same newest timestamp.
-	// If CloudKit has newer messages, the timestamp changes and we re-queue.
+	// If CloudKit has newer messages or chat metadata, the relevant timestamp
+	// changes and we re-queue.
 	if c.queuedPortals == nil {
-		c.queuedPortals = make(map[string]int64)
+		c.queuedPortals = make(map[string]queuedPortalWatermark)
 	}
 	ordered := make([]string, 0, len(portalInfos))
-	newestTSByPortal := make(map[string]int64, len(portalInfos))
+	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
+	lastQueuedByID := make(map[string]queuedPortalWatermark, len(portalInfos))
 	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
+	noContentSkipped := 0
 	groupDedupSkipped := 0
 	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
-		newestTSByPortal[p.PortalID] = p.NewestTS
+		portalInfoByID[p.PortalID] = p
 		// Skip portals that are recently deleted this session.
 		// Checked live (not from a static snapshot) so that mid-sync
 		// recoveries via handleChatRecover are respected immediately.
@@ -3949,6 +3994,13 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		c.recentlyDeletedPortalsMu.RUnlock()
 		if isDeleted {
 			pendingDeleteSkipped++
+			continue
+		}
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
+		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		newPortalNeedsContent := existingPortal == nil || existingPortal.MXID == ""
+		if newPortalNeedsContent && p.ContentfulCount == 0 {
+			noContentSkipped++
 			continue
 		}
 		// Dedup group portals: the same group can appear under multiple
@@ -3966,11 +4018,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 				// Already have a candidate for this group. Prefer
 				// whichever has an existing bridge portal.
 				existingKey := networkid.PortalKey{ID: networkid.PortalID(existingPortalID), Receiver: c.UserLogin.ID}
-				newKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
-				existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, existingKey)
-				newPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, newKey)
-				existingHasRoom := existingPortal != nil && existingPortal.MXID != ""
-				newHasRoom := newPortal != nil && newPortal.MXID != ""
+				existingGroupPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, existingKey)
+				existingHasRoom := existingGroupPortal != nil && existingGroupPortal.MXID != ""
+				newHasRoom := !newPortalNeedsContent
 				if newHasRoom && !existingHasRoom {
 					// Swap: the new one has the bridge portal, use it instead
 					log.Info().
@@ -3998,19 +4048,23 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			}
 			seenGroupKeys[key] = p.PortalID
 		}
-		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= p.NewestTS {
+		lastQueued := c.queuedPortals[p.PortalID]
+		lastQueuedByID[p.PortalID] = lastQueued
+		if last, ok := c.queuedPortals[p.PortalID]; ok && last.covers(p) {
 			alreadyQueued++
 			continue
 		}
-		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
-		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
-		if p.MessageCount > 0 && (existingPortal == nil || existingPortal.MXID == "") {
+		if newPortalNeedsContent || shouldForceCloudBackfill(p) {
 			forwardBackfillPortals++
 		}
 		ordered = append(ordered, p.PortalID)
 	}
 	if pendingDeleteSkipped > 0 {
 		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped tombstoned or recently deleted portals")
+	}
+	if noContentSkipped > 0 {
+		log.Info().Int("skipped", noContentSkipped).
+			Msg("Skipped new cloud portal candidates with no contentful messages")
 	}
 	if groupDedupSkipped > 0 {
 		log.Info().Int("skipped", groupDedupSkipped).Msg("Skipped duplicate group portal IDs (same group, different UUID)")
@@ -4020,6 +4074,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	log.Info().
 		Int("total_candidates", len(portalInfos)).
 		Int("already_queued", alreadyQueued).
+		Int("no_content_skipped", noContentSkipped).
 		Int("group_dedup_skipped", groupDedupSkipped).
 		Int("to_process", len(ordered)).
 		Msg("Creating portals from cloud sync")
@@ -4054,15 +4109,16 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// early completions rather than reaching 0. Setting it up-front ensures
 	// every decrement is counted correctly.
 	//
-	// Count ONLY portals that actually have message history. Chat-only portals
-	// still get ChatResync events so rooms are created, but GetChatInfo sets
-	// CanBackfill=false for them, so bridgev2 never calls FetchMessages(Forward)
-	// and they must not hold the APNs buffer open.
+	// Count portals that need an initial forward backfill. Portal candidates
+	// without backfillable messages are filtered out before this point; existing
+	// Matrix rooms are counted when we force a catch-up backfill for newer
+	// reaction activity because FetchMessages will still run and decrement this
+	// counter.
 	if !c.isCloudSyncDone() {
 		atomic.StoreInt64(&c.pendingInitialBackfills, int64(forwardBackfillPortals))
 		log.Debug().
 			Int("count", forwardBackfillPortals).
-			Int("chat_only_or_existing", len(ordered)-forwardBackfillPortals).
+			Int("existing_or_skipped", len(ordered)-forwardBackfillPortals).
 			Msg("Set pendingInitialBackfills for APNs buffer hold")
 	}
 
@@ -4081,17 +4137,47 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Receiver: c.UserLogin.ID,
 		}
 
-		newestTS := newestTSByPortal[portalID]
+		portalInfo := portalInfoByID[portalID]
+		triggerTS := backfillTriggerTimestamp(portalInfo)
 		var latestMessageTS time.Time
-		if newestTS > 0 {
-			latestMessageTS = time.UnixMilli(newestTS)
+		if triggerTS > 0 {
+			latestMessageTS = time.UnixMilli(triggerTS)
+		}
+		var checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
+		if shouldForceCloudBackfill(portalInfo) {
+			checkNeedsBackfill = func(context.Context, *database.Message) (bool, error) {
+				return true, nil
+			}
 		}
 		log.Debug().
 			Str("portal_id", portalID).
 			Int("index", i).
 			Int("total", len(ordered)).
-			Int64("newest_ts", newestTS).
+			Int64("newest_ts", portalInfo.NewestTS).
+			Int64("activity_ts", portalInfo.ActivityTS).
+			Int64("message_activity_ts", portalInfo.MessageActivityTS).
+			Int64("message_write_activity_ts", portalInfo.MessageWriteActivityTS).
+			Int64("metadata_ts", portalInfo.MetadataTS).
+			Int64("trigger_ts", triggerTS).
 			Msg("Queuing ChatResync for portal")
+		var bundledBackfill any
+		if shouldForceCloudBackfill(portalInfo) {
+			afterWriteTS := lastQueuedByID[portalID].MessageWriteActivityTS
+			if afterWriteTS == 0 {
+				var err error
+				afterWriteTS, err = c.cloudStore.completedBackfillWriteWatermark(ctx, portalID)
+				if err != nil {
+					log.Warn().
+						Err(err).
+						Str("portal_id", portalID).
+						Msg("Failed to load completed backfill watermark for cloud catch-up; falling back to full write-activity scan")
+					afterWriteTS = 0
+				}
+			}
+			bundledBackfill = cloudCatchupBackfillBundle{
+				AfterWriteTS: afterWriteTS,
+			}
+		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
@@ -4103,10 +4189,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 						Str("source", "cloud_sync")
 				},
 			},
-			GetChatInfoFunc: c.GetChatInfo,
-			LatestMessageTS: latestMessageTS,
+			GetChatInfoFunc:        c.GetChatInfo,
+			LatestMessageTS:        latestMessageTS,
+			CheckNeedsBackfillFunc: checkNeedsBackfill,
+			BundledBackfillData:    bundledBackfill,
 		})
-		c.queuedPortals[portalID] = newestTS
+		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalInfo)
 		created++
 		if (i+1)%25 == 0 {
 			log.Info().

@@ -11,11 +11,13 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +34,15 @@ import (
 // resolution. It does NOT listen for incoming messages (rustpush handles that).
 type chatDB struct {
 	api imessage.API
+}
+
+type chatDBBackfillableProber interface {
+	HasBackfillableMessagesBefore(chatID string, before time.Time, limit int) (bool, error)
+}
+
+type chatDBBackfillCursorPosition struct {
+	TimeNS int64 `json:"time_ns"`
+	RowID  int   `json:"row_id"`
 }
 
 // openChatDB attempts to open the local iMessage chat.db database.
@@ -160,10 +171,20 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// Respect the configured message cap. params.Count comes from the
 	// framework's MaxInitialMessages setting.
 	maxMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+	cursorTimes := decodeChatDBBackfillCursor(params.Cursor, chatGUIDs)
+	hasBackwardCursor := !params.Forward && len(cursorTimes) > 0
+	messagesByGUID := make(map[string][]*imessage.Message, len(chatGUIDs))
 
 	for _, chatGUID := range chatGUIDs {
 		var msgs []*imessage.Message
-		if params.AnchorMessage != nil {
+		cursorPos, useCursor, exhausted := chatDBCursorStateForGUID(cursorTimes, chatGUID, hasBackwardCursor)
+		if exhausted {
+			messagesByGUID[chatGUID] = nil
+			continue
+		}
+		if useCursor {
+			msgs, lastErr = db.api.GetMessagesBeforeCursor(chatGUID, time.Unix(0, cursorPos.TimeNS), cursorPos.RowID, count)
+		} else if params.AnchorMessage != nil {
 			if params.Forward {
 				msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
 			} else {
@@ -173,14 +194,12 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			// Fetch the most recent N messages (uncapped = MaxInt32, effectively all).
 			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, time.Now().Add(time.Minute), maxMessages)
 		}
-		if lastErr == nil {
-			messages = append(messages, msgs...)
+		if lastErr != nil {
+			log.Error().Err(lastErr).Str("chat_guid", chatGUID).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
+			return nil, fmt.Errorf("failed to fetch messages from chat.db for %s: %w", chatGUID, lastErr)
 		}
-	}
-
-	if len(messages) == 0 && lastErr != nil {
-		log.Error().Err(lastErr).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
-		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
+		messages = append(messages, msgs...)
+		messagesByGUID[chatGUID] = msgs
 	}
 
 	// Sort chronologically — messages may come from multiple chat GUIDs
@@ -189,25 +208,24 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	})
 
 	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	nextCursor := encodeChatDBBackfillCursor(messagesByGUID, count, params.Forward)
+	hasMore := len(messages) >= count
+	if !params.Forward {
+		hasMore = nextCursor != ""
+	}
 
 	// Get an intent for uploading media. The bot intent works for all uploads.
 	intent := c.Main.Bridge.Bot
 
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	for _, msg := range messages {
-		if msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+		if !chatDBMessageCanBackfill(msg) {
 			continue
 		}
 		sender := chatDBMakeEventSender(msg, c)
-		if sender.Sender == "" && !sender.IsFromMe {
-			continue
-		}
 		sender = c.canonicalizeDMSender(params.Portal.PortalKey, sender)
 
-		// Strip U+FFFC (object replacement character) — inline attachment
-		// placeholders from NSAttributedString that render as blank
-		msg.Text = strings.ReplaceAll(msg.Text, "\uFFFC", "")
-		msg.Text = strings.TrimSpace(msg.Text)
+		normalizeChatDBMessageText(msg)
 
 		// Only create a text part if there's actual text content
 		if msg.Text != "" || msg.Subject != "" {
@@ -233,7 +251,15 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
 			}
-			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
+			partID := chatDBAttachmentMessagePartID(msg.GUID, i, attCm)
+			if !chatDBAttachmentIsNotice(attCm) {
+				noticeID := makeMessageID(fmt.Sprintf("%s_att%d_notice", msg.GUID, i))
+				c.redactBackfillNotice(ctx, params.Portal, noticeID)
+				c.redactTransientBackfillNotice(ctx, params.Portal, makeMessageID(partID))
+				if i == 0 && msg.Text == "" && msg.Subject == "" {
+					c.redactTransientBackfillNotice(ctx, params.Portal, makeMessageID(msg.GUID))
+				}
+			}
 			if msg.ReplyToGUID != "" {
 				attCm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
 			}
@@ -250,10 +276,86 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	return &bridgev2.FetchMessagesResponse{
 		Messages:                backfillMessages,
-		HasMore:                 len(messages) >= count,
+		Cursor:                  nextCursor,
+		HasMore:                 hasMore,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
+}
+
+func chatDBCursorStateForGUID(cursorTimes map[string]chatDBBackfillCursorPosition, chatGUID string, hasBackwardCursor bool) (chatDBBackfillCursorPosition, bool, bool) {
+	if cursorPos, ok := cursorTimes[chatGUID]; ok {
+		return cursorPos, true, false
+	}
+	return chatDBBackfillCursorPosition{}, false, hasBackwardCursor
+}
+
+func encodeChatDBBackfillCursor(messagesByGUID map[string][]*imessage.Message, count int, forward bool) networkid.PaginationCursor {
+	if forward || count <= 0 {
+		return ""
+	}
+	cursor := make(map[string]chatDBBackfillCursorPosition, len(messagesByGUID))
+	for chatGUID, messages := range messagesByGUID {
+		if len(messages) < count {
+			continue
+		}
+		oldest := messages[0]
+		for _, msg := range messages[1:] {
+			if msg != nil && (oldest == nil || msg.Time.Before(oldest.Time) || (msg.Time.Equal(oldest.Time) && msg.RowID < oldest.RowID)) {
+				oldest = msg
+			}
+		}
+		if oldest == nil || oldest.Time.IsZero() {
+			continue
+		}
+		cursor[chatGUID] = chatDBBackfillCursorPosition{
+			TimeNS: oldest.Time.UnixNano(),
+			RowID:  oldest.RowID,
+		}
+	}
+	if len(cursor) == 0 {
+		return ""
+	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return networkid.PaginationCursor(encoded)
+}
+
+func decodeChatDBBackfillCursor(cursor networkid.PaginationCursor, chatGUIDs []string) map[string]chatDBBackfillCursorPosition {
+	times := make(map[string]chatDBBackfillCursorPosition, len(chatGUIDs))
+	if cursor == "" {
+		return times
+	}
+	var perGUID map[string]chatDBBackfillCursorPosition
+	if err := json.Unmarshal([]byte(cursor), &perGUID); err == nil {
+		for chatGUID, pos := range perGUID {
+			if pos.TimeNS == 0 {
+				continue
+			}
+			times[chatGUID] = pos
+		}
+		return times
+	}
+	var legacyPerGUID map[string]int64
+	if err := json.Unmarshal([]byte(cursor), &legacyPerGUID); err == nil {
+		for chatGUID, ns := range legacyPerGUID {
+			if ns == 0 {
+				continue
+			}
+			times[chatGUID] = chatDBBackfillCursorPosition{TimeNS: ns}
+		}
+		return times
+	}
+	ns, err := strconv.ParseInt(string(cursor), 10, 64)
+	if err != nil {
+		return times
+	}
+	for _, chatGUID := range chatGUIDs {
+		times[chatGUID] = chatDBBackfillCursorPosition{TimeNS: ns}
+	}
+	return times
 }
 
 // ============================================================================
@@ -324,7 +426,59 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 }
 
+func normalizeChatDBMessageText(msg *imessage.Message) {
+	msg.Text = strings.TrimSpace(strings.ReplaceAll(msg.Text, "\uFFFC", ""))
+	msg.Subject = strings.TrimSpace(msg.Subject)
+}
+
+func chatDBMessageCanBackfill(msg *imessage.Message) bool {
+	if msg == nil || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+		return false
+	}
+	if !msg.IsFromMe && msg.Sender.LocalID == "" {
+		return false
+	}
+	normalizeChatDBMessageText(msg)
+	if msg.Text != "" || msg.Subject != "" {
+		return true
+	}
+	for _, att := range msg.Attachments {
+		if att != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *chatDB) hasBackfillableMessages(chatGUID string, maxMessages int) (bool, error) {
+	before := time.Now().Add(time.Minute)
+	if prober, ok := db.api.(chatDBBackfillableProber); ok {
+		return prober.HasBackfillableMessagesBefore(chatGUID, before, maxMessages)
+	}
+
+	const uncappedInitialBackfill = 1<<31 - 1
+	var (
+		messages []*imessage.Message
+		err      error
+	)
+	if maxMessages > 0 && maxMessages < uncappedInitialBackfill {
+		messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, before, maxMessages)
+	} else {
+		messages, err = db.api.GetMessagesSinceDate(chatGUID, time.Time{}, "")
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, msg := range messages {
+		if chatDBMessageCanBackfill(msg) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, urlPreviewsInBackfill bool) (*bridgev2.ConvertedMessage, error) {
+	normalizeChatDBMessageText(msg)
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    msg.Text,
@@ -363,13 +517,29 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 	return cm, nil
 }
 
+func chatDBAttachmentMessagePartID(guid string, index int, cm *bridgev2.ConvertedMessage) string {
+	partID := fmt.Sprintf("%s_att%d", guid, index)
+	if chatDBAttachmentIsNotice(cm) {
+		return partID + "_notice"
+	}
+	return partID
+}
+
+func chatDBAttachmentIsNotice(cm *bridgev2.ConvertedMessage) bool {
+	return cm != nil &&
+		len(cm.Parts) == 1 &&
+		cm.Parts[0] != nil &&
+		cm.Parts[0].Content != nil &&
+		cm.Parts[0].Content.MsgType == event.MsgNotice
+}
+
 func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	mimeType := att.GetMimeType()
 	fileName := att.GetFileName()
 
 	data, err := att.Read()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read attachment %s: %w", att.PathOnDisk, err)
+		return chatDBAttachmentNotice(fileName, "read"), nil
 	}
 
 	// Convert CAF Opus voice messages to OGG Opus for Matrix/Beeper clients
@@ -456,7 +626,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	if intent != nil {
 		url, encFile, err := intent.UploadMedia(ctx, "", data, fileName, mimeType)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload attachment: %w", err)
+			return chatDBAttachmentNotice(fileName, "uploaded"), nil
 		}
 		if encFile != nil {
 			content.File = encFile
@@ -489,4 +659,19 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			Content: content,
 		}},
 	}, nil
+}
+
+func chatDBAttachmentNotice(fileName, action string) *bridgev2.ConvertedMessage {
+	if strings.TrimSpace(fileName) == "" {
+		fileName = "attachment"
+	}
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type: event.EventMessage,
+			Content: &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:    fmt.Sprintf("Attachment could not be %s (%s).", action, fileName),
+			},
+		}},
+	}
 }
