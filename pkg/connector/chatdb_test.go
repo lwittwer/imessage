@@ -1,15 +1,36 @@
 package connector
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 )
+
+type failingMergedChatDBAPI struct {
+	imessage.API
+}
+
+func (f failingMergedChatDBAPI) GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) ([]*imessage.Message, error) {
+	if chatID == "iMessage;-;+15550000001" {
+		return nil, errors.New("temporary chat.db read failure")
+	}
+	return []*imessage.Message{{
+		GUID:     "message-guid-1",
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "hello",
+		Time:     time.Unix(100, 0),
+	}}, nil
+}
 
 func TestChatDBMessageCanBackfill(t *testing.T) {
 	tests := []struct {
@@ -108,6 +129,31 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 				t.Fatalf("chatDBMessageCanBackfill() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChatDBFetchMessagesFailsWholePageOnMergedGUIDError(t *testing.T) {
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID("tel:+15550000001"),
+		Receiver: networkid.UserLoginID("login"),
+	}
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{
+				Config: &bridgeconfig.BridgeConfig{},
+			},
+		},
+	}
+	db := &chatDB{api: failingMergedChatDBAPI{}}
+
+	resp, err := db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal: &bridgev2.Portal{
+			Portal: &database.Portal{PortalKey: portalKey},
+		},
+		Count: 2,
+	}, client)
+	if err == nil {
+		t.Fatalf("FetchMessages returned nil error with response %#v, want merged GUID failure", resp)
 	}
 }
 

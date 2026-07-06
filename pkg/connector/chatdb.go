@@ -194,15 +194,12 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			// Fetch the most recent N messages (uncapped = MaxInt32, effectively all).
 			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, time.Now().Add(time.Minute), maxMessages)
 		}
-		if lastErr == nil {
-			messages = append(messages, msgs...)
-			messagesByGUID[chatGUID] = msgs
+		if lastErr != nil {
+			log.Error().Err(lastErr).Str("chat_guid", chatGUID).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
+			return nil, fmt.Errorf("failed to fetch messages from chat.db for %s: %w", chatGUID, lastErr)
 		}
-	}
-
-	if len(messages) == 0 && lastErr != nil {
-		log.Error().Err(lastErr).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
-		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
+		messages = append(messages, msgs...)
+		messagesByGUID[chatGUID] = msgs
 	}
 
 	// Sort chronologically — messages may come from multiple chat GUIDs
