@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -391,8 +390,7 @@ func (c *IMClient) enqueuePendingMMCSRecovery(ctx context.Context, portal *bridg
 		return
 	}
 
-	hasText := attMsg.WrappedMessage != nil && attMsg.WrappedMessage.Text != nil &&
-		strings.TrimRight(*attMsg.WrappedMessage.Text, "\ufffc \n") != ""
+	hasText := attMsg.WrappedMessage != nil && liveMessageHasText(*attMsg.WrappedMessage)
 	attID := makeAttID(attMsg.Uuid, attMsg.Index, hasText)
 
 	sender := ""
