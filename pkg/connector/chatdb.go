@@ -254,7 +254,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
 			}
-			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
+			partID := chatDBAttachmentMessagePartID(msg.GUID, i, attCm)
 			if msg.ReplyToGUID != "" {
 				attCm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
 			}
@@ -510,6 +510,22 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 		cm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)
 	}
 	return cm, nil
+}
+
+func chatDBAttachmentMessagePartID(guid string, index int, cm *bridgev2.ConvertedMessage) string {
+	partID := fmt.Sprintf("%s_att%d", guid, index)
+	if chatDBAttachmentIsNotice(cm) {
+		return partID + "_notice"
+	}
+	return partID
+}
+
+func chatDBAttachmentIsNotice(cm *bridgev2.ConvertedMessage) bool {
+	return cm != nil &&
+		len(cm.Parts) == 1 &&
+		cm.Parts[0] != nil &&
+		cm.Parts[0].Content != nil &&
+		cm.Parts[0].Content.MsgType == event.MsgNotice
 }
 
 func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {

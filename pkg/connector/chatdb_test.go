@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 )
 
 func TestChatDBMessageCanBackfill(t *testing.T) {
@@ -106,6 +108,30 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 				t.Fatalf("chatDBMessageCanBackfill() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChatDBAttachmentNoticeUsesNonCollidingMessageID(t *testing.T) {
+	notice := &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
+		Type: event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    "Attachment could not be read from chat.db.",
+		},
+	}}}
+	media := &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
+		Type: event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgImage,
+			Body:    "photo.jpg",
+		},
+	}}}
+
+	if got, want := chatDBAttachmentMessagePartID("message-guid-1", 0, notice), "message-guid-1_att0_notice"; got != want {
+		t.Fatalf("notice attachment part ID = %q, want %q", got, want)
+	}
+	if got, want := chatDBAttachmentMessagePartID("message-guid-1", 0, media), "message-guid-1_att0"; got != want {
+		t.Fatalf("media attachment part ID = %q, want %q", got, want)
 	}
 }
 

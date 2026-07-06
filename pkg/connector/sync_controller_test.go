@@ -69,3 +69,44 @@ func TestBackfillTriggerTimestampIncludesReactionOnlyActivity(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
+	tests := []struct {
+		name string
+		info portalWithNewestMessage
+		want bool
+	}{
+		{
+			name: "reaction only message rows",
+			info: portalWithNewestMessage{
+				ActivityTS:   7000,
+				MessageCount: 1,
+			},
+			want: true,
+		},
+		{
+			name: "contentful message uses timestamp comparison",
+			info: portalWithNewestMessage{
+				NewestTS:        5000,
+				ActivityTS:      7000,
+				MessageCount:    2,
+				ContentfulCount: 1,
+			},
+			want: false,
+		},
+		{
+			name: "metadata only chat row",
+			info: portalWithNewestMessage{
+				ActivityTS: 7000,
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldForceCloudBackfill(tt.info); got != tt.want {
+				t.Fatalf("shouldForceCloudBackfill(%#v) = %v, want %v", tt.info, got, tt.want)
+			}
+		})
+	}
+}

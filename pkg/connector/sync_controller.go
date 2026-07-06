@@ -3914,6 +3914,10 @@ func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
 	return 0
 }
 
+func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
+	return p.NewestTS == 0 && p.MessageCount > 0 && p.ActivityTS > 0
+}
+
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
 	if c.cloudStore == nil {
 		return
@@ -4111,6 +4115,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		if triggerTS > 0 {
 			latestMessageTS = time.UnixMilli(triggerTS)
 		}
+		var checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
+		if shouldForceCloudBackfill(portalInfo) {
+			checkNeedsBackfill = func(context.Context, *database.Message) (bool, error) {
+				return true, nil
+			}
+		}
 		log.Debug().
 			Str("portal_id", portalID).
 			Int("index", i).
@@ -4130,8 +4140,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 						Str("source", "cloud_sync")
 				},
 			},
-			GetChatInfoFunc: c.GetChatInfo,
-			LatestMessageTS: latestMessageTS,
+			GetChatInfoFunc:        c.GetChatInfo,
+			LatestMessageTS:        latestMessageTS,
+			CheckNeedsBackfillFunc: checkNeedsBackfill,
 		})
 		c.queuedPortals[portalID] = c.queuedPortals[portalID].withPortal(portalInfo)
 		created++
