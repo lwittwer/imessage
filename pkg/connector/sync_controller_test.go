@@ -53,12 +53,23 @@ func TestBackfillTriggerTimestampIncludesReactionOnlyActivity(t *testing.T) {
 			name: "contentful message",
 			info: portalWithNewestMessage{
 				NewestTS:          5000,
+				ActivityTS:        5000,
+				MessageActivityTS: 5000,
+				MessageCount:      2,
+				ContentfulCount:   1,
+			},
+			want: 5000,
+		},
+		{
+			name: "newer reaction after contentful message",
+			info: portalWithNewestMessage{
+				NewestTS:          5000,
 				ActivityTS:        7000,
 				MessageActivityTS: 7000,
 				MessageCount:      2,
 				ContentfulCount:   1,
 			},
-			want: 5000,
+			want: 7000,
 		},
 		{
 			name: "reaction only message rows",
@@ -106,12 +117,23 @@ func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
 			name: "contentful message uses timestamp comparison",
 			info: portalWithNewestMessage{
 				NewestTS:          5000,
+				ActivityTS:        5000,
+				MessageActivityTS: 5000,
+				MessageCount:      2,
+				ContentfulCount:   1,
+			},
+			want: false,
+		},
+		{
+			name: "newer reaction after contentful message",
+			info: portalWithNewestMessage{
+				NewestTS:          5000,
 				ActivityTS:        7000,
 				MessageActivityTS: 7000,
 				MessageCount:      2,
 				ContentfulCount:   1,
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "metadata only chat row",

@@ -3911,17 +3911,17 @@ func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPorta
 }
 
 func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
+	if p.MessageActivityTS > p.NewestTS {
+		return p.MessageActivityTS
+	}
 	if p.NewestTS > 0 {
 		return p.NewestTS
-	}
-	if p.MessageCount > 0 {
-		return p.MessageActivityTS
 	}
 	return 0
 }
 
 func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
-	return p.NewestTS == 0 && p.MessageCount > 0 && p.MessageActivityTS > 0
+	return p.MessageCount > 0 && p.MessageActivityTS > p.NewestTS
 }
 
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
