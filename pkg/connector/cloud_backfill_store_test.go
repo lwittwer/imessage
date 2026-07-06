@@ -186,6 +186,31 @@ func TestAttachmentGUIDPlaceholdersCountAsContentfulMessages(t *testing.T) {
 	}
 }
 
+func TestAttachmentPlaceholderNoticeUsesNonCollidingMessageID(t *testing.T) {
+	attachmentsJSON := cloudAttachmentGUIDPlaceholdersJSON([]string{"att-guid-1"})
+	if attachmentsJSON == "" {
+		t.Fatal("cloudAttachmentGUIDPlaceholdersJSON returned empty JSON")
+	}
+	client := &IMClient{}
+	rows := client.cloudRowToBackfillMessages(context.Background(), cloudMessageRow{
+		GUID:            "message-guid-1",
+		PortalID:        "tel:+15550000020",
+		TimestampMS:     2000,
+		Sender:          "tel:+15551111111",
+		AttachmentsJSON: attachmentsJSON,
+		HasBody:         true,
+	}, "")
+	if len(rows) != 1 {
+		t.Fatalf("cloudRowToBackfillMessages returned %d rows, want 1 notice", len(rows))
+	}
+	if rows[0].ID == makeMessageID("message-guid-1") {
+		t.Fatalf("placeholder notice used real message ID %q", rows[0].ID)
+	}
+	if rows[0].ID != cloudAttachmentNoticeMessageID("message-guid-1") {
+		t.Fatalf("placeholder notice ID = %q, want %q", rows[0].ID, cloudAttachmentNoticeMessageID("message-guid-1"))
+	}
+}
+
 func TestPortalsFullyBackfilledNoNewContentChecksChatMetadata(t *testing.T) {
 	ctx := context.Background()
 	rawDB, err := sql.Open("sqlite3", ":memory:")

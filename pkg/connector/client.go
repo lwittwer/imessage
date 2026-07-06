@@ -8485,7 +8485,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	if len(messages) == 0 && row.AttachmentsJSON != "" {
 		messages = append(messages, &bridgev2.BackfillMessage{
 			Sender:    sender,
-			ID:        makeMessageID(row.GUID),
+			ID:        cloudAttachmentNoticeMessageID(row.GUID),
 			Timestamp: ts,
 			ConvertedMessage: &bridgev2.ConvertedMessage{
 				Parts: []*bridgev2.ConvertedMessagePart{{
@@ -8514,6 +8514,10 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	}
 
 	return messages
+}
+
+func cloudAttachmentNoticeMessageID(guid string) networkid.MessageID {
+	return makeMessageID(guid + "_attachment_notice")
 }
 
 func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
