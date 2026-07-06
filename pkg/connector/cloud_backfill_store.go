@@ -2792,11 +2792,13 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 // portalWithNewestMessage pairs a portal ID with its newest message timestamp
 // and message count. Used to prioritize portal creation during initial sync.
 type portalWithNewestMessage struct {
-	PortalID        string
-	NewestTS        int64
-	ActivityTS      int64
-	MessageCount    int
-	ContentfulCount int
+	PortalID          string
+	NewestTS          int64
+	ActivityTS        int64
+	MessageActivityTS int64
+	MetadataTS        int64
+	MessageCount      int
+	ContentfulCount   int
 }
 
 // listPortalIDsWithNewestTimestamp returns portal IDs that have readable message
@@ -2811,19 +2813,22 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		WITH message_stats AS (
 			SELECT cm.portal_id,
 			       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
-			       MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
+			       MAX(cm.timestamp_ms) AS message_activity_ts, 0 AS metadata_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
 			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 			FROM cloud_message cm
 			WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
 			GROUP BY cm.portal_id
 		),
 		chat_stats AS (
-			SELECT cc.portal_id, 0 AS newest_ts, COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
+			SELECT cc.portal_id, 0 AS newest_ts, 0 AS message_activity_ts,
+			       COALESCE(MAX(cc.updated_ts), 0) AS metadata_ts,
+			       COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 			FROM cloud_chat cc
 			WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
 			GROUP BY cc.portal_id
 		)
 		SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
+		       MAX(message_activity_ts) AS message_activity_ts, MAX(metadata_ts) AS metadata_ts,
 		       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
 		FROM (
 			SELECT * FROM message_stats
@@ -2852,7 +2857,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			message_stats AS (
 				SELECT cm.portal_id,
 				       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
-				       MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
+				       MAX(cm.timestamp_ms) AS message_activity_ts, 0 AS metadata_ts, MAX(cm.timestamp_ms) AS activity_ts, COUNT(*) AS msg_count,
 				       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
 				FROM ranked cm
 				WHERE cm.rn <= $2
@@ -2860,12 +2865,15 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				GROUP BY cm.portal_id
 			),
 			chat_stats AS (
-				SELECT cc.portal_id, 0 AS newest_ts, COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
+				SELECT cc.portal_id, 0 AS newest_ts, 0 AS message_activity_ts,
+				       COALESCE(MAX(cc.updated_ts), 0) AS metadata_ts,
+				       COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 				FROM cloud_chat cc
 				WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
 				GROUP BY cc.portal_id
 			)
 			SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
+			       MAX(message_activity_ts) AS message_activity_ts, MAX(metadata_ts) AS metadata_ts,
 			       SUM(msg_count) AS msg_count, SUM(contentful_count) AS contentful_count
 			FROM (
 				SELECT * FROM message_stats
@@ -2886,7 +2894,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 	var out []portalWithNewestMessage
 	for rows.Next() {
 		var p portalWithNewestMessage
-		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.ActivityTS, &p.MessageCount, &p.ContentfulCount); err != nil {
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.ActivityTS, &p.MessageActivityTS, &p.MetadataTS, &p.MessageCount, &p.ContentfulCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

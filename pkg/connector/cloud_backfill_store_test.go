@@ -90,11 +90,20 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	if got[0].PortalID != "tel:+15550000002" || got[0].ActivityTS != 10000 || got[0].NewestTS != 2000 || got[0].MessageCount != 1 || got[0].ContentfulCount != 1 {
 		t.Fatalf("got first portal %#v, want portal ordered by newer chat metadata without advancing message timestamp", got[0])
 	}
+	if got[0].MessageActivityTS != 2000 || got[0].MetadataTS != 10000 {
+		t.Fatalf("got first portal split activity %#v, want message=2000 metadata=10000", got[0])
+	}
 	if got[1].PortalID != "tel:+15550000005" || got[1].ActivityTS != 5000 || got[1].NewestTS != 5000 || got[1].MessageCount != 1 || got[1].ContentfulCount != 1 {
 		t.Fatalf("got second portal %#v, want senderless DM fallback message", got[1])
 	}
+	if got[1].MessageActivityTS != 5000 || got[1].MetadataTS != now {
+		t.Fatalf("got second portal split activity %#v, want message=5000 metadata=%d", got[1], now)
+	}
 	if got[2].PortalID != "tel:+15550000003" || got[2].ActivityTS != 3000 || got[2].NewestTS != 0 || got[2].MessageCount != 1 || got[2].ContentfulCount != 0 {
 		t.Fatalf("got third portal %#v, want reaction-only readable candidate with no contentful messages", got[2])
+	}
+	if got[2].MessageActivityTS != 3000 || got[2].MetadataTS != now {
+		t.Fatalf("got third portal split activity %#v, want message=3000 metadata=%d", got[2], now)
 	}
 	byPortal := make(map[string]portalWithNewestMessage, len(got))
 	for _, p := range got {
@@ -112,7 +121,7 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 		if !ok {
 			t.Fatalf("metadata-only portal %q missing from candidates: %#v", portalID, got)
 		}
-		if p.ActivityTS != now || p.NewestTS != 0 || p.MessageCount != 0 || p.ContentfulCount != 0 {
+		if p.ActivityTS != now || p.MessageActivityTS != 0 || p.MetadataTS != now || p.NewestTS != 0 || p.MessageCount != 0 || p.ContentfulCount != 0 {
 			t.Fatalf("metadata-only portal %q = %#v, want chat timestamp with no message/contentful count", portalID, p)
 		}
 	}
@@ -311,6 +320,9 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	if got[0].PortalID != "tel:+15550000010" || got[0].ActivityTS != 3000 || got[0].NewestTS != 0 || got[0].MessageCount != 1 || got[0].ContentfulCount != 0 {
 		t.Fatalf("got portal %#v, want capped-window reaction-only portal with no contentful messages", got[0])
 	}
+	if got[0].MessageActivityTS != 3000 {
+		t.Fatalf("got portal message activity %#v, want reaction timestamp 3000", got[0])
+	}
 	hasAnyContent, err := store.hasContentfulMessages(ctx, "tel:+15550000010")
 	if err != nil {
 		t.Fatal(err)
@@ -351,6 +363,9 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 	}
 	if got[0].ActivityTS != 3000 || got[0].NewestTS != 1000 {
 		t.Fatalf("got first portal activity/newest %#v, want reaction activity with contentful message watermark", got[0])
+	}
+	if got[0].MessageActivityTS != 3000 {
+		t.Fatalf("got first portal message activity %#v, want reaction timestamp 3000", got[0])
 	}
 }
 

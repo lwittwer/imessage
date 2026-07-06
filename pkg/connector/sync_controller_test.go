@@ -5,13 +5,26 @@ import "testing"
 func TestQueuedPortalWatermarkKeepsMessageAndMetadataSeparate(t *testing.T) {
 	watermark := queuedPortalWatermark{}.withPortal(portalWithNewestMessage{
 		ActivityTS: 10000,
+		MetadataTS: 10000,
 	})
 	messageCandidate := portalWithNewestMessage{
-		NewestTS:   5000,
-		ActivityTS: 10000,
+		NewestTS:          5000,
+		ActivityTS:        10000,
+		MessageActivityTS: 5000,
+		MetadataTS:        10000,
 	}
 	if watermark.covers(messageCandidate) {
 		t.Fatalf("metadata-only watermark %#v covered later message candidate %#v", watermark, messageCandidate)
+	}
+
+	reactionCandidate := portalWithNewestMessage{
+		ActivityTS:        10000,
+		MessageActivityTS: 5000,
+		MetadataTS:        10000,
+		MessageCount:      1,
+	}
+	if watermark.covers(reactionCandidate) {
+		t.Fatalf("metadata-only watermark %#v covered later reaction candidate %#v", watermark, reactionCandidate)
 	}
 
 	watermark = watermark.withPortal(messageCandidate)
@@ -20,8 +33,10 @@ func TestQueuedPortalWatermarkKeepsMessageAndMetadataSeparate(t *testing.T) {
 	}
 
 	metadataCandidate := portalWithNewestMessage{
-		NewestTS:   5000,
-		ActivityTS: 11000,
+		NewestTS:          5000,
+		ActivityTS:        11000,
+		MessageActivityTS: 5000,
+		MetadataTS:        11000,
 	}
 	if watermark.covers(metadataCandidate) {
 		t.Fatalf("message watermark %#v covered later metadata candidate %#v", watermark, metadataCandidate)
@@ -37,19 +52,21 @@ func TestBackfillTriggerTimestampIncludesReactionOnlyActivity(t *testing.T) {
 		{
 			name: "contentful message",
 			info: portalWithNewestMessage{
-				NewestTS:        5000,
-				ActivityTS:      7000,
-				MessageCount:    2,
-				ContentfulCount: 1,
+				NewestTS:          5000,
+				ActivityTS:        7000,
+				MessageActivityTS: 7000,
+				MessageCount:      2,
+				ContentfulCount:   1,
 			},
 			want: 5000,
 		},
 		{
 			name: "reaction only message rows",
 			info: portalWithNewestMessage{
-				ActivityTS:      7000,
-				MessageCount:    1,
-				ContentfulCount: 0,
+				ActivityTS:        7000,
+				MessageActivityTS: 7000,
+				MessageCount:      1,
+				ContentfulCount:   0,
 			},
 			want: 7000,
 		},
@@ -79,18 +96,20 @@ func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
 		{
 			name: "reaction only message rows",
 			info: portalWithNewestMessage{
-				ActivityTS:   7000,
-				MessageCount: 1,
+				ActivityTS:        7000,
+				MessageActivityTS: 7000,
+				MessageCount:      1,
 			},
 			want: true,
 		},
 		{
 			name: "contentful message uses timestamp comparison",
 			info: portalWithNewestMessage{
-				NewestTS:        5000,
-				ActivityTS:      7000,
-				MessageCount:    2,
-				ContentfulCount: 1,
+				NewestTS:          5000,
+				ActivityTS:        7000,
+				MessageActivityTS: 7000,
+				MessageCount:      2,
+				ContentfulCount:   1,
 			},
 			want: false,
 		},

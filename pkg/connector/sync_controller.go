@@ -3886,20 +3886,26 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 }
 
 type queuedPortalWatermark struct {
-	MessageTS  int64
-	MetadataTS int64
+	MessageTS         int64
+	MessageActivityTS int64
+	MetadataTS        int64
 }
 
 func (w queuedPortalWatermark) covers(p portalWithNewestMessage) bool {
-	return w.MessageTS >= p.NewestTS && w.MetadataTS >= p.ActivityTS
+	return w.MessageTS >= p.NewestTS &&
+		w.MessageActivityTS >= p.MessageActivityTS &&
+		w.MetadataTS >= p.MetadataTS
 }
 
 func (w queuedPortalWatermark) withPortal(p portalWithNewestMessage) queuedPortalWatermark {
 	if p.NewestTS > w.MessageTS {
 		w.MessageTS = p.NewestTS
 	}
-	if p.ActivityTS > w.MetadataTS {
-		w.MetadataTS = p.ActivityTS
+	if p.MessageActivityTS > w.MessageActivityTS {
+		w.MessageActivityTS = p.MessageActivityTS
+	}
+	if p.MetadataTS > w.MetadataTS {
+		w.MetadataTS = p.MetadataTS
 	}
 	return w
 }
@@ -3909,13 +3915,13 @@ func backfillTriggerTimestamp(p portalWithNewestMessage) int64 {
 		return p.NewestTS
 	}
 	if p.MessageCount > 0 {
-		return p.ActivityTS
+		return p.MessageActivityTS
 	}
 	return 0
 }
 
 func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
-	return p.NewestTS == 0 && p.MessageCount > 0 && p.ActivityTS > 0
+	return p.NewestTS == 0 && p.MessageCount > 0 && p.MessageActivityTS > 0
 }
 
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
@@ -4127,6 +4133,8 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Int("total", len(ordered)).
 			Int64("newest_ts", portalInfo.NewestTS).
 			Int64("activity_ts", portalInfo.ActivityTS).
+			Int64("message_activity_ts", portalInfo.MessageActivityTS).
+			Int64("metadata_ts", portalInfo.MetadataTS).
 			Int64("trigger_ts", triggerTS).
 			Msg("Queuing ChatResync for portal")
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
