@@ -190,6 +190,10 @@ ensure-rustpush-source:
 			KEYCHAIN_REPL=$$(printf '            let my_id = \\&state.user_identity.as_ref().unwrap().identifier;\\\n&\\\n                if excluded == my_id {\\\n                    warn!(\\\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\\\n                        excluded,\\\n                        peer.0.hash.as_ref().unwrap()\\\n                    );\\\n                    continue;\\\n                }') && \
 			sed -i.bak "s|^            for excluded in \&trust\.excludeds {\$$|$${KEYCHAIN_REPL}|" $(RUSTPUSH_DIR)/src/icloud/keychain.rs && rm -f $(RUSTPUSH_DIR)/src/icloud/keychain.rs.bak; \
 		fi; \
+		if grep -q '^    pub passcode_generation: u32,$$' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null; then \
+			echo "Patching keychain.rs to default passcode_generation when the escrow record omits it (deserialize compat; ports OpenBubbles/rustpush#23)..."; \
+			sed -i.bak 's|^    pub passcode_generation: u32,$$|    #[serde(default)] pub passcode_generation: u32,|' $(RUSTPUSH_DIR)/src/icloud/keychain.rs && rm -f $(RUSTPUSH_DIR)/src/icloud/keychain.rs.bak; \
+		fi; \
 		if grep -q '^    let mut request = SignedRequest::new("id-register", Method::POST)$$' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null && \
 		   ! grep -q 'RUSTPUSH_LOG_REGISTER_BODY' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null; then \
 			echo "Patching user.rs to add env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports d77b1ac4)..."; \
