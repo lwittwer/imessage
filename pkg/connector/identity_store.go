@@ -11,6 +11,7 @@ package connector
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -163,8 +164,8 @@ func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 		log.Warn().Err(err).Msg("Failed to marshal session state")
 		return
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("Failed to write session file")
+	if err := writeSessionFileAtomically(path, data); err != nil {
+		log.Warn().Err(err).Str("path", path).Msg("Failed to atomically write session file")
 		return
 	}
 	log.Info().Str("path", path).
@@ -172,6 +173,61 @@ func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 		Bool("has_aps_state", state.APSState != "").
 		Bool("has_ids_users", state.IDSUsers != "").
 		Msg("Saved session state to file")
+}
+
+// writeSessionFileAtomically replaces session.json without ever exposing a
+// partially written file. This matters during reset: the bridge's final state
+// save runs immediately before the database is removed, so a crash or failed
+// write must leave the previous recoverable backup intact.
+func writeSessionFileAtomically(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".session.json-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err = tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace session file: %w", err)
+	}
+	return nil
+}
+
+// persistedSessionStateFromMetadata snapshots every recoverable field stored
+// in the bridge database. Keeping this conversion in one place prevents the
+// periodic/final state save from silently omitting login or device data.
+func persistedSessionStateFromMetadata(meta *UserLoginMetadata) PersistedSessionState {
+	return PersistedSessionState{
+		IDSIdentity:              meta.IDSIdentity,
+		APSState:                 meta.APSState,
+		IDSUsers:                 meta.IDSUsers,
+		PreferredHandle:          meta.PreferredHandle,
+		Platform:                 meta.Platform,
+		HardwareKey:              meta.HardwareKey,
+		DeviceID:                 meta.DeviceID,
+		AccountUsername:          meta.AccountUsername,
+		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+		AccountPET:               meta.AccountPET,
+		AccountADSID:             meta.AccountADSID,
+		AccountDSID:              meta.AccountDSID,
+		AccountSPDBase64:         meta.AccountSPDBase64,
+		MmeDelegateJSON:          meta.MmeDelegateJSON,
+	}
 }
 
 // loadSessionState reads the persisted session state from the JSON file.
@@ -255,9 +311,12 @@ func ListHandles() []string {
 // keystore) exists and the IDS user keys are present in the keystore.
 // Returns true if login can be auto-restored without re-authentication.
 // This is intended to be called from the CLI (check-restore subcommand)
-// before starting the bridge.
-func CheckSessionRestore() bool {
+// before starting the bridge. By default it also requires the trusted-peers
+// keychain state used by contacts and CloudKit; callers that have confirmed
+// those features are disabled may pass false.
+func CheckSessionRestore(requireKeychain ...bool) bool {
 	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+	mustHaveKeychain := sessionRestoreRequiresKeychain(requireKeychain)
 
 	// Initialize keystore (loads from XDG path, migrates if needed)
 	rustpushgo.InitLogger()
@@ -276,9 +335,13 @@ func CheckSessionRestore() bool {
 	if !session.validate(log) {
 		return false
 	}
-	if !hasKeychainCliqueState(log) {
+	if mustHaveKeychain && !hasKeychainCliqueState(log) {
 		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
 		return false
 	}
 	return true
+}
+
+func sessionRestoreRequiresKeychain(option []bool) bool {
+	return len(option) == 0 || option[0]
 }

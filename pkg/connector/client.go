@@ -9681,7 +9681,12 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
+		return
 	}
+	// Keep the reset-safe file backup synchronized with the same snapshot that
+	// was just committed to the bridge database. In particular, the final save
+	// on shutdown now refreshes session.json before a DB-only reset proceeds.
+	saveSessionState(log, persistedSessionStateFromMetadata(meta))
 }
 
 func (c *IMClient) periodicStateSave(log zerolog.Logger) {
