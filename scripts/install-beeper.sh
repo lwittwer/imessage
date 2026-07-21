@@ -80,30 +80,16 @@ fi
 echo "✓ Logged in: $WHOAMI"
 
 # ── Check for existing bridge registration ────────────────────
-# If the bridge is already registered on the server but we're about to
-# generate a fresh config (no local config file), the old registration's
-# rooms would be orphaned.  Delete it first so the server cleans up rooms.
+# Re-fetch an existing registration when local config is missing (for example,
+# after a local-only reset). Never delete it implicitly: registration deletion
+# may remove remote Matrix rooms and requires a separate reset confirmation.
 EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
 if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
-    echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
-    echo "   Deleting old registration to avoid orphaned rooms..."
-    # bbctl whoami can list a registration that the server can no longer
-    # delete (404 M_NOT_FOUND) — the appservice record is already gone but
-    # still shows in whoami.  Don't let that abort the install under set -e:
-    # a 404 means it's already deleted, and any other error is non-fatal
-    # because config regeneration re-registers anyway (worst case: a few
-    # orphaned rooms, far better than a failed setup).
-    if DELETE_OUT=$("$BINARY" bbctl delete "$BRIDGE_NAME" 2>&1); then
-        echo "✓ Old registration cleaned up"
-        echo "   Waiting for server-side deletion to complete..."
-        sleep 5
-    elif echo "$DELETE_OUT" | grep -qi "not found\|M_NOT_FOUND\|404"; then
-        echo "✓ Registration already absent on server — continuing"
-    else
-        echo "⚠  Could not delete old registration: $DELETE_OUT"
-        echo "   Continuing anyway — config regeneration will re-register."
-    fi
+    echo "⚠  Found existing '$BRIDGE_NAME' registration but no local config."
+    echo "   Reusing it; setup will not delete remote Matrix rooms."
+    echo "   A fresh local database cannot reconnect old rooms automatically, so"
+    echo "   rebuilt rooms may coexist with old ones. See the README reset guidance."
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -120,11 +106,10 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     sleep 3
     EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
     if [ -z "$EXISTING_BRIDGE" ]; then
-        echo "⚠  Local config exists but bridge is not registered on server."
-        echo "   Removing stale config and database to re-register..."
-        rm -f "$CONFIG"
-        DB_DIR="$(cd "$DATA_DIR" && pwd)"
-        rm -f "$DB_DIR"/corten-matrix.db*
+        echo "ERROR: local config exists but the bridge is not registered on server." >&2
+        echo "Setup will not delete the config or database automatically." >&2
+        echo "Back up the data, then use the explicitly confirmed reset flow." >&2
+        exit 1
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
