@@ -360,3 +360,12 @@ func TestIsBridgeAbsentRejectsMissingBridgesMap(t *testing.T) {
 		t.Fatalf("missing bridges map returned absent=%t, error=%v", absent, err)
 	}
 }
+
+func TestIsBridgeAbsentRejectsNilWhoamiResponse(t *testing.T) {
+	absent, err := isBridgeAbsent("sh-imessage", "token", func(string, string) (*beeperapi.RespWhoami, error) {
+		return nil, nil
+	})
+	if err == nil || absent {
+		t.Fatalf("nil whoami returned absent=%t, error=%v", absent, err)
+	}
+}

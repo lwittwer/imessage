@@ -72,6 +72,9 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	if strictRemoteDelete < stop {
 		t.Fatalf("remote deletion appears before the service stop")
 	}
+	if strictRemoteDelete > deleteLocal {
+		t.Fatalf("local deletion appears before strict remote deletion: remote=%d local=%d", strictRemoteDelete, deleteLocal)
+	}
 	for _, required := range []string{
 		"if [ ! -t 0 ]",
 		"--local-only",
@@ -229,9 +232,12 @@ func TestResetRemotePolicy(t *testing.T) {
 		want     string
 		wantErr  bool
 	}{
-		{name: "Beeper", contents: "homeserver:\n  domain: \"beeper.com\"\n", want: "beeper"},
+		{name: "Beeper public domain", contents: "homeserver:\n  domain: \"beeper.com\"\n", want: "beeper"},
+		{name: "Beeper generated config", contents: "homeserver:\n  address: https://matrix.beeper.com/_hungryserv/example\n  domain: beeper.local\n", want: "beeper"},
+		{name: "Beeper address fallback", contents: "homeserver:\n  address: https://matrix.beeper.com/_hungryserv/example\n", want: "beeper"},
 		{name: "self-hosted", contents: "homeserver:\n  domain: matrix.example.org\n", want: "self-hosted"},
-		{name: "missing domain", contents: "homeserver: {}\n", wantErr: true},
+		{name: "self-hosted domain is authoritative", contents: "homeserver:\n  address: https://matrix.beeper.com/_hungryserv/proxy\n  domain: matrix.example.org\n", want: "self-hosted"},
+		{name: "missing identity", contents: "homeserver: {}\n", wantErr: true},
 		{name: "malformed YAML", contents: "homeserver: [\n", wantErr: true},
 	}
 	for _, tt := range tests {

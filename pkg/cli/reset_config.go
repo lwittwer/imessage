@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -18,18 +19,35 @@ func resetConfigKind(path string) (string, error) {
 	}
 	var config struct {
 		Homeserver struct {
-			Domain string `yaml:"domain"`
+			Address string `yaml:"address"`
+			Domain  string `yaml:"domain"`
 		} `yaml:"homeserver"`
 	}
 	if err = yaml.Unmarshal(data, &config); err != nil {
 		return "", fmt.Errorf("parse config: %w", err)
 	}
-	domain := strings.TrimSpace(config.Homeserver.Domain)
-	if domain == "" {
-		return "", fmt.Errorf("config has no homeserver domain")
-	}
-	if strings.EqualFold(domain, "beeper.com") {
+	domain := strings.ToLower(strings.TrimSpace(config.Homeserver.Domain))
+	address := strings.TrimSpace(config.Homeserver.Address)
+	if domain == "beeper.com" || domain == "beeper.local" {
 		return "beeper", nil
 	}
-	return "self-hosted", nil
+	if domain != "" {
+		return "self-hosted", nil
+	}
+	if isBeeperHomeserverAddress(address) {
+		return "beeper", nil
+	}
+	return "", fmt.Errorf("config has no identifiable homeserver domain or address")
+}
+
+func isBeeperHomeserverAddress(address string) bool {
+	if address == "" {
+		return false
+	}
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "matrix.beeper.com" || host == "matrix.beeper.local"
 }
