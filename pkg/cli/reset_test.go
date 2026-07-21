@@ -52,11 +52,16 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	stop := strings.Index(script, "echo \"Stopping bridge...\"")
 	localConfirm := strings.Index(script, `read -r -p "Type RESET BRIDGE DATA to continue: "`)
 	imessageConfirm := strings.Index(script, `read -r -p "Type DELETE IMESSAGE STATE to confirm Apple session deletion: "`)
-	remoteConfirm := strings.Index(script, `read -r -p "Type DELETE MATRIX ROOMS to confirm remote deletion: "`)
+	remoteConfirm := strings.Index(script, `read -r -p "Type DELETE BEEPER BRIDGE to confirm Beeper deletion: "`)
+	remotePreflight := strings.Index(script, `if ! "$BINARY" bbctl whoami >/dev/null 2>&1; then`)
+	strictRemoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
 	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`)
 
-	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || deleteLocal < 0 {
+	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || remotePreflight < 0 || strictRemoteDelete < 0 || deleteLocal < 0 {
 		t.Fatalf("reset script is missing a required confirmation or mutation marker")
+	}
+	if remotePreflight > localConfirm || remotePreflight > stop {
+		t.Fatalf("Beeper preflight runs too late: preflight=%d confirmation=%d stop=%d", remotePreflight, localConfirm, stop)
 	}
 	if localConfirm > stop || imessageConfirm > stop || remoteConfirm > stop {
 		t.Fatalf("reset can stop the service before all confirmations: local=%d imessage=%d remote=%d stop=%d", localConfirm, imessageConfirm, remoteConfirm, stop)
@@ -64,8 +69,13 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	if stop > deleteLocal {
 		t.Fatalf("local state deletion appears before the service stop")
 	}
+	if strictRemoteDelete < stop {
+		t.Fatalf("remote deletion appears before the service stop")
+	}
 	for _, required := range []string{
 		"if [ ! -t 0 ]",
+		"--local-only",
+		"--keep-remote",
 		"--delete-remote",
 		"--delete-imessage-state",
 		"--external-database-cleared",
@@ -117,7 +127,7 @@ func TestResetPreservesIMessageStateByDefault(t *testing.T) {
 func TestResetFilesystemBehavior(t *testing.T) {
 	helper := resetFilesystemHelper(t)
 
-	t.Run("default preserves config and iMessage state", func(t *testing.T) {
+	t.Run("local-only preserves config and iMessage state", func(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "custom.db")
 		preserved := []string{
@@ -146,6 +156,32 @@ func TestResetFilesystemBehavior(t *testing.T) {
 		for _, name := range append(deleted, "logs") {
 			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 				t.Errorf("bridge artifact %q still exists after default reset", name)
+			}
+		}
+	})
+
+	t.Run("Beeper cleanup deletes stale config but preserves iMessage state", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "corten-matrix.db")
+		for _, name := range []string{
+			"config.yaml", "corten-matrix.db", "session.json", "keystore.plist",
+			"trustedpeers.plist", "future-apple-state.bin",
+		} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		runResetFilesystemHelper(t, helper, dir, dbPath, true, false)
+
+		for _, name := range []string{"session.json", "keystore.plist", "trustedpeers.plist", "future-apple-state.bin"} {
+			if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+				t.Errorf("iMessage state %q missing after Beeper cleanup: %v", name, err)
+			}
+		}
+		for _, name := range []string{"config.yaml", "corten-matrix.db"} {
+			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Errorf("stale bridge path %q still exists after Beeper cleanup", name)
 			}
 		}
 	})
@@ -186,14 +222,96 @@ func TestResetFilesystemBehavior(t *testing.T) {
 	})
 }
 
+func TestResetRemotePolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		want     string
+		wantErr  bool
+	}{
+		{name: "Beeper", contents: "homeserver:\n  domain: \"beeper.com\"\n", want: "beeper"},
+		{name: "self-hosted", contents: "homeserver:\n  domain: matrix.example.org\n", want: "self-hosted"},
+		{name: "missing domain", contents: "homeserver: {}\n", wantErr: true},
+		{name: "malformed YAML", contents: "homeserver: [\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := resetConfigKind(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resetConfigKind unexpectedly returned %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resetConfigKind: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("resetConfigKind = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if got, err := resetConfigKind(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
+		t.Fatalf("resetConfigKind accepted missing config as %q", got)
+	}
+
+	script := embeddedScript(t, "reset-bridge.sh")
+	for _, required := range []string{
+		`"$BINARY" reset-config-kind "$config"`,
+		`if [ "$keep_remote" = true ]; then`,
+		`printf 'local-only'`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("reset script missing remote-policy guard %q", required)
+		}
+	}
+}
+
+func TestBridgeBinaryDispatchesResetConfigKind(t *testing.T) {
+	mainPath := filepath.Join("..", "..", "cmd", "corten-matrix", "main.go")
+	source, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managementCase := regexp.MustCompile(`(?s)case "setup".*?cli\.RunManagement\(os\.Args\[1\], os\.Args\[2:\]\)`).Find(source)
+	if managementCase == nil || !strings.Contains(string(managementCase), `"reset-config-kind"`) {
+		t.Fatal("corten-matrix main does not dispatch the reset config inspector through the management CLI")
+	}
+}
+
+func TestResetBareDualAccountRequiresExplicitSelection(t *testing.T) {
+	scriptPath := filepath.Join("..", "..", "scripts", "reset-bridge.sh")
+	root := t.TempDir()
+	primary := filepath.Join(root, "corten-matrix")
+	secondary := filepath.Join(root, "corten-matrix-1")
+	for _, dir := range []string{primary, secondary} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("/bin/bash", scriptPath, "/tmp/corten-test-bin", primary, secondary, "test.bundle")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("bare reset unexpectedly accepted two configured accounts")
+	}
+	if !strings.Contains(string(output), "both bridge accounts are configured; choose --account 0, 1, or all") {
+		t.Fatalf("unexpected refusal: %s", output)
+	}
+}
+
+func boolString(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
 func runResetFilesystemHelper(t *testing.T, helper, dir, dbPath string, deleteRemote, deleteIMessage bool) {
 	t.Helper()
-	boolString := func(value bool) string {
-		if value {
-			return "true"
-		}
-		return "false"
-	}
 	script := helper + "\ndelete_local_bridge_data \"$1\" \"$2\" \"$3\" \"$4\"\n"
 	cmd := exec.Command("/bin/bash", "-c", script, "reset-helper-test", dir, dbPath, boolString(deleteRemote), boolString(deleteIMessage))
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -218,18 +336,13 @@ func TestEmbeddedResetRunsAsSudoTargetUser(t *testing.T) {
 	}
 }
 
-func TestResetConfigGuardsAcceptQuotedYAMLScalars(t *testing.T) {
+func TestResetPostgresGuardAcceptsQuotedYAMLScalars(t *testing.T) {
 	script := embeddedScript(t, "reset-bridge.sh")
 	tests := []struct {
 		name    string
 		pattern string
 		values  []string
 	}{
-		{
-			name:    "beeper domain",
-			pattern: `^[[:space:]]+domain:[[:space:]]+['\"]?beeper\\.com['\"]?([[:space:]]|$)`,
-			values:  []string{"    domain: beeper.com", `    domain: "beeper.com"`, "    domain: 'beeper.com'"},
-		},
 		{
 			name:    "postgres database",
 			pattern: `^[[:space:]]+type:[[:space:]]+['\"]?postgres['\"]?([[:space:]]|$)`,

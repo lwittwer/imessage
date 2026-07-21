@@ -128,7 +128,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
-| `corten-matrix reset` | Reset the local bridge database/logs with exact confirmation; Apple/iMessage state and remote cleanup are separate opt-ins — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
+| `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
 | `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
 | `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
@@ -509,23 +509,34 @@ Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`, `max
 
 ### Reset and duplicate-room recovery
 
-`corten-matrix reset` is intentionally destructive and interactive. It shows the exact account directories it will change and does nothing until you type `RESET BRIDGE DATA`. There is no non-interactive bypass. By default it stops the service and deletes only the selected local SQLite bridge database (including its WAL/SHM sidecars and stored backfill/portal mappings) and logs. It **preserves** configuration, Apple/iMessage login and session state, cryptographic keys, trusted-peers data, Matrix rooms, and the Beeper registration. After stopping the bridge, reset validates that the final Apple session backup and keystore are restorable; it refuses to delete the database if that validation fails.
+`corten-matrix reset` is intentionally destructive and interactive. It shows a per-account action plan and does nothing until you enter its exact confirmations. There is no non-interactive bypass. It always stops the service and deletes the selected local SQLite bridge database (including its WAL/SHM sidecars and stored backfill/portal mappings) and logs. For a Beeper account, the default reset also deletes its remote appservice registration as part of the clean rebuild; server-side cleanup may remove rooms owned by that registration. This requires typing `DELETE BEEPER BRIDGE` in addition to `RESET BRIDGE DATA`. For a self-hosted account, automatic remote deletion is unavailable and reset changes only local bridge state.
+
+The default reset **preserves** Apple/iMessage login and session state, cryptographic keys, and trusted-peers data. After stopping the bridge, reset validates that the final Apple session backup and keystore are restorable; it refuses to delete the database or Beeper registration if that validation fails.
 
 ```bash
-corten-matrix reset                         # all configured accounts
+corten-matrix reset                         # the only configured account
 corten-matrix reset --account 0             # primary account only
 corten-matrix reset --account 1             # second account only
+corten-matrix reset --account all           # both accounts, explicitly
 ```
+
+If both account directories exist, bare `corten-matrix reset` refuses to proceed: choose account `0`, `1`, or `all` explicitly. If a selected config is missing or its homeserver cannot be identified, the normal reset also fails closed; use `--local-only` only when deliberately keeping all remote state.
 
 For a clean rebuild after the DM-alias canonicalization fix:
 
 1. Install the binary containing the canonicalization fix **before** starting the rebuilt bridge. Otherwise the first sync can recreate the bad portal IDs.
 2. Back up the selected data directory (and the PostgreSQL database, if used).
 3. Run the appropriate reset command and read the full warning before confirming.
-4. Run `corten-matrix start`. The preserved configuration and Apple/iMessage session are reused automatically.
+4. For Beeper, run `corten-matrix setup-beeper` (add `1` for account 1) to create a new registration. For self-hosted, run `corten-matrix start`. The preserved Apple/iMessage session is reused automatically.
 5. Verify that new traffic and backfill use one canonical room per DM before leaving or archiving old duplicate rooms.
 
-A local reset forgets the mapping between portal IDs and Matrix room IDs. Matrix room history cannot be merged into a newly created room, and old rooms do not disappear: the rebuilt bridge may create canonical rooms alongside the old duplicates. This is expected when remote cleanup is not requested. Keep the old rooms until you have verified the rebuild, then leave or archive duplicates manually in your Matrix client.
+To keep an existing Beeper registration and its Matrix rooms, explicitly request a local-only database/log reset with `--local-only` (or its synonym `--keep-remote`):
+
+```bash
+corten-matrix reset --account 0 --local-only
+```
+
+A local-only reset forgets the mapping between portal IDs and Matrix room IDs, but Matrix room history cannot be merged into a newly created room and old rooms do not disappear. The rebuilt bridge may therefore create canonical rooms alongside the old duplicates. Keep the old rooms until you have verified the rebuild, then leave or archive duplicates manually in your Matrix client.
 
 To deliberately discard the selected account's Apple/iMessage identity as well, add `--delete-imessage-state`. This requires a separate exact confirmation (`DELETE IMESSAGE STATE`), forces a fresh Apple login, and may cause Apple or your contacts to treat the rebuilt bridge as a new device:
 
@@ -535,17 +546,9 @@ corten-matrix reset --account 0 --delete-imessage-state
 
 This flag is not required for duplicate-DM recovery. Do not use it merely to rebuild the bridge database.
 
-For Beeper only, `--delete-remote` additionally deletes the selected Beeper appservice registration. This is a separate, opt-in destructive action with a second exact confirmation (`DELETE MATRIX ROOMS`):
+> **Beeper reset warning:** deleting a Beeper registration may remove **all** Matrix rooms owned by that registration, not just duplicate DMs. It is not reversible by restoring local files. Reset requires a separate exact confirmation before doing this. For a self-hosted homeserver, remote rooms must be managed with your Matrix client or homeserver administration tools.
 
-```bash
-corten-matrix reset --account 0 --delete-remote
-```
-
-> **Remote deletion warning:** deleting a Beeper registration may remove **all** Matrix rooms owned by that registration, not just duplicate DMs. It is not reversible by restoring local files. Setup and reset never do this automatically. For a self-hosted homeserver, remote rooms must be managed with your Matrix client or homeserver administration tools.
-
-`--delete-remote` does not delete the preserved Apple/iMessage state. The two destructive opt-ins are independent and each has its own confirmation. After a requested remote deletion succeeds, reset removes the stale local Beeper config so `setup-beeper` can create a fresh registration; it does not remove the Apple session.
-
-After a reset using `--delete-remote`, run `corten-matrix setup-beeper` (or `corten-matrix setup-beeper 1` for account 1) instead of `start`, because a new Beeper registration and config must be created first.
+The Beeper default does not delete the preserved Apple/iMessage state. Remote Beeper cleanup and `--delete-imessage-state` are independent: the former is the normal Beeper reset behavior, while the latter always requires its explicit flag and separate confirmation. After Beeper deletion succeeds, reset removes the stale local config so `setup-beeper` can create a fresh registration.
 
 If the selected config uses PostgreSQL, reset refuses to proceed because deleting local files would leave the portal database intact. Back up and clear or recreate the configured PostgreSQL database yourself, then acknowledge that separate step with `--external-database-cleared`. The flag is only an assertion; it does not connect to or modify PostgreSQL.
 
@@ -701,7 +704,7 @@ scripts/                                    # Setup scripts, embedded into the b
   ├── install.sh / install-linux.sh         #   interactive setup — self-hosted bridge (macOS / Linux)
   ├── install-beeper.sh / -linux.sh         #   interactive setup — Beeper (macOS / Linux)
   ├── bootstrap-linux.sh                    #   installs build deps
-  ├── reset-bridge.sh                       #   confirmed DB/log reset; iMessage state and deregistration are opt-in
+  ├── reset-bridge.sh                       #   confirmed DB/Beeper reset; iMessage state deletion is opt-in
   └── patch_bindings.py / .sh               #   patches uniffi-generated Go bindings for Go 1.24+ cgo types
 ```
 

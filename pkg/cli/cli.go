@@ -692,7 +692,7 @@ func PrintHelp() {
 		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
-		{"reset [options]", "reset bridge database/logs (iMessage state and remote cleanup are opt-in)"},
+		{"reset [options]", "rebuild local + Beeper state (preserves iMessage state)"},
 		{"uninstall", "remove the service"},
 		{"login", "re-run the iMessage login flow"},
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
@@ -715,7 +715,7 @@ func IsManagementCommand(cmd string) bool {
 	switch cmd {
 	case "setup", "setup-beeper", "start", "stop", "restart",
 		"status", "logs", "bbctl", "reset", "uninstall",
-		"install-service", "uninstall-service":
+		"install-service", "uninstall-service", "reset-config-kind":
 		return true
 	}
 	return false
@@ -739,6 +739,17 @@ func RunManagement(cmd string, args []string) {
 		runEmbeddedScript("reset-bridge.sh", append([]string{
 			selfPath(), cortenDataDir(), secondDataDir(), cortenBundleID,
 		}, args...)...)
+	case "reset-config-kind":
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-kind requires a config path")
+			os.Exit(2)
+		}
+		kind, err := resetConfigKind(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-kind: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(kind)
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Explicit bridge reset. Apple/iMessage login state is preserved by default.
-# Deleting it and deleting a Beeper registration are independent opt-ins.
+# Beeper registrations are rebuilt by default; local-only reset is opt-in.
 #
 # This script is embedded in corten-matrix and invoked by pkg/cli. The first
 # four arguments are internal, resolved paths/identifiers supplied by Go.
@@ -15,6 +15,9 @@ BUNDLE_ID="$4"
 shift 4
 
 ACCOUNT="all"
+ACCOUNT_SPECIFIED=false
+KEEP_REMOTE=false
+FORCE_DELETE_REMOTE=false
 DELETE_REMOTE=false
 DELETE_IMESSAGE_STATE=false
 EXTERNAL_DB_CLEARED=false
@@ -38,16 +41,18 @@ read_yaml_scalar() {
 
 usage() {
     cat <<'EOF'
-Usage: corten-matrix reset [--account 0|1|all] [--delete-remote] [--delete-imessage-state] [--external-database-cleared]
+Usage: corten-matrix reset [--account 0|1|all] [--local-only] [--delete-imessage-state] [--external-database-cleared]
 
 Deletes the local bridge database and logs only after an exact confirmation.
-By default, configuration, Apple/iMessage login state, Matrix rooms, and Beeper
-registrations are preserved.
+Apple/iMessage state is always preserved unless explicitly deleted. For Beeper
+accounts, reset deletes and rebuilds the remote registration by default. For
+self-hosted accounts, remote cleanup is unavailable and reset is local only.
 
-  --account 0|1|all              reset one account or all configured accounts
-  --delete-remote                Beeper only: also delete the selected bridge
-                                 registration(s); requires a second confirmation
-                                 and may remove their Matrix rooms
+  --account 0|1|all              reset one account or explicitly reset both;
+                                 required when both accounts are configured
+  --local-only, --keep-remote    keep Beeper registration(s) and Matrix rooms;
+                                 only reset the local bridge database and logs
+  --delete-remote                compatibility alias for the Beeper default
   --delete-imessage-state        also delete Apple/iMessage login, cryptographic
                                  keys, and session state; requires a separate
                                  confirmation and a fresh Apple login afterward
@@ -55,8 +60,9 @@ registrations are preserved.
                                  has already been backed up and cleared manually
 
 For duplicate-DM recovery, install a binary containing the canonicalization fix
-before resetting. The two deletion flags are independent. See the README
-recovery section before using this command.
+before resetting. Remote Beeper cleanup and Apple-state deletion are independent:
+the former is the default, while the latter always requires its explicit flag.
+See the README recovery section before using this command.
 EOF
 }
 
@@ -65,10 +71,15 @@ while [ "$#" -gt 0 ]; do
         --account)
             [ "$#" -ge 2 ] || { echo "ERROR: --account requires 0, 1, or all" >&2; exit 2; }
             ACCOUNT="$2"
+            ACCOUNT_SPECIFIED=true
             shift 2
             ;;
         --delete-remote)
-            DELETE_REMOTE=true
+            FORCE_DELETE_REMOTE=true
+            shift
+            ;;
+        --local-only|--keep-remote)
+            KEEP_REMOTE=true
             shift
             ;;
         --delete-imessage-state)
@@ -91,10 +102,27 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$KEEP_REMOTE" = true ] && [ "$FORCE_DELETE_REMOTE" = true ]; then
+    echo "ERROR: --local-only/--keep-remote cannot be combined with --delete-remote" >&2
+    exit 2
+fi
+
+if [ "$ACCOUNT_SPECIFIED" != true ]; then
+    if [ -d "$PRIMARY_DIR" ] && [ -d "$SECOND_DIR" ]; then
+        echo "ERROR: both bridge accounts are configured; choose --account 0, 1, or all." >&2
+        echo "Nothing was stopped or deleted." >&2
+        exit 2
+    elif [ -d "$PRIMARY_DIR" ]; then
+        ACCOUNT=0
+    elif [ -d "$SECOND_DIR" ]; then
+        ACCOUNT=1
+    fi
+fi
+
 case "$ACCOUNT" in
-    0) DIRS=("$PRIMARY_DIR"); BRIDGES=("sh-imessage") ;;
-    1) DIRS=("$SECOND_DIR"); BRIDGES=("sh-imessage1") ;;
-    all) DIRS=("$PRIMARY_DIR" "$SECOND_DIR"); BRIDGES=("sh-imessage" "sh-imessage1") ;;
+    0) DIRS=("$PRIMARY_DIR"); BRIDGES=("sh-imessage"); ACCOUNT_IDS=(0) ;;
+    1) DIRS=("$SECOND_DIR"); BRIDGES=("sh-imessage1"); ACCOUNT_IDS=(1) ;;
+    all) DIRS=("$PRIMARY_DIR" "$SECOND_DIR"); BRIDGES=("sh-imessage" "sh-imessage1"); ACCOUNT_IDS=(0 1) ;;
     *) echo "ERROR: --account must be 0, 1, or all" >&2; exit 2 ;;
 esac
 
@@ -122,10 +150,12 @@ fi
 
 SELECTED=()
 SELECTED_BRIDGES=()
+SELECTED_ACCOUNT_IDS=()
 for i in "${!DIRS[@]}"; do
     if [ -d "${DIRS[$i]}" ]; then
         SELECTED+=("${DIRS[$i]}")
         SELECTED_BRIDGES+=("${BRIDGES[$i]}")
+        SELECTED_ACCOUNT_IDS+=("${ACCOUNT_IDS[$i]}")
     fi
 done
 
@@ -178,12 +208,62 @@ for dir in "${SELECTED[@]}"; do
     DB_PATHS+=("$db_path")
 done
 
-if [ "$DELETE_REMOTE" = true ]; then
-    for dir in "${SELECTED[@]}"; do
-        config="$dir/config.yaml"
-        if [ ! -f "$config" ] || ! grep -Eqi "^[[:space:]]+domain:[[:space:]]+['\"]?beeper\\.com['\"]?([[:space:]]|$)" "$config"; then
-            echo "ERROR: --delete-remote is only available for a selected Beeper account" >&2
-            echo "with an identifiable local config. Nothing was stopped or deleted." >&2
+# BEGIN RESET REMOTE POLICY HELPER
+classify_remote_policy() {
+    local dir="$1"
+    local keep_remote="$2"
+    local config="$dir/config.yaml"
+    local kind
+    if [ "$keep_remote" = true ]; then
+        printf 'local-only'
+        return
+    fi
+    if [ ! -f "$config" ]; then
+        printf 'unknown'
+        return
+    fi
+    if ! kind=$("$BINARY" reset-config-kind "$config" 2>/dev/null); then
+        printf 'unknown'
+    else
+        case "$kind" in
+            beeper|self-hosted) printf '%s' "$kind" ;;
+            *) printf 'unknown' ;;
+        esac
+    fi
+}
+# END RESET REMOTE POLICY HELPER
+
+# A normal Beeper reset rebuilds the registration as well as the local DB.
+# Self-hosted configs are deliberately local-only because bbctl cannot manage
+# their rooms or appservice registration.
+SELECTED_DELETE_REMOTE=()
+SELECTED_REMOTE_POLICY=()
+for i in "${!SELECTED[@]}"; do
+    dir="${SELECTED[$i]}"
+    policy=$(classify_remote_policy "$dir" "$KEEP_REMOTE")
+    SELECTED_REMOTE_POLICY+=("$policy")
+    case "$policy" in
+        beeper)
+            SELECTED_DELETE_REMOTE+=(true)
+            DELETE_REMOTE=true
+            ;;
+        self-hosted|local-only)
+            SELECTED_DELETE_REMOTE+=(false)
+            ;;
+        *)
+            echo "ERROR: cannot determine whether account ${SELECTED_ACCOUNT_IDS[$i]} is Beeper or self-hosted" >&2
+            echo "from $dir/config.yaml. Nothing was stopped or deleted." >&2
+            echo "Repair the config, or use --local-only to explicitly keep remote state." >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$FORCE_DELETE_REMOTE" = true ]; then
+    for i in "${!SELECTED_REMOTE_POLICY[@]}"; do
+        if [ "${SELECTED_REMOTE_POLICY[$i]}" != beeper ]; then
+            echo "ERROR: --delete-remote requires every selected account to be Beeper;" >&2
+            echo "account ${SELECTED_ACCOUNT_IDS[$i]} is ${SELECTED_REMOTE_POLICY[$i]}. Nothing was stopped or deleted." >&2
             exit 1
         fi
     done
@@ -206,34 +286,48 @@ if [ "$EXTERNAL_DB_CLEARED" != true ]; then
     done
 fi
 
+# Verify Beeper credentials and connectivity before confirmations or stopping
+# the bridge. The strict delete still runs after the daemon has stopped.
+if [ "$DELETE_REMOTE" = true ]; then
+    if ! "$BINARY" bbctl whoami >/dev/null 2>&1; then
+        echo "ERROR: could not list Beeper registrations. Nothing was stopped or deleted." >&2
+        echo "Resolve Beeper authentication/network access and retry." >&2
+        exit 1
+    fi
+fi
+
 echo ""
-echo "DANGER: this will stop the bridge and permanently delete its database and logs:"
-for dir in "${SELECTED[@]}"; do
-    echo "  - $dir"
+echo "DANGER: this will stop the bridge. Planned actions:"
+for i in "${!SELECTED[@]}"; do
+    echo ""
+    echo "  Account ${SELECTED_ACCOUNT_IDS[$i]}: ${SELECTED[$i]}"
+    echo "    - DELETE local bridge database (including portal/backfill mappings) and logs"
+    case "${SELECTED_REMOTE_POLICY[$i]}" in
+        beeper)
+            echo "    - DELETE Beeper bridge registration; its Matrix rooms may also be removed"
+            echo "    - DELETE stale local bridge config so setup-beeper can regenerate it"
+            ;;
+        local-only)
+            echo "    - KEEP remote bridge registration, Matrix rooms, and local config (--local-only)"
+            ;;
+        self-hosted)
+            echo "    - KEEP self-hosted remote state and local config (automatic cleanup unavailable)"
+            ;;
+    esac
+    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
+        echo "    - DELETE Apple/iMessage login, cryptographic keys, and session state"
+    else
+        echo "    - KEEP Apple/iMessage login, cryptographic keys, and session state"
+    fi
 done
-echo ""
-echo "This removes the bridge database (including backfill/portal mappings) and logs."
-echo "Bridge configuration will be preserved."
+if [ "$DELETE_REMOTE" = true ]; then
+    echo ""
+    echo "Deleting a Beeper registration may remove ALL Matrix rooms owned by it,"
+    echo "not only duplicate DMs. This cannot be undone by restoring local files."
+fi
 if [ "$DELETE_IMESSAGE_STATE" = true ]; then
     echo ""
-    echo "IMESSAGE STATE DELETION REQUESTED: Apple/iMessage login, cryptographic"
-    echo "keys, trusted-peers data, and session state will also be deleted. A fresh"
-    echo "Apple login will be required, and Apple may treat it as a new device."
-else
-    echo "Apple/iMessage login, cryptographic keys, trusted-peers data, and session"
-    echo "state will be preserved so setup can restore the existing Apple session."
-fi
-echo ""
-if [ "$DELETE_REMOTE" = true ]; then
-    echo "REMOTE DELETION REQUESTED: the selected Beeper registration(s) will also"
-    echo "be deleted. This may remove ALL Matrix rooms owned by those registrations,"
-    echo "not only duplicate DMs. This cannot be undone by restoring local files."
-    echo "After remote deletion succeeds, its now-stale local config will be removed"
-    echo "so setup can create a new registration. Apple/iMessage state is independent."
-else
-    echo "Matrix rooms and Beeper registrations will NOT be deleted. Old rooms will"
-    echo "remain in Matrix, and newly rebuilt canonical rooms may coexist with them."
-    echo "Verify the rebuilt rooms before manually leaving or archiving old duplicates."
+    echo "Apple state deletion requires a fresh login and may appear as a new device."
 fi
 echo ""
 read -r -p "Type RESET BRIDGE DATA to continue: " CONFIRM_LOCAL
@@ -253,8 +347,8 @@ fi
 
 if [ "$DELETE_REMOTE" = true ]; then
     echo ""
-    read -r -p "Type DELETE MATRIX ROOMS to confirm remote deletion: " CONFIRM_REMOTE
-    if [ "$CONFIRM_REMOTE" != "DELETE MATRIX ROOMS" ]; then
+    read -r -p "Type DELETE BEEPER BRIDGE to confirm Beeper deletion: " CONFIRM_REMOTE
+    if [ "$CONFIRM_REMOTE" != "DELETE BEEPER BRIDGE" ]; then
         echo "Reset cancelled; nothing was changed."
         exit 1
     fi
@@ -330,21 +424,14 @@ fi
 
 if [ "$DELETE_REMOTE" = true ]; then
     echo ""
-    if ! remote_listing=$("$BINARY" bbctl whoami 2>&1); then
-        echo "ERROR: could not list Beeper registrations; local state was NOT deleted." >&2
-        echo "The bridge remains stopped. Resolve Beeper authentication/network access and retry." >&2
-        exit 1
-    fi
-    for bridge in "${SELECTED_BRIDGES[@]}"; do
-        if ! printf '%s\n' "$remote_listing" | grep -Eq "^[[:space:]]*$bridge([[:space:]]|$)"; then
-            echo "Beeper registration '$bridge' is already absent; continuing."
-            continue
-        fi
-        echo "Deleting Beeper registration '$bridge'..."
+    for i in "${!SELECTED_BRIDGES[@]}"; do
+        [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
+        bridge="${SELECTED_BRIDGES[$i]}"
+        echo "Converging Beeper registration '$bridge' to deleted state..."
         if ! "$BINARY" bbctl delete "$bridge"; then
             echo "ERROR: remote deletion failed; local state was NOT deleted." >&2
             echo "An earlier selected registration may already have been deleted." >&2
-            echo "The bridge remains stopped. Resolve the error or run reset again without --delete-remote." >&2
+            echo "The bridge remains stopped. Resolve the error or run reset again with --local-only." >&2
             exit 1
         fi
     done
@@ -393,25 +480,34 @@ delete_local_bridge_data() {
 for i in "${!SELECTED[@]}"; do
     dir="${SELECTED[$i]}"
     db_path="${DB_PATHS[$i]}"
-    delete_local_bridge_data "$dir" "$db_path" "$DELETE_REMOTE" "$DELETE_IMESSAGE_STATE"
+    delete_local_bridge_data "$dir" "$db_path" "${SELECTED_DELETE_REMOTE[$i]}" "$DELETE_IMESSAGE_STATE"
 done
 
 echo ""
 echo "Bridge reset complete."
-if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-    echo "Apple/iMessage login and session state were deleted as requested."
-else
-    echo "Apple/iMessage login and session state were preserved."
-fi
-if [ "$DELETE_REMOTE" = true ]; then
-    echo "Remote Beeper registration deletion was requested and completed."
-else
-    echo "Remote Matrix rooms and bridge registrations were left untouched."
-fi
-if [ "$DELETE_REMOTE" = true ]; then
-    echo "Run the matching setup-beeper command to create a new registration."
-elif [ "$DELETE_IMESSAGE_STATE" = true ]; then
-    echo "Run corten-matrix login for each reset account, then start the bridge."
-else
+for i in "${!SELECTED[@]}"; do
+    echo ""
+    echo "Account ${SELECTED_ACCOUNT_IDS[$i]}: local database and logs deleted."
+    if [ "${SELECTED_DELETE_REMOTE[$i]}" = true ]; then
+        echo "  Beeper registration deletion completed; local config removed."
+        if [ "${SELECTED_ACCOUNT_IDS[$i]}" = 1 ]; then
+            echo "  Next: run corten-matrix setup-beeper 1."
+        else
+            echo "  Next: run corten-matrix setup-beeper."
+        fi
+    else
+        echo "  Remote state and local config preserved."
+    fi
+    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
+        echo "  Apple/iMessage login and session state deleted as requested."
+    else
+        echo "  Apple/iMessage login and session state preserved."
+    fi
+done
+if [ "$DELETE_REMOTE" != true ] && [ "$DELETE_IMESSAGE_STATE" != true ]; then
+    echo ""
     echo "Configuration and Apple/iMessage state are ready; run corten-matrix start."
+elif [ "$DELETE_IMESSAGE_STATE" = true ]; then
+    echo ""
+    echo "Complete Apple login for each reset account before starting the bridge."
 fi
