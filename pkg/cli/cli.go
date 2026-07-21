@@ -692,7 +692,7 @@ func PrintHelp() {
 		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
-		{"reset [options]", "explicitly reset local state (remote cleanup is opt-in)"},
+		{"reset [options]", "reset bridge database/logs (iMessage state and remote cleanup are opt-in)"},
 		{"uninstall", "remove the service"},
 		{"login", "re-run the iMessage login flow"},
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
