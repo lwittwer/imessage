@@ -231,23 +231,17 @@ func (c *IMClient) getContactChatGUIDs(portalID string) []string {
 
 // contactKeyFromContact returns a stable identity key for grouping a contact's
 // DM entries during initial sync deduplication. Returns "" if no merging is
-// needed (single phone, no name, etc.).
+// needed (single handle, no name, etc.).
 func contactKeyFromContact(contact *imessage.Contact) string {
 	if contact == nil || !contact.HasName() {
 		return ""
 	}
-	phones := make([]string, 0, len(contact.Phones))
-	for _, p := range contact.Phones {
-		n := normalizePhoneForPortalID(p)
-		if n != "" {
-			phones = append(phones, n)
-		}
-	}
-	if len(phones) <= 1 {
+	portalIDs := contactPortalIDs(contact)
+	if len(portalIDs) <= 1 {
 		return ""
 	}
-	sort.Strings(phones)
-	return strings.Join(phones, "|")
+	sort.Strings(portalIDs)
+	return strings.Join(portalIDs, "|")
 }
 
 // contactPortalIDs returns all portal ID strings for a contact's phone numbers
@@ -287,6 +281,80 @@ func contactPortalIDs(contact *imessage.Contact) []string {
 	return ids
 }
 
+// preferredContactPortalIDs returns all of a contact's handles in stable
+// canonical order: phone numbers first, then emails, with each kind sorted.
+func preferredContactPortalIDs(contact *imessage.Contact) []string {
+	ids := contactPortalIDs(contact)
+	sort.Slice(ids, func(i, j int) bool {
+		iPhone := strings.HasPrefix(ids[i], "tel:")
+		jPhone := strings.HasPrefix(ids[j], "tel:")
+		if iPhone != jPhone {
+			return iPhone
+		}
+		return ids[i] < ids[j]
+	})
+	return ids
+}
+
+// canonicalizeChatDBInitialSyncDMPortalIDs maps each multi-handle contact to
+// one portal ID and marks duplicate chat.db entries to skip. Existing Matrix
+// rooms win so upgrades keep their current portal identity; new contacts use a
+// deterministic phone-preferred handle. The first input for a contact is kept
+// as the representative because chat.db returns chats in activity order.
+func canonicalizeChatDBInitialSyncDMPortalIDs(
+	portalIDs []string,
+	lookupContact func(string) *imessage.Contact,
+	hasExistingRoom func(string) bool,
+) (canonical []string, skip map[int]bool) {
+	canonical = append([]string(nil), portalIDs...)
+	skip = make(map[int]bool)
+
+	type contactGroup struct {
+		contact *imessage.Contact
+		indices []int
+	}
+	groups := make(map[string]*contactGroup)
+	for i, portalID := range portalIDs {
+		if strings.Contains(portalID, ",") || strings.HasPrefix(portalID, "gid:") {
+			continue
+		}
+		contact := lookupContact(portalID)
+		key := contactKeyFromContact(contact)
+		if key == "" {
+			continue
+		}
+		if group, ok := groups[key]; ok {
+			group.indices = append(group.indices, i)
+		} else {
+			groups[key] = &contactGroup{contact: contact, indices: []int{i}}
+		}
+	}
+
+	for _, group := range groups {
+		candidates := preferredContactPortalIDs(group.contact)
+		if len(candidates) == 0 {
+			continue
+		}
+		chosen := candidates[0]
+		if hasExistingRoom != nil {
+			for _, candidate := range candidates {
+				if hasExistingRoom(candidate) {
+					chosen = candidate
+					break
+				}
+			}
+		}
+
+		for position, idx := range group.indices {
+			canonical[idx] = chosen
+			if position > 0 {
+				skip[idx] = true
+			}
+		}
+	}
+	return canonical, skip
+}
+
 // normalizePhoneForPortalID converts a phone number to E.164-like format.
 func normalizePhoneForPortalID(phone string) string {
 	n := normalizePhone(phone)
@@ -314,15 +382,9 @@ func (c *IMClient) canonicalContactHandle(identifier string) string {
 	if contact == nil || !contact.HasName() {
 		return identifier
 	}
-	altIDs := contactPortalIDs(contact)
+	altIDs := preferredContactPortalIDs(contact)
 	if len(altIDs) <= 1 {
 		return identifier
-	}
-	sort.Strings(altIDs)
-	for _, id := range altIDs {
-		if strings.HasPrefix(id, "tel:") {
-			return id
-		}
 	}
 	return altIDs[0]
 }

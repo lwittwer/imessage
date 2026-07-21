@@ -12565,42 +12565,46 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		})
 	}
 
-	// Deduplicate DM entries for contacts with multiple phone numbers.
+	// Canonicalize and deduplicate DM entries for contacts with multiple
+	// phone/email handles. Preserve an existing room's portal ID on upgrades;
+	// otherwise use the deterministic phone-preferred contact handle.
 	{
-		type contactGroup struct {
-			indices []int
-		}
-		groups := make(map[string]*contactGroup)
+		portalIDs := make([]string, len(entries))
 		for i, entry := range entries {
-			portalID := string(entry.portalKey.ID)
-			if strings.Contains(portalID, ",") {
-				continue
-			}
-			contact := c.lookupContact(portalID)
-			key := contactKeyFromContact(contact)
-			if key == "" {
-				continue
-			}
-			if g, ok := groups[key]; ok {
-				g.indices = append(g.indices, i)
-			} else {
-				groups[key] = &contactGroup{indices: []int{i}}
-			}
+			portalIDs[i] = string(entry.portalKey.ID)
 		}
 
-		skip := make(map[int]bool)
-		for _, group := range groups {
-			if len(group.indices) <= 1 {
-				continue
+		existingRoomCache := make(map[string]bool)
+		checkedExistingRoom := make(map[string]bool)
+		hasExistingRoom := func(portalID string) bool {
+			if checkedExistingRoom[portalID] {
+				return existingRoomCache[portalID]
 			}
-			primaryIdx := group.indices[0]
-			for _, idx := range group.indices[1:] {
-				skip[idx] = true
+			checkedExistingRoom[portalID] = true
+			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       networkid.PortalID(portalID),
+				Receiver: c.UserLogin.ID,
+			})
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).
+					Msg("Failed to check existing contact portal during initial sync")
+				return false
+			}
+			exists := portal != nil && portal.MXID != ""
+			existingRoomCache[portalID] = exists
+			return exists
+		}
+
+		canonicalIDs, skip := canonicalizeChatDBInitialSyncDMPortalIDs(portalIDs, c.lookupContact, hasExistingRoom)
+		for i := range entries {
+			if canonicalIDs[i] != portalIDs[i] {
 				log.Info().
-					Str("skip_portal", string(entries[idx].portalKey.ID)).
-					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
-					Msg("Merging DM portal for contact with multiple phone numbers")
+					Str("original_portal", portalIDs[i]).
+					Str("canonical_portal", canonicalIDs[i]).
+					Bool("duplicate", skip[i]).
+					Msg("Canonicalized chat.db DM portal by contact aliases")
 			}
+			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
 		}
 
 		if len(skip) > 0 {
@@ -12610,8 +12614,17 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 					merged = append(merged, entry)
 				}
 			}
-			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
 			entries = merged
+		}
+
+		// updatePortalSMS originally records the raw chat.db alias above. Also
+		// record the canonical portal so live routing agrees with the room that
+		// initial sync creates.
+		for _, entry := range entries {
+			if entry.isSms {
+				c.updatePortalSMS(string(entry.portalKey.ID), true)
+			}
 		}
 	}
 
@@ -12628,7 +12641,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	synced := 0
 	for _, entry := range entries {
 		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
 		chatGUID := entry.chatGUID
 		isSms := entry.isSms
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
@@ -12692,8 +12705,10 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		Msg("Initial sync complete")
 }
 
-// chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+// chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo. For
+// DMs, portalID is the canonical contact handle selected by initial sync and
+// must also be used as OtherUserID so the room and ghost identities agree.
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networkid.PortalID) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
@@ -12736,9 +12751,12 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
-		otherUser := makeUserID(portalID)
-		isSelfChat := c.isMyHandle(portalID)
+		canonicalPortalID := string(portalID)
+		if canonicalPortalID == "" {
+			canonicalPortalID = addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
+		}
+		otherUser := makeUserID(canonicalPortalID)
+		isSelfChat := c.isMyHandle(canonicalPortalID)
 
 		memberMap := map[networkid.UserID]bridgev2.ChatMember{
 			makeUserID(c.handle): {
@@ -12772,17 +12790,17 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		// framework, which blocks UpdateInfoFromGhost (it returns early when
 		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
-			selfName := c.resolveContactDisplayname(portalID)
+			selfName := c.resolveContactDisplayname(canonicalPortalID)
 			chatInfo.Name = &selfName
 
 			// Pull contact photo for self-chat room avatar.
-			localID := stripIdentifierPrefix(portalID)
+			localID := stripIdentifierPrefix(canonicalPortalID)
 			if c.contacts != nil {
 				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
 					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{
-						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", canonicalPortalID, hex.EncodeToString(avatarHash[:8]))),
 						Get: func(ctx context.Context) ([]byte, error) {
 							return avatarData, nil
 						},
