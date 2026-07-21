@@ -5,7 +5,7 @@
 // setup-beeper, start, stop, restart, status, logs, bbctl, reset, uninstall.
 //
 // Design:
-//   - setup / setup-beeper / reset run the project's existing shell scripts,
+//   - setup / setup-beeper / reset run the project's embedded shell scripts,
 //     embedded into the binary (so behaviour matches what users know today).
 //   - start / stop / restart / status / logs / bbctl are handled natively
 //     (launchd on macOS, systemd --user on Linux).
@@ -671,7 +671,7 @@ func PrintHelp() {
 		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
-		{"reset", "reset bridge state"},
+		{"reset [options]", "explicitly reset local state (remote cleanup is opt-in)"},
 		{"uninstall", "remove the service"},
 		{"login", "re-run the iMessage login flow"},
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
@@ -715,10 +715,9 @@ func RunManagement(cmd string, args []string) {
 		}
 		runSetup(true)
 	case "reset":
-		if runtime.GOOS == "darwin" {
-			runEmbeddedScript("reset-bridge.sh", cortenBundleID)
-		}
-		runEmbeddedScript("reset-bridge.sh")
+		runEmbeddedScript("reset-bridge.sh", append([]string{
+			selfPath(), cortenDataDir(), secondDataDir(), cortenBundleID,
+		}, args...)...)
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":
