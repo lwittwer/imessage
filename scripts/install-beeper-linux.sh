@@ -123,8 +123,8 @@ echo "✓ Logged in: $WHOAMI"
 
 # ── Check for existing bridge registration ────────────────────
 # Re-fetch an existing registration when local config is missing (for example,
-# after a local-only reset). Never delete it implicitly: registration deletion
-# may remove remote Matrix rooms and requires a separate reset confirmation.
+# after a local-only reset). Setup never deletes it implicitly: registration
+# deletion may remove remote Matrix rooms and requires reset confirmation.
 EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
 if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
