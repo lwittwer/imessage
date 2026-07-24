@@ -17,6 +17,7 @@ import (
 const (
 	deleteVerificationAttempts = 10
 	deleteVerificationInterval = 3 * time.Second
+	deleteVerificationTimeout  = time.Minute
 )
 
 type appServiceDeleteClient interface {
@@ -78,23 +79,26 @@ func deleteBridgeAndVerify(ctx context.Context, bridge, accessToken string, deps
 		return fmt.Errorf("failed to delete bridge from Beeper API: %w", err)
 	}
 
+	verificationCtx, cancelVerification := context.WithTimeout(ctx, deleteVerificationTimeout)
+	defer cancelVerification()
+
 	var lastErr error
 	for attempt := 0; attempt < deleteVerificationAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("bridge deletion verification cancelled: %w", err)
+		if err := verificationCtx.Err(); err != nil {
+			return deleteVerificationContextError(err)
 		}
 
-		appserviceAbsent, err := isAppServiceAbsent(ctx, bridge, deps.appservices)
+		appserviceAbsent, err := isAppServiceAbsent(verificationCtx, bridge, deps.appservices)
 		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return fmt.Errorf("bridge deletion verification cancelled: %w", ctxErr)
+			if ctxErr := verificationCtx.Err(); ctxErr != nil {
+				return deleteVerificationContextError(ctxErr)
 			}
 			lastErr = fmt.Errorf("failed to verify appservice deletion: %w", err)
 		} else {
-			bridgeAbsent, err := isBridgeAbsent(bridge, accessToken, deps.whoami)
+			bridgeAbsent, err := isBridgeAbsent(verificationCtx, bridge, accessToken, deps.whoami)
 			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return fmt.Errorf("bridge deletion verification cancelled: %w", ctxErr)
+				if ctxErr := verificationCtx.Err(); ctxErr != nil {
+					return deleteVerificationContextError(ctxErr)
 				}
 				lastErr = fmt.Errorf("failed to verify Beeper bridge deletion: %w", err)
 			} else {
@@ -106,7 +110,10 @@ func deleteBridgeAndVerify(ctx context.Context, bridge, accessToken string, deps
 		}
 
 		if attempt+1 < deleteVerificationAttempts {
-			if err = deps.wait(ctx, deleteVerificationInterval); err != nil {
+			if err = deps.wait(verificationCtx, deleteVerificationInterval); err != nil {
+				if ctxErr := verificationCtx.Err(); ctxErr != nil {
+					return deleteVerificationContextError(ctxErr)
+				}
 				return fmt.Errorf("bridge deletion verification interrupted: %w", err)
 			}
 		}
@@ -125,19 +132,48 @@ func isAppServiceAbsent(ctx context.Context, bridge string, client appServiceDel
 	return false, err
 }
 
-func isBridgeAbsent(bridge, accessToken string, whoami func(string, string) (*beeperapi.RespWhoami, error)) (bool, error) {
-	resp, err := whoami(baseDomain, accessToken)
-	if err != nil {
-		return false, err
+func isBridgeAbsent(
+	ctx context.Context,
+	bridge,
+	accessToken string,
+	whoami func(string, string) (*beeperapi.RespWhoami, error),
+) (bool, error) {
+	type result struct {
+		response *beeperapi.RespWhoami
+		err      error
 	}
-	if resp == nil {
-		return false, errors.New("Beeper API returned an empty whoami response")
+	// bridge-manager's Whoami helper does not accept a context. Run it
+	// asynchronously so the verification deadline can still stop the caller;
+	// the buffered channel lets the request finish without leaking a sender.
+	resultChan := make(chan result, 1)
+	go func() {
+		response, err := whoami(baseDomain, accessToken)
+		resultChan <- result{response: response, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case result := <-resultChan:
+		if result.err != nil {
+			return false, result.err
+		}
+		if result.response == nil {
+			return false, errors.New("Beeper API returned an empty whoami response")
+		}
+		if result.response.User.Bridges == nil {
+			return false, errors.New("Beeper API returned whoami without a bridges map")
+		}
+		_, present := result.response.User.Bridges[bridge]
+		return !present, nil
 	}
-	if resp.User.Bridges == nil {
-		return false, errors.New("Beeper API returned whoami without a bridges map")
+}
+
+func deleteVerificationContextError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("bridge deletion verification timed out: %w", err)
 	}
-	_, present := resp.User.Bridges[bridge]
-	return !present, nil
+	return fmt.Errorf("bridge deletion verification cancelled: %w", err)
 }
 
 func waitForDeleteVerification(ctx context.Context, duration time.Duration) error {
