@@ -86,17 +86,25 @@ func deleteBridgeAndVerify(ctx context.Context, bridge, accessToken string, deps
 
 		appserviceAbsent, err := isAppServiceAbsent(ctx, bridge, deps.appservices)
 		if err != nil {
-			return fmt.Errorf("failed to verify appservice deletion: %w", err)
-		}
-		bridgeAbsent, err := isBridgeAbsent(bridge, accessToken, deps.whoami)
-		if err != nil {
-			return fmt.Errorf("failed to verify Beeper bridge deletion: %w", err)
-		}
-		if appserviceAbsent && bridgeAbsent {
-			return nil
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("bridge deletion verification cancelled: %w", ctxErr)
+			}
+			lastErr = fmt.Errorf("failed to verify appservice deletion: %w", err)
+		} else {
+			bridgeAbsent, err := isBridgeAbsent(bridge, accessToken, deps.whoami)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("bridge deletion verification cancelled: %w", ctxErr)
+				}
+				lastErr = fmt.Errorf("failed to verify Beeper bridge deletion: %w", err)
+			} else {
+				if appserviceAbsent && bridgeAbsent {
+					return nil
+				}
+				lastErr = fmt.Errorf("server still reports appservice present=%t, bridge present=%t", !appserviceAbsent, !bridgeAbsent)
+			}
 		}
 
-		lastErr = fmt.Errorf("server still reports appservice present=%t, bridge present=%t", !appserviceAbsent, !bridgeAbsent)
 		if attempt+1 < deleteVerificationAttempts {
 			if err = deps.wait(ctx, deleteVerificationInterval); err != nil {
 				return fmt.Errorf("bridge deletion verification interrupted: %w", err)

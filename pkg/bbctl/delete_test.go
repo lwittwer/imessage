@@ -221,32 +221,93 @@ func TestDeleteBridgeAndVerifyFailsWhenPostconditionNeverConverges(t *testing.T)
 	}
 }
 
-func TestDeleteBridgeAndVerifyFailsClosedOnVerificationError(t *testing.T) {
-	appservices := &fakeAppServiceDeleteClient{getErrs: []error{errors.New("verification unavailable")}}
+func TestDeleteBridgeAndVerifyRetriesAppServiceVerificationError(t *testing.T) {
+	notFound := fakeHTTPStatusError{status: http.StatusNotFound}
+	appservices := &fakeAppServiceDeleteClient{getErrs: []error{
+		errors.New("verification unavailable"),
+		notFound,
+	}}
+	waits := 0
+	err := deleteBridgeAndVerify(context.Background(), "sh-imessage", "token", bridgeDeleteDependencies{
+		appservices:  appservices,
+		deleteBridge: func(string, string, string) error { return nil },
+		whoami:       absentWhoami,
+		wait: func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("eventually confirmed deletion returned error: %v", err)
+	}
+	if appservices.getCalls != 2 || waits != 1 {
+		t.Fatalf("unexpected verification calls: appservice=%d waits=%d", appservices.getCalls, waits)
+	}
+}
+
+func TestDeleteBridgeAndVerifyRetriesWhoamiVerificationError(t *testing.T) {
+	notFound := fakeHTTPStatusError{status: http.StatusNotFound}
+	appservices := &fakeAppServiceDeleteClient{getErrs: []error{notFound}}
+	whoamiCalls := 0
+	err := deleteBridgeAndVerify(context.Background(), "sh-imessage", "token", bridgeDeleteDependencies{
+		appservices:  appservices,
+		deleteBridge: func(string, string, string) error { return nil },
+		whoami: func(string, string) (*beeperapi.RespWhoami, error) {
+			whoamiCalls++
+			if whoamiCalls == 1 {
+				return nil, errors.New("whoami unavailable")
+			}
+			return absentWhoami("", "")
+		},
+		wait: noWait,
+	})
+	if err != nil {
+		t.Fatalf("eventually confirmed deletion returned error: %v", err)
+	}
+	if appservices.getCalls != 2 || whoamiCalls != 2 {
+		t.Fatalf("unexpected verification calls: appservice=%d whoami=%d", appservices.getCalls, whoamiCalls)
+	}
+}
+
+func TestDeleteBridgeAndVerifyPreservesFinalVerificationError(t *testing.T) {
+	verificationErr := errors.New("verification unavailable")
+	appservices := &fakeAppServiceDeleteClient{getErrs: []error{verificationErr}}
 	err := deleteBridgeAndVerify(context.Background(), "sh-imessage", "token", bridgeDeleteDependencies{
 		appservices:  appservices,
 		deleteBridge: func(string, string, string) error { return nil },
 		whoami:       absentWhoami,
 		wait:         noWait,
 	})
-	if err == nil || !strings.Contains(err.Error(), "failed to verify appservice deletion") {
-		t.Fatalf("expected verification error, got %v", err)
+	if err == nil || !errors.Is(err, verificationErr) {
+		t.Fatalf("expected final verification error to be preserved, got %v", err)
+	}
+	if appservices.getCalls != deleteVerificationAttempts {
+		t.Fatalf("got %d verification attempts, want %d", appservices.getCalls, deleteVerificationAttempts)
 	}
 }
 
-func TestDeleteBridgeAndVerifyFailsClosedOnWhoamiError(t *testing.T) {
+func TestDeleteBridgeAndVerifyStopsWhenContextIsCancelledDuringVerification(t *testing.T) {
 	notFound := fakeHTTPStatusError{status: http.StatusNotFound}
 	appservices := &fakeAppServiceDeleteClient{getErrs: []error{notFound}}
-	err := deleteBridgeAndVerify(context.Background(), "sh-imessage", "token", bridgeDeleteDependencies{
+	ctx, cancel := context.WithCancel(context.Background())
+	waits := 0
+	err := deleteBridgeAndVerify(ctx, "sh-imessage", "token", bridgeDeleteDependencies{
 		appservices:  appservices,
 		deleteBridge: func(string, string, string) error { return nil },
 		whoami: func(string, string) (*beeperapi.RespWhoami, error) {
-			return nil, errors.New("whoami unavailable")
+			cancel()
+			return nil, errors.New("whoami interrupted")
 		},
-		wait: noWait,
+		wait: func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "failed to verify Beeper bridge deletion") {
-		t.Fatalf("expected whoami verification error, got %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	if appservices.getCalls != 1 || waits != 0 {
+		t.Fatalf("unexpected verification calls: appservice=%d waits=%d", appservices.getCalls, waits)
 	}
 }
 
