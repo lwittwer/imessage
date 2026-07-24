@@ -185,6 +185,40 @@ func updatePortalChatDBGUIDMetadata(
 	return true, nil
 }
 
+// updateInitialSyncPortalMetadata persists the exact GUID bundle together with
+// the retained chat's SMS routing state. The bundle already supplies the
+// in-flight forward fetch, so this explicit post-handler save can roll back on
+// failure instead of relying on bridgev2 ChatInfo.ExtraUpdates, whose save
+// errors are not returned to the connector.
+func updateInitialSyncPortalMetadata(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	isSms bool,
+	smsDestination string,
+	chatGUIDs []string,
+	save func(context.Context, *bridgev2.Portal) error,
+) (bool, error) {
+	oldMetadata := portal.Metadata
+	refreshed, changed := initialSyncPortalMetadata(oldMetadata, isSms, smsDestination)
+	updatedGUIDs := appendUniqueStrings(refreshed.ChatDBGUIDs, chatGUIDs...)
+	if !stringSlicesEqual(refreshed.ChatDBGUIDs, updatedGUIDs) {
+		refreshed.ChatDBGUIDs = append([]string(nil), updatedGUIDs...)
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+
+	portal.Metadata = refreshed
+	if save != nil {
+		if err := save(ctx, portal); err != nil {
+			portal.Metadata = oldMetadata
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 func applyChatDBGUIDMetadataRefresh(
 	ctx context.Context,
 	assignments map[string][]string,

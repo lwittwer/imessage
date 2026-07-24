@@ -12737,9 +12737,10 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		Msg("Initial sync: processing chats sequentially (oldest activity first)")
 
 	synced := 0
+	metadataComplete := true
 	for _, entry := range entries {
-		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID, entry.isSms, entry.chatGUIDs...)
+		done := make(chan error, 1)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
 		chatGUIDs := append([]string(nil), entry.chatGUIDs...)
 		isSms := entry.isSms
 		smsDestination := entry.smsDestination
@@ -12749,17 +12750,23 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					meta, changed := initialSyncPortalMetadata(portal.Metadata, isSms, smsDestination)
-					if changed {
-						portal.Metadata = meta
-						if err := portal.Save(ctx); err != nil {
-							zerolog.Ctx(ctx).Warn().Err(err).
-								Str("portal_id", logSafeHandle(string(portal.ID))).
-								Bool("is_sms", isSms).
-								Msg("Failed to persist SMS routing metadata during initial sync")
-						}
+					_, err := updateInitialSyncPortalMetadata(
+						ctx,
+						portal,
+						isSms,
+						smsDestination,
+						chatGUIDs,
+						func(ctx context.Context, portal *bridgev2.Portal) error {
+							return portal.Save(ctx)
+						},
+					)
+					if err != nil {
+						zerolog.Ctx(ctx).Warn().Err(err).
+							Str("portal_id", logSafeHandle(string(portal.ID))).
+							Bool("is_sms", isSms).
+							Msg("Failed to persist chat.db initial-sync metadata; will retry on next connect")
 					}
-					close(done)
+					done <- err
 				},
 				LogContext: func(lc zerolog.Context) zerolog.Context {
 					return lc.Strs("chat_guids", chatGUIDs).Str("source", "initial_sync")
@@ -12773,8 +12780,11 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		})
 
 		select {
-		case <-done:
+		case persistErr := <-done:
 			synced++
+			if persistErr != nil {
+				metadataComplete = false
+			}
 			if synced%10 == 0 || synced == len(entries) {
 				log.Info().
 					Int("progress", synced).
@@ -12783,18 +12793,29 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			}
 		case <-time.After(30 * time.Minute):
 			synced++
+			metadataComplete = false
 			log.Warn().
 				Strs("chat_guids", entry.chatGUIDs).
-				Msg("Initial sync: timeout waiting for chat, continuing")
+				Msg("Initial sync: timeout waiting for chat; metadata completion will retry on next connect")
 		case <-c.stopChan:
 			log.Info().Msg("Initial sync stopped")
 			return
 		}
 	}
 
-	meta.ChatsSynced = true
-	if err := c.UserLogin.Save(ctx); err != nil {
-		log.Err(err).Msg("Failed to save metadata after initial sync")
+	completed, err := completeChatDBInitialSync(meta, metadataComplete, func() error {
+		return c.UserLogin.Save(ctx)
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to mark chat.db initial sync complete; will retry on next connect")
+		return
+	}
+	if !completed {
+		log.Warn().
+			Int("synced_chats", synced).
+			Int("total_chats", len(entries)).
+			Msg("Chat.db initial-sync metadata incomplete; leaving initial sync pending for next connect")
+		return
 	}
 	log.Info().
 		Int("synced_chats", synced).
@@ -12802,10 +12823,36 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		Msg("Initial sync complete")
 }
 
+// completeChatDBInitialSync persists the completion bit only after every
+// portal's exact GUID and SMS routing metadata is known to be durable. Leaving
+// ChatsSynced false makes the next connect rerun the activity-ordered initial
+// sync, which reconstructs IsSms and SMSDestination without creating or
+// rekeying portals. A failed user-login save restores the in-memory bit too.
+func completeChatDBInitialSync(
+	meta *UserLoginMetadata,
+	portalMetadataComplete bool,
+	save func() error,
+) (bool, error) {
+	if !portalMetadataComplete {
+		return false, nil
+	}
+	wasSynced := meta.ChatsSynced
+	meta.ChatsSynced = true
+	if save != nil {
+		if err := save(); err != nil {
+			meta.ChatsSynced = wasSynced
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo. For
 // DMs, portalID is the canonical contact handle selected by initial sync and
 // must also be used as OtherUserID so the room and ghost identities agree.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networkid.PortalID, isSms bool, exactChatGUIDs ...string) *bridgev2.ChatInfo {
+// Exact chat.db GUIDs travel in BundledBackfillData for the in-flight fetch and
+// are persisted explicitly by the post-handler so save failures can roll back.
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networkid.PortalID) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
@@ -12813,31 +12860,6 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networ
 
 	chatInfo := &bridgev2.ChatInfo{
 		CanBackfill: true,
-	}
-	exactChatGUIDs = uniqueStrings(exactChatGUIDs)
-	if len(exactChatGUIDs) == 0 && info.JSONChatGUID != "" {
-		exactChatGUIDs = []string{info.JSONChatGUID}
-	}
-	if len(exactChatGUIDs) > 0 {
-		persistedChatGUIDs := append([]string(nil), exactChatGUIDs...)
-		chatInfo.ExtraUpdates = func(_ context.Context, portal *bridgev2.Portal) bool {
-			meta, ok := portal.Metadata.(*PortalMetadata)
-			if !ok || meta == nil {
-				meta = &PortalMetadata{}
-				portal.Metadata = meta
-			}
-			changed := false
-			updatedChatGUIDs := appendUniqueStrings(meta.ChatDBGUIDs, persistedChatGUIDs...)
-			if !stringSlicesEqual(meta.ChatDBGUIDs, updatedChatGUIDs) {
-				meta.ChatDBGUIDs = updatedChatGUIDs
-				changed = true
-			}
-			if meta.IsSms != isSms {
-				meta.IsSms = isSms
-				changed = true
-			}
-			return changed
-		}
 	}
 
 	if parsed.IsGroup {

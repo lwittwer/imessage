@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -394,7 +395,7 @@ func TestChatDBInfoToBridgev2UsesCanonicalDMIdentity(t *testing.T) {
 	info := &imessage.ChatInfo{JSONChatGUID: "iMessage;-;alias@example.com"}
 	canonicalPortalID := networkid.PortalID("tel:+15550000002")
 
-	got := client.chatDBInfoToBridgev2(info, canonicalPortalID, false)
+	got := client.chatDBInfoToBridgev2(info, canonicalPortalID)
 	wantUserID := makeUserID(string(canonicalPortalID))
 	if got.Members == nil {
 		t.Fatal("chatDBInfoToBridgev2 returned no DM members")
@@ -596,66 +597,123 @@ func TestMergeChatDBInitialSyncEntriesKeepsSMSStatePortalScoped(t *testing.T) {
 	}
 }
 
-func TestChatDBInfoToBridgev2PersistsExactGUIDsBeforeBackfill(t *testing.T) {
-	client := &IMClient{
-		handle: "tel:+15559999999",
-		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
-			ID: networkid.UserLoginID("login"),
-		}},
+func TestUpdateInitialSyncPortalMetadataUnionsRetriesAndIsIdempotent(t *testing.T) {
+	oldGUID := "SMS;-;+15550000001(sms)"
+	newGUID := "SMS;-;+15550000001(smsft)"
+	originalMetadata := &PortalMetadata{
+		ThreadID:       "keep",
+		IsSms:          true,
+		SMSDestination: "tel:+15550000001",
+		ChatDBGUIDs:    []string{oldGUID},
 	}
-	tests := []struct {
-		name       string
-		exactGUIDs []string
-		isSms      bool
-	}{
-		{
-			name:  "newer SMS persists current SMS state",
-			isSms: true,
-			exactGUIDs: []string{
-				"SMS;-;+15550000001(smsft)",
-				"iMessage;-;alias@example.com",
-				"SMS;-;+15550000001(smsft)",
-			},
+	portal := &bridgev2.Portal{Portal: &database.Portal{Metadata: originalMetadata}}
+
+	saveCalls := 0
+	changed, err := updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return errors.New("temporary database failure")
 		},
-		{
-			name: "newer iMessage clears historical SMS state",
-			exactGUIDs: []string{
-				"iMessage;-;alias@example.com",
-				"SMS;-;+15550000001(smsft)",
-			},
-		},
+	)
+	if err == nil || changed {
+		t.Fatalf("failed metadata update = changed %v err %v, want false and error", changed, err)
+	}
+	if saveCalls != 1 {
+		t.Fatalf("failed metadata update save calls = %d, want 1", saveCalls)
+	}
+	if portal.Metadata != originalMetadata {
+		t.Fatal("failed metadata update did not restore the original metadata object")
+	}
+	if originalMetadata.ThreadID != "keep" || !originalMetadata.IsSms ||
+		originalMetadata.SMSDestination != "tel:+15550000001" ||
+		!reflect.DeepEqual(originalMetadata.ChatDBGUIDs, []string{oldGUID}) {
+		t.Fatalf("failed metadata update mutated original metadata: %#v", originalMetadata)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			info := &imessage.ChatInfo{JSONChatGUID: tt.exactGUIDs[0]}
-			chatInfo := client.chatDBInfoToBridgev2(info, networkid.PortalID("tel:+15550000001"), tt.isSms, tt.exactGUIDs...)
-			if chatInfo.ExtraUpdates == nil {
-				t.Fatal("chatDBInfoToBridgev2 did not provide exact GUID metadata update")
-			}
-			portal := &bridgev2.Portal{Portal: &database.Portal{Metadata: &PortalMetadata{
-				ThreadID:    "keep",
-				IsSms:       !tt.isSms,
-				ChatDBGUIDs: []string{"SMS;-;+15550000001(sms)"},
-			}}}
-			if changed := chatInfo.ExtraUpdates(context.Background(), portal); !changed {
-				t.Fatal("exact GUID and SMS metadata update reported no change")
-			}
-			meta := portal.Metadata.(*PortalMetadata)
-			want := appendUniqueStrings([]string{"SMS;-;+15550000001(sms)"}, tt.exactGUIDs...)
-			if !reflect.DeepEqual(meta.ChatDBGUIDs, want) {
-				t.Fatalf("persisted exact GUIDs = %#v, want %#v", meta.ChatDBGUIDs, want)
-			}
-			if meta.IsSms != tt.isSms {
-				t.Fatalf("persisted IsSms = %v, want current service %v", meta.IsSms, tt.isSms)
-			}
-			if meta.ThreadID != "keep" {
-				t.Fatalf("metadata update replaced unrelated fields: %#v", meta)
-			}
-			if changed := chatInfo.ExtraUpdates(context.Background(), portal); changed {
-				t.Fatal("unchanged exact GUID and SMS metadata reported a change")
-			}
-		})
+	changed, err = updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return nil
+		},
+	)
+	if err != nil || !changed {
+		t.Fatalf("retry metadata update = changed %v err %v, want true and nil", changed, err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("successful metadata retry lost unrelated fields or retained stale SMS routing: %#v", meta)
+	}
+	if want := []string{oldGUID, newGUID}; !reflect.DeepEqual(meta.ChatDBGUIDs, want) {
+		t.Fatalf("successful metadata retry GUIDs = %#v, want %#v", meta.ChatDBGUIDs, want)
+	}
+
+	changed, err = updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return nil
+		},
+	)
+	if err != nil || changed {
+		t.Fatalf("idempotent metadata update = changed %v err %v, want false and nil", changed, err)
+	}
+	if saveCalls != 2 {
+		t.Fatalf("metadata update save calls = %d, want 2 with idempotent retry unsaved", saveCalls)
+	}
+}
+
+func TestCompleteChatDBInitialSyncRequiresDurablePortalMetadata(t *testing.T) {
+	meta := &UserLoginMetadata{}
+	saveCalls := 0
+
+	completed, err := completeChatDBInitialSync(meta, false, func() error {
+		saveCalls++
+		return nil
+	})
+	if err != nil || completed {
+		t.Fatalf("incomplete portal metadata = completed %v err %v, want false and nil", completed, err)
+	}
+	if meta.ChatsSynced || saveCalls != 0 {
+		t.Fatalf("incomplete portal metadata set completion = %v with %d saves, want false and 0", meta.ChatsSynced, saveCalls)
+	}
+
+	completed, err = completeChatDBInitialSync(meta, true, func() error {
+		saveCalls++
+		return errors.New("temporary user-login save failure")
+	})
+	if err == nil || completed {
+		t.Fatalf("failed completion save = completed %v err %v, want false and error", completed, err)
+	}
+	if meta.ChatsSynced {
+		t.Fatal("failed completion save did not restore ChatsSynced=false")
+	}
+
+	completed, err = completeChatDBInitialSync(meta, true, func() error {
+		saveCalls++
+		return nil
+	})
+	if err != nil || !completed {
+		t.Fatalf("successful completion retry = completed %v err %v, want true and nil", completed, err)
+	}
+	if !meta.ChatsSynced {
+		t.Fatal("successful completion retry did not persist ChatsSynced=true in memory")
+	}
+	if saveCalls != 2 {
+		t.Fatalf("completion save calls = %d, want 2", saveCalls)
 	}
 }
 
@@ -688,7 +746,7 @@ func TestChatDBSelfAliasCanonicalizationPreservesDMIdentity(t *testing.T) {
 	}
 
 	info := &imessage.ChatInfo{JSONChatGUID: "iMessage;-;+15559999999"}
-	chatInfo := client.chatDBInfoToBridgev2(info, networkid.PortalID(portalIDs[0]), false)
+	chatInfo := client.chatDBInfoToBridgev2(info, networkid.PortalID(portalIDs[0]))
 	wantUserID := makeUserID(selfID)
 	if chatInfo.Members.OtherUserID != wantUserID {
 		t.Fatalf("self DM OtherUserID = %q, want %q", chatInfo.Members.OtherUserID, wantUserID)
