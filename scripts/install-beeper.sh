@@ -13,7 +13,15 @@ ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
+RESET_CONFIG_BACKUP="$DATA_DIR/config.reset-backup.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
+
+if [ ! -f "$CONFIG" ] && [ -f "$RESET_CONFIG_BACKUP" ]; then
+    if ! BRIDGE_NAME=$("$BINARY" reset-config-value "$RESET_CONFIG_BACKUP" appservice-id); then
+        echo "ERROR: reset config backup is invalid; refusing to guess the Beeper registration name." >&2
+        exit 1
+    fi
+fi
 
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 
@@ -80,30 +88,16 @@ fi
 echo "✓ Logged in: $WHOAMI"
 
 # ── Check for existing bridge registration ────────────────────
-# If the bridge is already registered on the server but we're about to
-# generate a fresh config (no local config file), the old registration's
-# rooms would be orphaned.  Delete it first so the server cleans up rooms.
+# Re-fetch an existing registration when local config is missing (for example,
+# after a local-only reset). Setup never deletes it implicitly: registration
+# deletion may remove remote Matrix rooms and requires reset confirmation.
 EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
 if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
-    echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
-    echo "   Deleting old registration to avoid orphaned rooms..."
-    # bbctl whoami can list a registration that the server can no longer
-    # delete (404 M_NOT_FOUND) — the appservice record is already gone but
-    # still shows in whoami.  Don't let that abort the install under set -e:
-    # a 404 means it's already deleted, and any other error is non-fatal
-    # because config regeneration re-registers anyway (worst case: a few
-    # orphaned rooms, far better than a failed setup).
-    if DELETE_OUT=$("$BINARY" bbctl delete "$BRIDGE_NAME" 2>&1); then
-        echo "✓ Old registration cleaned up"
-        echo "   Waiting for server-side deletion to complete..."
-        sleep 5
-    elif echo "$DELETE_OUT" | grep -qi "not found\|M_NOT_FOUND\|404"; then
-        echo "✓ Registration already absent on server — continuing"
-    else
-        echo "⚠  Could not delete old registration: $DELETE_OUT"
-        echo "   Continuing anyway — config regeneration will re-register."
-    fi
+    echo "⚠  Found existing '$BRIDGE_NAME' registration but no local config."
+    echo "   Reusing it; setup will not delete remote Matrix rooms."
+    echo "   A fresh local database cannot reconnect old rooms automatically, so"
+    echo "   rebuilt rooms may coexist with old ones. See the README reset guidance."
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -120,11 +114,10 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     sleep 3
     EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
     if [ -z "$EXISTING_BRIDGE" ]; then
-        echo "⚠  Local config exists but bridge is not registered on server."
-        echo "   Removing stale config and database to re-register..."
-        rm -f "$CONFIG"
-        DB_DIR="$(cd "$DATA_DIR" && pwd)"
-        rm -f "$DB_DIR"/corten-matrix.db*
+        echo "ERROR: local config exists but the bridge is not registered on server." >&2
+        echo "Setup will not delete the config or database automatically." >&2
+        echo "Back up the data, then use the explicitly confirmed reset flow." >&2
+        exit 1
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
@@ -134,8 +127,13 @@ if [ -f "$CONFIG" ]; then
     echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
+    CONFIG_WORK="$CONFIG"
+    if [ -f "$RESET_CONFIG_BACKUP" ]; then
+        CONFIG_WORK="$DATA_DIR/.config.reset-new.yaml"
+    fi
     for attempt in 1 2 3 4 5; do
-        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+        rm -f -- "$CONFIG_WORK"
+        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG_WORK" "$BRIDGE_NAME" 2>&1; then
             break
         fi
         if [ "$attempt" -eq 5 ]; then
@@ -147,17 +145,28 @@ else
     done
     # Make DB path absolute so it doesn't depend on working directory
     DATA_ABS_TMP="$(cd "$DATA_DIR" && pwd)"
-    sed -i '' -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_ABS_TMP/corten-matrix.db?_txlock=immediate#" "$CONFIG"
+    sed -i '' -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_ABS_TMP/corten-matrix.db?_txlock=immediate#" "$CONFIG_WORK"
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
-    sed -i '' 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
-    sed -i '' 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
-    sed -i '' 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    sed -i '' 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG_WORK"
+    sed -i '' 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG_WORK"
+    sed -i '' 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG_WORK"
     # Enable unlimited backward backfill (default is 0 which disables it)
-    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG_WORK"
     # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
-    sed -i '' 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
+    sed -i '' 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG_WORK"
 
+    if [ -f "$RESET_CONFIG_BACKUP" ]; then
+        if ! "$BINARY" reset-merge-database "$RESET_CONFIG_BACKUP" "$CONFIG_WORK"; then
+            rm -f -- "$CONFIG_WORK"
+            echo "ERROR: fresh appservice credentials were registered, but the preserved database configuration could not be restored." >&2
+            echo "The new config was removed; fix $RESET_CONFIG_BACKUP and run setup-beeper again." >&2
+            exit 1
+        fi
+        mv -f -- "$CONFIG_WORK" "$CONFIG"
+        rm -f -- "$RESET_CONFIG_BACKUP"
+        echo "✓ Preserved database configuration restored"
+    fi
     echo "✓ Config saved to $CONFIG"
 fi
 

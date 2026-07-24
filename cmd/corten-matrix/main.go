@@ -109,7 +109,8 @@ func main() {
 			cli.RunAllBridges()
 		case "setup", "setup-beeper", "start", "stop", "restart",
 			"status", "logs", "bbctl", "reset", "uninstall",
-			"install-service", "uninstall-service":
+			"install-service", "uninstall-service", "reset-config-kind",
+			"reset-config-value", "reset-merge-database":
 			// Host-side management CLI (the familiar ops, now via subcommands
 			// instead of a Makefile). Docker-aware; see pkg/cli.
 			cli.RunManagement(os.Args[1], os.Args[2:])
@@ -126,8 +127,17 @@ func main() {
 			return
 		case "check-restore":
 			// Validate that backup session state can be restored without
-			// re-authentication. Exits 0 if valid, 1 if not.
-			if connector.CheckSessionRestore() {
+			// re-authentication. --without-keychain is for configurations such
+			// as chat.db backfill that do not use the CloudKit trust circle.
+			requireKeychain := true
+			if len(os.Args) > 2 {
+				if len(os.Args) != 3 || os.Args[2] != "--without-keychain" {
+					fmt.Fprintln(os.Stderr, "usage: corten-matrix check-restore [--without-keychain]")
+					os.Exit(2)
+				}
+				requireKeychain = false
+			}
+			if connector.CheckSessionRestore(requireKeychain) {
 				fmt.Fprintln(os.Stderr, "[+] Backup session state is valid — login can be auto-restored")
 				os.Exit(0)
 			} else {

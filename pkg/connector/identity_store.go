@@ -11,8 +11,11 @@ package connector
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -72,6 +75,51 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
 }
 
+func sessionExportMarkerPath(name string) (string, error) {
+	path, err := sessionFilePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(path), name), nil
+}
+
+func acknowledgeSessionExport(log zerolog.Logger) error {
+	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
+	if err != nil {
+		return err
+	}
+	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
+	if err != nil {
+		return err
+	}
+	request, err := os.ReadFile(requestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read reset session export request: %w", err)
+	}
+	if len(bytes.TrimSpace(request)) == 0 {
+		return fmt.Errorf("reset session export request is empty")
+	}
+	if err = writeSessionFileAtomically(ackPath, request); err != nil {
+		return fmt.Errorf("acknowledge reset session export: %w", err)
+	}
+	log.Info().Str("path", ackPath).Msg("Acknowledged fresh reset session export")
+	return nil
+}
+
+func clearSessionExportAcknowledgement() error {
+	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
+	if err != nil {
+		return err
+	}
+	if err = os.Remove(ackPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear reset session export acknowledgement: %w", err)
+	}
+	return nil
+}
+
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
 // ~/.local/share/corten-matrix/identity.plist
 func legacyIdentityFilePath() (string, error) {
@@ -128,23 +176,23 @@ func hasKeychainCliqueState(log zerolog.Logger) bool {
 var sessionStateMu sync.Mutex
 
 // saveSessionState writes the full session state to the JSON file (locked).
-func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
+func saveSessionState(log zerolog.Logger, state PersistedSessionState) error {
 	sessionStateMu.Lock()
 	defer sessionStateMu.Unlock()
-	saveSessionStateLocked(log, state)
+	return saveSessionStateLocked(log, state)
 }
 
 // saveSessionStateLocked is saveSessionState without the lock; callers must hold
-// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
-func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
+// sessionStateMu. Creates parent directories if needed.
+func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) error {
 	path, err := sessionFilePath()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
-		return
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("Failed to create session file directory")
-		return
+		return err
 	}
 	// Preserve the opaque IDS key cache across saves. Callers that rebuild the
 	// struct from login metadata don't carry it, so re-read it from the existing
@@ -161,17 +209,101 @@ func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 	data, err := json.Marshal(state)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to marshal session state")
-		return
+		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("Failed to write session file")
-		return
+	if err := writeSessionFileAtomically(path, data); err != nil {
+		log.Warn().Err(err).Str("path", path).Msg("Failed to atomically write session file")
+		return err
 	}
 	log.Info().Str("path", path).
 		Bool("has_identity", state.IDSIdentity != "").
 		Bool("has_aps_state", state.APSState != "").
 		Bool("has_ids_users", state.IDSUsers != "").
 		Msg("Saved session state to file")
+	return nil
+}
+
+// writeSessionFileAtomically replaces session.json without ever exposing a
+// partially written file. This matters during reset: the bridge's final state
+// save runs immediately before the database is removed, so a crash or failed
+// write must leave the previous recoverable backup intact.
+func writeSessionFileAtomically(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".session.json-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err = tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace session file: %w", err)
+	}
+	return nil
+}
+
+// persistedSessionStateFromMetadata snapshots every recoverable field stored
+// in the bridge database. Keeping this conversion in one place prevents the
+// periodic/final state save from silently omitting login or device data.
+func persistedSessionStateFromMetadata(meta *UserLoginMetadata) PersistedSessionState {
+	return PersistedSessionState{
+		IDSIdentity:              meta.IDSIdentity,
+		APSState:                 meta.APSState,
+		IDSUsers:                 meta.IDSUsers,
+		PreferredHandle:          meta.PreferredHandle,
+		Platform:                 meta.Platform,
+		HardwareKey:              meta.HardwareKey,
+		DeviceID:                 meta.DeviceID,
+		AccountUsername:          meta.AccountUsername,
+		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+		AccountPET:               meta.AccountPET,
+		AccountADSID:             meta.AccountADSID,
+		AccountDSID:              meta.AccountDSID,
+		AccountSPDBase64:         meta.AccountSPDBase64,
+		MmeDelegateJSON:          meta.MmeDelegateJSON,
+	}
+}
+
+// userLoginMetadataFromPersistedSessionState reconstructs every login field
+// that reset deliberately carries outside the bridge database. Keep this as
+// the inverse of persistedSessionStateFromMetadata so recovery cannot silently
+// drop the selected outgoing handle or another restorable identity field.
+func userLoginMetadataFromPersistedSessionState(state PersistedSessionState, goos string) *UserLoginMetadata {
+	platform := state.Platform
+	if platform == "" {
+		platform = goos
+	}
+	return &UserLoginMetadata{
+		Platform:                 platform,
+		HardwareKey:              state.HardwareKey,
+		DeviceID:                 state.DeviceID,
+		ChatsSynced:              false,
+		APSState:                 state.APSState,
+		IDSUsers:                 state.IDSUsers,
+		IDSIdentity:              state.IDSIdentity,
+		PreferredHandle:          state.PreferredHandle,
+		AccountUsername:          state.AccountUsername,
+		AccountHashedPasswordHex: state.AccountHashedPasswordHex,
+		AccountPET:               state.AccountPET,
+		AccountADSID:             state.AccountADSID,
+		AccountDSID:              state.AccountDSID,
+		AccountSPDBase64:         state.AccountSPDBase64,
+		MmeDelegateJSON:          state.MmeDelegateJSON,
+	}
 }
 
 // loadSessionState reads the persisted session state from the JSON file.
@@ -221,7 +353,7 @@ func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
 		IDSIdentity: string(legacyData),
 	}
 	// Migrate: save in new format and remove old file (already under the lock)
-	saveSessionStateLocked(log, state)
+	_ = saveSessionStateLocked(log, state)
 	_ = os.Remove(legacyPath)
 	return state
 }
@@ -255,15 +387,26 @@ func ListHandles() []string {
 // keystore) exists and the IDS user keys are present in the keystore.
 // Returns true if login can be auto-restored without re-authentication.
 // This is intended to be called from the CLI (check-restore subcommand)
-// before starting the bridge.
-func CheckSessionRestore() bool {
+// before starting the bridge. By default it also requires the trusted-peers
+// keychain state used by contacts and CloudKit; callers that have confirmed
+// those features are disabled may pass false.
+func CheckSessionRestore(requireKeychain ...bool) bool {
 	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+	mustHaveKeychain := sessionRestoreRequiresKeychain(requireKeychain)
 
 	// Initialize keystore (loads from XDG path, migrates if needed)
 	rustpushgo.InitLogger()
 
 	state := loadSessionState(log)
 	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
+		return false
+	}
+	if !sessionRestoreHasRequiredPlatformState(state, runtime.GOOS) {
+		log.Info().Str("platform", runtime.GOOS).Msg("Session restore check failed: hardware key is required on this platform")
+		return false
+	}
+	if err := validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
+		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Session restore check failed: platform configuration is not restorable")
 		return false
 	}
 
@@ -276,9 +419,49 @@ func CheckSessionRestore() bool {
 	if !session.validate(log) {
 		return false
 	}
-	if !hasKeychainCliqueState(log) {
+	if mustHaveKeychain && !hasKeychainCliqueState(log) {
 		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
 		return false
 	}
 	return true
+}
+
+func sessionRestoreRequiresKeychain(option []bool) bool {
+	return len(option) == 0 || option[0]
+}
+
+func sessionRestoreHasRequiredPlatformState(state PersistedSessionState, goos string) bool {
+	return goos == "darwin" || strings.TrimSpace(state.HardwareKey) != ""
+}
+
+// validateSessionRestorePlatformConfig exercises the same hardware-config
+// constructor LoadUserLogin will use after reset. A merely non-empty but
+// malformed hardware key must not authorize deletion of the database on
+// non-macOS systems.
+func validateSessionRestorePlatformConfig(state PersistedSessionState, goos string) (err error) {
+	if goos == "darwin" {
+		return nil
+	}
+	if strings.TrimSpace(state.HardwareKey) == "" {
+		return fmt.Errorf("hardware key is empty")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("hardware key validation panicked: %v", recovered)
+		}
+	}()
+	var config *rustpushgo.WrappedOsConfig
+	if state.DeviceID != "" {
+		config, err = rustpushgo.CreateConfigFromHardwareKeyWithDeviceId(state.HardwareKey, state.DeviceID)
+	} else {
+		config, err = rustpushgo.CreateConfigFromHardwareKey(state.HardwareKey)
+	}
+	if err != nil {
+		return fmt.Errorf("invalid hardware key: %w", err)
+	}
+	if config == nil {
+		return fmt.Errorf("hardware key produced no platform configuration")
+	}
+	config.Destroy()
+	return nil
 }

@@ -165,9 +165,17 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		log.Debug().Msg("No complete backup session state found, skipping auto-restore")
 		return
 	}
+	rustpushgo.InitLogger()
+	if !sessionRestoreHasRequiredPlatformState(state, runtime.GOOS) {
+		log.Info().Str("platform", runtime.GOOS).Msg("Backup session has no hardware key required for auto-restore on this platform")
+		return
+	}
+	if err = validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
+		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Backup session platform configuration is not restorable")
+		return
+	}
 
 	// Validate against keystore
-	rustpushgo.InitLogger()
 	session := &cachedSessionState{
 		IDSIdentity: state.IDSIdentity,
 		APSState:    state.APSState,
@@ -224,27 +232,7 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		Str("username", username).
 		Msg("Auto-restoring login from backup session state")
 
-	platform := state.Platform
-	if platform == "" {
-		platform = runtime.GOOS
-	}
-
-	meta := &UserLoginMetadata{
-		Platform:                 platform,
-		HardwareKey:              state.HardwareKey,
-		DeviceID:                 state.DeviceID,
-		ChatsSynced:              false,
-		APSState:                 state.APSState,
-		IDSUsers:                 state.IDSUsers,
-		IDSIdentity:              state.IDSIdentity,
-		AccountUsername:          state.AccountUsername,
-		AccountHashedPasswordHex: state.AccountHashedPasswordHex,
-		AccountPET:               state.AccountPET,
-		AccountADSID:             state.AccountADSID,
-		AccountDSID:              state.AccountDSID,
-		AccountSPDBase64:         state.AccountSPDBase64,
-		MmeDelegateJSON:          state.MmeDelegateJSON,
-	}
+	meta := userLoginMetadataFromPersistedSessionState(state, runtime.GOOS)
 
 	_, err = user.NewLogin(ctx, &database.UserLogin{
 		ID:         loginID,
