@@ -3081,7 +3081,11 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 
 	// Track SMS portals so outbound replies use the correct service type.
 	// Unconditional so SMS→iMessage transitions are reflected immediately.
-	smsChanged := c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
+	c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
+	smsDestination := ""
+	if msg.IsSms && !isGroupPortalID(string(portalKey.ID)) {
+		smsDestination = c.smsDestinationForDM(msg.Participants, msg.Sender)
+	}
 
 	// Only create new portals after CloudKit sync is done.
 	cloudSyncDone := c.isCloudSyncDone()
@@ -3102,28 +3106,28 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	msgTS := int64(msg.TimestampMs)
 	existingPortal, _ := c.Main.Bridge.GetExistingPortalByKey(backgroundCtx, portalKey)
 
-	// Persist IsSms change to DB immediately so it survives a crash.
-	// Without this, the in-memory update above would be lost on restart
-	// because loadSenderGuidsFromDB only loads IsSms=true entries.
-	if smsChanged && existingPortal != nil {
-		meta, ok := existingPortal.Metadata.(*PortalMetadata)
-		if !ok {
-			meta = &PortalMetadata{}
-		}
-		if meta.IsSms != msg.IsSms {
-			meta.IsSms = msg.IsSms
-			existingPortal.Metadata = meta
-			if err := existingPortal.Save(backgroundCtx); err != nil {
-				log.Warn().Err(err).
-					Str("portal_id", portalID).
-					Bool("is_sms", msg.IsSms).
-					Msg("Failed to persist IsSms change to database")
-			} else {
-				log.Debug().
-					Str("portal_id", portalID).
-					Bool("is_sms", msg.IsSms).
-					Msg("Persisted IsSms change to database")
-			}
+	// Persist SMS routing changes immediately so they survive a crash. This
+	// includes destination-only changes while the service remains SMS and
+	// clearing a stale destination when the conversation returns to iMessage.
+	if existingPortal != nil {
+		changed, persistErr := persistPortalSMSRouting(
+			existingPortal,
+			msg.IsSms,
+			smsDestination,
+			func() error {
+				return existingPortal.Save(backgroundCtx)
+			},
+		)
+		if persistErr != nil {
+			log.Warn().Err(persistErr).
+				Str("portal_id", logSafeHandle(portalID)).
+				Bool("is_sms", msg.IsSms).
+				Msg("Failed to persist SMS routing metadata")
+		} else if changed {
+			log.Debug().
+				Str("portal_id", logSafeHandle(portalID)).
+				Bool("is_sms", msg.IsSms).
+				Msg("Persisted SMS routing metadata")
 		}
 	}
 	missingPortal := existingPortal == nil || existingPortal.MXID == ""
@@ -7012,7 +7016,15 @@ func (c *IMClient) recoverChatOnApple(portalID string) {
 			IsSms:        isSms,
 		}
 	} else {
-		sendTo := c.resolveSendTarget(portalID)
+		var metadata any
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(context.Background(), networkid.PortalKey{
+			ID:       networkid.PortalID(portalID),
+			Receiver: c.UserLogin.ID,
+		})
+		if err == nil && portal != nil {
+			metadata = portal.Metadata
+		}
+		sendTo := c.resolveDMSendTarget(portalID, isSms, metadata)
 		participants := []string{c.handle, sendTo}
 		if c.isMyHandle(sendTo) {
 			participants = []string{sendTo}
@@ -11178,8 +11190,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// Strip any legacy (sms...) suffix before resolution — resolveSendTarget
 	// calls lookupContact → stripIdentifierPrefix, which would pass the suffix
 	// through to contact lookup and break alternate-handle resolution.
-	cleanPortalID := stripSmsSuffix(portalID)
-	sendTo := c.resolveSendTarget(cleanPortalID)
+	sendTo := c.resolveDMSendTarget(portalID, isSms, portal.Metadata)
 
 	// For self-chats, only include one participant. Duplicating our own
 	// handle (e.g. [self, self]) causes rustpush to reject the message
@@ -11193,6 +11204,76 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		Participants: participants,
 		IsSms:        isSms,
 	}
+}
+
+// resolveDMSendTarget returns the concrete recipient for a DM portal. SMS
+// transport identity is persisted independently from the stable Matrix portal
+// key because contact alias canonicalization can make those values differ.
+func (c *IMClient) resolveDMSendTarget(portalID string, isSms bool, metadata any) string {
+	if isSms {
+		if meta, ok := metadata.(*PortalMetadata); ok && meta.SMSDestination != "" {
+			return meta.SMSDestination
+		}
+	}
+	return c.resolveSendTarget(stripSmsSuffix(portalID))
+}
+
+// portalMetadataWithSMSRouting applies the authoritative routing state for the
+// latest representative of a portal. SMSDestination is deliberately
+// independent from portal identity because contact alias canonicalization may
+// keep a different phone or email as the stable Matrix portal key.
+func portalMetadataWithSMSRouting(existing any, isSms bool, smsDestination string) (*PortalMetadata, bool) {
+	meta := &PortalMetadata{}
+	if existingMeta, ok := existing.(*PortalMetadata); ok {
+		*meta = *existingMeta
+	}
+	if !isSms {
+		smsDestination = ""
+	}
+	changed := meta.IsSms != isSms || meta.SMSDestination != smsDestination
+	meta.IsSms = isSms
+	meta.SMSDestination = smsDestination
+	return meta, changed
+}
+
+// persistPortalSMSRouting writes routing metadata through the provided save
+// function and returns its error unchanged so callers can leave initial sync
+// incomplete and retry on the next connection.
+func persistPortalSMSRouting(
+	portal *bridgev2.Portal,
+	isSms bool,
+	smsDestination string,
+	save func() error,
+) (bool, error) {
+	previousMetadata := portal.Metadata
+	meta, changed := portalMetadataWithSMSRouting(previousMetadata, isSms, smsDestination)
+	if !changed {
+		return false, nil
+	}
+	portal.Metadata = meta
+	if err := save(); err != nil {
+		portal.Metadata = previousMetadata
+		return true, err
+	}
+	return true, nil
+}
+
+// smsDestinationForDM returns the concrete remote handle carried by an SMS DM
+// envelope before contact alias canonicalization rewrites its portal key.
+func (c *IMClient) smsDestinationForDM(participants []string, sender *string) string {
+	for _, participant := range participants {
+		normalized := normalizeIdentifierForPortalID(participant)
+		if normalized != "" && !c.isMyHandle(normalized) {
+			return normalized
+		}
+	}
+	if sender != nil {
+		normalized := normalizeIdentifierForPortalID(*sender)
+		if normalized != "" && !c.isMyHandle(normalized) {
+			return normalized
+		}
+	}
+	return ""
 }
 
 // persistGroupParticipantsIfChanged keeps cloud_chat.participants_json — the
@@ -12513,10 +12594,11 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	}
 
 	type chatEntry struct {
-		chatGUID  string
-		portalKey networkid.PortalKey
-		info      *imessage.ChatInfo
-		isSms     bool
+		chatGUID       string
+		portalKey      networkid.PortalKey
+		info           *imessage.ChatInfo
+		isSms          bool
+		smsDestination string
 	}
 	var entries []chatEntry
 	maxInitialMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
@@ -12554,53 +12636,56 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				Receiver: c.UserLogin.ID,
 			}
 		}
+		smsDestination := ""
+		if isSms && !parsed.IsGroup {
+			// Keep the concrete chat.db recipient separate from the portal ID:
+			// contact canonicalization below may map this chat onto a sibling
+			// phone/email alias that is not the SMS transport destination.
+			smsDestination = string(portalKey.ID)
+		}
 		if isSms {
 			c.updatePortalSMS(string(portalKey.ID), true)
 		}
 		entries = append(entries, chatEntry{
-			chatGUID:  chat.ChatGUID,
-			portalKey: portalKey,
-			info:      info,
-			isSms:     isSms,
+			chatGUID:       chat.ChatGUID,
+			portalKey:      portalKey,
+			info:           info,
+			isSms:          isSms,
+			smsDestination: smsDestination,
 		})
 	}
 
-	// Deduplicate DM entries for contacts with multiple phone numbers.
+	// Canonicalize and deduplicate DM entries for contacts with multiple
+	// phone/email handles. Preserve an existing room's portal ID on upgrades;
+	// otherwise use the deterministic phone-preferred contact handle.
 	{
-		type contactGroup struct {
-			indices []int
-		}
-		groups := make(map[string]*contactGroup)
+		portalIDs := make([]string, len(entries))
 		for i, entry := range entries {
-			portalID := string(entry.portalKey.ID)
-			if strings.Contains(portalID, ",") {
-				continue
-			}
-			contact := c.lookupContact(portalID)
-			key := contactKeyFromContact(contact)
-			if key == "" {
-				continue
-			}
-			if g, ok := groups[key]; ok {
-				g.indices = append(g.indices, i)
-			} else {
-				groups[key] = &contactGroup{indices: []int{i}}
-			}
+			portalIDs[i] = string(entry.portalKey.ID)
 		}
 
-		skip := make(map[int]bool)
-		for _, group := range groups {
-			if len(group.indices) <= 1 {
-				continue
-			}
-			primaryIdx := group.indices[0]
-			for _, idx := range group.indices[1:] {
-				skip[idx] = true
+		canonicalIDs, skip, existingErr := canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+			ctx,
+			portalIDs,
+			c.UserLogin.ID,
+			c.lookupContact,
+			c.isMyHandle,
+			c.Main.Bridge.GetAllPortalsWithMXID,
+		)
+		if existingErr != nil {
+			log.Warn().Err(existingErr).
+				Msg("Failed to load existing portals; leaving chat.db initial sync incomplete for retry")
+			return
+		}
+		for i := range entries {
+			if canonicalIDs[i] != portalIDs[i] {
 				log.Info().
-					Str("skip_portal", string(entries[idx].portalKey.ID)).
-					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
-					Msg("Merging DM portal for contact with multiple phone numbers")
+					Str("original_portal", logSafeHandle(portalIDs[i])).
+					Str("canonical_portal", logSafeHandle(canonicalIDs[i])).
+					Bool("duplicate", skip[i]).
+					Msg("Canonicalized chat.db DM portal by contact aliases")
 			}
+			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
 		}
 
 		if len(skip) > 0 {
@@ -12610,8 +12695,16 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 					merged = append(merged, entry)
 				}
 			}
-			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
 			entries = merged
+		}
+
+		// Raw SMS aliases seed the cache above before contact deduplication.
+		// Overwrite the retained canonical portal with its representative's
+		// exact state, including false, so a discarded SMS alias cannot make a
+		// newer iMessage chat route through SMS.
+		for _, entry := range entries {
+			c.updatePortalSMS(string(entry.portalKey.ID), entry.isSms)
 		}
 	}
 
@@ -12627,32 +12720,30 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 
 	synced := 0
 	for _, entry := range entries {
-		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		done := make(chan error, 1)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
 		chatGUID := entry.chatGUID
 		isSms := entry.isSms
+		smsDestination := entry.smsDestination
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					if isSms {
-						meta := &PortalMetadata{}
-						if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-							*meta = *existing
-						}
-						if !meta.IsSms {
-							meta.IsSms = true
-							portal.Metadata = meta
-							if err := portal.Save(ctx); err != nil {
-								zerolog.Ctx(ctx).Warn().Err(err).
-									Str("portal_id", string(portal.ID)).
-									Msg("Failed to persist IsSms metadata during initial sync")
-							}
-						}
+					_, err := persistPortalSMSRouting(
+						portal,
+						isSms,
+						smsDestination,
+						func() error {
+							return portal.Save(ctx)
+						},
+					)
+					if err != nil {
+						done <- err
+						return
 					}
-					close(done)
+					done <- nil
 				},
 				LogContext: func(lc zerolog.Context) zerolog.Context {
 					return lc.Str("chat_guid", chatGUID).Str("source", "initial_sync")
@@ -12663,7 +12754,13 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		})
 
 		select {
-		case <-done:
+		case persistErr := <-done:
+			if persistErr != nil {
+				log.Error().Err(persistErr).
+					Str("chat_guid", entry.chatGUID).
+					Msg("Initial sync: failed to persist SMS routing metadata; leaving sync incomplete for retry")
+				return
+			}
 			synced++
 			if synced%10 == 0 || synced == len(entries) {
 				log.Info().
@@ -12672,10 +12769,10 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 					Msg("Initial sync progress")
 			}
 		case <-time.After(30 * time.Minute):
-			synced++
 			log.Warn().
 				Str("chat_guid", entry.chatGUID).
-				Msg("Initial sync: timeout waiting for chat, continuing")
+				Msg("Initial sync: timeout waiting for chat; leaving sync incomplete for retry")
+			return
 		case <-c.stopChan:
 			log.Info().Msg("Initial sync stopped")
 			return
@@ -12684,7 +12781,9 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 
 	meta.ChatsSynced = true
 	if err := c.UserLogin.Save(ctx); err != nil {
+		meta.ChatsSynced = false
 		log.Err(err).Msg("Failed to save metadata after initial sync")
+		return
 	}
 	log.Info().
 		Int("synced_chats", synced).
@@ -12692,8 +12791,10 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		Msg("Initial sync complete")
 }
 
-// chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+// chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo. For
+// DMs, portalID is the canonical contact handle selected by initial sync and
+// must also be used as OtherUserID so the room and ghost identities agree.
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networkid.PortalID) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
@@ -12736,9 +12837,12 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		portalID := addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
-		otherUser := makeUserID(portalID)
-		isSelfChat := c.isMyHandle(portalID)
+		canonicalPortalID := string(portalID)
+		if canonicalPortalID == "" {
+			canonicalPortalID = addIdentifierPrefix(stripSmsSuffix(parsed.LocalID))
+		}
+		otherUser := makeUserID(canonicalPortalID)
+		isSelfChat := c.isMyHandle(canonicalPortalID)
 
 		memberMap := map[networkid.UserID]bridgev2.ChatMember{
 			makeUserID(c.handle): {
@@ -12772,17 +12876,17 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		// framework, which blocks UpdateInfoFromGhost (it returns early when
 		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
-			selfName := c.resolveContactDisplayname(portalID)
+			selfName := c.resolveContactDisplayname(canonicalPortalID)
 			chatInfo.Name = &selfName
 
 			// Pull contact photo for self-chat room avatar.
-			localID := stripIdentifierPrefix(portalID)
+			localID := stripIdentifierPrefix(canonicalPortalID)
 			if c.contacts != nil {
 				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
 					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{
-						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", canonicalPortalID, hex.EncodeToString(avatarHash[:8]))),
 						Get: func(ctx context.Context) ([]byte, error) {
 							return avatarData, nil
 						},
