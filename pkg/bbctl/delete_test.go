@@ -399,7 +399,7 @@ func TestIsBridgeAbsentRejectsMissingBridgesMap(t *testing.T) {
 }
 
 func TestIsBridgeAbsentRejectsNilWhoamiResponse(t *testing.T) {
-	absent, err := isBridgeAbsent("sh-imessage", "token", func(string, string) (*beeperapi.RespWhoami, error) {
+	absent, err := isBridgeAbsent(context.Background(), "sh-imessage", "token", func(string, string) (*beeperapi.RespWhoami, error) {
 		return nil, nil
 	})
 	if err == nil || absent {
