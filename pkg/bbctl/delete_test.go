@@ -311,6 +311,43 @@ func TestDeleteBridgeAndVerifyStopsWhenContextIsCancelledDuringVerification(t *t
 	}
 }
 
+func TestDeleteBridgeAndVerifyStopsWhenBlockedWhoamiIsCancelled(t *testing.T) {
+	notFound := fakeHTTPStatusError{status: http.StatusNotFound}
+	appservices := &fakeAppServiceDeleteClient{getErrs: []error{notFound}}
+	whoamiStarted := make(chan struct{})
+	releaseWhoami := make(chan struct{})
+	defer close(releaseWhoami)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deleteDone := make(chan error, 1)
+
+	go func() {
+		deleteDone <- deleteBridgeAndVerify(ctx, "sh-imessage", "token", bridgeDeleteDependencies{
+			appservices:  appservices,
+			deleteBridge: func(string, string, string) error { return nil },
+			whoami: func(string, string) (*beeperapi.RespWhoami, error) {
+				close(whoamiStarted)
+				<-releaseWhoami
+				return absentWhoami("", "")
+			},
+			wait: noWait,
+		})
+	}()
+	<-whoamiStarted
+	cancel()
+
+	var err error
+	select {
+	case err = <-deleteDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked whoami prevented prompt cancellation")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected verification cancellation, got %v", err)
+	}
+}
+
 func TestIsHTTPNotFound(t *testing.T) {
 	tests := []struct {
 		name string
@@ -353,7 +390,7 @@ func TestIsBeeperNotFoundError(t *testing.T) {
 }
 
 func TestIsBridgeAbsentRejectsMissingBridgesMap(t *testing.T) {
-	absent, err := isBridgeAbsent("sh-imessage", "token", func(string, string) (*beeperapi.RespWhoami, error) {
+	absent, err := isBridgeAbsent(context.Background(), "sh-imessage", "token", func(string, string) (*beeperapi.RespWhoami, error) {
 		return &beeperapi.RespWhoami{}, nil
 	})
 	if err == nil || absent {
