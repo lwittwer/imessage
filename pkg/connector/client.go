@@ -12574,48 +12574,62 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			portalIDs[i] = string(entry.portalKey.ID)
 		}
 
-		existingRoomCache := make(map[string]bool)
-		checkedExistingRoom := make(map[string]bool)
-		hasExistingRoom := func(portalID string) bool {
-			if checkedExistingRoom[portalID] {
-				return existingRoomCache[portalID]
-			}
-			checkedExistingRoom[portalID] = true
-			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-				ID:       networkid.PortalID(portalID),
-				Receiver: c.UserLogin.ID,
-			})
-			if err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).
-					Msg("Failed to check existing contact portal during initial sync")
-				return false
-			}
-			exists := portal != nil && portal.MXID != ""
-			existingRoomCache[portalID] = exists
-			return exists
-		}
-
-		canonicalIDs, skip := canonicalizeChatDBInitialSyncDMPortalIDs(portalIDs, c.lookupContact, hasExistingRoom)
-		for i := range entries {
-			if canonicalIDs[i] != portalIDs[i] {
-				log.Info().
-					Str("original_portal", portalIDs[i]).
-					Str("canonical_portal", canonicalIDs[i]).
-					Bool("duplicate", skip[i]).
-					Msg("Canonicalized chat.db DM portal by contact aliases")
-			}
-			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
-		}
-
-		if len(skip) > 0 {
-			var merged []chatEntry
-			for i, entry := range entries {
-				if !skip[i] {
-					merged = append(merged, entry)
+		existingPortals, existingErr := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+		if existingErr != nil {
+			log.Warn().Err(existingErr).
+				Msg("Failed to load existing portals; preserving chat.db portal IDs")
+		} else {
+			existingByID := make(map[string]bool)
+			existingByNormalizedID := make(map[string][]string)
+			for _, portal := range existingPortals {
+				if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
+					continue
 				}
+				portalID := string(portal.ID)
+				existingByID[portalID] = true
+				normalized := normalizeIdentifierForPortalID(portalID)
+				existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
 			}
-			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
-			entries = merged
+			for normalized := range existingByNormalizedID {
+				sort.Strings(existingByNormalizedID[normalized])
+			}
+			findExistingRoom := func(portalID string) string {
+				for _, variant := range existingDMPortalIDVariants(portalID) {
+					if existingByID[variant] {
+						return variant
+					}
+				}
+				normalized := normalizeIdentifierForPortalID(portalID)
+				if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
+					return matches[0]
+				}
+				return ""
+			}
+
+			canonicalIDs, skip := canonicalizeChatDBInitialSyncDMPortalIDs(
+				portalIDs, c.lookupContact, c.isMyHandle, findExistingRoom,
+			)
+			for i := range entries {
+				if canonicalIDs[i] != portalIDs[i] {
+					log.Info().
+						Str("original_portal", portalIDs[i]).
+						Str("canonical_portal", canonicalIDs[i]).
+						Bool("duplicate", skip[i]).
+						Msg("Canonicalized chat.db DM portal by contact aliases")
+				}
+				entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
+			}
+
+			if len(skip) > 0 {
+				var merged []chatEntry
+				for i, entry := range entries {
+					if !skip[i] {
+						merged = append(merged, entry)
+					}
+				}
+				log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
+				entries = merged
+			}
 		}
 
 		// updatePortalSMS originally records the raw chat.db alias above. Also

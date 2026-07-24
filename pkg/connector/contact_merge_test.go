@@ -60,7 +60,8 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 		name         string
 		contacts     []*imessage.Contact
 		portalIDs    []string
-		existingRoom map[string]bool
+		existingRoom map[string]string
+		selfIDs      map[string]bool
 		wantIDs      []string
 		wantSkip     map[int]bool
 	}{
@@ -74,6 +75,17 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 			portalIDs: []string{"mailto:person@example.com", "tel:+15550000002"},
 			wantIDs:   []string{"tel:+15550000002", "tel:+15550000002"},
 			wantSkip:  map[int]bool{1: true},
+		},
+		{
+			name: "single email chat still canonicalizes to phone",
+			contacts: []*imessage.Contact{{
+				FirstName: "SingleAlias",
+				Phones:    []string{"+15550000012"},
+				Emails:    []string{"single@example.com"},
+			}},
+			portalIDs: []string{"mailto:single@example.com"},
+			wantIDs:   []string{"tel:+15550000012"},
+			wantSkip:  map[int]bool{},
 		},
 		{
 			name: "multiple emails combine deterministically",
@@ -114,9 +126,43 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 				Emails:    []string{"existing@example.com"},
 			}},
 			portalIDs:    []string{"tel:+15550000003", "mailto:existing@example.com"},
-			existingRoom: map[string]bool{"mailto:existing@example.com": true},
+			existingRoom: map[string]string{"mailto:existing@example.com": "mailto:existing@example.com"},
 			wantIDs:      []string{"mailto:existing@example.com", "mailto:existing@example.com"},
 			wantSkip:     map[int]bool{1: true},
+		},
+		{
+			name: "existing legacy phone portal keeps exact key",
+			contacts: []*imessage.Contact{{
+				FirstName: "LegacyPhone",
+				Phones:    []string{"+15550000013"},
+				Emails:    []string{"legacy@example.com"},
+			}},
+			portalIDs:    []string{"mailto:legacy@example.com"},
+			existingRoom: map[string]string{"tel:+15550000013": "tel:15550000013"},
+			wantIDs:      []string{"tel:15550000013"},
+			wantSkip:     map[int]bool{},
+		},
+		{
+			name: "existing mixed case email portal keeps exact key",
+			contacts: []*imessage.Contact{{
+				FirstName: "LegacyEmail",
+				Emails:    []string{"Person@Example.com", "other@example.com"},
+			}},
+			portalIDs:    []string{"mailto:other@example.com"},
+			existingRoom: map[string]string{"mailto:person@example.com": "mailto:Person@Example.com"},
+			wantIDs:      []string{"mailto:Person@Example.com"},
+			wantSkip:     map[int]bool{},
+		},
+		{
+			name: "self contact is never canonicalized to another handle",
+			contacts: []*imessage.Contact{{
+				FirstName: "Self",
+				Phones:    []string{"+15550000001", "+15559999999"},
+			}},
+			portalIDs: []string{"tel:+15559999999"},
+			selfIDs:   map[string]bool{"tel:+15559999999": true},
+			wantIDs:   []string{"tel:+15559999999"},
+			wantSkip:  map[int]bool{},
 		},
 		{
 			name: "unrelated contacts stay separate",
@@ -150,13 +196,15 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hasExistingRoom := func(portalID string) bool {
+			findExistingRoom := func(portalID string) string {
 				return tt.existingRoom[portalID]
 			}
+			isSelf := func(portalID string) bool { return tt.selfIDs[portalID] }
 			gotIDs, gotSkip := canonicalizeChatDBInitialSyncDMPortalIDs(
 				tt.portalIDs,
 				contactLookupForTests(tt.contacts...),
-				hasExistingRoom,
+				isSelf,
+				findExistingRoom,
 			)
 			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
 				t.Fatalf("canonical portal IDs = %#v, want %#v", gotIDs, tt.wantIDs)
@@ -168,6 +216,27 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 				t.Fatalf("combined backfill entries = %d, want %d", got, want)
 			}
 		})
+	}
+}
+
+func TestExistingDMPortalIDVariantsPreserveExactAndLegacyForms(t *testing.T) {
+	tests := []struct {
+		identifier string
+		want       []string
+	}{
+		{
+			identifier: "mailto:Person@Example.com",
+			want:       []string{"mailto:Person@Example.com", "mailto:person@example.com"},
+		},
+		{
+			identifier: "tel:+15550000013",
+			want:       []string{"tel:+15550000013", "tel:15550000013", "tel:5550000013"},
+		},
+	}
+	for _, tt := range tests {
+		if got := existingDMPortalIDVariants(tt.identifier); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("existingDMPortalIDVariants(%q) = %#v, want %#v", tt.identifier, got, tt.want)
+		}
 	}
 }
 
@@ -195,6 +264,45 @@ func TestChatDBInfoToBridgev2UsesCanonicalDMIdentity(t *testing.T) {
 	aliasUserID := makeUserID("mailto:alias@example.com")
 	if _, ok := got.Members.MemberMap[aliasUserID]; ok {
 		t.Fatalf("noncanonical alias %q unexpectedly present in member map %#v", aliasUserID, got.Members.MemberMap)
+	}
+}
+
+func TestChatDBSelfAliasCanonicalizationPreservesDMIdentity(t *testing.T) {
+	selfID := "tel:+15559999999"
+	main := &IMConnector{Config: IMConfig{DisplaynameTemplate: "{{.ID}}"}}
+	if err := main.Config.PostProcess(); err != nil {
+		t.Fatalf("initialize displayname template: %v", err)
+	}
+	client := &IMClient{
+		Main:       main,
+		handle:     selfID,
+		allHandles: []string{selfID},
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	selfContact := &imessage.Contact{
+		FirstName: "Self",
+		Phones:    []string{"+15550000001", "+15559999999"},
+	}
+	portalIDs, skip := canonicalizeChatDBInitialSyncDMPortalIDs(
+		[]string{selfID}, contactLookupForTests(selfContact), client.isMyHandle, nil,
+	)
+	if got := portalIDs[0]; got != selfID {
+		t.Fatalf("self portal ID = %q, want %q", got, selfID)
+	}
+	if len(skip) != 0 {
+		t.Fatalf("self chat unexpectedly skipped: %#v", skip)
+	}
+
+	info := &imessage.ChatInfo{JSONChatGUID: "iMessage;-;+15559999999"}
+	chatInfo := client.chatDBInfoToBridgev2(info, networkid.PortalID(portalIDs[0]))
+	wantUserID := makeUserID(selfID)
+	if chatInfo.Members.OtherUserID != wantUserID {
+		t.Fatalf("self DM OtherUserID = %q, want %q", chatInfo.Members.OtherUserID, wantUserID)
+	}
+	if len(chatInfo.Members.MemberMap) != 1 || !chatInfo.Members.MemberMap[wantUserID].IsFromMe {
+		t.Fatalf("self DM member map = %#v, want one IsFromMe member", chatInfo.Members.MemberMap)
 	}
 }
 
