@@ -134,6 +134,8 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
 | `corten-matrix help` | Show the command list. |
 
+**Verified Beeper deletion.** `corten-matrix bbctl delete BRIDGE` may wait up to one minute while it checks both the Matrix appservice record and the Beeper bridge-manager registration. It prints success only after both are absent; a timeout, failed verification read, or either record remaining returns a nonzero exit, so remote cleanup must not be assumed. `setup-beeper` does not delete an existing registration implicitly, and a Beeper `reset` that cannot verify deletion stops before removing local bridge state; fix the reported authentication, network, or server error and retry the same command.
+
 > `update` is shown by `corten-matrix help` **only on the official prebuilt binaries**. If you built from source it isn't there — update by pulling this repo and rebuilding (see [Updating](#updating)).
 
 The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.

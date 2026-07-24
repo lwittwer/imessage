@@ -12695,62 +12695,39 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			portalIDs[i] = string(entry.portalKey.ID)
 		}
 
-		existingPortals, existingErr := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+		canonicalIDs, skip, existingErr := canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+			ctx,
+			portalIDs,
+			c.UserLogin.ID,
+			c.lookupContact,
+			c.isMyHandle,
+			c.Main.Bridge.GetAllPortalsWithMXID,
+		)
 		if existingErr != nil {
 			log.Warn().Err(existingErr).
-				Msg("Failed to load existing portals; preserving chat.db portal IDs")
-		} else {
-			existingByID := make(map[string]bool)
-			existingByNormalizedID := make(map[string][]string)
-			for _, portal := range existingPortals {
-				if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
-					continue
-				}
-				portalID := string(portal.ID)
-				existingByID[portalID] = true
-				normalized := normalizeIdentifierForPortalID(portalID)
-				existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
+				Msg("Failed to load existing portals; leaving chat.db initial sync incomplete for retry")
+			return
+		}
+		for i := range entries {
+			if canonicalIDs[i] != portalIDs[i] {
+				log.Info().
+					Str("original_portal", logSafeHandle(portalIDs[i])).
+					Str("canonical_portal", logSafeHandle(canonicalIDs[i])).
+					Bool("duplicate", skip[i]).
+					Msg("Canonicalized chat.db DM portal by contact aliases")
 			}
-			for normalized := range existingByNormalizedID {
-				sort.Strings(existingByNormalizedID[normalized])
-			}
-			findExistingRoom := func(portalID string) string {
-				for _, variant := range existingDMPortalIDVariants(portalID) {
-					if existingByID[variant] {
-						return variant
-					}
-				}
-				normalized := normalizeIdentifierForPortalID(portalID)
-				if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
-					return matches[0]
-				}
-				return ""
-			}
+			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
+		}
 
-			canonicalIDs, skip := canonicalizeChatDBInitialSyncDMPortalIDs(
-				portalIDs, c.lookupContact, c.isMyHandle, findExistingRoom,
-			)
-			for i := range entries {
-				if canonicalIDs[i] != portalIDs[i] {
-					log.Info().
-						Str("original_portal", logSafeHandle(portalIDs[i])).
-						Str("canonical_portal", logSafeHandle(canonicalIDs[i])).
-						Bool("duplicate", skip[i]).
-						Msg("Canonicalized chat.db DM portal by contact aliases")
+		if len(skip) > 0 {
+			var merged []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					merged = append(merged, entry)
 				}
-				entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
 			}
-
-			if len(skip) > 0 {
-				var merged []chatEntry
-				for i, entry := range entries {
-					if !skip[i] {
-						merged = append(merged, entry)
-					}
-				}
-				log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
-				entries = merged
-			}
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
+			entries = merged
 		}
 
 		// Raw SMS aliases seed the cache above before contact deduplication.
