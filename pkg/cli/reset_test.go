@@ -58,7 +58,7 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	remotePreflight := strings.Index(script, `if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then`)
 	freshExportCheck := strings.Index(script, `if [ "$ack_token" != "$export_token" ]; then`)
 	strictRemoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
-	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`)
+	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"`)
 
 	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || externalDBConfirm < 0 ||
 		remotePreflight < 0 || freshExportCheck < 0 || strictRemoteDelete < 0 || deleteLocal < 0 {
@@ -121,7 +121,7 @@ func TestResetPreservesIMessageStateByDefault(t *testing.T) {
 			t.Errorf("default reset has over-broad deletion pattern %q", forbidden)
 		}
 	}
-	if !strings.Contains(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`) {
+	if !strings.Contains(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"`) {
 		t.Fatal("reset does not delete the expected SQLite database sidecars")
 	}
 	for _, stateName := range []string{
@@ -149,7 +149,7 @@ func TestResetFilesystemBehavior(t *testing.T) {
 			"config.yaml", "registration.yaml", "session.json", "keystore.plist",
 			"trustedpeers.plist", "facetime-state.plist", "future-apple-state.bin",
 		}
-		deleted := []string{"custom.db", "custom.db-wal", "custom.db-shm", "bridge.stdout.log", "bridge.stderr.log"}
+		deleted := []string{"custom.db", "custom.db-wal", "custom.db-shm", "custom.db-journal", "bridge.stdout.log", "bridge.stderr.log"}
 		for _, name := range append(append([]string{}, preserved...), deleted...) {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 				t.Fatal(err)
@@ -361,6 +361,115 @@ func TestResetFailsClosedWithoutProcessChecker(t *testing.T) {
 	serviceStop := strings.Index(script, "echo \"Stopping bridge...\"")
 	if checkerPreflight < 0 || serviceStop < 0 || checkerPreflight > serviceStop {
 		t.Fatalf("pgrep availability is not verified before the service stop: preflight=%d stop=%d", checkerPreflight, serviceStop)
+	}
+}
+
+func TestResetProcessMatcherScopesCortenMatrixDaemons(t *testing.T) {
+	helper := markedShellHelper(t, "RESET PROCESS MATCHER HELPER")
+	tests := []struct {
+		name       string
+		binaryPath string
+		command    string
+		wantMatch  bool
+	}{
+		{
+			name:       "bridge-all supervisor",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix bridge-all",
+			wantMatch:  true,
+		},
+		{
+			name:       "self-hosted managed child",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -c /var/lib/corten-matrix/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "Beeper managed child",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n -c /var/lib/corten-matrix/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "long config flag",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix --config=/var/lib/corten-matrix/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "bare daemon",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix",
+			wantMatch:  true,
+		},
+		{
+			name:       "reset parent",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix reset --account 0",
+			wantMatch:  false,
+		},
+		{
+			name:       "embedded reset shell",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/bin/bash /tmp/reset-bridge.sh /usr/local/bin/corten-matrix /var/lib/corten-matrix",
+			wantMatch:  false,
+		},
+		{
+			name:       "unrelated mautrix bridge",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "mautrix-signal -c /etc/mautrix-signal/config.yaml",
+			wantMatch:  false,
+		},
+		{
+			name:       "similar binary name",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/not-corten-matrix bridge-all",
+			wantMatch:  false,
+		},
+		{
+			name:       "renamed binary with regex characters",
+			binaryPath: "/tmp/corten-matrix[dev]",
+			command:    "/tmp/corten-matrix[dev] bridge-all",
+			wantMatch:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := helper + `
+pattern=$(bridge_daemon_pattern "$1")
+printf '%s\n' "$2" | grep -Eq "$pattern"
+`
+			cmd := exec.Command("/bin/bash", "-c", script, "process-matcher-test", tt.binaryPath, tt.command)
+			err := cmd.Run()
+			if (err == nil) != tt.wantMatch {
+				t.Errorf("process match for %q success=%t, want %t", tt.command, err == nil, tt.wantMatch)
+			}
+		})
+	}
+
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, `pgrep -f '(bridge-all| -c .*config\.yaml)'`) {
+		t.Fatal("reset still uses the unscoped mautrix process matcher")
+	}
+	if !strings.Contains(script, `pgrep -f "$BRIDGE_PROCESS_PATTERN"`) {
+		t.Fatal("reset does not use the scoped corten-matrix process matcher")
+	}
+}
+
+func TestResetAlwaysReconfirmsPostgreSQLAfterStop(t *testing.T) {
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, `DB_TYPES[$i]}" = postgres ] && [ "${SELECTED_RESUME_REMOTE[$i]}" != true`) {
+		t.Fatal("resumed reset still skips PostgreSQL confirmation")
+	}
+	if strings.Contains(script, "Reusing the external-database confirmation recorded by the interrupted reset.") {
+		t.Fatal("reset treats an earlier PostgreSQL confirmation as durable")
+	}
+	externalDBGate := strings.Index(script, `if [ "$HAS_EXTERNAL_DB" = true ]; then`)
+	externalDBConfirm := strings.Index(script, `read -r -p "Type EXTERNAL DATABASE CLEARED after completing that step: "`)
+	remoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
+	if externalDBGate < 0 || externalDBConfirm < externalDBGate || remoteDelete < externalDBConfirm {
+		t.Fatalf("PostgreSQL reconfirmation is not required before remote deletion: gate=%d confirm=%d delete=%d",
+			externalDBGate, externalDBConfirm, remoteDelete)
 	}
 }
 

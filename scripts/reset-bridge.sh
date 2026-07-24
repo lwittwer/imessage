@@ -45,7 +45,8 @@ self-hosted accounts, remote cleanup is unavailable and reset is local only.
                                  confirmation and a fresh Apple login afterward
   --external-database-cleared    coordinate a selected PostgreSQL reset; after
                                  the fresh session export, reset pauses for you
-                                 to clear the database and acknowledge that step
+                                 to clear the database and acknowledge that step;
+                                 every retry requires clearing it again
 
 For duplicate-DM recovery, install a binary containing the canonicalization fix
 before resetting. Remote Beeper cleanup and Apple-state deletion are independent:
@@ -166,11 +167,31 @@ if [ "${#SELECTED[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# BEGIN RESET PROCESS MATCHER HELPER
+bridge_daemon_pattern() {
+    local binary_name
+    local escaped_binary_name
+    binary_name=$(basename "$1") || return 1
+    [ -n "$binary_name" ] || return 1
+    # pgrep accepts an extended regular expression. Escape the executable's
+    # basename so a renamed development binary cannot widen the match.
+    escaped_binary_name=$(printf '%s\n' "$binary_name" |
+        sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
+    printf '^([^[:space:]]*/)?%s([[:space:]]+(bridge-all([[:space:]]|$)|(-n[[:space:]]+)?(-c|--config)([[:space:]]|=|$))|$)' \
+        "$escaped_binary_name"
+}
+# END RESET PROCESS MATCHER HELPER
+
 # The post-stop process check is a destructive-boundary guard, not an optional
-# diagnostic. A missing pgrep must fail closed instead of being mistaken for
-# "no daemon found" by the negated command below.
+# diagnostic. A missing or unusable checker must fail closed instead of being
+# mistaken for "no daemon found" by the negated command below.
 if ! command -v pgrep >/dev/null 2>&1; then
     echo "ERROR: pgrep is required to verify that the bridge stopped." >&2
+    echo "Nothing was stopped or deleted." >&2
+    exit 1
+fi
+if ! BRIDGE_PROCESS_PATTERN=$(bridge_daemon_pattern "$BINARY"); then
+    echo "ERROR: could not construct the corten-matrix process check." >&2
     echo "Nothing was stopped or deleted." >&2
     exit 1
 fi
@@ -573,10 +594,12 @@ else
     fi
 fi
 
-# Never remove state while a bridge daemon still appears to be running. The
-# parent `corten-matrix reset` process does not match these daemon arguments.
+# Never remove state while a bridge daemon still appears to be running. Match
+# the actual corten-matrix supervisor, managed child, or bare daemon forms—not
+# unrelated mautrix processes that also use "-c .../config.yaml". The parent
+# `corten-matrix reset` process does not match these daemon arguments.
 for attempt in 1 2 3 4 5; do
-    if pgrep -f '(bridge-all| -c .*config\.yaml)' >/dev/null 2>&1; then
+    if pgrep -f "$BRIDGE_PROCESS_PATTERN" >/dev/null 2>&1; then
         :
     else
         pgrep_status=$?
@@ -649,14 +672,12 @@ if [ "$DELETE_IMESSAGE_STATE" != true ]; then
     done
 fi
 
-NEEDS_EXTERNAL_DB_CONFIRMATION=false
-for i in "${!SELECTED[@]}"; do
-    if [ "${DB_TYPES[$i]}" = postgres ] && [ "${SELECTED_RESUME_REMOTE[$i]}" != true ]; then
-        NEEDS_EXTERNAL_DB_CONFIRMATION=true
-    fi
-done
-
-if [ "$HAS_EXTERNAL_DB" = true ] && [ "$NEEDS_EXTERNAL_DB_CONFIRMATION" = true ]; then
+# A remote-deletion intent proves which operation the operator authorized; it
+# does not prove that PostgreSQL stayed empty. The still-registered bridge may
+# have been restarted after an interrupted attempt and repopulated the database.
+# Therefore every attempt clears and reconfirms PostgreSQL after the service is
+# stopped, including recovery attempts that reuse a remote-deletion intent.
+if [ "$HAS_EXTERNAL_DB" = true ]; then
     echo ""
     if [ "$DELETE_IMESSAGE_STATE" = true ]; then
         echo "The bridge is stopped and Apple/iMessage state deletion was explicitly confirmed."
@@ -672,9 +693,6 @@ if [ "$HAS_EXTERNAL_DB" = true ] && [ "$NEEDS_EXTERNAL_DB_CONFIRMATION" = true ]
         echo "Any external database work you already performed is unchanged."
         exit 1
     fi
-elif [ "$HAS_EXTERNAL_DB" = true ]; then
-    echo ""
-    echo "Reusing the external-database confirmation recorded by the interrupted reset."
 fi
 
 if [ "$DELETE_REMOTE" = true ]; then
@@ -710,7 +728,8 @@ if [ "$DELETE_REMOTE" = true ]; then
         if ! "$BINARY" bbctl delete "$bridge"; then
             echo "ERROR: remote deletion failed; local file state was NOT deleted." >&2
             if [ "$HAS_EXTERNAL_DB" = true ]; then
-                echo "Any selected external database already cleared remains cleared." >&2
+                echo "A retry will require clearing and confirming each selected" >&2
+                echo "PostgreSQL database again after the bridge is stopped." >&2
             fi
             echo "An earlier selected registration may already have been deleted." >&2
             echo "The bridge remains stopped. Resolve the error and run the same reset again." >&2
@@ -731,7 +750,7 @@ delete_local_bridge_data() {
 
     echo "Deleting local bridge database and logs: $dir"
     if [ -n "$db_path" ]; then
-        rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"
+        rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"
     fi
     rm -rf -- "$dir/logs"
     rm -f -- "$dir/bridge.stdout.log" "$dir/bridge.stderr.log"
