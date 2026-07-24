@@ -199,7 +199,7 @@ func updateInitialSyncPortalMetadata(
 	save func(context.Context, *bridgev2.Portal) error,
 ) (bool, error) {
 	oldMetadata := portal.Metadata
-	refreshed, changed := initialSyncPortalMetadata(oldMetadata, isSms, smsDestination)
+	refreshed, changed := portalMetadataWithSMSRouting(oldMetadata, isSms, smsDestination)
 	updatedGUIDs := appendUniqueStrings(refreshed.ChatDBGUIDs, chatGUIDs...)
 	if !stringSlicesEqual(refreshed.ChatDBGUIDs, updatedGUIDs) {
 		refreshed.ChatDBGUIDs = append([]string(nil), updatedGUIDs...)

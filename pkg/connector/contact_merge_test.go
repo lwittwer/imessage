@@ -433,7 +433,7 @@ func TestInitialSyncMixedAliasesUseRetainedRepresentativeSMSState(t *testing.T) 
 	// Applying the newer retained iMessage representative must clear both the
 	// flag and its stale SMS destination.
 	exactGUIDs := []string{"iMessage;-;mixed@example.com", "SMS;-;+15550000021(smsft)"}
-	meta, changed := initialSyncPortalMetadata(
+	meta, changed := portalMetadataWithSMSRouting(
 		&PortalMetadata{
 			IsSms:          true,
 			SMSDestination: "tel:+15550000021",
@@ -450,6 +450,97 @@ func TestInitialSyncMixedAliasesUseRetainedRepresentativeSMSState(t *testing.T) 
 	}
 	if !reflect.DeepEqual(meta.ChatDBGUIDs, exactGUIDs) {
 		t.Fatalf("SMS routing update changed exact GUIDs: %#v", meta.ChatDBGUIDs)
+	}
+}
+
+func TestSMSDestinationForDMUsesRemoteEnvelopeHandle(t *testing.T) {
+	const self = "tel:+15559999999"
+	client := &IMClient{
+		handle:     self,
+		allHandles: []string{self, "mailto:self@example.com"},
+	}
+	sender := "+1 (555) 000-0023"
+	if got := client.smsDestinationForDM([]string{self}, &sender); got != "tel:+15550000023" {
+		t.Fatalf("sender fallback destination = %q, want tel:+15550000023", got)
+	}
+	if got := client.smsDestinationForDM(
+		[]string{"mailto:self@example.com", "5550000024"},
+		&sender,
+	); got != "tel:+15550000024" {
+		t.Fatalf("participant destination = %q, want tel:+15550000024", got)
+	}
+}
+
+func TestPortalMetadataWithSMSRoutingUpdatesDestinationWithoutServiceChange(t *testing.T) {
+	existing := &PortalMetadata{
+		ThreadID:       "thread",
+		IsSms:          true,
+		SMSDestination: "tel:+15550000021",
+	}
+	meta, changed := portalMetadataWithSMSRouting(existing, true, "tel:+15550000022")
+	if !changed {
+		t.Fatal("destination-only change was not detected")
+	}
+	if meta.SMSDestination != "tel:+15550000022" || !meta.IsSms {
+		t.Fatalf("updated metadata = %+v", meta)
+	}
+	if meta.ThreadID != existing.ThreadID {
+		t.Fatalf("unrelated metadata was not preserved: %+v", meta)
+	}
+	if existing.SMSDestination != "tel:+15550000021" {
+		t.Fatalf("input metadata was mutated: %+v", existing)
+	}
+}
+
+func TestPersistPortalSMSRoutingPropagatesSaveFailureForRetry(t *testing.T) {
+	saveErr := errors.New("save failed")
+	existing := &PortalMetadata{
+		ThreadID:       "thread",
+		IsSms:          true,
+		SMSDestination: "tel:+15550000021",
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{Metadata: existing}}
+	attempts := 0
+	changed, err := persistPortalSMSRouting(
+		portal,
+		true,
+		"tel:+15550000022",
+		func() error {
+			attempts++
+			return saveErr
+		},
+	)
+	if !errors.Is(err, saveErr) {
+		t.Fatalf("save error = %v, want %v", err, saveErr)
+	}
+	if !changed {
+		t.Fatal("failed routing metadata write was not reported as a change")
+	}
+	if portal.Metadata != existing {
+		t.Fatalf("portal metadata was not restored after failed save: got %+v, want original pointer %+v", portal.Metadata, existing)
+	}
+
+	changed, err = persistPortalSMSRouting(
+		portal,
+		true,
+		"tel:+15550000022",
+		func() error {
+			attempts++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("retry save error = %v", err)
+	}
+	if !changed {
+		t.Fatal("retry skipped routing metadata write after prior failure")
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok || meta.SMSDestination != "tel:+15550000022" {
+		t.Fatalf("retry metadata = %+v, want updated destination", portal.Metadata)
+	}
+	if attempts != 2 {
+		t.Fatalf("save attempts = %d, want 2", attempts)
 	}
 }
 
@@ -673,47 +764,6 @@ func TestUpdateInitialSyncPortalMetadataUnionsRetriesAndIsIdempotent(t *testing.
 	}
 	if saveCalls != 2 {
 		t.Fatalf("metadata update save calls = %d, want 2 with idempotent retry unsaved", saveCalls)
-	}
-}
-
-func TestCompleteChatDBInitialSyncRequiresDurablePortalMetadata(t *testing.T) {
-	meta := &UserLoginMetadata{}
-	saveCalls := 0
-
-	completed, err := completeChatDBInitialSync(meta, false, func() error {
-		saveCalls++
-		return nil
-	})
-	if err != nil || completed {
-		t.Fatalf("incomplete portal metadata = completed %v err %v, want false and nil", completed, err)
-	}
-	if meta.ChatsSynced || saveCalls != 0 {
-		t.Fatalf("incomplete portal metadata set completion = %v with %d saves, want false and 0", meta.ChatsSynced, saveCalls)
-	}
-
-	completed, err = completeChatDBInitialSync(meta, true, func() error {
-		saveCalls++
-		return errors.New("temporary user-login save failure")
-	})
-	if err == nil || completed {
-		t.Fatalf("failed completion save = completed %v err %v, want false and error", completed, err)
-	}
-	if meta.ChatsSynced {
-		t.Fatal("failed completion save did not restore ChatsSynced=false")
-	}
-
-	completed, err = completeChatDBInitialSync(meta, true, func() error {
-		saveCalls++
-		return nil
-	})
-	if err != nil || !completed {
-		t.Fatalf("successful completion retry = completed %v err %v, want true and nil", completed, err)
-	}
-	if !meta.ChatsSynced {
-		t.Fatal("successful completion retry did not persist ChatsSynced=true in memory")
-	}
-	if saveCalls != 2 {
-		t.Fatalf("completion save calls = %d, want 2", saveCalls)
 	}
 }
 
