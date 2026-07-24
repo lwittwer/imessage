@@ -15,6 +15,14 @@ ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
+RESET_CONFIG_BACKUP="$DATA_DIR/config.reset-backup.yaml"
+
+if [ ! -f "$CONFIG" ] && [ -f "$RESET_CONFIG_BACKUP" ]; then
+    if ! BRIDGE_NAME=$("$BINARY" reset-config-value "$RESET_CONFIG_BACKUP" appservice-id); then
+        echo "ERROR: reset config backup is invalid; refusing to guess the Beeper registration name." >&2
+        exit 1
+    fi
+fi
 
 # sudo prefix for SYSTEM-mode systemd calls. Root (e.g. LXC, where sudo often
 # isn't even installed) drives the system manager directly; a non-root sudo user
@@ -170,8 +178,13 @@ if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
 else
     echo "Generating Beeper config..."
+    CONFIG_WORK="$CONFIG"
+    if [ -f "$RESET_CONFIG_BACKUP" ]; then
+        CONFIG_WORK="$DATA_DIR/.config.reset-new.yaml"
+    fi
     for attempt in 1 2 3 4 5; do
-        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+        rm -f -- "$CONFIG_WORK"
+        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG_WORK" "$BRIDGE_NAME" 2>&1; then
             break
         fi
         if [ "$attempt" -eq 5 ]; then
@@ -184,16 +197,27 @@ else
     # Make the DB path absolute for ANY relative filename (file: or sqlite:, any name).
     # A relative uri makes the service crash-loop — it can't create the DB from the
     # service working dir. Idempotent: already-absolute (leading /) uris are left alone.
-    sed -i -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_DIR/corten-matrix.db?_txlock=immediate#" "$CONFIG"
+    sed -i -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_DIR/corten-matrix.db?_txlock=immediate#" "$CONFIG_WORK"
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
-    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
-    sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
-    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG_WORK"
+    sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG_WORK"
+    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG_WORK"
     # Enable unlimited backward backfill (default is 0 which disables it)
-    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG_WORK"
     # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
-    sed -i 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
+    sed -i 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG_WORK"
+    if [ -f "$RESET_CONFIG_BACKUP" ]; then
+        if ! "$BINARY" reset-merge-database "$RESET_CONFIG_BACKUP" "$CONFIG_WORK"; then
+            rm -f -- "$CONFIG_WORK"
+            echo "ERROR: fresh appservice credentials were registered, but the preserved database configuration could not be restored." >&2
+            echo "The new config was removed; fix $RESET_CONFIG_BACKUP and run setup-beeper again." >&2
+            exit 1
+        fi
+        mv -f -- "$CONFIG_WORK" "$CONFIG"
+        rm -f -- "$RESET_CONFIG_BACKUP"
+        echo "✓ Preserved database configuration restored"
+    fi
     echo "✓ Config saved to $CONFIG"
 fi
 

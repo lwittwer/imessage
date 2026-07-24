@@ -165,6 +165,10 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		log.Debug().Msg("No complete backup session state found, skipping auto-restore")
 		return
 	}
+	if !sessionRestoreHasRequiredPlatformState(state, runtime.GOOS) {
+		log.Info().Str("platform", runtime.GOOS).Msg("Backup session has no hardware key required for auto-restore on this platform")
+		return
+	}
 
 	// Validate against keystore
 	rustpushgo.InitLogger()

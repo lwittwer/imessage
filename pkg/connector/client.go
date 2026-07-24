@@ -389,7 +389,8 @@ type IMClient struct {
 	chatDB *chatDB
 
 	// Background goroutine lifecycle
-	stopChan chan struct{}
+	stopChan      chan struct{}
+	stateSaveDone chan struct{}
 	// Serializes Disconnect — see the comment there.
 	disconnectMu sync.Mutex
 
@@ -1402,8 +1403,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	// Start periodic state saver (every 5 minutes)
 	c.stopChan = make(chan struct{})
+	c.stateSaveDone = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
-	go c.periodicStateSave(log)
+	go c.periodicStateSave(log, c.stopChan, c.stateSaveDone)
 	go c.periodicPetRefresh(log)
 	go c.periodicStatusSharingReinvite(log)
 	go c.startSharedStreamsWatcher(log)
@@ -1632,9 +1634,20 @@ func (c *IMClient) Disconnect() {
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
+	stateSaveDone := c.stateSaveDone
 	if c.stopChan != nil {
 		close(c.stopChan)
 		c.stopChan = nil
+	}
+	if stateSaveDone != nil {
+		select {
+		case <-stateSaveDone:
+		case <-time.After(15 * time.Second):
+			c.UserLogin.Log.Warn().Msg("Final session export timed out during disconnect")
+		}
+		if c.stateSaveDone == stateSaveDone {
+			c.stateSaveDone = nil
+		}
 	}
 	// Close the APNs ResourceManager BEFORE stopping the Client: its death
 	// signal (a non-blocking try_send) aborts any in-flight reconnect so
@@ -9632,13 +9645,14 @@ func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfil
 // State persistence
 // ============================================================================
 
-func (c *IMClient) persistState(log zerolog.Logger) {
+func (c *IMClient) persistState(log zerolog.Logger) (success bool) {
 	// Guard against panics crossing the FFI boundary from any of the four
 	// rustpushgo calls below. A panic here would otherwise kill the bridge
 	// on a non-essential periodic persist; skipping one cycle is strictly
 	// safer than crashing the process.
 	defer func() {
 		if r := recover(); r != nil {
+			success = false
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
@@ -9664,7 +9678,7 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 	}
 	if cur, _ := c.UserLogin.Client.(*IMClient); cur != c {
 		log.Debug().Msg("Dropping state save from a replaced client")
-		return
+		return false
 	}
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if haveAPS {
@@ -9681,24 +9695,36 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
-		return
+		return false
 	}
 	// Keep the reset-safe file backup synchronized with the same snapshot that
 	// was just committed to the bridge database. In particular, the final save
 	// on shutdown now refreshes session.json before a DB-only reset proceeds.
-	saveSessionState(log, persistedSessionStateFromMetadata(meta))
+	if err := saveSessionState(log, persistedSessionStateFromMetadata(meta)); err != nil {
+		return false
+	}
+	return true
 }
 
-func (c *IMClient) periodicStateSave(log zerolog.Logger) {
+func (c *IMClient) periodicStateSave(log zerolog.Logger, stopChan <-chan struct{}, stateSaveDone chan<- struct{}) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
+	defer close(stateSaveDone)
 	for {
 		select {
 		case <-ticker.C:
 			c.persistState(log)
 			log.Debug().Msg("Periodic state save completed")
-		case <-c.stopChan:
-			c.persistState(log)
+		case <-stopChan:
+			clearErr := clearSessionExportAcknowledgement()
+			if clearErr != nil {
+				log.Error().Err(clearErr).Msg("Failed to clear prior reset session export acknowledgement")
+			}
+			if c.persistState(log) && clearErr == nil {
+				if err := acknowledgeSessionExport(log); err != nil {
+					log.Error().Err(err).Msg("Failed to acknowledge fresh reset session export")
+				}
+			}
 			log.Debug().Msg("Final state save on disconnect")
 			return
 		}

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/lrhodin/corten-matrix/scripts"
+	"gopkg.in/yaml.v3"
 )
 
 func embeddedScript(t *testing.T, name string) string {
@@ -53,11 +54,14 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	localConfirm := strings.Index(script, `read -r -p "Type RESET BRIDGE DATA to continue: "`)
 	imessageConfirm := strings.Index(script, `read -r -p "Type DELETE IMESSAGE STATE to confirm Apple session deletion: "`)
 	remoteConfirm := strings.Index(script, `read -r -p "Type DELETE BEEPER BRIDGE to confirm Beeper deletion: "`)
-	remotePreflight := strings.Index(script, `if ! "$BINARY" bbctl whoami >/dev/null 2>&1; then`)
+	externalDBConfirm := strings.Index(script, `read -r -p "Type EXTERNAL DATABASE CLEARED after completing that step: "`)
+	remotePreflight := strings.Index(script, `if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then`)
+	freshExportCheck := strings.Index(script, `if [ "$ack_token" != "$export_token" ]; then`)
 	strictRemoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
 	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`)
 
-	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || remotePreflight < 0 || strictRemoteDelete < 0 || deleteLocal < 0 {
+	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || externalDBConfirm < 0 ||
+		remotePreflight < 0 || freshExportCheck < 0 || strictRemoteDelete < 0 || deleteLocal < 0 {
 		t.Fatalf("reset script is missing a required confirmation or mutation marker")
 	}
 	if remotePreflight > localConfirm || remotePreflight > stop {
@@ -72,6 +76,12 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	if strictRemoteDelete < stop {
 		t.Fatalf("remote deletion appears before the service stop")
 	}
+	if freshExportCheck < stop || freshExportCheck > strictRemoteDelete || freshExportCheck > deleteLocal {
+		t.Fatalf("fresh session export is not required inside the deletion boundary")
+	}
+	if externalDBConfirm < stop || externalDBConfirm > strictRemoteDelete || externalDBConfirm > deleteLocal {
+		t.Fatalf("external database acknowledgement is outside the post-export deletion boundary")
+	}
 	if strictRemoteDelete > deleteLocal {
 		t.Fatalf("local deletion appears before strict remote deletion: remote=%d local=%d", strictRemoteDelete, deleteLocal)
 	}
@@ -83,6 +93,8 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 		"--delete-imessage-state",
 		"--external-database-cleared",
 		"check-restore --without-keychain",
+		".reset-session-export-request",
+		".reset-session-export-ack",
 		"Local file deletion cannot clear that external database.",
 		"refusing unsafe reset target",
 		"a corten-matrix bridge process is still running; no state was deleted.",
@@ -167,7 +179,7 @@ func TestResetFilesystemBehavior(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "corten-matrix.db")
 		for _, name := range []string{
-			"config.yaml", "corten-matrix.db", "session.json", "keystore.plist",
+			"config.yaml", "config.reset-backup.yaml", "corten-matrix.db", "session.json", "keystore.plist",
 			"trustedpeers.plist", "future-apple-state.bin",
 		} {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
@@ -177,7 +189,7 @@ func TestResetFilesystemBehavior(t *testing.T) {
 
 		runResetFilesystemHelper(t, helper, dir, dbPath, true, false)
 
-		for _, name := range []string{"session.json", "keystore.plist", "trustedpeers.plist", "future-apple-state.bin"} {
+		for _, name := range []string{"config.reset-backup.yaml", "session.json", "keystore.plist", "trustedpeers.plist", "future-apple-state.bin"} {
 			if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 				t.Errorf("iMessage state %q missing after Beeper cleanup: %v", name, err)
 			}
@@ -268,6 +280,7 @@ func TestResetRemotePolicy(t *testing.T) {
 	script := embeddedScript(t, "reset-bridge.sh")
 	for _, required := range []string{
 		`"$BINARY" reset-config-kind "$config"`,
+		`"$BINARY" reset-config-value "$config" appservice-id`,
 		`if [ "$keep_remote" = true ]; then`,
 		`printf 'local-only'`,
 	} {
@@ -284,7 +297,9 @@ func TestBridgeBinaryDispatchesResetConfigKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	managementCase := regexp.MustCompile(`(?s)case "setup".*?cli\.RunManagement\(os\.Args\[1\], os\.Args\[2:\]\)`).Find(source)
-	if managementCase == nil || !strings.Contains(string(managementCase), `"reset-config-kind"`) {
+	if managementCase == nil || !strings.Contains(string(managementCase), `"reset-config-kind"`) ||
+		!strings.Contains(string(managementCase), `"reset-config-value"`) ||
+		!strings.Contains(string(managementCase), `"reset-merge-database"`) {
 		t.Fatal("corten-matrix main does not dispatch the reset config inspector through the management CLI")
 	}
 }
@@ -342,57 +357,144 @@ func TestEmbeddedResetRunsAsSudoTargetUser(t *testing.T) {
 	}
 }
 
-func TestResetPostgresGuardAcceptsQuotedYAMLScalars(t *testing.T) {
-	script := embeddedScript(t, "reset-bridge.sh")
-	tests := []struct {
-		name    string
-		pattern string
-		values  []string
-	}{
-		{
-			name:    "postgres database",
-			pattern: `^[[:space:]]+type:[[:space:]]+['\"]?postgres['\"]?([[:space:]]|$)`,
-			values:  []string{"    type: postgres", `    type: "postgres"`, "    type: 'postgres'"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if !strings.Contains(script, tt.pattern) {
-				t.Fatalf("reset script missing config guard pattern %q", tt.pattern)
-			}
-			// The shell source needs a doubled backslash inside its double-quoted
-			// grep pattern; grep receives the single-backslash regexp below.
-			re := regexp.MustCompile(strings.ReplaceAll(tt.pattern, `\\`, `\`))
-			for _, value := range tt.values {
-				if !re.MatchString(value) {
-					t.Errorf("guard pattern does not match %q", value)
-				}
-			}
-		})
-	}
-}
-
-func TestResetYAMLScalarParsing(t *testing.T) {
-	helper := markedShellHelper(t, "RESET YAML HELPER")
+func TestResetConfigValuesParseFlowStyleYAML(t *testing.T) {
 	config := filepath.Join(t.TempDir(), "config.yaml")
-	contents := "network:\n  cloudkit_backfill: \"true\" # enabled\n  backfill_source: 'chatdb'\n  uri: \"file:/tmp/example.db?_txlock=immediate\"\n"
+	contents := `homeserver: {domain: beeper.local}
+appservice: {id: custom-imessage, as_token: old-as, hs_token: old-hs}
+database: {type: postgres, uri: "postgres://db/example?sslmode=disable"}
+network: {cloudkit_backfill: true, backfill_source: chatdb}
+`
 	if err := os.WriteFile(config, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		"cloudkit_backfill": "true",
-		"backfill_source":   "chatdb",
-		"uri":               "file:/tmp/example.db?_txlock=immediate",
+		"appservice-id":             "custom-imessage",
+		"database-type":             "postgres",
+		"database-uri":              "postgres://db/example?sslmode=disable",
+		"network-cloudkit-backfill": "true",
+		"network-backfill-source":   "chatdb",
 	} {
-		cmd := exec.Command("/bin/bash", "-c", helper+"\nread_yaml_scalar \"$1\" \"$2\"", "yaml-helper-test", key, config)
-		got, err := cmd.Output()
+		got, err := resetConfigValue(config, key)
 		if err != nil {
 			t.Fatalf("parse %s: %v", key, err)
 		}
-		if string(got) != want {
+		if got != want {
 			t.Errorf("parse %s = %q, want %q", key, got, want)
 		}
+	}
+	if got, err := resetConfigKind(config); err != nil || got != "beeper" {
+		t.Fatalf("flow-style homeserver classified as %q, %v", got, err)
+	}
+
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, `grep -Eq "^[[:space:]]+type:`) || strings.Contains(script, "read_yaml_scalar") {
+		t.Fatal("reset still uses line-oriented YAML parsing for database policy")
+	}
+}
+
+func TestMergeResetDatabaseConfigPreservesDatabaseOnly(t *testing.T) {
+	dir := t.TempDir()
+	backup := filepath.Join(dir, "config.reset-backup.yaml")
+	fresh := filepath.Join(dir, "config.yaml")
+	backupData := `appservice: {id: custom-imessage, as_token: old-as, hs_token: old-hs}
+database: {type: postgres, uri: "postgres://db/example", max_open_conns: 23}
+`
+	freshData := `appservice:
+  id: custom-imessage
+  as_token: fresh-as
+  hs_token: fresh-hs
+database:
+  type: sqlite3-fk-wal
+  uri: file:fresh.db
+`
+	if err := os.WriteFile(backup, []byte(backupData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, []byte(freshData), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := mergeResetDatabaseConfig(backup, fresh); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Appservice struct {
+			ASToken string `yaml:"as_token"`
+			HSToken string `yaml:"hs_token"`
+		} `yaml:"appservice"`
+		Database struct {
+			Type         string `yaml:"type"`
+			URI          string `yaml:"uri"`
+			MaxOpenConns int    `yaml:"max_open_conns"`
+		} `yaml:"database"`
+	}
+	if err = yaml.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Appservice.ASToken != "fresh-as" || got.Appservice.HSToken != "fresh-hs" {
+		t.Fatalf("fresh appservice credentials were overwritten: %#v", got.Appservice)
+	}
+	if got.Database.Type != "postgres" || got.Database.URI != "postgres://db/example" || got.Database.MaxOpenConns != 23 {
+		t.Fatalf("database stanza was not preserved: %#v", got.Database)
+	}
+	info, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("merged config mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestMergeResetDatabaseConfigFailureLeavesFreshConfigUntouched(t *testing.T) {
+	dir := t.TempDir()
+	backup := filepath.Join(dir, "config.reset-backup.yaml")
+	fresh := filepath.Join(dir, "config.yaml")
+	original := []byte("appservice: [\ndatabase: {type: sqlite3-fk-wal, uri: file:fresh.db}\n")
+	if err := os.WriteFile(backup, []byte("database: {type: postgres, uri: postgres://db/example}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mergeResetDatabaseConfig(backup, fresh); err == nil {
+		t.Fatal("malformed fresh config unexpectedly merged")
+	}
+	after, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, original) {
+		t.Fatal("failed merge modified the fresh config")
+	}
+}
+
+func TestResetWhoamiBridgeMatchIsExact(t *testing.T) {
+	helper := markedShellHelper(t, "RESET WHOAMI HELPER")
+	whoami := "lucas\n  custom-imessage imessage RUNNING\n  custom-imessage-old imessage RUNNING\n"
+	for bridge, wantSuccess := range map[string]bool{
+		"custom-imessage":     true,
+		"custom":              false,
+		"custom-imessage-old": true,
+		"sh-imessage":         false,
+	} {
+		cmd := exec.Command("/bin/bash", "-c", helper+"\nprintf '%s' \"$2\" | whoami_has_bridge \"$1\"", "whoami-helper-test", bridge, whoami)
+		err := cmd.Run()
+		if (err == nil) != wantSuccess {
+			t.Errorf("whoami match for %q success=%t, want %t", bridge, err == nil, wantSuccess)
+		}
+	}
+}
+
+func TestResetFirstBridgeTargetWorksWithBashNounset(t *testing.T) {
+	helper := markedShellHelper(t, "RESET BRIDGE TARGET HELPER")
+	script := "set -u\nSELECTED_BRIDGES=()\n" + helper + "\nbridge_target_is_unique custom-imessage\n"
+	cmd := exec.Command("/bin/bash", "-c", script)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("first bridge target failed under nounset: %v\n%s", err, output)
 	}
 }
 
@@ -411,6 +513,11 @@ func TestBeeperSetupNeverDeletesStateToRepairRegistration(t *testing.T) {
 			for _, required := range []string{
 				"Reusing it; setup will not delete remote Matrix rooms.",
 				"Setup will not delete the config or database automatically.",
+				`reset-config-value "$RESET_CONFIG_BACKUP" appservice-id`,
+				`CONFIG_WORK="$DATA_DIR/.config.reset-new.yaml"`,
+				`reset-merge-database "$RESET_CONFIG_BACKUP" "$CONFIG_WORK"`,
+				`mv -f -- "$CONFIG_WORK" "$CONFIG"`,
+				"Preserved database configuration restored",
 			} {
 				if !strings.Contains(script, required) {
 					t.Errorf("setup missing safety warning %q", required)
