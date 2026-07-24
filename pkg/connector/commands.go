@@ -617,6 +617,7 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 	type chatDBEntry struct {
 		portalID string
 		name     string
+		chatGUID string
 	}
 	var candidates []chatDBEntry
 	maxInitialMessages := client.Main.Bridge.Config.Backfill.MaxInitialMessages
@@ -654,7 +655,7 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 		}
 
 		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
-		candidates = append(candidates, chatDBEntry{portalID: portalID, name: name})
+		candidates = append(candidates, chatDBEntry{portalID: portalID, name: name, chatGUID: chat.ChatGUID})
 	}
 
 	if len(candidates) == 0 {
@@ -689,20 +690,27 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 			delete(client.recentlyDeletedPortals, chosen.portalID)
 			client.recentlyDeletedPortalsMu.Unlock()
 
-			client.Main.Bridge.QueueRemoteEvent(login, &simplevent.ChatResync{
-				EventMeta: simplevent.EventMeta{
-					Type:         bridgev2.RemoteEventChatResync,
-					PortalKey:    portalKey,
-					CreatePortal: true,
-					Timestamp:    time.Now(),
-				},
-				GetChatInfoFunc: client.GetChatInfo,
-			})
+			client.Main.Bridge.QueueRemoteEvent(login, newChatDBRestoreResync(portalKey, chosen.chatGUID, client))
 
 			ce.Reply("Restoring **%s** — the room will appear shortly with history from chat.db.", chosen.name)
 		}),
 		Cancel: func() {},
 	})
+}
+
+func newChatDBRestoreResync(portalKey networkid.PortalKey, chatGUID string, client *IMClient) *simplevent.ChatResync {
+	return &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    portalKey,
+			CreatePortal: true,
+			Timestamp:    time.Now(),
+		},
+		GetChatInfoFunc: client.GetChatInfo,
+		BundledBackfillData: chatDBBackfillGUIDBundle{
+			ChatGUIDs: []string{chatGUID},
+		},
+	}
 }
 
 // restoreChatCandidate represents a chat that can be restored.

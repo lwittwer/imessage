@@ -12555,12 +12555,21 @@ func mergeChatDBInitialSyncEntries(entries []chatDBInitialSyncEntry) []chatDBIni
 }
 
 // runChatDBInitialSync creates portals and backfills messages for all recent
-// chats found in chat.db. Runs once on first login, then marks ChatsSynced.
+// chats found in chat.db. On later connects it performs a non-destructive exact
+// GUID metadata refresh for existing rooms instead of simply returning.
 func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	ctx := log.WithContext(context.Background())
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if meta.ChatsSynced {
-		log.Info().Msg("Initial sync already completed, skipping")
+		updated, unchanged, err := c.refreshChatDBGUIDMetadata(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Exact chat.db GUID metadata refresh incomplete; will retry on next connect")
+			return
+		}
+		log.Info().
+			Int("updated_portals", updated).
+			Int("unchanged_portals", unchanged).
+			Msg("Refreshed exact chat.db GUID metadata for existing portals")
 		return
 	}
 
@@ -12673,16 +12682,13 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				return candidate
 			}
 			findExistingRoom := func(portalID string) existingDMPortalCandidate {
-				for _, variant := range existingDMPortalIDVariants(portalID) {
-					if _, exists := existingByID[variant]; exists {
-						return toCandidate(variant)
-					}
-				}
 				normalized := normalizeIdentifierForPortalID(portalID)
-				if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
-					return toCandidate(matches[0])
-				}
-				return existingDMPortalCandidate{}
+				return preferredExistingDMPortalSpelling(portalID, existingByNormalizedID[normalized], func(candidate string) existingDMPortalCandidate {
+					if _, exists := existingByID[candidate]; !exists {
+						return existingDMPortalCandidate{}
+					}
+					return toCandidate(candidate)
+				})
 			}
 
 			canonicalIDs, skip = canonicalizeChatDBInitialSyncDMPortalIDs(
@@ -12821,8 +12827,9 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networ
 				portal.Metadata = meta
 			}
 			changed := false
-			if !stringSlicesEqual(meta.ChatDBGUIDs, persistedChatGUIDs) {
-				meta.ChatDBGUIDs = append([]string(nil), persistedChatGUIDs...)
+			updatedChatGUIDs := appendUniqueStrings(meta.ChatDBGUIDs, persistedChatGUIDs...)
+			if !stringSlicesEqual(meta.ChatDBGUIDs, updatedChatGUIDs) {
+				meta.ChatDBGUIDs = updatedChatGUIDs
 				changed = true
 			}
 			if meta.IsSms != isSms {
@@ -12940,4 +12947,11 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func appendUniqueStrings(existing []string, additions ...string) []string {
+	combined := make([]string, 0, len(existing)+len(additions))
+	combined = append(combined, existing...)
+	combined = append(combined, additions...)
+	return uniqueStrings(combined)
 }

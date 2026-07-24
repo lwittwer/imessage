@@ -84,18 +84,60 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 // resolution avoid redirecting new traffic into an already-created empty
 // duplicate when another alias contains the real conversation.
 func (c *IMClient) findExistingDMPortalCandidate(identifier string) (existingDMPortalCandidate, error) {
-	existingID, err := c.findExistingDMPortalID(identifier)
-	if err != nil || existingID == "" {
-		return existingDMPortalCandidate{ID: existingID}, err
+	ctx := context.Background()
+	portalKeys := make(map[string]networkid.PortalKey)
+	for _, candidate := range existingDMPortalIDVariants(identifier) {
+		key := networkid.PortalKey{
+			ID:       networkid.PortalID(candidate),
+			Receiver: c.UserLogin.ID,
+		}
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, key)
+		if err != nil {
+			return existingDMPortalCandidate{}, err
+		}
+		if portal != nil && portal.MXID != "" {
+			portalKeys[candidate] = portal.PortalKey
+		}
 	}
-	firstMessage, err := c.Main.Bridge.DB.Message.GetFirstPortalMessage(context.Background(), networkid.PortalKey{
-		ID:       networkid.PortalID(existingID),
-		Receiver: c.UserLogin.ID,
-	})
+
+	// Direct key lookups cannot discover case-only legacy email variants.
+	// Include every normalized match so a populated legacy spelling can beat
+	// an empty canonical room.
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
 	if err != nil {
 		return existingDMPortalCandidate{}, err
 	}
-	return existingDMPortalCandidate{ID: existingID, HasMessages: firstMessage != nil}, nil
+	normalized := normalizeIdentifierForPortalID(identifier)
+	var normalizedMatches []string
+	for _, portal := range portals {
+		portalID := string(portal.ID)
+		if (portal.Receiver == "" || portal.Receiver == c.UserLogin.ID) &&
+			normalizeIdentifierForPortalID(portalID) == normalized {
+			portalKeys[portalID] = portal.PortalKey
+			normalizedMatches = append(normalizedMatches, portalID)
+		}
+	}
+
+	var lookupErr error
+	chosen := preferredExistingDMPortalSpelling(identifier, normalizedMatches, func(candidate string) existingDMPortalCandidate {
+		if lookupErr != nil {
+			return existingDMPortalCandidate{}
+		}
+		key, ok := portalKeys[candidate]
+		if !ok {
+			return existingDMPortalCandidate{}
+		}
+		firstMessage, queryErr := c.Main.Bridge.DB.Message.GetFirstPortalMessage(ctx, key)
+		if queryErr != nil {
+			lookupErr = queryErr
+			return existingDMPortalCandidate{}
+		}
+		return existingDMPortalCandidate{ID: candidate, HasMessages: firstMessage != nil}
+	})
+	if lookupErr != nil {
+		return existingDMPortalCandidate{}, lookupErr
+	}
+	return chosen, nil
 }
 
 // preferredExistingDMPortalCandidate chooses the first populated existing
@@ -119,6 +161,32 @@ func preferredExistingDMPortalCandidate(
 		}
 	}
 	return chosen
+}
+
+// preferredExistingDMPortalSpelling compares all direct legacy spellings and
+// all normalized stored matches before choosing. Direct spellings retain their
+// deterministic priority for ties, while any populated spelling beats an
+// empty one.
+func preferredExistingDMPortalSpelling(
+	identifier string,
+	normalizedMatches []string,
+	findExistingRoom func(string) existingDMPortalCandidate,
+) existingDMPortalCandidate {
+	candidates := existingDMPortalIDVariants(identifier)
+	seen := make(map[string]struct{}, len(candidates)+len(normalizedMatches))
+	for _, candidate := range candidates {
+		seen[candidate] = struct{}{}
+	}
+	normalizedMatches = append([]string(nil), normalizedMatches...)
+	sort.Strings(normalizedMatches)
+	for _, candidate := range normalizedMatches {
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return preferredExistingDMPortalCandidate(candidates, findExistingRoom)
 }
 
 // validateTargetsSafe wraps Client.ValidateTargets with a recover guard.
@@ -386,43 +454,6 @@ func existingDMPortalIDVariants(identifier string) []string {
 		}
 	}
 	return variants
-}
-
-// findExistingDMPortalID returns the exact portal key already associated with
-// a Matrix room for this identifier, including legacy phone spellings.
-func (c *IMClient) findExistingDMPortalID(identifier string) (string, error) {
-	ctx := context.Background()
-	for _, candidate := range existingDMPortalIDVariants(identifier) {
-		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-			ID:       networkid.PortalID(candidate),
-			Receiver: c.UserLogin.ID,
-		})
-		if err != nil {
-			return "", err
-		}
-		if portal != nil && portal.MXID != "" {
-			return candidate, nil
-		}
-	}
-
-	// Direct key lookups cannot discover case-only legacy email variants.
-	// Fall back to a normalized scan and return the exact stored key.
-	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
-	if err != nil {
-		return "", err
-	}
-	normalized := normalizeIdentifierForPortalID(identifier)
-	var matches []string
-	for _, portal := range portals {
-		if (portal.Receiver == "" || portal.Receiver == c.UserLogin.ID) && normalizeIdentifierForPortalID(string(portal.ID)) == normalized {
-			matches = append(matches, string(portal.ID))
-		}
-	}
-	if len(matches) > 0 {
-		sort.Strings(matches)
-		return matches[0], nil
-	}
-	return "", nil
 }
 
 type existingDMPortalCandidate struct {
