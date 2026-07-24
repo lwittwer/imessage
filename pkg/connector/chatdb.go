@@ -45,6 +45,12 @@ type chatDBBackfillCursorPosition struct {
 	RowID  int   `json:"row_id"`
 }
 
+type chatDBBackfillGUIDBundle struct {
+	// ChatGUIDs are literal values selected from the fresh chat.db
+	// enumeration that queued the initial-sync or restore resync.
+	ChatGUIDs []string
+}
+
 // openChatDB attempts to open the local iMessage chat.db database.
 // Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
 func openChatDB(log zerolog.Logger) *chatDB {
@@ -137,17 +143,13 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	portalID := string(params.Portal.ID)
 	log := zerolog.Ctx(ctx)
 
-	var chatGUIDs []string
-	if strings.Contains(portalID, ",") {
-		// Group portal: find chat GUID by matching members
-		chatGUID := db.findGroupChatGUID(portalID, c)
-		if chatGUID != "" {
-			chatGUIDs = []string{chatGUID}
-		}
-	} else {
-		// Use contact-aware lookup: includes chat GUIDs for all of the
-		// contact's phone numbers, so merged DM portals get complete history.
-		chatGUIDs = c.getContactChatGUIDs(portalID)
+	// Re-enumerate exact variants at the start of each real backfill session:
+	// forward backfill is one-shot, while an empty cursor identifies the first
+	// backward page. A resumed backward cursor keeps its original GUID set.
+	refreshExactGUIDs := params.Forward || params.Cursor == ""
+	chatGUIDs, err := db.chatGUIDsForPortal(ctx, params.Portal, c, params.BundledData, refreshExactGUIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
@@ -201,6 +203,11 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		messages = append(messages, msgs...)
 		messagesByGUID[chatGUID] = msgs
 	}
+
+	// Cursor state is intentionally calculated from the raw per-GUID pages.
+	// The same chat_message row can be joined through multiple exact chat GUIDs,
+	// so deduplicate the merged event stream before conversion.
+	messages = deduplicateChatDBMessages(messages)
 
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
@@ -275,12 +282,225 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	}
 
 	return &bridgev2.FetchMessagesResponse{
-		Messages:                backfillMessages,
-		Cursor:                  nextCursor,
-		HasMore:                 hasMore,
-		Forward:                 params.Forward,
-		AggressiveDeduplication: params.Forward,
+		Messages: backfillMessages,
+		Cursor:   nextCursor,
+		HasMore:  hasMore,
+		Forward:  params.Forward,
+		// A shared chat_message row may fall on different per-GUID backward
+		// pages. In-page deduplication cannot suppress a copy already persisted
+		// by live APNs or an earlier page, so multi-GUID backward sessions need
+		// the framework's database-level deduplication too.
+		AggressiveDeduplication: params.Forward || len(chatGUIDs) > 1,
 	}, nil
+}
+
+// chatGUIDsForPortal returns the exact chat.db GUID set saved while deciding
+// whether an initial-sync portal has backfillable content. The saved set is
+// authoritative: in particular, Apple SMS-forwarding GUID suffixes cannot be
+// reconstructed from the normalized portal ID. Older portals without saved
+// GUIDs retain the pre-existing lookup behavior.
+func (db *chatDB) chatGUIDsForPortal(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	c *IMClient,
+	bundledData any,
+	refreshExact bool,
+) ([]string, error) {
+	var exactGUIDs []string
+	bundleSuppliedExactGUIDs := false
+	if bundle, ok := bundledData.(chatDBBackfillGUIDBundle); ok && len(bundle.ChatGUIDs) > 0 {
+		exactGUIDs = uniqueStrings(bundle.ChatGUIDs)
+		bundleSuppliedExactGUIDs = len(exactGUIDs) > 0
+	}
+	if portal != nil {
+		if meta, ok := portal.Metadata.(*PortalMetadata); ok && len(meta.ChatDBGUIDs) > 0 {
+			exactGUIDs = appendUniqueStrings(exactGUIDs, meta.ChatDBGUIDs...)
+		}
+	}
+	if len(exactGUIDs) > 0 {
+		if refreshExact {
+			if bundleSuppliedExactGUIDs {
+				// Initial sync and restore-chat build this bundle from the same
+				// complete chat.db enumeration that queued the resync. Persist
+				// its union without immediately repeating that global scan once
+				// per portal.
+				changed, err := persistExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
+				if err != nil {
+					return nil, fmt.Errorf("persist bundled exact chat.db GUID metadata: %w", err)
+				}
+				if changed {
+					zerolog.Ctx(ctx).Info().
+						Int("guid_count", len(exactGUIDs)).
+						Msg("Persisted bundled exact chat.db GUID metadata before backfill")
+				}
+			} else {
+				var err error
+				exactGUIDs, err = db.refreshExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		return exactGUIDs, nil
+	}
+
+	portalID := ""
+	if portal != nil {
+		portalID = string(portal.ID)
+	}
+	if strings.Contains(portalID, ",") {
+		chatGUID := db.findGroupChatGUID(portalID, c)
+		if chatGUID != "" {
+			return []string{chatGUID}, nil
+		}
+		return nil, nil
+	}
+	// Contact-aware fallback for portals created before exact GUID metadata
+	// was introduced.
+	return uniqueStrings(c.getContactChatGUIDs(portalID)), nil
+}
+
+// refreshExactChatDBGUIDsForPortal grows an already-authoritative exact set at
+// a backfill-session boundary. Only enumerated GUIDs whose normalized identity
+// is already represented may be added; contact aliases and guessed suffixes
+// are never expanded. Enumeration failures retain the prior set, while save
+// failures roll back in-memory metadata and fail the fetch so a retry can
+// persist the same union.
+func (db *chatDB) refreshExactChatDBGUIDsForPortal(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	existing []string,
+) ([]string, error) {
+	merged := uniqueStrings(existing)
+	var added []string
+	chats, err := db.api.GetChatsWithMessagesAfter(time.Time{})
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to enumerate chat.db exact GUID variants before backfill")
+	} else {
+		merged, added = refreshedChatDBGUIDs(existing, chats)
+	}
+
+	if portal != nil {
+		changed, updateErr := persistExactChatDBGUIDsForPortal(ctx, portal, merged)
+		if updateErr != nil {
+			err = updateErr
+			return nil, fmt.Errorf("persist refreshed exact chat.db GUID metadata: %w", err)
+		}
+		if changed {
+			zerolog.Ctx(ctx).Info().
+				Int("added_guid_count", len(added)).
+				Msg("Persisted exact chat.db GUID metadata before backfill")
+		}
+	}
+	if len(added) > 0 {
+		zerolog.Ctx(ctx).Info().
+			Int("added_guid_count", len(added)).
+			Msg("Refreshed exact chat.db GUID set before backfill")
+	}
+	return merged, nil
+}
+
+func persistExactChatDBGUIDsForPortal(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	exactGUIDs []string,
+) (bool, error) {
+	if portal == nil {
+		return false, nil
+	}
+	var save func(context.Context, *bridgev2.Portal) error
+	if portal.Bridge != nil {
+		save = func(ctx context.Context, portal *bridgev2.Portal) error {
+			return portal.Save(ctx)
+		}
+	}
+	return updatePortalChatDBGUIDMetadata(ctx, portal, exactGUIDs, save)
+}
+
+// chatDBGUIDIdentityKey removes only representation details that do not change
+// the remote conversation identity: the service prefix and Apple's known SMS
+// forwarding suffix. It deliberately does not expand through contacts.
+func chatDBGUIDIdentityKey(chatGUID string) string {
+	parsed := imessage.ParseIdentifier(chatGUID)
+	if parsed.LocalID == "" {
+		return ""
+	}
+	if parsed.IsGroup {
+		return "group:" + strings.ToLower(stripSmsSuffix(parsed.LocalID))
+	}
+	portalID := identifierToPortalID(parsed)
+	if portalID == "" {
+		return ""
+	}
+	return "dm:" + normalizeIdentifierForPortalID(string(portalID))
+}
+
+// refreshedChatDBGUIDs unions exact GUIDs currently enumerated by chat.db into
+// an existing authoritative set. Existing entries are never removed, and an
+// empty set remains empty so legacy portals retain contact-aware fallback.
+func refreshedChatDBGUIDs(existing []string, chats []imessage.ChatIdentifier) (merged, added []string) {
+	merged = uniqueStrings(existing)
+	if len(merged) == 0 {
+		return merged, nil
+	}
+	identities := make(map[string]struct{}, len(merged))
+	seen := make(map[string]struct{}, len(merged))
+	for _, chatGUID := range merged {
+		seen[chatGUID] = struct{}{}
+		if identity := chatDBGUIDIdentityKey(chatGUID); identity != "" {
+			identities[identity] = struct{}{}
+		}
+	}
+	for _, chat := range chats {
+		chatGUID := chat.ChatGUID
+		if chatGUID == "" {
+			continue
+		}
+		if _, exists := seen[chatGUID]; exists {
+			continue
+		}
+		identity := chatDBGUIDIdentityKey(chatGUID)
+		if _, matches := identities[identity]; identity == "" || !matches {
+			continue
+		}
+		seen[chatGUID] = struct{}{}
+		merged = append(merged, chatGUID)
+		added = append(added, chatGUID)
+	}
+	return merged, added
+}
+
+func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message {
+	seen := make(map[string]struct{}, len(messages))
+	result := make([]*imessage.Message, 0, len(messages))
+	for _, message := range messages {
+		if message == nil || message.GUID == "" {
+			result = append(result, message)
+			continue
+		}
+		if _, ok := seen[message.GUID]; ok {
+			continue
+		}
+		seen[message.GUID] = struct{}{}
+		result = append(result, message)
+	}
+	return result
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func chatDBCursorStateForGUID(cursorTimes map[string]chatDBBackfillCursorPosition, chatGUID string, hasBackwardCursor bool) (chatDBBackfillCursorPosition, bool, bool) {

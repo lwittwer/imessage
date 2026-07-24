@@ -2,6 +2,7 @@ package connector
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -47,6 +48,7 @@ func TestPortalMetadata_JSON(t *testing.T) {
 		GroupName:      "My Group",
 		IsSms:          true,
 		SMSDestination: "tel:+15551234567",
+		ChatDBGUIDs:    []string{"SMS;-;+15550000001(smsft)"},
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
@@ -57,7 +59,7 @@ func TestPortalMetadata_JSON(t *testing.T) {
 	if err := json.Unmarshal(data, &pm2); err != nil {
 		t.Fatalf("Unmarshal error: %v", err)
 	}
-	if pm2 != *pm {
+	if !reflect.DeepEqual(pm2, *pm) {
 		t.Errorf("round-trip mismatch: got %+v, want %+v", pm2, *pm)
 	}
 }

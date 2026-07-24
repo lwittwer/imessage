@@ -46,22 +46,130 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 		return defaultID
 	}
 
-	existingID, err := c.findExistingDMPortalIDForCandidates(preferredContactPortalIDs(contact))
+	chosen, err := c.findExistingDMPortalCandidateForCandidates(preferredContactPortalIDs(contact))
 	if err != nil {
 		c.UserLogin.Log.Warn().Err(err).
 			Str("original", logSafeHandle(identifier)).
 			Msg("Failed to check existing contact portals; preserving original portal ID")
 		return defaultID
 	}
-	if existingID != "" {
+	if chosen.ID != "" {
 		c.UserLogin.Log.Debug().
 			Str("original", logSafeHandle(identifier)).
-			Str("resolved", logSafeHandle(existingID)).
+			Str("resolved", logSafeHandle(chosen.ID)).
+			Bool("has_messages", chosen.HasMessages).
 			Msg("Resolved contact portal to existing portal")
-		return networkid.PortalID(existingID)
+		return networkid.PortalID(chosen.ID)
 	}
 
 	return defaultID
+}
+
+// findExistingDMPortalCandidateForCandidates returns the best exact existing
+// portal key across all contact aliases. It loads the normalized portal index
+// once, then prefers a populated room over an empty duplicate while preserving
+// deterministic contact and legacy-spelling order as the tie-break.
+func (c *IMClient) findExistingDMPortalCandidateForCandidates(identifiers []string) (existingDMPortalCandidate, error) {
+	ctx := context.Background()
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		return existingDMPortalCandidate{}, err
+	}
+
+	portalKeys := make(map[string]networkid.PortalKey)
+	normalizedMatches := make(map[string][]string)
+	for _, portal := range portals {
+		portalID := string(portal.ID)
+		if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
+			continue
+		}
+		portalKeys[portalID] = portal.PortalKey
+		normalized := normalizeIdentifierForPortalID(portalID)
+		normalizedMatches[normalized] = append(normalizedMatches[normalized], portalID)
+	}
+	for normalized := range normalizedMatches {
+		sort.Strings(normalizedMatches[normalized])
+	}
+
+	messageState := make(map[string]existingDMPortalCandidate)
+	var lookupErr error
+	findExistingRoom := func(candidate string) existingDMPortalCandidate {
+		if lookupErr != nil {
+			return existingDMPortalCandidate{}
+		}
+		if existing, ok := messageState[candidate]; ok {
+			return existing
+		}
+		key, ok := portalKeys[candidate]
+		if !ok {
+			return existingDMPortalCandidate{}
+		}
+		firstMessage, queryErr := c.Main.Bridge.DB.Message.GetFirstPortalMessage(ctx, key)
+		if queryErr != nil {
+			lookupErr = queryErr
+			return existingDMPortalCandidate{}
+		}
+		existing := existingDMPortalCandidate{ID: candidate, HasMessages: firstMessage != nil}
+		messageState[candidate] = existing
+		return existing
+	}
+	chosen := preferredExistingDMPortalCandidate(identifiers, func(identifier string) existingDMPortalCandidate {
+		normalized := normalizeIdentifierForPortalID(identifier)
+		return preferredExistingDMPortalSpelling(identifier, normalizedMatches[normalized], findExistingRoom)
+	})
+	if lookupErr != nil {
+		return existingDMPortalCandidate{}, lookupErr
+	}
+	return chosen, nil
+}
+
+// preferredExistingDMPortalCandidate chooses the first populated existing
+// portal in candidate order. If none are populated, it chooses the first empty
+// existing portal. Candidate order provides the deterministic tie-break.
+func preferredExistingDMPortalCandidate(
+	candidates []string,
+	findExistingRoom func(string) existingDMPortalCandidate,
+) existingDMPortalCandidate {
+	var chosen existingDMPortalCandidate
+	if findExistingRoom == nil {
+		return chosen
+	}
+	for _, candidate := range candidates {
+		existing := findExistingRoom(candidate)
+		if existing.ID == "" {
+			continue
+		}
+		if chosen.ID == "" || (!chosen.HasMessages && existing.HasMessages) {
+			chosen = existing
+		}
+	}
+	return chosen
+}
+
+// preferredExistingDMPortalSpelling compares all direct legacy spellings and
+// all normalized stored matches before choosing. Direct spellings retain their
+// deterministic priority for ties, while any populated spelling beats an
+// empty one.
+func preferredExistingDMPortalSpelling(
+	identifier string,
+	normalizedMatches []string,
+	findExistingRoom func(string) existingDMPortalCandidate,
+) existingDMPortalCandidate {
+	candidates := existingDMPortalIDVariants(identifier)
+	seen := make(map[string]struct{}, len(candidates)+len(normalizedMatches))
+	for _, candidate := range candidates {
+		seen[candidate] = struct{}{}
+	}
+	normalizedMatches = append([]string(nil), normalizedMatches...)
+	sort.Strings(normalizedMatches)
+	for _, candidate := range normalizedMatches {
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return preferredExistingDMPortalCandidate(candidates, findExistingRoom)
 }
 
 // validateTargetsSafe wraps Client.ValidateTargets with a recover guard.
@@ -331,82 +439,23 @@ func existingDMPortalIDVariants(identifier string) []string {
 	return variants
 }
 
-// findExistingDMPortalIDForCandidates checks candidates in preference order
-// while loading the normalized portal index at most once. The normalized scan
-// is required for case-only legacy email keys, but repeating it for every
-// handle of every contact makes initial CloudKit routing scale as
-// handles × portals.
-func (c *IMClient) findExistingDMPortalIDForCandidates(identifiers []string) (string, error) {
-	ctx := context.Background()
-	var existingByID map[string]bool
-	var existingByNormalizedID map[string][]string
-	loadPortalIndex := func() error {
-		portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
-		if err != nil {
-			return err
-		}
-		existingByID = make(map[string]bool, len(portals))
-		existingByNormalizedID = make(map[string][]string)
-		for _, portal := range portals {
-			if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
-				continue
-			}
-			portalID := string(portal.ID)
-			existingByID[portalID] = true
-			normalized := normalizeIdentifierForPortalID(portalID)
-			existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
-		}
-		for normalized := range existingByNormalizedID {
-			sort.Strings(existingByNormalizedID[normalized])
-		}
-		return nil
-	}
-
-	for _, identifier := range identifiers {
-		variants := existingDMPortalIDVariants(identifier)
-		if existingByID == nil {
-			for _, candidate := range variants {
-				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-					ID:       networkid.PortalID(candidate),
-					Receiver: c.UserLogin.ID,
-				})
-				if err != nil {
-					return "", err
-				}
-				if portal != nil && portal.MXID != "" {
-					return candidate, nil
-				}
-			}
-			// Direct key lookups cannot discover case-only legacy email
-			// variants. Load one normalized index and reuse it for every
-			// remaining candidate in this contact.
-			if err := loadPortalIndex(); err != nil {
-				return "", err
-			}
-		}
-		for _, candidate := range variants {
-			if existingByID[candidate] {
-				return candidate, nil
-			}
-		}
-		normalized := normalizeIdentifierForPortalID(identifier)
-		if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
-			return matches[0], nil
-		}
-	}
-	return "", nil
+type existingDMPortalCandidate struct {
+	ID          string
+	HasMessages bool
 }
 
 // canonicalizeChatDBInitialSyncDMPortalIDs maps each multi-handle contact to
 // one portal ID and marks duplicate chat.db entries to skip. Existing Matrix
-// rooms win so upgrades keep their current portal identity; new contacts use a
-// deterministic phone-preferred handle. The first input for a contact is kept
-// as the representative because chat.db returns chats in activity order.
+// rooms with messages win so upgrades keep the populated conversation instead
+// of an empty alias. Otherwise existing rooms win over new IDs, with the
+// deterministic phone-preferred candidate order breaking ties. New contacts
+// use that same deterministic order. The first input for a contact is kept as
+// the representative because chat.db returns chats in activity order.
 func canonicalizeChatDBInitialSyncDMPortalIDs(
 	portalIDs []string,
 	lookupContact func(string) *imessage.Contact,
 	isSelf func(string) bool,
-	findExistingRoom func(string) string,
+	findExistingRoom func(string) existingDMPortalCandidate,
 ) (canonical []string, skip map[int]bool) {
 	canonical = append([]string(nil), portalIDs...)
 	skip = make(map[int]bool)
@@ -451,11 +500,9 @@ func canonicalizeChatDBInitialSyncDMPortalIDs(
 		}
 		chosen := candidates[0]
 		if findExistingRoom != nil {
-			for _, candidate := range candidates {
-				if existingID := findExistingRoom(candidate); existingID != "" {
-					chosen = existingID
-					break
-				}
+			chosenExisting := preferredExistingDMPortalCandidate(candidates, findExistingRoom)
+			if chosenExisting.ID != "" {
+				chosen = chosenExisting.ID
 			}
 		}
 
@@ -481,20 +528,21 @@ func canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
 	lookupContact func(string) *imessage.Contact,
 	isSelf func(string) bool,
 	loadExistingRooms func(context.Context) ([]*bridgev2.Portal, error),
+	inspectExistingRoom func(*bridgev2.Portal) existingDMPortalCandidate,
 ) (canonical []string, skip map[int]bool, err error) {
 	existingPortals, err := loadExistingRooms(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	existingByID := make(map[string]bool, len(existingPortals))
+	existingByID := make(map[string]*bridgev2.Portal, len(existingPortals))
 	existingByNormalizedID := make(map[string][]string)
 	for _, portal := range existingPortals {
 		if portal.Receiver != "" && portal.Receiver != receiver {
 			continue
 		}
 		portalID := string(portal.ID)
-		existingByID[portalID] = true
+		existingByID[portalID] = portal
 		normalized := normalizeIdentifierForPortalID(portalID)
 		existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
 	}
@@ -502,17 +550,29 @@ func canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
 		sort.Strings(existingByNormalizedID[normalized])
 	}
 
-	findExistingRoom := func(portalID string) string {
-		for _, variant := range existingDMPortalIDVariants(portalID) {
-			if existingByID[variant] {
-				return variant
-			}
+	inspectedByID := make(map[string]existingDMPortalCandidate)
+	findExistingRoomByID := func(portalID string) existingDMPortalCandidate {
+		portal, ok := existingByID[portalID]
+		if !ok {
+			return existingDMPortalCandidate{}
 		}
+		if inspected, ok := inspectedByID[portalID]; ok {
+			return inspected
+		}
+		candidate := existingDMPortalCandidate{ID: portalID}
+		if inspectExistingRoom != nil {
+			candidate.HasMessages = inspectExistingRoom(portal).HasMessages
+		}
+		inspectedByID[portalID] = candidate
+		return candidate
+	}
+	findExistingRoom := func(portalID string) existingDMPortalCandidate {
 		normalized := normalizeIdentifierForPortalID(portalID)
-		if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
-			return matches[0]
-		}
-		return ""
+		return preferredExistingDMPortalSpelling(
+			portalID,
+			existingByNormalizedID[normalized],
+			findExistingRoomByID,
+		)
 	}
 	canonical, skip = canonicalizeChatDBInitialSyncDMPortalIDs(
 		portalIDs, lookupContact, isSelf, findExistingRoom,
