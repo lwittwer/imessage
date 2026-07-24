@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 func TestPersistedSessionStateFromMetadata(t *testing.T) {
@@ -36,6 +38,46 @@ func TestPersistedSessionStateFromMetadata(t *testing.T) {
 		got.AccountDSID != meta.AccountDSID || got.AccountSPDBase64 != meta.AccountSPDBase64 ||
 		got.MmeDelegateJSON != meta.MmeDelegateJSON {
 		t.Fatalf("metadata was not fully copied: %#v", got)
+	}
+}
+
+func TestUserLoginMetadataFromPersistedSessionState(t *testing.T) {
+	state := PersistedSessionState{
+		Platform:                 "macos",
+		APSState:                 "aps",
+		IDSUsers:                 "users",
+		IDSIdentity:              "identity",
+		DeviceID:                 "device",
+		HardwareKey:              "hardware",
+		PreferredHandle:          "mailto:user@example.invalid",
+		AccountUsername:          "user@example.invalid",
+		AccountHashedPasswordHex: "hash",
+		AccountPET:               "pet",
+		AccountADSID:             "adsid",
+		AccountDSID:              "dsid",
+		AccountSPDBase64:         "spd",
+		MmeDelegateJSON:          "delegate",
+	}
+
+	got := userLoginMetadataFromPersistedSessionState(state, "fallback-os")
+	if got.Platform != state.Platform || got.APSState != state.APSState ||
+		got.IDSUsers != state.IDSUsers || got.IDSIdentity != state.IDSIdentity ||
+		got.DeviceID != state.DeviceID || got.HardwareKey != state.HardwareKey ||
+		got.PreferredHandle != state.PreferredHandle ||
+		got.AccountUsername != state.AccountUsername ||
+		got.AccountHashedPasswordHex != state.AccountHashedPasswordHex ||
+		got.AccountPET != state.AccountPET || got.AccountADSID != state.AccountADSID ||
+		got.AccountDSID != state.AccountDSID || got.AccountSPDBase64 != state.AccountSPDBase64 ||
+		got.MmeDelegateJSON != state.MmeDelegateJSON {
+		t.Fatalf("persisted session was not fully restored: %#v", got)
+	}
+	if got.ChatsSynced {
+		t.Fatal("reset recovery must force a fresh chat sync")
+	}
+
+	state.Platform = ""
+	if got = userLoginMetadataFromPersistedSessionState(state, "fallback-os"); got.Platform != "fallback-os" {
+		t.Fatalf("empty platform restored as %q, want fallback-os", got.Platform)
 	}
 }
 
@@ -111,6 +153,13 @@ func TestSessionRestoreRequiresHardwareKeyOutsideMacOS(t *testing.T) {
 	}
 	if !sessionRestoreHasRequiredPlatformState(withKey, "linux") {
 		t.Fatal("Linux restore rejected a session with a hardware key")
+	}
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "darwin"); err != nil {
+		t.Fatalf("Darwin restore unexpectedly parsed a hardware key: %v", err)
+	}
+	rustpushgo.InitLogger()
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "linux"); err == nil {
+		t.Fatal("Linux restore accepted a malformed hardware key")
 	}
 }
 

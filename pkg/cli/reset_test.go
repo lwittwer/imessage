@@ -324,6 +324,46 @@ func TestResetBareDualAccountRequiresExplicitSelection(t *testing.T) {
 	}
 }
 
+func TestResetRejectsSymlinkedAccountDirectory(t *testing.T) {
+	scriptPath := filepath.Join("..", "..", "scripts", "reset-bridge.sh")
+	root := t.TempDir()
+	target := filepath.Join(root, "unrelated")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primary := filepath.Join(root, "corten-matrix")
+	if err := os.Symlink(target, primary); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/bash", scriptPath, "/tmp/corten-test-bin", primary, filepath.Join(root, "corten-matrix-1"), "test.bundle", "--account", "0")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("reset unexpectedly accepted a symlinked account directory")
+	}
+	if !strings.Contains(string(output), "refusing symlinked reset target") {
+		t.Fatalf("unexpected refusal: %s", output)
+	}
+}
+
+func TestResetSupportsMacOSBash32(t *testing.T) {
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, "$BASHPID") {
+		t.Fatal("reset uses BASHPID, which is undefined in the macOS system Bash 3.2")
+	}
+	if !strings.Contains(script, `RESET_RUN_ID="$$-$RANDOM-$RANDOM"`) {
+		t.Fatal("reset lacks a Bash-3-compatible per-run staging identifier")
+	}
+}
+
+func TestResetFailsClosedWithoutProcessChecker(t *testing.T) {
+	script := embeddedScript(t, "reset-bridge.sh")
+	checkerPreflight := strings.Index(script, "if ! command -v pgrep")
+	serviceStop := strings.Index(script, "echo \"Stopping bridge...\"")
+	if checkerPreflight < 0 || serviceStop < 0 || checkerPreflight > serviceStop {
+		t.Fatalf("pgrep availability is not verified before the service stop: preflight=%d stop=%d", checkerPreflight, serviceStop)
+	}
+}
+
 func boolString(value bool) string {
 	if value {
 		return "true"
@@ -486,6 +526,50 @@ func TestResetWhoamiBridgeMatchIsExact(t *testing.T) {
 		if (err == nil) != wantSuccess {
 			t.Errorf("whoami match for %q success=%t, want %t", bridge, err == nil, wantSuccess)
 		}
+	}
+}
+
+func TestResetRemoteDeleteIntentIsExact(t *testing.T) {
+	helper := markedShellHelper(t, "RESET REMOTE INTENT HELPER")
+	marker := filepath.Join(t.TempDir(), "intent")
+	if err := os.WriteFile(marker, []byte("custom-imessage\nbridge-user\nexport-token\npostgres\npostgres://db/reset\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		bridge, username, databaseType, databaseURI string
+		wantSuccess                                 bool
+	}{
+		{bridge: "custom-imessage", username: "bridge-user", databaseType: "postgres", databaseURI: "postgres://db/reset", wantSuccess: true},
+		{bridge: "custom", username: "bridge-user", databaseType: "postgres", databaseURI: "postgres://db/reset", wantSuccess: false},
+		{bridge: "custom-imessage", username: "other-user", databaseType: "postgres", databaseURI: "postgres://db/reset", wantSuccess: false},
+		{bridge: "custom-imessage", username: "bridge-user", databaseType: "sqlite3-fk-wal", databaseURI: "file:test.db", wantSuccess: false},
+		{bridge: "sh-imessage", username: "bridge-user", databaseType: "postgres", databaseURI: "postgres://db/reset", wantSuccess: false},
+	}
+	for _, tt := range tests {
+		cmd := exec.Command("/bin/bash", "-c", helper+"\nremote_delete_intent_matches \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"",
+			"intent-helper-test", marker, tt.bridge, tt.username, tt.databaseType, tt.databaseURI)
+		err := cmd.Run()
+		if (err == nil) != tt.wantSuccess {
+			t.Errorf("intent match for %q/%q/%q/%q success=%t, want %t",
+				tt.bridge, tt.username, tt.databaseType, tt.databaseURI, err == nil, tt.wantSuccess)
+		}
+	}
+	tokenCmd := exec.Command("/bin/bash", "-c", helper+"\nremote_delete_intent_export_token \"$1\"",
+		"intent-helper-test", marker)
+	token, err := tokenCmd.Output()
+	if err != nil || strings.TrimSpace(string(token)) != "export-token" {
+		t.Fatalf("intent export token = %q, %v", token, err)
+	}
+
+	script := embeddedScript(t, "reset-bridge.sh")
+	writeIntent := strings.Index(script, `printf '%s\n%s\n%s\n%s\n%s\n'`)
+	deleteRemote := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
+	deleteLocal := strings.Index(script, `delete_local_bridge_data "$dir"`)
+	removeIntent := strings.LastIndex(script, `rm -f -- "${SELECTED_REMOTE_INTENTS[$i]}"`)
+	if writeIntent < 0 || deleteRemote < 0 || deleteLocal < 0 || removeIntent < 0 ||
+		writeIntent > deleteRemote || deleteRemote > deleteLocal || deleteLocal > removeIntent {
+		t.Fatalf("remote intent lifecycle is not ordered safely: write=%d remote=%d local=%d remove=%d",
+			writeIntent, deleteRemote, deleteLocal, removeIntent)
 	}
 }
 

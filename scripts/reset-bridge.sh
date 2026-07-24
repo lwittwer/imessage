@@ -21,6 +21,10 @@ FORCE_DELETE_REMOTE=false
 DELETE_REMOTE=false
 DELETE_IMESSAGE_STATE=false
 EXTERNAL_DB_CLEARED=false
+# macOS still ships Bash 3.2, which does not define BASHPID. Combine the
+# portable shell PID with two Bash-3-compatible RANDOM values so per-run
+# marker and staging paths remain distinct without aborting under `set -u`.
+RESET_RUN_ID="$$-$RANDOM-$RANDOM"
 
 usage() {
     cat <<'EOF'
@@ -125,6 +129,13 @@ for dir in "${DIRS[@]}"; do
         echo "ERROR: refusing reset target directly under /: $dir" >&2
         exit 1
     fi
+    # A final-component symlink can make an apparently safe
+    # .../corten-matrix target resolve to an arbitrary directory (including
+    # /), after which paths such as "$dir/logs" cross the intended boundary.
+    if [ -L "$dir" ]; then
+        echo "ERROR: refusing symlinked reset target: $dir" >&2
+        exit 1
+    fi
 done
 
 if [ ! -t 0 ]; then
@@ -136,7 +147,16 @@ SELECTED=()
 SELECTED_ACCOUNT_IDS=()
 for i in "${!DIRS[@]}"; do
     if [ -d "${DIRS[$i]}" ]; then
-        SELECTED+=("${DIRS[$i]}")
+        dir_real=$(cd "${DIRS[$i]}" && pwd -P)
+        case "$(basename "$dir_real")" in
+            corten-matrix|corten-matrix-1) ;;
+            *) echo "ERROR: refusing reset target with unsafe physical path: $dir_real" >&2; exit 1 ;;
+        esac
+        if [ "$(dirname "$dir_real")" = "/" ]; then
+            echo "ERROR: refusing reset target physically located under /: $dir_real" >&2
+            exit 1
+        fi
+        SELECTED+=("$dir_real")
         SELECTED_ACCOUNT_IDS+=("${ACCOUNT_IDS[$i]}")
     fi
 done
@@ -146,18 +166,34 @@ if [ "${#SELECTED[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# The post-stop process check is a destructive-boundary guard, not an optional
+# diagnostic. A missing pgrep must fail closed instead of being mistaken for
+# "no daemon found" by the negated command below.
+if ! command -v pgrep >/dev/null 2>&1; then
+    echo "ERROR: pgrep is required to verify that the bridge stopped." >&2
+    echo "Nothing was stopped or deleted." >&2
+    exit 1
+fi
+
 # Resolve each generated SQLite URI before stopping anything. Reset must never
 # claim success while a custom database path still contains the old portal
 # rows, and it must never delete a database outside the selected account dir.
 DB_PATHS=()
 DB_TYPES=()
+DB_URIS=()
 for dir in "${SELECTED[@]}"; do
     config="$dir/config.yaml"
     db_path="$dir/corten-matrix.db"
     db_type="sqlite3-fk-wal"
+    db_uri="file:$db_path"
     if [ -f "$config" ]; then
         if ! db_type=$("$BINARY" reset-config-value "$config" database-type 2>/dev/null); then
             echo "ERROR: cannot read database type from $config." >&2
+            echo "Nothing was stopped or deleted." >&2
+            exit 1
+        fi
+        if ! db_uri=$("$BINARY" reset-config-value "$config" database-uri 2>/dev/null); then
+            echo "ERROR: cannot read database URI from $config." >&2
             echo "Nothing was stopped or deleted." >&2
             exit 1
         fi
@@ -168,11 +204,6 @@ for dir in "${SELECTED[@]}"; do
             ;;
         sqlite*)
             if [ -f "$config" ]; then
-                if ! db_uri=$("$BINARY" reset-config-value "$config" database-uri 2>/dev/null); then
-                    echo "ERROR: cannot read database URI from $config." >&2
-                    echo "Nothing was stopped or deleted." >&2
-                    exit 1
-                fi
                 case "$db_uri" in
                     file:*) db_path=${db_uri#file:}; db_path=${db_path%%\?*} ;;
                     *)
@@ -209,6 +240,7 @@ for dir in "${SELECTED[@]}"; do
             ;;
     esac
     DB_TYPES+=("$db_type")
+    DB_URIS+=("$db_uri")
     DB_PATHS+=("$db_path")
 done
 
@@ -231,6 +263,39 @@ bridge_target_is_unique() {
     return 0
 }
 # END RESET BRIDGE TARGET HELPER
+
+# BEGIN RESET REMOTE INTENT HELPER
+remote_delete_intent_matches() {
+    local marker="$1"
+    local bridge="$2"
+    local username="$3"
+    local database_type="$4"
+    local database_uri="$5"
+    local marked_bridge=""
+    local marked_username=""
+    local marked_export_token=""
+    local marked_database_type=""
+    local marked_database_uri=""
+    if [ -f "$marker" ]; then
+        {
+            IFS= read -r marked_bridge || true
+            IFS= read -r marked_username || true
+            IFS= read -r marked_export_token || true
+            IFS= read -r marked_database_type || true
+            IFS= read -r marked_database_uri || true
+        } < "$marker"
+    fi
+    [ "$marked_bridge" = "$bridge" ] &&
+        [ "$marked_username" = "$username" ] &&
+        [ "$marked_database_type" = "$database_type" ] &&
+        [ "$marked_database_uri" = "$database_uri" ]
+}
+
+remote_delete_intent_export_token() {
+    local marker="$1"
+    sed -n '3p' "$marker"
+}
+# END RESET REMOTE INTENT HELPER
 
 # BEGIN RESET REMOTE POLICY HELPER
 classify_remote_policy() {
@@ -263,6 +328,9 @@ classify_remote_policy() {
 SELECTED_DELETE_REMOTE=()
 SELECTED_REMOTE_POLICY=()
 SELECTED_BRIDGES=()
+SELECTED_REMOTE_INTENTS=()
+SELECTED_RESUME_REMOTE=()
+SELECTED_INTENT_EXPORT_TOKENS=()
 for i in "${!SELECTED[@]}"; do
     dir="${SELECTED[$i]}"
     policy=$(classify_remote_policy "$dir" "$KEEP_REMOTE")
@@ -281,11 +349,17 @@ for i in "${!SELECTED[@]}"; do
                 exit 1
             fi
             SELECTED_BRIDGES+=("$bridge")
+            SELECTED_REMOTE_INTENTS+=("$dir/.reset-remote-delete-intent")
+            SELECTED_RESUME_REMOTE+=(false)
+            SELECTED_INTENT_EXPORT_TOKENS+=("")
             SELECTED_DELETE_REMOTE+=(true)
             DELETE_REMOTE=true
             ;;
         self-hosted|local-only)
             SELECTED_BRIDGES+=("")
+            SELECTED_REMOTE_INTENTS+=("")
+            SELECTED_RESUME_REMOTE+=(false)
+            SELECTED_INTENT_EXPORT_TOKENS+=("")
             SELECTED_DELETE_REMOTE+=(false)
             ;;
         *)
@@ -336,14 +410,29 @@ if [ "$DELETE_REMOTE" = true ]; then
         echo "Resolve Beeper authentication/network access and retry." >&2
         exit 1
     fi
+    WHOAMI_USERNAME=$(printf '%s\n' "$WHOAMI_OUTPUT" | sed -n '1p')
+    if [ -z "$WHOAMI_USERNAME" ] || [ "$WHOAMI_USERNAME" = null ]; then
+        echo "ERROR: Beeper identity is unavailable. Nothing was stopped or deleted." >&2
+        exit 1
+    fi
     for i in "${!SELECTED_BRIDGES[@]}"; do
         [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
         bridge="${SELECTED_BRIDGES[$i]}"
+        intent="${SELECTED_REMOTE_INTENTS[$i]}"
+        if remote_delete_intent_matches "$intent" "$bridge" "$WHOAMI_USERNAME" "${DB_TYPES[$i]}" "${DB_URIS[$i]}"; then
+            SELECTED_RESUME_REMOTE[$i]=true
+            SELECTED_INTENT_EXPORT_TOKENS[$i]=$(remote_delete_intent_export_token "$intent")
+        fi
         if ! printf '%s\n' "$WHOAMI_OUTPUT" | whoami_has_bridge "$bridge"; then
-            echo "ERROR: selected config names Beeper registration '$bridge'," >&2
-            echo "but bbctl whoami does not list that exact registration." >&2
-            echo "Nothing was stopped or deleted." >&2
-            exit 1
+            if [ "${SELECTED_RESUME_REMOTE[$i]}" = true ]; then
+                echo "NOTE: Beeper registration '$bridge' is already absent after an earlier" >&2
+                echo "confirmed reset attempt; resuming its local cleanup." >&2
+            else
+                echo "ERROR: selected config names Beeper registration '$bridge'," >&2
+                echo "but bbctl whoami does not list that exact registration." >&2
+                echo "Nothing was stopped or deleted." >&2
+                exit 1
+            fi
         fi
     done
 fi
@@ -418,7 +507,7 @@ for i in "${!SELECTED[@]}"; do
     config_backup=""
     if [ "${SELECTED_DELETE_REMOTE[$i]}" = true ]; then
         config_backup="$dir/config.reset-backup.yaml"
-        config_backup_tmp="$config_backup.tmp.$BASHPID"
+        config_backup_tmp="$config_backup.tmp.$RESET_RUN_ID"
         if ! cp -p -- "$dir/config.yaml" "$config_backup_tmp" ||
             ! chmod 0600 "$config_backup_tmp" ||
             ! mv -f -- "$config_backup_tmp" "$config_backup"; then
@@ -430,7 +519,7 @@ for i in "${!SELECTED[@]}"; do
     fi
     CONFIG_BACKUPS+=("$config_backup")
 
-    if [ "$dir" = "$SECOND_DIR" ]; then
+    if [ "${SELECTED_ACCOUNT_IDS[$i]}" = 1 ]; then
         session_state_dir="$dir/corten-matrix"
     else
         session_state_dir="$dir"
@@ -443,17 +532,26 @@ for i in "${!SELECTED[@]}"; do
             echo "The bridge was not stopped and nothing was deleted." >&2
             exit 1
         fi
-        export_token="$BASHPID-$RANDOM-$i"
         request="$session_state_dir/.reset-session-export-request"
         ack="$session_state_dir/.reset-session-export-ack"
-        request_tmp="$request.tmp.$BASHPID"
-        rm -f -- "$request" "$ack" "$request_tmp"
-        if ! (umask 077 && printf '%s\n' "$export_token" > "$request_tmp") ||
-            ! mv -f -- "$request_tmp" "$request"; then
-            rm -f -- "$request_tmp"
-            echo "ERROR: could not request a fresh session export for $dir." >&2
-            echo "The bridge was not stopped and nothing was deleted." >&2
-            exit 1
+        if [ "${SELECTED_RESUME_REMOTE[$i]}" = true ]; then
+            export_token="${SELECTED_INTENT_EXPORT_TOKENS[$i]}"
+            if [ -z "$export_token" ]; then
+                echo "ERROR: reset recovery intent for $dir has no validated session export." >&2
+                echo "Nothing was stopped or deleted." >&2
+                exit 1
+            fi
+        else
+            export_token="$RESET_RUN_ID-$RANDOM-$i"
+            request_tmp="$request.tmp.$RESET_RUN_ID"
+            rm -f -- "$request" "$ack" "$request_tmp"
+            if ! (umask 077 && printf '%s\n' "$export_token" > "$request_tmp") ||
+                ! mv -f -- "$request_tmp" "$request"; then
+                rm -f -- "$request_tmp"
+                echo "ERROR: could not request a fresh session export for $dir." >&2
+                echo "The bridge was not stopped and nothing was deleted." >&2
+                exit 1
+            fi
         fi
     fi
     SESSION_EXPORT_TOKENS+=("$export_token")
@@ -478,8 +576,16 @@ fi
 # Never remove state while a bridge daemon still appears to be running. The
 # parent `corten-matrix reset` process does not match these daemon arguments.
 for attempt in 1 2 3 4 5; do
-    if ! pgrep -f '(bridge-all| -c .*config\.yaml)' >/dev/null 2>&1; then
-        break
+    if pgrep -f '(bridge-all| -c .*config\.yaml)' >/dev/null 2>&1; then
+        :
+    else
+        pgrep_status=$?
+        if [ "$pgrep_status" -eq 1 ]; then
+            break
+        fi
+        echo "ERROR: could not verify whether a corten-matrix bridge process is still running." >&2
+        echo "No state was deleted." >&2
+        exit 1
     fi
     if [ "$attempt" -eq 5 ]; then
         echo "ERROR: a corten-matrix bridge process is still running; no state was deleted." >&2
@@ -543,28 +649,71 @@ if [ "$DELETE_IMESSAGE_STATE" != true ]; then
     done
 fi
 
-if [ "$HAS_EXTERNAL_DB" = true ]; then
+NEEDS_EXTERNAL_DB_CONFIRMATION=false
+for i in "${!SELECTED[@]}"; do
+    if [ "${DB_TYPES[$i]}" = postgres ] && [ "${SELECTED_RESUME_REMOTE[$i]}" != true ]; then
+        NEEDS_EXTERNAL_DB_CONFIRMATION=true
+    fi
+done
+
+if [ "$HAS_EXTERNAL_DB" = true ] && [ "$NEEDS_EXTERNAL_DB_CONFIRMATION" = true ]; then
     echo ""
-    echo "The bridge is stopped and its fresh Apple/iMessage session export is valid."
+    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
+        echo "The bridge is stopped and Apple/iMessage state deletion was explicitly confirmed."
+    else
+        echo "The bridge is stopped and its fresh Apple/iMessage session export is valid."
+    fi
     echo "Back up and clear/recreate each selected PostgreSQL database now."
     echo "No remote registration or local bridge state has been deleted yet."
+    echo "Once cleared, the external database cannot be restored by cancelling this command."
     read -r -p "Type EXTERNAL DATABASE CLEARED after completing that step: " CONFIRM_EXTERNAL_DB
     if [ "$CONFIRM_EXTERNAL_DB" != "EXTERNAL DATABASE CLEARED" ]; then
-        echo "Reset cancelled; the bridge remains stopped and no remote or local bridge state was deleted."
+        echo "Reset stopped before remote or local file cleanup; the bridge remains stopped."
+        echo "Any external database work you already performed is unchanged."
         exit 1
     fi
+elif [ "$HAS_EXTERNAL_DB" = true ]; then
+    echo ""
+    echo "Reusing the external-database confirmation recorded by the interrupted reset."
 fi
 
 if [ "$DELETE_REMOTE" = true ]; then
     echo ""
+    NEW_REMOTE_INTENTS=()
+    for i in "${!SELECTED_BRIDGES[@]}"; do
+        [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
+        [ "${SELECTED_RESUME_REMOTE[$i]}" = true ] && continue
+        bridge="${SELECTED_BRIDGES[$i]}"
+        intent="${SELECTED_REMOTE_INTENTS[$i]}"
+        intent_tmp="$intent.tmp.$RESET_RUN_ID"
+        rm -f -- "$intent_tmp"
+        if ! (umask 077 && printf '%s\n%s\n%s\n%s\n%s\n' \
+            "$bridge" "$WHOAMI_USERNAME" "${SESSION_EXPORT_TOKENS[$i]}" \
+            "${DB_TYPES[$i]}" "${DB_URIS[$i]}" > "$intent_tmp") ||
+            ! mv -f -- "$intent_tmp" "$intent"; then
+            rm -f -- "$intent_tmp"
+            if [ "${#NEW_REMOTE_INTENTS[@]}" -gt 0 ]; then
+                for new_intent in "${NEW_REMOTE_INTENTS[@]}"; do
+                    rm -f -- "$new_intent"
+                done
+            fi
+            echo "ERROR: could not record the confirmed remote-deletion intent for '$bridge'." >&2
+            echo "No remote registration or local bridge state was deleted." >&2
+            exit 1
+        fi
+        NEW_REMOTE_INTENTS+=("$intent")
+    done
     for i in "${!SELECTED_BRIDGES[@]}"; do
         [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
         bridge="${SELECTED_BRIDGES[$i]}"
         echo "Converging Beeper registration '$bridge' to deleted state..."
         if ! "$BINARY" bbctl delete "$bridge"; then
-            echo "ERROR: remote deletion failed; local state was NOT deleted." >&2
+            echo "ERROR: remote deletion failed; local file state was NOT deleted." >&2
+            if [ "$HAS_EXTERNAL_DB" = true ]; then
+                echo "Any selected external database already cleared remains cleared." >&2
+            fi
             echo "An earlier selected registration may already have been deleted." >&2
-            echo "The bridge remains stopped. Resolve the error or run reset again with --local-only." >&2
+            echo "The bridge remains stopped. Resolve the error and run the same reset again." >&2
             exit 1
         fi
     done
@@ -616,6 +765,9 @@ for i in "${!SELECTED[@]}"; do
     delete_local_bridge_data "$dir" "$db_path" "${SELECTED_DELETE_REMOTE[$i]}" "$DELETE_IMESSAGE_STATE"
     rm -f -- "${SESSION_STATE_DIRS[$i]}/.reset-session-export-request" \
         "${SESSION_STATE_DIRS[$i]}/.reset-session-export-ack"
+    if [ -n "${SELECTED_REMOTE_INTENTS[$i]}" ]; then
+        rm -f -- "${SELECTED_REMOTE_INTENTS[$i]}"
+    fi
 done
 
 echo ""

@@ -278,6 +278,34 @@ func persistedSessionStateFromMetadata(meta *UserLoginMetadata) PersistedSession
 	}
 }
 
+// userLoginMetadataFromPersistedSessionState reconstructs every login field
+// that reset deliberately carries outside the bridge database. Keep this as
+// the inverse of persistedSessionStateFromMetadata so recovery cannot silently
+// drop the selected outgoing handle or another restorable identity field.
+func userLoginMetadataFromPersistedSessionState(state PersistedSessionState, goos string) *UserLoginMetadata {
+	platform := state.Platform
+	if platform == "" {
+		platform = goos
+	}
+	return &UserLoginMetadata{
+		Platform:                 platform,
+		HardwareKey:              state.HardwareKey,
+		DeviceID:                 state.DeviceID,
+		ChatsSynced:              false,
+		APSState:                 state.APSState,
+		IDSUsers:                 state.IDSUsers,
+		IDSIdentity:              state.IDSIdentity,
+		PreferredHandle:          state.PreferredHandle,
+		AccountUsername:          state.AccountUsername,
+		AccountHashedPasswordHex: state.AccountHashedPasswordHex,
+		AccountPET:               state.AccountPET,
+		AccountADSID:             state.AccountADSID,
+		AccountDSID:              state.AccountDSID,
+		AccountSPDBase64:         state.AccountSPDBase64,
+		MmeDelegateJSON:          state.MmeDelegateJSON,
+	}
+}
+
 // loadSessionState reads the persisted session state from the JSON file.
 // Falls back to the legacy identity.plist file (v1 format) if the new file
 // doesn't exist. Returns a zero-value struct if nothing is found.
@@ -377,6 +405,10 @@ func CheckSessionRestore(requireKeychain ...bool) bool {
 		log.Info().Str("platform", runtime.GOOS).Msg("Session restore check failed: hardware key is required on this platform")
 		return false
 	}
+	if err := validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
+		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Session restore check failed: platform configuration is not restorable")
+		return false
+	}
 
 	session := &cachedSessionState{
 		IDSIdentity: state.IDSIdentity,
@@ -400,4 +432,36 @@ func sessionRestoreRequiresKeychain(option []bool) bool {
 
 func sessionRestoreHasRequiredPlatformState(state PersistedSessionState, goos string) bool {
 	return goos == "darwin" || strings.TrimSpace(state.HardwareKey) != ""
+}
+
+// validateSessionRestorePlatformConfig exercises the same hardware-config
+// constructor LoadUserLogin will use after reset. A merely non-empty but
+// malformed hardware key must not authorize deletion of the database on
+// non-macOS systems.
+func validateSessionRestorePlatformConfig(state PersistedSessionState, goos string) (err error) {
+	if goos == "darwin" {
+		return nil
+	}
+	if strings.TrimSpace(state.HardwareKey) == "" {
+		return fmt.Errorf("hardware key is empty")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("hardware key validation panicked: %v", recovered)
+		}
+	}()
+	var config *rustpushgo.WrappedOsConfig
+	if state.DeviceID != "" {
+		config, err = rustpushgo.CreateConfigFromHardwareKeyWithDeviceId(state.HardwareKey, state.DeviceID)
+	} else {
+		config, err = rustpushgo.CreateConfigFromHardwareKey(state.HardwareKey)
+	}
+	if err != nil {
+		return fmt.Errorf("invalid hardware key: %w", err)
+	}
+	if config == nil {
+		return fmt.Errorf("hardware key produced no platform configuration")
+	}
+	config.Destroy()
+	return nil
 }
