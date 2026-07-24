@@ -11179,7 +11179,15 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// calls lookupContact → stripIdentifierPrefix, which would pass the suffix
 	// through to contact lookup and break alternate-handle resolution.
 	cleanPortalID := stripSmsSuffix(portalID)
-	sendTo := c.resolveSendTarget(cleanPortalID)
+	sendTo := ""
+	if isSms {
+		if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+			sendTo = meta.SMSDestination
+		}
+	}
+	if sendTo == "" {
+		sendTo = c.resolveSendTarget(cleanPortalID)
+	}
 
 	// For self-chats, only include one participant. Duplicating our own
 	// handle (e.g. [self, self]) causes rustpush to reject the message
@@ -11193,6 +11201,24 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		Participants: participants,
 		IsSms:        isSms,
 	}
+}
+
+// initialSyncPortalMetadata applies the retained, activity-ordered chat.db
+// representative's SMS routing state exactly. SMSDestination is deliberately
+// independent from portal identity because contact alias canonicalization may
+// keep a different phone or email as the stable Matrix portal key.
+func initialSyncPortalMetadata(existing any, isSms bool, smsDestination string) (*PortalMetadata, bool) {
+	meta := &PortalMetadata{}
+	if existingMeta, ok := existing.(*PortalMetadata); ok {
+		*meta = *existingMeta
+	}
+	if !isSms {
+		smsDestination = ""
+	}
+	changed := meta.IsSms != isSms || meta.SMSDestination != smsDestination
+	meta.IsSms = isSms
+	meta.SMSDestination = smsDestination
+	return meta, changed
 }
 
 // persistGroupParticipantsIfChanged keeps cloud_chat.participants_json — the
@@ -12513,10 +12539,11 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	}
 
 	type chatEntry struct {
-		chatGUID  string
-		portalKey networkid.PortalKey
-		info      *imessage.ChatInfo
-		isSms     bool
+		chatGUID       string
+		portalKey      networkid.PortalKey
+		info           *imessage.ChatInfo
+		isSms          bool
+		smsDestination string
 	}
 	var entries []chatEntry
 	maxInitialMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
@@ -12554,14 +12581,22 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				Receiver: c.UserLogin.ID,
 			}
 		}
+		smsDestination := ""
+		if isSms && !parsed.IsGroup {
+			// Keep the concrete chat.db recipient separate from the portal ID:
+			// contact canonicalization below may map this chat onto a sibling
+			// phone/email alias that is not the SMS transport destination.
+			smsDestination = string(portalKey.ID)
+		}
 		if isSms {
 			c.updatePortalSMS(string(portalKey.ID), true)
 		}
 		entries = append(entries, chatEntry{
-			chatGUID:  chat.ChatGUID,
-			portalKey: portalKey,
-			info:      info,
-			isSms:     isSms,
+			chatGUID:       chat.ChatGUID,
+			portalKey:      portalKey,
+			info:           info,
+			isSms:          isSms,
+			smsDestination: smsDestination,
 		})
 	}
 
@@ -12632,13 +12667,12 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			}
 		}
 
-		// updatePortalSMS originally records the raw chat.db alias above. Also
-		// record the canonical portal so live routing agrees with the room that
-		// initial sync creates.
+		// Raw SMS aliases seed the cache above before contact deduplication.
+		// Overwrite the retained canonical portal with its representative's
+		// exact state, including false, so a discarded SMS alias cannot make a
+		// newer iMessage chat route through SMS.
 		for _, entry := range entries {
-			if entry.isSms {
-				c.updatePortalSMS(string(entry.portalKey.ID), true)
-			}
+			c.updatePortalSMS(string(entry.portalKey.ID), entry.isSms)
 		}
 	}
 
@@ -12658,25 +12692,21 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
 		chatGUID := entry.chatGUID
 		isSms := entry.isSms
+		smsDestination := entry.smsDestination
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					if isSms {
-						meta := &PortalMetadata{}
-						if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-							*meta = *existing
-						}
-						if !meta.IsSms {
-							meta.IsSms = true
-							portal.Metadata = meta
-							if err := portal.Save(ctx); err != nil {
-								zerolog.Ctx(ctx).Warn().Err(err).
-									Str("portal_id", string(portal.ID)).
-									Msg("Failed to persist IsSms metadata during initial sync")
-							}
+					meta, changed := initialSyncPortalMetadata(portal.Metadata, isSms, smsDestination)
+					if changed {
+						portal.Metadata = meta
+						if err := portal.Save(ctx); err != nil {
+							zerolog.Ctx(ctx).Warn().Err(err).
+								Str("portal_id", string(portal.ID)).
+								Bool("is_sms", isSms).
+								Msg("Failed to persist SMS routing metadata during initial sync")
 						}
 					}
 					close(done)

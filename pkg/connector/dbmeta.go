@@ -13,10 +13,11 @@ import (
 )
 
 type PortalMetadata struct {
-	ThreadID   string `json:"thread_id,omitempty"`
-	SenderGuid string `json:"sender_guid,omitempty"` // Persistent iMessage group UUID
-	GroupName  string `json:"group_name,omitempty"`  // iMessage cv_name for outbound routing
-	IsSms      bool   `json:"is_sms,omitempty"`      // True if this portal routes through SMS
+	ThreadID       string `json:"thread_id,omitempty"`
+	SenderGuid     string `json:"sender_guid,omitempty"`     // Persistent iMessage group UUID
+	GroupName      string `json:"group_name,omitempty"`      // iMessage cv_name for outbound routing
+	IsSms          bool   `json:"is_sms,omitempty"`          // True if this portal routes through SMS
+	SMSDestination string `json:"sms_destination,omitempty"` // Actual SMS recipient when the portal ID is a canonical contact alias
 }
 
 type GhostMetadata struct{}

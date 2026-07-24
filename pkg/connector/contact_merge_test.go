@@ -267,6 +267,68 @@ func TestChatDBInfoToBridgev2UsesCanonicalDMIdentity(t *testing.T) {
 	}
 }
 
+func TestInitialSyncMixedAliasesUseRetainedRepresentativeSMSState(t *testing.T) {
+	contact := &imessage.Contact{
+		FirstName: "MixedService",
+		Phones:    []string{"+15550000021"},
+		Emails:    []string{"mixed@example.com"},
+	}
+	portalIDs := []string{"mailto:mixed@example.com", "tel:+15550000021"}
+	canonical, skip := canonicalizeChatDBInitialSyncDMPortalIDs(
+		portalIDs, contactLookupForTests(contact), nil, nil,
+	)
+	if canonical[0] != "tel:+15550000021" || canonical[1] != "tel:+15550000021" {
+		t.Fatalf("canonical portal IDs = %#v", canonical)
+	}
+	if !skip[1] {
+		t.Fatalf("older SMS alias was not discarded: %#v", skip)
+	}
+
+	// The older discarded alias previously marked the canonical portal SMS.
+	// Applying the newer retained iMessage representative must clear both the
+	// flag and its stale SMS destination.
+	meta, changed := initialSyncPortalMetadata(
+		&PortalMetadata{IsSms: true, SMSDestination: "tel:+15550000021"},
+		false,
+		"",
+	)
+	if !changed {
+		t.Fatal("retained iMessage representative did not change stale SMS metadata")
+	}
+	if meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("retained iMessage metadata = %+v, want non-SMS with no destination", meta)
+	}
+}
+
+func TestPortalToConversationUsesPersistedSMSDestination(t *testing.T) {
+	const (
+		canonical   = "mailto:mixed@example.com"
+		destination = "tel:+15550000022"
+		self        = "tel:+15559999999"
+	)
+	client := &IMClient{
+		handle:     self,
+		allHandles: []string{self},
+		smsPortals: map[string]bool{canonical: true},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID(canonical)},
+		Metadata: &PortalMetadata{
+			IsSms:          true,
+			SMSDestination: destination,
+		},
+	}}
+
+	conv := client.portalToConversation(portal)
+	if !conv.IsSms {
+		t.Fatal("conversation is not marked SMS")
+	}
+	want := []string{self, destination}
+	if !reflect.DeepEqual(conv.Participants, want) {
+		t.Fatalf("SMS participants = %#v, want %#v", conv.Participants, want)
+	}
+}
+
 func TestChatDBSelfAliasCanonicalizationPreservesDMIdentity(t *testing.T) {
 	selfID := "tel:+15559999999"
 	main := &IMConnector{Config: IMConfig{DisplaynameTemplate: "{{.ID}}"}}
