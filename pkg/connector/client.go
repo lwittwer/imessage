@@ -12697,58 +12697,31 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		for i, entry := range entries {
 			portalIDs[i] = string(entry.portalKey.ID)
 		}
-		canonicalIDs := append([]string(nil), portalIDs...)
-		skip := make(map[int]bool)
-
-		existingPortals, existingErr := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+		inspectExistingRoom := func(portal *bridgev2.Portal) existingDMPortalCandidate {
+			portalID := string(portal.ID)
+			candidate := existingDMPortalCandidate{ID: portalID}
+			firstMessage, err := c.Main.Bridge.DB.Message.GetFirstPortalMessage(ctx, portal.PortalKey)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", logSafeHandle(portalID)).
+					Msg("Failed to check whether existing chat.db alias portal has messages")
+			} else {
+				candidate.HasMessages = firstMessage != nil
+			}
+			return candidate
+		}
+		canonicalIDs, skip, existingErr := canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+			ctx,
+			portalIDs,
+			c.UserLogin.ID,
+			c.lookupContact,
+			c.isMyHandle,
+			c.Main.Bridge.GetAllPortalsWithMXID,
+			inspectExistingRoom,
+		)
 		if existingErr != nil {
 			log.Warn().Err(existingErr).
-				Msg("Failed to load existing portals; preserving chat.db portal IDs")
-		} else {
-			existingByID := make(map[string]networkid.PortalKey)
-			existingByNormalizedID := make(map[string][]string)
-			for _, portal := range existingPortals {
-				if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
-					continue
-				}
-				portalID := string(portal.ID)
-				existingByID[portalID] = portal.PortalKey
-				normalized := normalizeIdentifierForPortalID(portalID)
-				existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
-			}
-			for normalized := range existingByNormalizedID {
-				sort.Strings(existingByNormalizedID[normalized])
-			}
-			messageStateByID := make(map[string]bool)
-			messageStateKnown := make(map[string]bool)
-			toCandidate := func(portalID string) existingDMPortalCandidate {
-				candidate := existingDMPortalCandidate{ID: portalID}
-				if !messageStateKnown[portalID] {
-					messageStateKnown[portalID] = true
-					firstMessage, err := c.Main.Bridge.DB.Message.GetFirstPortalMessage(ctx, existingByID[portalID])
-					if err != nil {
-						log.Warn().Err(err).Str("portal_id", logSafeHandle(portalID)).
-							Msg("Failed to check whether existing chat.db alias portal has messages")
-					} else {
-						messageStateByID[portalID] = firstMessage != nil
-					}
-				}
-				candidate.HasMessages = messageStateByID[portalID]
-				return candidate
-			}
-			findExistingRoom := func(portalID string) existingDMPortalCandidate {
-				normalized := normalizeIdentifierForPortalID(portalID)
-				return preferredExistingDMPortalSpelling(portalID, existingByNormalizedID[normalized], func(candidate string) existingDMPortalCandidate {
-					if _, exists := existingByID[candidate]; !exists {
-						return existingDMPortalCandidate{}
-					}
-					return toCandidate(candidate)
-				})
-			}
-
-			canonicalIDs, skip = canonicalizeChatDBInitialSyncDMPortalIDs(
-				portalIDs, c.lookupContact, c.isMyHandle, findExistingRoom,
-			)
+				Msg("Failed to load existing portals; leaving chat.db initial sync incomplete for retry")
+			return
 		}
 		for i := range entries {
 			if canonicalIDs[i] != portalIDs[i] {
@@ -12764,8 +12737,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		// Multiple exact chat.db GUIDs may normalize or canonicalize to one
 		// portal. Keep their complete GUID set on the surviving entry so the
 		// same sources that passed eligibility are used for forward and
-		// backward backfill. This must also run when the existing-portal lookup
-		// failed, because suffix normalization alone can produce duplicate keys.
+		// backward backfill.
 		merged := mergeChatDBInitialSyncEntries(entries)
 		if len(merged) != len(entries) {
 			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db entries while preserving exact GUID variants")

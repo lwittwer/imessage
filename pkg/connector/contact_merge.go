@@ -516,6 +516,70 @@ func canonicalizeChatDBInitialSyncDMPortalIDs(
 	return canonical, skip
 }
 
+// canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms loads the existing
+// Matrix-room index before choosing canonical DM portal IDs. Loading that index
+// is required rather than best-effort: without it, a transient database failure
+// could create a second room under a different contact alias and then make the
+// one-shot initial sync permanent.
+func canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+	ctx context.Context,
+	portalIDs []string,
+	receiver networkid.UserLoginID,
+	lookupContact func(string) *imessage.Contact,
+	isSelf func(string) bool,
+	loadExistingRooms func(context.Context) ([]*bridgev2.Portal, error),
+	inspectExistingRoom func(*bridgev2.Portal) existingDMPortalCandidate,
+) (canonical []string, skip map[int]bool, err error) {
+	existingPortals, err := loadExistingRooms(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	existingByID := make(map[string]*bridgev2.Portal, len(existingPortals))
+	existingByNormalizedID := make(map[string][]string)
+	for _, portal := range existingPortals {
+		if portal.Receiver != "" && portal.Receiver != receiver {
+			continue
+		}
+		portalID := string(portal.ID)
+		existingByID[portalID] = portal
+		normalized := normalizeIdentifierForPortalID(portalID)
+		existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
+	}
+	for normalized := range existingByNormalizedID {
+		sort.Strings(existingByNormalizedID[normalized])
+	}
+
+	inspectedByID := make(map[string]existingDMPortalCandidate)
+	findExistingRoomByID := func(portalID string) existingDMPortalCandidate {
+		portal, ok := existingByID[portalID]
+		if !ok {
+			return existingDMPortalCandidate{}
+		}
+		if inspected, ok := inspectedByID[portalID]; ok {
+			return inspected
+		}
+		candidate := existingDMPortalCandidate{ID: portalID}
+		if inspectExistingRoom != nil {
+			candidate.HasMessages = inspectExistingRoom(portal).HasMessages
+		}
+		inspectedByID[portalID] = candidate
+		return candidate
+	}
+	findExistingRoom := func(portalID string) existingDMPortalCandidate {
+		normalized := normalizeIdentifierForPortalID(portalID)
+		return preferredExistingDMPortalSpelling(
+			portalID,
+			existingByNormalizedID[normalized],
+			findExistingRoomByID,
+		)
+	}
+	canonical, skip = canonicalizeChatDBInitialSyncDMPortalIDs(
+		portalIDs, lookupContact, isSelf, findExistingRoom,
+	)
+	return canonical, skip, nil
+}
+
 // normalizePhoneForPortalID converts a phone number to E.164-like format.
 func normalizePhoneForPortalID(phone string) string {
 	n := normalizePhone(phone)
