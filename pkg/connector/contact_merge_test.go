@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -217,6 +218,69 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 				t.Fatalf("combined backfill entries = %d, want %d", got, want)
 			}
 		})
+	}
+}
+
+func TestCanonicalizeChatDBInitialSyncPortalIndexFailureIsRetryable(t *testing.T) {
+	const receiver = networkid.UserLoginID("login")
+	contact := &imessage.Contact{
+		FirstName: "Retry",
+		Phones:    []string{"+15550000003"},
+		Emails:    []string{"existing@example.com"},
+	}
+	portalIDs := []string{"tel:+15550000003", "mailto:existing@example.com"}
+	loadErr := errors.New("temporary portal index failure")
+	attempts := 0
+	loadExistingRooms := func(context.Context) ([]*bridgev2.Portal, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, loadErr
+		}
+		return []*bridgev2.Portal{{
+			Portal: &database.Portal{
+				PortalKey: networkid.PortalKey{
+					ID:       "mailto:existing@example.com",
+					Receiver: receiver,
+				},
+			},
+		}}, nil
+	}
+
+	canonical, skip, err := canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+		context.Background(),
+		portalIDs,
+		receiver,
+		contactLookupForTests(contact),
+		nil,
+		loadExistingRooms,
+	)
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("first attempt error = %v, want %v", err, loadErr)
+	}
+	if canonical != nil || skip != nil {
+		t.Fatalf("failed attempt returned canonicalization result: %#v, %#v", canonical, skip)
+	}
+
+	canonical, skip, err = canonicalizeChatDBInitialSyncDMPortalIDsWithExistingRooms(
+		context.Background(),
+		portalIDs,
+		receiver,
+		contactLookupForTests(contact),
+		nil,
+		loadExistingRooms,
+	)
+	if err != nil {
+		t.Fatalf("retry returned error: %v", err)
+	}
+	wantCanonical := []string{"mailto:existing@example.com", "mailto:existing@example.com"}
+	if !reflect.DeepEqual(canonical, wantCanonical) {
+		t.Fatalf("retry canonical IDs = %#v, want %#v", canonical, wantCanonical)
+	}
+	if !reflect.DeepEqual(skip, map[int]bool{1: true}) {
+		t.Fatalf("retry skip map = %#v, want second alias deduplicated", skip)
+	}
+	if attempts != 2 {
+		t.Fatalf("portal index load attempts = %d, want 2", attempts)
 	}
 }
 
