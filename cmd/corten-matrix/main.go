@@ -109,7 +109,8 @@ func main() {
 			cli.RunAllBridges()
 		case "setup", "setup-beeper", "start", "stop", "restart",
 			"status", "logs", "bbctl", "reset", "uninstall",
-			"install-service", "uninstall-service", "reset-config-kind":
+			"install-service", "uninstall-service", "reset-config-kind",
+			"reset-config-value", "reset-merge-database":
 			// Host-side management CLI (the familiar ops, now via subcommands
 			// instead of a Makefile). Docker-aware; see pkg/cli.
 			cli.RunManagement(os.Args[1], os.Args[2:])

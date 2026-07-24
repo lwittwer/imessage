@@ -99,3 +99,77 @@ func TestCheckSessionRestoreKeychainRequirementDefaultsStrict(t *testing.T) {
 		t.Fatal("explicit true must require keychain state")
 	}
 }
+
+func TestSessionRestoreRequiresHardwareKeyOutsideMacOS(t *testing.T) {
+	withoutKey := PersistedSessionState{}
+	withKey := PersistedSessionState{HardwareKey: "hardware"}
+	if !sessionRestoreHasRequiredPlatformState(withoutKey, "darwin") {
+		t.Fatal("Darwin restore unexpectedly required a hardware key")
+	}
+	if sessionRestoreHasRequiredPlatformState(withoutKey, "linux") {
+		t.Fatal("Linux restore accepted a session without a hardware key")
+	}
+	if !sessionRestoreHasRequiredPlatformState(withKey, "linux") {
+		t.Fatal("Linux restore rejected a session with a hardware key")
+	}
+}
+
+func TestSessionExportAcknowledgementUsesRequestedNonce(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	log := zerolog.Nop()
+	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(filepath.Dir(requestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(requestPath, []byte("nonce-123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = saveSessionState(log, PersistedSessionState{IDSIdentity: "identity"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = acknowledgeSessionExport(log); err != nil {
+		t.Fatal(err)
+	}
+	if request, readErr := os.ReadFile(requestPath); readErr != nil || string(request) != "nonce-123\n" {
+		t.Fatalf("request marker was consumed by acknowledgement: %q, %v", request, readErr)
+	}
+	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ack) != "nonce-123\n" {
+		t.Fatalf("acknowledged nonce = %q, want exact request", ack)
+	}
+	if err = clearSessionExportAcknowledgement(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(ackPath); !os.IsNotExist(err) {
+		t.Fatalf("ack marker still exists after clearing: %v", err)
+	}
+	if err = acknowledgeSessionExport(log); err != nil {
+		t.Fatalf("request could not be re-acknowledged by a later disconnect: %v", err)
+	}
+	ack, err = os.ReadFile(ackPath)
+	if err != nil || string(ack) != "nonce-123\n" {
+		t.Fatalf("later acknowledgement = %q, %v", ack, err)
+	}
+}
+
+func TestSaveSessionStateReportsWriteFailure(t *testing.T) {
+	dataHome := t.TempDir()
+	blocker := filepath.Join(dataHome, "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", blocker)
+	if err := saveSessionState(zerolog.Nop(), PersistedSessionState{IDSIdentity: "identity"}); err == nil {
+		t.Fatal("session save did not report an unwritable session path")
+	}
+}

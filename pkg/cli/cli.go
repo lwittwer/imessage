@@ -715,7 +715,8 @@ func IsManagementCommand(cmd string) bool {
 	switch cmd {
 	case "setup", "setup-beeper", "start", "stop", "restart",
 		"status", "logs", "bbctl", "reset", "uninstall",
-		"install-service", "uninstall-service", "reset-config-kind":
+		"install-service", "uninstall-service", "reset-config-kind",
+		"reset-config-value", "reset-merge-database":
 		return true
 	}
 	return false
@@ -750,6 +751,26 @@ func RunManagement(cmd string, args []string) {
 			os.Exit(1)
 		}
 		fmt.Println(kind)
+	case "reset-config-value":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-value requires a config path and value name")
+			os.Exit(2)
+		}
+		value, err := resetConfigValue(args[0], args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-value: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(value)
+	case "reset-merge-database":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-merge-database requires backup and fresh config paths")
+			os.Exit(2)
+		}
+		if err := mergeResetDatabaseConfig(args[0], args[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-merge-database: %v\n", err)
+			os.Exit(1)
+		}
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":

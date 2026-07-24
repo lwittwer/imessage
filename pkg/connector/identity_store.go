@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -73,6 +75,51 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
 }
 
+func sessionExportMarkerPath(name string) (string, error) {
+	path, err := sessionFilePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(path), name), nil
+}
+
+func acknowledgeSessionExport(log zerolog.Logger) error {
+	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
+	if err != nil {
+		return err
+	}
+	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
+	if err != nil {
+		return err
+	}
+	request, err := os.ReadFile(requestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read reset session export request: %w", err)
+	}
+	if len(bytes.TrimSpace(request)) == 0 {
+		return fmt.Errorf("reset session export request is empty")
+	}
+	if err = writeSessionFileAtomically(ackPath, request); err != nil {
+		return fmt.Errorf("acknowledge reset session export: %w", err)
+	}
+	log.Info().Str("path", ackPath).Msg("Acknowledged fresh reset session export")
+	return nil
+}
+
+func clearSessionExportAcknowledgement() error {
+	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
+	if err != nil {
+		return err
+	}
+	if err = os.Remove(ackPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear reset session export acknowledgement: %w", err)
+	}
+	return nil
+}
+
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
 // ~/.local/share/corten-matrix/identity.plist
 func legacyIdentityFilePath() (string, error) {
@@ -129,23 +176,23 @@ func hasKeychainCliqueState(log zerolog.Logger) bool {
 var sessionStateMu sync.Mutex
 
 // saveSessionState writes the full session state to the JSON file (locked).
-func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
+func saveSessionState(log zerolog.Logger, state PersistedSessionState) error {
 	sessionStateMu.Lock()
 	defer sessionStateMu.Unlock()
-	saveSessionStateLocked(log, state)
+	return saveSessionStateLocked(log, state)
 }
 
 // saveSessionStateLocked is saveSessionState without the lock; callers must hold
-// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
-func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
+// sessionStateMu. Creates parent directories if needed.
+func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) error {
 	path, err := sessionFilePath()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
-		return
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("Failed to create session file directory")
-		return
+		return err
 	}
 	// Preserve the opaque IDS key cache across saves. Callers that rebuild the
 	// struct from login metadata don't carry it, so re-read it from the existing
@@ -162,17 +209,18 @@ func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 	data, err := json.Marshal(state)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to marshal session state")
-		return
+		return err
 	}
 	if err := writeSessionFileAtomically(path, data); err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("Failed to atomically write session file")
-		return
+		return err
 	}
 	log.Info().Str("path", path).
 		Bool("has_identity", state.IDSIdentity != "").
 		Bool("has_aps_state", state.APSState != "").
 		Bool("has_ids_users", state.IDSUsers != "").
 		Msg("Saved session state to file")
+	return nil
 }
 
 // writeSessionFileAtomically replaces session.json without ever exposing a
@@ -277,7 +325,7 @@ func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
 		IDSIdentity: string(legacyData),
 	}
 	// Migrate: save in new format and remove old file (already under the lock)
-	saveSessionStateLocked(log, state)
+	_ = saveSessionStateLocked(log, state)
 	_ = os.Remove(legacyPath)
 	return state
 }
@@ -325,6 +373,10 @@ func CheckSessionRestore(requireKeychain ...bool) bool {
 	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
 		return false
 	}
+	if !sessionRestoreHasRequiredPlatformState(state, runtime.GOOS) {
+		log.Info().Str("platform", runtime.GOOS).Msg("Session restore check failed: hardware key is required on this platform")
+		return false
+	}
 
 	session := &cachedSessionState{
 		IDSIdentity: state.IDSIdentity,
@@ -344,4 +396,8 @@ func CheckSessionRestore(requireKeychain ...bool) bool {
 
 func sessionRestoreRequiresKeychain(option []bool) bool {
 	return len(option) == 0 || option[0]
+}
+
+func sessionRestoreHasRequiredPlatformState(state PersistedSessionState, goos string) bool {
+	return goos == "darwin" || strings.TrimSpace(state.HardwareKey) != ""
 }
