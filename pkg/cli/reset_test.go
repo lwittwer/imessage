@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -43,6 +45,59 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 		if !strings.Contains(script, required) {
 			t.Errorf("reset script missing safety guard %q", required)
 		}
+	}
+}
+
+func TestEmbeddedResetRunsAsSudoTargetUser(t *testing.T) {
+	cmd := embeddedScriptCommand("/tmp/reset script.sh", []string{"--account", "1", "--delete-remote"}, 0, "bridge-user")
+	want := []string{
+		"sudo", "-u", "bridge-user", "-H", "/bin/bash", "/tmp/reset script.sh",
+		"--account", "1", "--delete-remote",
+	}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("sudo reset command = %#v, want %#v", cmd.Args, want)
+	}
+
+	direct := embeddedScriptCommand("/tmp/reset.sh", []string{"--account", "0"}, 501, "")
+	wantDirect := []string{"/bin/bash", "/tmp/reset.sh", "--account", "0"}
+	if !reflect.DeepEqual(direct.Args, wantDirect) {
+		t.Fatalf("direct reset command = %#v, want %#v", direct.Args, wantDirect)
+	}
+}
+
+func TestResetConfigGuardsAcceptQuotedYAMLScalars(t *testing.T) {
+	script := embeddedScript(t, "reset-bridge.sh")
+	tests := []struct {
+		name    string
+		pattern string
+		values  []string
+	}{
+		{
+			name:    "beeper domain",
+			pattern: `^[[:space:]]+domain:[[:space:]]+['\"]?beeper\\.com['\"]?([[:space:]]|$)`,
+			values:  []string{"    domain: beeper.com", `    domain: "beeper.com"`, "    domain: 'beeper.com'"},
+		},
+		{
+			name:    "postgres database",
+			pattern: `^[[:space:]]+type:[[:space:]]+['\"]?postgres['\"]?([[:space:]]|$)`,
+			values:  []string{"    type: postgres", `    type: "postgres"`, "    type: 'postgres'"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.Contains(script, tt.pattern) {
+				t.Fatalf("reset script missing config guard pattern %q", tt.pattern)
+			}
+			// The shell source needs a doubled backslash inside its double-quoted
+			// grep pattern; grep receives the single-backslash regexp below.
+			re := regexp.MustCompile(strings.ReplaceAll(tt.pattern, `\\`, `\`))
+			for _, value := range tt.values {
+				if !re.MatchString(value) {
+					t.Errorf("guard pattern does not match %q", value)
+				}
+			}
+		})
 	}
 }
 

@@ -689,7 +689,7 @@ scripts/                                    # Setup scripts, embedded into the b
   ├── install.sh / install-linux.sh         #   interactive setup — self-hosted bridge (macOS / Linux)
   ├── install-beeper.sh / -linux.sh         #   interactive setup — Beeper (macOS / Linux)
   ├── bootstrap-linux.sh                    #   installs build deps
-  ├── reset-bridge.sh                       #   wipes state + Beeper deregistration (with prompts)
+  ├── reset-bridge.sh                       #   confirmed local wipe; Beeper deregistration is opt-in
   └── patch_bindings.py / .sh               #   patches uniffi-generated Go bindings for Go 1.24+ cgo types
 ```
 

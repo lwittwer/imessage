@@ -148,7 +148,28 @@ func runEmbeddedScript(name string, args ...string) {
 	}
 	tmp.Close()
 	_ = os.Chmod(tmp.Name(), 0o755)
-	exitWith("/bin/bash", append([]string{tmp.Name()}, args...)...)
+	c := embeddedScriptCommand(tmp.Name(), args, os.Geteuid(), os.Getenv("SUDO_USER"))
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := c.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		fmt.Fprintf(os.Stderr, "corten-matrix: reset: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// embeddedScriptCommand keeps destructive management scripts in the target
+// user's account context when the CLI was launched through sudo. In particular,
+// bbctl must read that user's credentials rather than root's config directory.
+func embeddedScriptCommand(scriptPath string, args []string, euid int, sudoUser string) *exec.Cmd {
+	bashArgs := append([]string{scriptPath}, args...)
+	if euid == 0 && sudoUser != "" && sudoUser != "root" {
+		sudoArgs := []string{"-u", sudoUser, "-H", "/bin/bash"}
+		return exec.Command("sudo", append(sudoArgs, bashArgs...)...)
+	}
+	return exec.Command("/bin/bash", bashArgs...)
 }
 
 // serviceCtl runs a lifecycle action on THE bridge service. There is ONE service
