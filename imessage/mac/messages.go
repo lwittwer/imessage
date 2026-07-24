@@ -150,7 +150,7 @@ WHERE message.date>$1
     )
   )
 GROUP BY chat.guid, chat.group_id
-ORDER BY MAX(message.date) DESC
+ORDER BY MAX(message.date) DESC, chat.guid DESC, chat.group_id DESC
 `
 
 const hasAnyBackfillableQuery = `

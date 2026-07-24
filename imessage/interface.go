@@ -60,6 +60,8 @@ type API interface {
 	GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) ([]*Message, error)
 	GetMessagesBeforeCursor(chatID string, before time.Time, beforeRowID int, limit int) ([]*Message, error)
 	GetMessagesWithLimit(chatID string, limit int, backfillID string) ([]*Message, error)
+	// GetChatsWithMessagesAfter returns chats in descending latest-message
+	// order, with a deterministic GUID tie-break.
 	GetChatsWithMessagesAfter(minDate time.Time) ([]ChatIdentifier, error)
 	GetMessage(guid string) (*Message, error)
 	GetMessageGUIDsSince(chatID string, minDate time.Time) ([]string, error)

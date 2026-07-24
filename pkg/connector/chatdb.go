@@ -45,6 +45,10 @@ type chatDBBackfillCursorPosition struct {
 	RowID  int   `json:"row_id"`
 }
 
+type chatDBBackfillGUIDBundle struct {
+	ChatGUIDs []string
+}
+
 // openChatDB attempts to open the local iMessage chat.db database.
 // Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
 func openChatDB(log zerolog.Logger) *chatDB {
@@ -137,18 +141,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	portalID := string(params.Portal.ID)
 	log := zerolog.Ctx(ctx)
 
-	var chatGUIDs []string
-	if strings.Contains(portalID, ",") {
-		// Group portal: find chat GUID by matching members
-		chatGUID := db.findGroupChatGUID(portalID, c)
-		if chatGUID != "" {
-			chatGUIDs = []string{chatGUID}
-		}
-	} else {
-		// Use contact-aware lookup: includes chat GUIDs for all of the
-		// contact's phone numbers, so merged DM portals get complete history.
-		chatGUIDs = c.getContactChatGUIDs(portalID)
-	}
+	chatGUIDs := db.chatGUIDsForPortal(params.Portal, c, params.BundledData)
 
 	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
 
@@ -201,6 +194,11 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		messages = append(messages, msgs...)
 		messagesByGUID[chatGUID] = msgs
 	}
+
+	// Cursor state is intentionally calculated from the raw per-GUID pages.
+	// The same chat_message row can be joined through multiple exact chat GUIDs,
+	// so deduplicate the merged event stream before conversion.
+	messages = deduplicateChatDBMessages(messages)
 
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
@@ -281,6 +279,70 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
+}
+
+// chatGUIDsForPortal returns the exact chat.db GUID set saved while deciding
+// whether an initial-sync portal has backfillable content. The saved set is
+// authoritative: in particular, Apple SMS-forwarding GUID suffixes cannot be
+// reconstructed from the normalized portal ID. Older portals without saved
+// GUIDs retain the pre-existing lookup behavior.
+func (db *chatDB) chatGUIDsForPortal(portal *bridgev2.Portal, c *IMClient, bundledData any) []string {
+	if bundle, ok := bundledData.(chatDBBackfillGUIDBundle); ok && len(bundle.ChatGUIDs) > 0 {
+		return uniqueStrings(bundle.ChatGUIDs)
+	}
+	if portal != nil {
+		if meta, ok := portal.Metadata.(*PortalMetadata); ok && len(meta.ChatDBGUIDs) > 0 {
+			return uniqueStrings(meta.ChatDBGUIDs)
+		}
+	}
+
+	portalID := ""
+	if portal != nil {
+		portalID = string(portal.ID)
+	}
+	if strings.Contains(portalID, ",") {
+		chatGUID := db.findGroupChatGUID(portalID, c)
+		if chatGUID != "" {
+			return []string{chatGUID}
+		}
+		return nil
+	}
+	// Contact-aware fallback for portals created before exact GUID metadata
+	// was introduced.
+	return uniqueStrings(c.getContactChatGUIDs(portalID))
+}
+
+func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message {
+	seen := make(map[string]struct{}, len(messages))
+	result := make([]*imessage.Message, 0, len(messages))
+	for _, message := range messages {
+		if message == nil || message.GUID == "" {
+			result = append(result, message)
+			continue
+		}
+		if _, ok := seen[message.GUID]; ok {
+			continue
+		}
+		seen[message.GUID] = struct{}{}
+		result = append(result, message)
+	}
+	return result
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func chatDBCursorStateForGUID(cursorTimes map[string]chatDBBackfillCursorPosition, chatGUID string, hasBackwardCursor bool) (chatDBBackfillCursorPosition, bool, bool) {

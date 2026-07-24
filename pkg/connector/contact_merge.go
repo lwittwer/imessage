@@ -46,25 +46,79 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 		return defaultID
 	}
 
-	for _, candidate := range preferredContactPortalIDs(contact) {
-		existingID, err := c.findExistingDMPortalID(candidate)
-		if err != nil {
-			c.UserLogin.Log.Warn().Err(err).
-				Str("original", identifier).
-				Str("candidate", candidate).
-				Msg("Failed to check existing contact portal; preserving original portal ID")
-			return defaultID
-		}
-		if existingID != "" {
-			c.UserLogin.Log.Debug().
-				Str("original", identifier).
-				Str("resolved", existingID).
-				Msg("Resolved contact portal to existing portal")
-			return networkid.PortalID(existingID)
-		}
+	var lookupErr error
+	chosen := preferredExistingDMPortalCandidate(
+		preferredContactPortalIDs(contact),
+		func(candidate string) existingDMPortalCandidate {
+			if lookupErr != nil {
+				return existingDMPortalCandidate{}
+			}
+			existing, err := c.findExistingDMPortalCandidate(candidate)
+			if err != nil {
+				lookupErr = err
+				return existingDMPortalCandidate{}
+			}
+			return existing
+		},
+	)
+	if lookupErr != nil {
+		c.UserLogin.Log.Warn().Err(lookupErr).
+			Str("original", identifier).
+			Msg("Failed to check existing contact portals; preserving original portal ID")
+		return defaultID
+	}
+	if chosen.ID != "" {
+		c.UserLogin.Log.Debug().
+			Str("original", identifier).
+			Str("resolved", chosen.ID).
+			Bool("has_messages", chosen.HasMessages).
+			Msg("Resolved contact portal to existing portal")
+		return networkid.PortalID(chosen.ID)
 	}
 
 	return defaultID
+}
+
+// findExistingDMPortalCandidate returns the exact existing portal key and
+// whether that portal contains bridged messages. The populated bit lets alias
+// resolution avoid redirecting new traffic into an already-created empty
+// duplicate when another alias contains the real conversation.
+func (c *IMClient) findExistingDMPortalCandidate(identifier string) (existingDMPortalCandidate, error) {
+	existingID, err := c.findExistingDMPortalID(identifier)
+	if err != nil || existingID == "" {
+		return existingDMPortalCandidate{ID: existingID}, err
+	}
+	firstMessage, err := c.Main.Bridge.DB.Message.GetFirstPortalMessage(context.Background(), networkid.PortalKey{
+		ID:       networkid.PortalID(existingID),
+		Receiver: c.UserLogin.ID,
+	})
+	if err != nil {
+		return existingDMPortalCandidate{}, err
+	}
+	return existingDMPortalCandidate{ID: existingID, HasMessages: firstMessage != nil}, nil
+}
+
+// preferredExistingDMPortalCandidate chooses the first populated existing
+// portal in candidate order. If none are populated, it chooses the first empty
+// existing portal. Candidate order provides the deterministic tie-break.
+func preferredExistingDMPortalCandidate(
+	candidates []string,
+	findExistingRoom func(string) existingDMPortalCandidate,
+) existingDMPortalCandidate {
+	var chosen existingDMPortalCandidate
+	if findExistingRoom == nil {
+		return chosen
+	}
+	for _, candidate := range candidates {
+		existing := findExistingRoom(candidate)
+		if existing.ID == "" {
+			continue
+		}
+		if chosen.ID == "" || (!chosen.HasMessages && existing.HasMessages) {
+			chosen = existing
+		}
+	}
+	return chosen
 }
 
 // validateTargetsSafe wraps Client.ValidateTargets with a recover guard.
@@ -371,16 +425,23 @@ func (c *IMClient) findExistingDMPortalID(identifier string) (string, error) {
 	return "", nil
 }
 
+type existingDMPortalCandidate struct {
+	ID          string
+	HasMessages bool
+}
+
 // canonicalizeChatDBInitialSyncDMPortalIDs maps each multi-handle contact to
 // one portal ID and marks duplicate chat.db entries to skip. Existing Matrix
-// rooms win so upgrades keep their current portal identity; new contacts use a
-// deterministic phone-preferred handle. The first input for a contact is kept
-// as the representative because chat.db returns chats in activity order.
+// rooms with messages win so upgrades keep the populated conversation instead
+// of an empty alias. Otherwise existing rooms win over new IDs, with the
+// deterministic phone-preferred candidate order breaking ties. New contacts
+// use that same deterministic order. The first input for a contact is kept as
+// the representative because chat.db returns chats in activity order.
 func canonicalizeChatDBInitialSyncDMPortalIDs(
 	portalIDs []string,
 	lookupContact func(string) *imessage.Contact,
 	isSelf func(string) bool,
-	findExistingRoom func(string) string,
+	findExistingRoom func(string) existingDMPortalCandidate,
 ) (canonical []string, skip map[int]bool) {
 	canonical = append([]string(nil), portalIDs...)
 	skip = make(map[int]bool)
@@ -425,11 +486,9 @@ func canonicalizeChatDBInitialSyncDMPortalIDs(
 		}
 		chosen := candidates[0]
 		if findExistingRoom != nil {
-			for _, candidate := range candidates {
-				if existingID := findExistingRoom(candidate); existingID != "" {
-					chosen = existingID
-					break
-				}
+			chosenExisting := preferredExistingDMPortalCandidate(candidates, findExistingRoom)
+			if chosenExisting.ID != "" {
+				chosen = chosenExisting.ID
 			}
 		}
 
