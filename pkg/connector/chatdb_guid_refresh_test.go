@@ -1,15 +1,119 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 )
+
+type chatDBGUIDRefreshEnumerationAPI struct {
+	imessage.API
+	chats          []imessage.ChatIdentifier
+	enumerationErr error
+	infoByGUID     map[string]*imessage.ChatInfo
+	infoErrByGUID  map[string]error
+}
+
+func (api *chatDBGUIDRefreshEnumerationAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	if api.enumerationErr != nil {
+		return nil, api.enumerationErr
+	}
+	return append([]imessage.ChatIdentifier(nil), api.chats...), nil
+}
+
+func (api *chatDBGUIDRefreshEnumerationAPI) GetChatInfo(chatGUID, _ string) (*imessage.ChatInfo, error) {
+	if err := api.infoErrByGUID[chatGUID]; err != nil {
+		return nil, err
+	}
+	return api.infoByGUID[chatGUID], nil
+}
+
+func TestEnumerateChatDBGUIDRefreshEntriesSkipsMalformedRowsAndKeepsProgress(t *testing.T) {
+	const (
+		dmGUID          = "SMS;-;+15550000006(smsft)"
+		unreadableGroup = "iMessage;+;chat-unreadable"
+		nilGroup        = "iMessage;+;chat-empty-info"
+		validGroup      = "iMessage;+;chat-valid"
+	)
+	api := &chatDBGUIDRefreshEnumerationAPI{
+		chats: []imessage.ChatIdentifier{
+			{ChatGUID: dmGUID},
+			{ChatGUID: "iMessage;-;"},
+			{ChatGUID: unreadableGroup},
+			{ChatGUID: nilGroup},
+			{ChatGUID: validGroup},
+		},
+		infoByGUID: map[string]*imessage.ChatInfo{
+			validGroup: {Members: []string{"+15550000007"}},
+		},
+		infoErrByGUID: map[string]error{
+			unreadableGroup: errors.New("row-local group lookup failure"),
+		},
+	}
+	client := &IMClient{
+		handle: "self@example.com",
+		chatDB: &chatDB{api: api},
+	}
+
+	entries, err := client.enumerateChatDBGUIDRefreshEntries(context.Background())
+	if err != nil {
+		t.Fatalf("row-local failures aborted exact GUID enumeration: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("enumerated entries = %#v, want the valid DM and group only", entries)
+	}
+	if entries[0].ChatGUID != dmGUID || entries[0].PortalID != "tel:+15550000006" {
+		t.Fatalf("valid DM entry = %#v, want literal GUID and normalized portal ID", entries[0])
+	}
+	if entries[1].ChatGUID != validGroup || entries[1].PortalID == "" {
+		t.Fatalf("valid group entry = %#v, want retained group after bad rows", entries[1])
+	}
+}
+
+func TestEnumerateChatDBGUIDRefreshEntriesReturnsGlobalEnumerationFailure(t *testing.T) {
+	client := &IMClient{chatDB: &chatDB{api: &chatDBGUIDRefreshEnumerationAPI{
+		enumerationErr: errors.New("global chat.db failure"),
+	}}}
+	entries, err := client.enumerateChatDBGUIDRefreshEntries(context.Background())
+	if err == nil {
+		t.Fatalf("global enumeration failure returned entries %#v and no error", entries)
+	}
+}
+
+func TestEnumerateChatDBGUIDRefreshEntriesLogsRowFailuresPrivacySafely(t *testing.T) {
+	const (
+		privateGUID  = "iMessage;+;private-person@example.com"
+		privateError = "failed while reading private-person@example.com"
+	)
+	client := &IMClient{chatDB: &chatDB{api: &chatDBGUIDRefreshEnumerationAPI{
+		chats: []imessage.ChatIdentifier{{ChatGUID: privateGUID}},
+		infoErrByGUID: map[string]error{
+			privateGUID: errors.New(privateError),
+		},
+	}}}
+	var output bytes.Buffer
+	log := zerolog.New(&output)
+
+	entries, err := client.enumerateChatDBGUIDRefreshEntries(log.WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("row-local group failure returned an error: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unreadable group produced entries %#v", entries)
+	}
+	if got := output.String(); strings.Contains(got, privateGUID) || strings.Contains(got, privateError) || strings.Contains(got, "private-person@example.com") {
+		t.Fatalf("row-local warning exposed private chat.db data: %s", got)
+	}
+}
 
 func TestMatchChatDBGUIDsToExistingPortalPreservesSuffixVariants(t *testing.T) {
 	entries := []chatDBGUIDRefreshEntry{

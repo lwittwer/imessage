@@ -276,6 +276,9 @@ func TestChatDBFetchMessagesUsesPersistedExactGUIDForBothDirections(t *testing.T
 	if !forward.AggressiveDeduplication {
 		t.Fatal("forward FetchMessages did not enable database-level aggressive deduplication")
 	}
+	if api.enumerationCalls != 1 {
+		t.Fatalf("first backward plus bundled forward enumerated chat.db %d times, want only the unbundled backward scan", api.enumerationCalls)
+	}
 
 	wantCalls := []string{"backward:" + exactGUID, "forward:" + exactGUID}
 	if len(api.calls) != len(wantCalls) {
@@ -483,9 +486,10 @@ func TestChatDBRestoreBundleSeedsExactMetadata(t *testing.T) {
 		PortalKey: networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001")},
 		Metadata:  &PortalMetadata{},
 	}}
-	db := &chatDB{api: &recordingExactChatDBAPI{
+	api := &recordingExactChatDBAPI{
 		chats: []imessage.ChatIdentifier{{ChatGUID: exactGUID}},
-	}}
+	}
+	db := &chatDB{api: api}
 	got, err := db.chatGUIDsForPortal(
 		context.Background(),
 		portal,
@@ -502,6 +506,47 @@ func TestChatDBRestoreBundleSeedsExactMetadata(t *testing.T) {
 	if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; !stringSlicesEqual(persisted, []string{exactGUID}) {
 		t.Fatalf("seeded exact metadata = %#v, want %#v", persisted, []string{exactGUID})
 	}
+	if api.enumerationCalls != 0 {
+		t.Fatalf("restore bundle repeated the global chat.db enumeration %d times, want 0", api.enumerationCalls)
+	}
+}
+
+func TestChatDBBundledSessionsDoNotRepeatGlobalEnumerationPerPortal(t *testing.T) {
+	api := &recordingExactChatDBAPI{}
+	db := &chatDB{api: api}
+
+	for i, exactGUID := range []string{
+		"SMS;-;+15550000001(smsft)",
+		"iMessage;-;person@example.com",
+		"iMessage;+;chat-group-1",
+	} {
+		portal := &bridgev2.Portal{Portal: &database.Portal{
+			PortalKey: networkid.PortalKey{
+				ID:       networkid.PortalID("portal-" + strconv.Itoa(i)),
+				Receiver: networkid.UserLoginID("login"),
+			},
+			Metadata: &PortalMetadata{},
+		}}
+		got, err := db.chatGUIDsForPortal(
+			context.Background(),
+			portal,
+			&IMClient{},
+			chatDBBackfillGUIDBundle{ChatGUIDs: []string{exactGUID}},
+			true,
+		)
+		if err != nil {
+			t.Fatalf("portal %d bundled GUID selection failed: %v", i, err)
+		}
+		if !stringSlicesEqual(got, []string{exactGUID}) {
+			t.Fatalf("portal %d GUIDs = %#v, want %#v", i, got, []string{exactGUID})
+		}
+		if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; !stringSlicesEqual(persisted, []string{exactGUID}) {
+			t.Fatalf("portal %d metadata = %#v, want %#v", i, persisted, []string{exactGUID})
+		}
+	}
+	if api.enumerationCalls != 0 {
+		t.Fatalf("three bundled portal sessions repeated the global chat.db enumeration %d times, want 0", api.enumerationCalls)
+	}
 }
 
 func TestChatDBGUIDSelectionUnionsBundleWithPersistedMetadata(t *testing.T) {
@@ -516,7 +561,7 @@ func TestChatDBGUIDSelectionUnionsBundleWithPersistedMetadata(t *testing.T) {
 		portal,
 		&IMClient{},
 		chatDBBackfillGUIDBundle{ChatGUIDs: []string{bundledGUID}},
-		false,
+		true,
 	)
 	if err != nil {
 		t.Fatalf("exact GUID selection failed: %v", err)
@@ -524,6 +569,9 @@ func TestChatDBGUIDSelectionUnionsBundleWithPersistedMetadata(t *testing.T) {
 	want := []string{bundledGUID, persistedGUID}
 	if !stringSlicesEqual(got, want) {
 		t.Fatalf("selected exact GUIDs = %#v, want bundled and persisted union %#v", got, want)
+	}
+	if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; !stringSlicesEqual(persisted, []string{persistedGUID, bundledGUID}) {
+		t.Fatalf("persisted exact GUID union = %#v, want existing metadata plus bundle", persisted)
 	}
 }
 

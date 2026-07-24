@@ -46,6 +46,8 @@ type chatDBBackfillCursorPosition struct {
 }
 
 type chatDBBackfillGUIDBundle struct {
+	// ChatGUIDs are literal values selected from the fresh chat.db
+	// enumeration that queued the initial-sync or restore resync.
 	ChatGUIDs []string
 }
 
@@ -305,8 +307,10 @@ func (db *chatDB) chatGUIDsForPortal(
 	refreshExact bool,
 ) ([]string, error) {
 	var exactGUIDs []string
+	bundleSuppliedExactGUIDs := false
 	if bundle, ok := bundledData.(chatDBBackfillGUIDBundle); ok && len(bundle.ChatGUIDs) > 0 {
 		exactGUIDs = uniqueStrings(bundle.ChatGUIDs)
+		bundleSuppliedExactGUIDs = len(exactGUIDs) > 0
 	}
 	if portal != nil {
 		if meta, ok := portal.Metadata.(*PortalMetadata); ok && len(meta.ChatDBGUIDs) > 0 {
@@ -315,10 +319,26 @@ func (db *chatDB) chatGUIDsForPortal(
 	}
 	if len(exactGUIDs) > 0 {
 		if refreshExact {
-			var err error
-			exactGUIDs, err = db.refreshExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
-			if err != nil {
-				return nil, err
+			if bundleSuppliedExactGUIDs {
+				// Initial sync and restore-chat build this bundle from the same
+				// complete chat.db enumeration that queued the resync. Persist
+				// its union without immediately repeating that global scan once
+				// per portal.
+				changed, err := persistExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
+				if err != nil {
+					return nil, fmt.Errorf("persist bundled exact chat.db GUID metadata: %w", err)
+				}
+				if changed {
+					zerolog.Ctx(ctx).Info().
+						Int("guid_count", len(exactGUIDs)).
+						Msg("Persisted bundled exact chat.db GUID metadata before backfill")
+				}
+			} else {
+				var err error
+				exactGUIDs, err = db.refreshExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 		return exactGUIDs, nil
@@ -361,13 +381,7 @@ func (db *chatDB) refreshExactChatDBGUIDsForPortal(
 	}
 
 	if portal != nil {
-		var save func(context.Context, *bridgev2.Portal) error
-		if portal.Bridge != nil {
-			save = func(ctx context.Context, portal *bridgev2.Portal) error {
-				return portal.Save(ctx)
-			}
-		}
-		changed, updateErr := updatePortalChatDBGUIDMetadata(ctx, portal, merged, save)
+		changed, updateErr := persistExactChatDBGUIDsForPortal(ctx, portal, merged)
 		if updateErr != nil {
 			err = updateErr
 			return nil, fmt.Errorf("persist refreshed exact chat.db GUID metadata: %w", err)
@@ -384,6 +398,23 @@ func (db *chatDB) refreshExactChatDBGUIDsForPortal(
 			Msg("Refreshed exact chat.db GUID set before backfill")
 	}
 	return merged, nil
+}
+
+func persistExactChatDBGUIDsForPortal(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	exactGUIDs []string,
+) (bool, error) {
+	if portal == nil {
+		return false, nil
+	}
+	var save func(context.Context, *bridgev2.Portal) error
+	if portal.Bridge != nil {
+		save = func(ctx context.Context, portal *bridgev2.Portal) error {
+			return portal.Save(ctx)
+		}
+	}
+	return updatePortalChatDBGUIDMetadata(ctx, portal, exactGUIDs, save)
 }
 
 // chatDBGUIDIdentityKey removes only representation details that do not change
