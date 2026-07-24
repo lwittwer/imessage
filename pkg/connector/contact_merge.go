@@ -46,22 +46,19 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 		return defaultID
 	}
 
-	for _, candidate := range preferredContactPortalIDs(contact) {
-		existingID, err := c.findExistingDMPortalID(candidate)
-		if err != nil {
-			c.UserLogin.Log.Warn().Err(err).
-				Str("original", identifier).
-				Str("candidate", candidate).
-				Msg("Failed to check existing contact portal; preserving original portal ID")
-			return defaultID
-		}
-		if existingID != "" {
-			c.UserLogin.Log.Debug().
-				Str("original", identifier).
-				Str("resolved", existingID).
-				Msg("Resolved contact portal to existing portal")
-			return networkid.PortalID(existingID)
-		}
+	existingID, err := c.findExistingDMPortalIDForCandidates(preferredContactPortalIDs(contact))
+	if err != nil {
+		c.UserLogin.Log.Warn().Err(err).
+			Str("original", logSafeHandle(identifier)).
+			Msg("Failed to check existing contact portals; preserving original portal ID")
+		return defaultID
+	}
+	if existingID != "" {
+		c.UserLogin.Log.Debug().
+			Str("original", logSafeHandle(identifier)).
+			Str("resolved", logSafeHandle(existingID)).
+			Msg("Resolved contact portal to existing portal")
+		return networkid.PortalID(existingID)
 	}
 
 	return defaultID
@@ -334,39 +331,68 @@ func existingDMPortalIDVariants(identifier string) []string {
 	return variants
 }
 
-// findExistingDMPortalID returns the exact portal key already associated with
-// a Matrix room for this identifier, including legacy phone spellings.
-func (c *IMClient) findExistingDMPortalID(identifier string) (string, error) {
+// findExistingDMPortalIDForCandidates checks candidates in preference order
+// while loading the normalized portal index at most once. The normalized scan
+// is required for case-only legacy email keys, but repeating it for every
+// handle of every contact makes initial CloudKit routing scale as
+// handles × portals.
+func (c *IMClient) findExistingDMPortalIDForCandidates(identifiers []string) (string, error) {
 	ctx := context.Background()
-	for _, candidate := range existingDMPortalIDVariants(identifier) {
-		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-			ID:       networkid.PortalID(candidate),
-			Receiver: c.UserLogin.ID,
-		})
+	var existingByID map[string]bool
+	var existingByNormalizedID map[string][]string
+	loadPortalIndex := func() error {
+		portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
 		if err != nil {
-			return "", err
+			return err
 		}
-		if portal != nil && portal.MXID != "" {
-			return candidate, nil
+		existingByID = make(map[string]bool, len(portals))
+		existingByNormalizedID = make(map[string][]string)
+		for _, portal := range portals {
+			if portal.Receiver != "" && portal.Receiver != c.UserLogin.ID {
+				continue
+			}
+			portalID := string(portal.ID)
+			existingByID[portalID] = true
+			normalized := normalizeIdentifierForPortalID(portalID)
+			existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
 		}
+		for normalized := range existingByNormalizedID {
+			sort.Strings(existingByNormalizedID[normalized])
+		}
+		return nil
 	}
 
-	// Direct key lookups cannot discover case-only legacy email variants.
-	// Fall back to a normalized scan and return the exact stored key.
-	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
-	if err != nil {
-		return "", err
-	}
-	normalized := normalizeIdentifierForPortalID(identifier)
-	var matches []string
-	for _, portal := range portals {
-		if (portal.Receiver == "" || portal.Receiver == c.UserLogin.ID) && normalizeIdentifierForPortalID(string(portal.ID)) == normalized {
-			matches = append(matches, string(portal.ID))
+	for _, identifier := range identifiers {
+		variants := existingDMPortalIDVariants(identifier)
+		if existingByID == nil {
+			for _, candidate := range variants {
+				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+					ID:       networkid.PortalID(candidate),
+					Receiver: c.UserLogin.ID,
+				})
+				if err != nil {
+					return "", err
+				}
+				if portal != nil && portal.MXID != "" {
+					return candidate, nil
+				}
+			}
+			// Direct key lookups cannot discover case-only legacy email
+			// variants. Load one normalized index and reuse it for every
+			// remaining candidate in this contact.
+			if err := loadPortalIndex(); err != nil {
+				return "", err
+			}
 		}
-	}
-	if len(matches) > 0 {
-		sort.Strings(matches)
-		return matches[0], nil
+		for _, candidate := range variants {
+			if existingByID[candidate] {
+				return candidate, nil
+			}
+		}
+		normalized := normalizeIdentifierForPortalID(identifier)
+		if matches := existingByNormalizedID[normalized]; len(matches) > 0 {
+			return matches[0], nil
+		}
 	}
 	return "", nil
 }
