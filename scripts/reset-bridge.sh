@@ -110,7 +110,7 @@ fi
 if [ "$DELETE_REMOTE" = true ]; then
     for dir in "${SELECTED[@]}"; do
         config="$dir/config.yaml"
-        if [ ! -f "$config" ] || ! grep -Eqi '^[[:space:]]+domain:[[:space:]]+beeper\.com([[:space:]]|$)' "$config"; then
+        if [ ! -f "$config" ] || ! grep -Eqi "^[[:space:]]+domain:[[:space:]]+['\"]?beeper\\.com['\"]?([[:space:]]|$)" "$config"; then
             echo "ERROR: --delete-remote is only available for a selected Beeper account" >&2
             echo "with an identifiable local config. Nothing was stopped or deleted." >&2
             exit 1
@@ -124,7 +124,7 @@ fi
 if [ "$EXTERNAL_DB_CLEARED" != true ]; then
     for dir in "${SELECTED[@]}"; do
         config="$dir/config.yaml"
-        if [ -f "$config" ] && grep -Eq '^[[:space:]]+type:[[:space:]]+postgres([[:space:]]|$)' "$config"; then
+        if [ -f "$config" ] && grep -Eq "^[[:space:]]+type:[[:space:]]+['\"]?postgres['\"]?([[:space:]]|$)" "$config"; then
             echo "ERROR: $config uses PostgreSQL." >&2
             echo "Local file deletion cannot clear that external database." >&2
             echo "Back it up and clear/recreate it manually, then re-run with:" >&2
