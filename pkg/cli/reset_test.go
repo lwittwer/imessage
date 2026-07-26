@@ -58,7 +58,7 @@ func TestResetRequiresConfirmationBeforeMutation(t *testing.T) {
 	remotePreflight := strings.Index(script, `if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then`)
 	freshExportCheck := strings.Index(script, `if [ "$ack_token" != "$export_token" ]; then`)
 	strictRemoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
-	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`)
+	deleteLocal := strings.Index(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"`)
 
 	if stop < 0 || localConfirm < 0 || imessageConfirm < 0 || remoteConfirm < 0 || externalDBConfirm < 0 ||
 		remotePreflight < 0 || freshExportCheck < 0 || strictRemoteDelete < 0 || deleteLocal < 0 {
@@ -121,7 +121,7 @@ func TestResetPreservesIMessageStateByDefault(t *testing.T) {
 			t.Errorf("default reset has over-broad deletion pattern %q", forbidden)
 		}
 	}
-	if !strings.Contains(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"`) {
+	if !strings.Contains(script, `rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"`) {
 		t.Fatal("reset does not delete the expected SQLite database sidecars")
 	}
 	for _, stateName := range []string{
@@ -149,7 +149,7 @@ func TestResetFilesystemBehavior(t *testing.T) {
 			"config.yaml", "registration.yaml", "session.json", "keystore.plist",
 			"trustedpeers.plist", "facetime-state.plist", "future-apple-state.bin",
 		}
-		deleted := []string{"custom.db", "custom.db-wal", "custom.db-shm", "bridge.stdout.log", "bridge.stderr.log"}
+		deleted := []string{"custom.db", "custom.db-wal", "custom.db-shm", "custom.db-journal", "bridge.stdout.log", "bridge.stderr.log"}
 		for _, name := range append(append([]string{}, preserved...), deleted...) {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 				t.Fatal(err)
@@ -361,6 +361,177 @@ func TestResetFailsClosedWithoutProcessChecker(t *testing.T) {
 	serviceStop := strings.Index(script, "echo \"Stopping bridge...\"")
 	if checkerPreflight < 0 || serviceStop < 0 || checkerPreflight > serviceStop {
 		t.Fatalf("pgrep availability is not verified before the service stop: preflight=%d stop=%d", checkerPreflight, serviceStop)
+	}
+}
+
+func TestResetProcessMatcherScopesCortenMatrixDaemons(t *testing.T) {
+	helper := markedShellHelper(t, "RESET PROCESS MATCHER HELPER")
+	tests := []struct {
+		name       string
+		binaryPath string
+		command    string
+		wantMatch  bool
+	}{
+		{
+			name:       "bridge-all supervisor",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix bridge-all",
+			wantMatch:  true,
+		},
+		{
+			name:       "short config separated",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -c /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "short config equals",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -c=/tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "long config separated",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "corten-matrix --config /tmp/custom.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "long config equals",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "corten-matrix --config=/tmp/custom.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "child short config separated",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n -c /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "child short config equals",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n -c=/tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "child long config separated",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n --config /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "child long config equals",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n --config=/tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "long no update before config",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix --no-update -c /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "short no update with default config",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n",
+			wantMatch:  true,
+		},
+		{
+			name:       "long no update with default config",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix --no-update",
+			wantMatch:  true,
+		},
+		{
+			name:       "boolean no update before config",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix --no-update=true -c /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "chained short flags",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -nc /tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "attached short config",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix -n -c/tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "bare daemon",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix",
+			wantMatch:  true,
+		},
+		{
+			name:       "reset parent",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix reset --account 0",
+			wantMatch:  false,
+		},
+		{
+			name:       "unrelated mautrix bridge",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "mautrix-signal -c /etc/mautrix-signal/config.yaml",
+			wantMatch:  false,
+		},
+		{
+			name:       "renamed binary regex characters",
+			binaryPath: "/tmp/corten-matrix.dev+1",
+			command:    "/tmp/corten-matrix.dev+1 --config=/tmp/config.yaml",
+			wantMatch:  true,
+		},
+		{
+			name:       "similarly named binary",
+			binaryPath: "/usr/local/bin/corten-matrix",
+			command:    "/usr/local/bin/corten-matrix-helper -c /tmp/config.yaml",
+			wantMatch:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := helper + `
+daemon_pattern=$(bridge_daemon_pattern "$1")
+reset_pattern=$(bridge_reset_parent_pattern "$1")
+printf '%s\n' "$2" | grep -Eq "$daemon_pattern" &&
+    ! printf '%s\n' "$2" | grep -Eq "$reset_pattern"
+`
+			cmd := exec.Command("/bin/bash", "-c", script, "process-matcher-test", tt.binaryPath, tt.command)
+			err := cmd.Run()
+			if (err == nil) != tt.wantMatch {
+				t.Errorf("process match for %q success=%t, want %t", tt.command, err == nil, tt.wantMatch)
+			}
+		})
+	}
+
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, `pgrep -f '(bridge-all| -c .*config\.yaml)'`) {
+		t.Fatal("reset still uses the unscoped mautrix process matcher")
+	}
+	if !strings.Contains(script, `pgrep -f "$BRIDGE_PROCESS_PATTERN"`) {
+		t.Fatal("reset does not use the scoped corten-matrix process matcher")
+	}
+}
+
+func TestResetAlwaysReconfirmsPostgreSQLAfterStop(t *testing.T) {
+	script := embeddedScript(t, "reset-bridge.sh")
+	if strings.Contains(script, `DB_TYPES[$i]}" = postgres ] && [ "${SELECTED_RESUME_REMOTE[$i]}" != true`) {
+		t.Fatal("resumed reset still skips PostgreSQL confirmation")
+	}
+	if strings.Contains(script, "Reusing the external-database confirmation recorded by the interrupted reset.") {
+		t.Fatal("reset treats an earlier PostgreSQL confirmation as durable")
+	}
+	externalDBGate := strings.Index(script, `if [ "$HAS_EXTERNAL_DB" = true ]; then`)
+	externalDBConfirm := strings.Index(script, `read -r -p "Type EXTERNAL DATABASE CLEARED after completing that step: "`)
+	remoteDelete := strings.Index(script, `if ! "$BINARY" bbctl delete "$bridge"; then`)
+	if externalDBGate < 0 || externalDBConfirm < externalDBGate || remoteDelete < externalDBConfirm {
+		t.Fatalf("PostgreSQL reconfirmation is not required before remote deletion: gate=%d confirm=%d delete=%d",
+			externalDBGate, externalDBConfirm, remoteDelete)
 	}
 }
 

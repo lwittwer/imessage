@@ -166,11 +166,47 @@ if [ "${#SELECTED[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# BEGIN RESET PROCESS MATCHER HELPER
+bridge_daemon_pattern() {
+    local binary_name
+    local escaped_binary_name
+    binary_name=$(basename "$1") || return 1
+    [ -n "$binary_name" ] || return 1
+    # pgrep accepts an extended regular expression. Escape the executable's
+    # basename so a renamed development binary cannot widen the match.
+    escaped_binary_name=$(printf '%s\n' "$binary_name" |
+        sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
+    printf '^([^[:space:]]*/)?%s([[:space:]]|$)' \
+        "$escaped_binary_name"
+}
+
+bridge_reset_parent_pattern() {
+    local binary_name
+    local escaped_binary_name
+    binary_name=$(basename "$1") || return 1
+    [ -n "$binary_name" ] || return 1
+    escaped_binary_name=$(printf '%s\n' "$binary_name" |
+        sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
+    printf '^([^[:space:]]*/)?%s[[:space:]]+reset([[:space:]]|$)' \
+        "$escaped_binary_name"
+}
+# END RESET PROCESS MATCHER HELPER
+
 # The post-stop process check is a destructive-boundary guard, not an optional
-# diagnostic. A missing pgrep must fail closed instead of being mistaken for
-# "no daemon found" by the negated command below.
+# diagnostic. A missing or unusable checker must fail closed instead of being
+# mistaken for "no daemon found" by the negated command below.
 if ! command -v pgrep >/dev/null 2>&1; then
     echo "ERROR: pgrep is required to verify that the bridge stopped." >&2
+    echo "Nothing was stopped or deleted." >&2
+    exit 1
+fi
+if ! BRIDGE_PROCESS_PATTERN=$(bridge_daemon_pattern "$BINARY"); then
+    echo "ERROR: could not construct the corten-matrix process check." >&2
+    echo "Nothing was stopped or deleted." >&2
+    exit 1
+fi
+if ! RESET_PARENT_PATTERN=$(bridge_reset_parent_pattern "$BINARY"); then
+    echo "ERROR: could not construct the corten-matrix reset-parent check." >&2
     echo "Nothing was stopped or deleted." >&2
     exit 1
 fi
@@ -573,16 +609,38 @@ else
     fi
 fi
 
-# Never remove state while a bridge daemon still appears to be running. The
-# parent `corten-matrix reset` process does not match these daemon arguments.
+# Never remove state while another process from this corten-matrix executable
+# still appears to be running. This is deliberately based on executable
+# identity rather than enumerating flag spellings accepted by the bridge flag
+# parser. The known `corten-matrix reset` parent is the only excluded process.
 for attempt in 1 2 3 4 5; do
-    if pgrep -f '(bridge-all| -c .*config\.yaml)' >/dev/null 2>&1; then
-        :
+    if process_pids=$(pgrep -f "$BRIDGE_PROCESS_PATTERN" 2>/dev/null); then
+        process_check_failed=false
+        bridge_process_found=false
+        for process_pid in $process_pids; do
+            if ! process_command=$(ps -p "$process_pid" -o command= 2>/dev/null); then
+                process_check_failed=true
+                break
+            fi
+            if printf '%s\n' "$process_command" | grep -Eq "$RESET_PARENT_PATTERN"; then
+                continue
+            fi
+            bridge_process_found=true
+            break
+        done
+        if [ "$process_check_failed" = true ]; then
+            pgrep_status=2
+        elif [ "$bridge_process_found" = true ]; then
+            pgrep_status=0
+        else
+            pgrep_status=1
+        fi
     else
         pgrep_status=$?
-        if [ "$pgrep_status" -eq 1 ]; then
-            break
-        fi
+    fi
+    if [ "$pgrep_status" -eq 1 ]; then
+        break
+    elif [ "$pgrep_status" -ne 0 ]; then
         echo "ERROR: could not verify whether a corten-matrix bridge process is still running." >&2
         echo "No state was deleted." >&2
         exit 1
@@ -649,14 +707,12 @@ if [ "$DELETE_IMESSAGE_STATE" != true ]; then
     done
 fi
 
-NEEDS_EXTERNAL_DB_CONFIRMATION=false
-for i in "${!SELECTED[@]}"; do
-    if [ "${DB_TYPES[$i]}" = postgres ] && [ "${SELECTED_RESUME_REMOTE[$i]}" != true ]; then
-        NEEDS_EXTERNAL_DB_CONFIRMATION=true
-    fi
-done
-
-if [ "$HAS_EXTERNAL_DB" = true ] && [ "$NEEDS_EXTERNAL_DB_CONFIRMATION" = true ]; then
+# A remote-deletion intent proves which operation the operator authorized; it
+# does not prove that PostgreSQL stayed empty. The still-registered bridge may
+# have been restarted after an interrupted attempt and repopulated the database.
+# Therefore every attempt clears and reconfirms PostgreSQL after the service is
+# stopped, including recovery attempts that reuse a remote-deletion intent.
+if [ "$HAS_EXTERNAL_DB" = true ]; then
     echo ""
     if [ "$DELETE_IMESSAGE_STATE" = true ]; then
         echo "The bridge is stopped and Apple/iMessage state deletion was explicitly confirmed."
@@ -672,9 +728,6 @@ if [ "$HAS_EXTERNAL_DB" = true ] && [ "$NEEDS_EXTERNAL_DB_CONFIRMATION" = true ]
         echo "Any external database work you already performed is unchanged."
         exit 1
     fi
-elif [ "$HAS_EXTERNAL_DB" = true ]; then
-    echo ""
-    echo "Reusing the external-database confirmation recorded by the interrupted reset."
 fi
 
 if [ "$DELETE_REMOTE" = true ]; then
@@ -731,7 +784,7 @@ delete_local_bridge_data() {
 
     echo "Deleting local bridge database and logs: $dir"
     if [ -n "$db_path" ]; then
-        rm -f -- "$db_path" "$db_path-wal" "$db_path-shm"
+        rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"
     fi
     rm -rf -- "$dir/logs"
     rm -f -- "$dir/bridge.stdout.log" "$dir/bridge.stderr.log"
