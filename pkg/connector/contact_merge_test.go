@@ -324,6 +324,21 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 			wantSkip: map[int]bool{1: true},
 		},
 		{
+			name: "equally populated aliases use preferred order",
+			contacts: []*imessage.Contact{{
+				FirstName: "ExistingTie",
+				Phones:    []string{"+15550000015"},
+				Emails:    []string{"tie@example.com"},
+			}},
+			portalIDs: []string{"mailto:tie@example.com", "tel:+15550000015"},
+			existingRoom: map[string]existingDMPortalCandidate{
+				"tel:+15550000015":       {ID: "tel:+15550000015", HasMessages: true},
+				"mailto:tie@example.com": {ID: "mailto:tie@example.com", HasMessages: true},
+			},
+			wantIDs:  []string{"tel:+15550000015", "tel:+15550000015"},
+			wantSkip: map[int]bool{1: true},
+		},
+		{
 			name: "existing legacy phone portal keeps exact key",
 			contacts: []*imessage.Contact{{
 				FirstName: "LegacyPhone",
@@ -360,6 +375,21 @@ func TestCanonicalizeChatDBInitialSyncDMPortalIDs(t *testing.T) {
 			selfIDs:   map[string]bool{"tel:+15559999999": true},
 			wantIDs:   []string{"tel:+15559999999"},
 			wantSkip:  map[int]bool{},
+		},
+		{
+			name: "multiple self aliases remain distinct",
+			contacts: []*imessage.Contact{{
+				FirstName: "SelfAliases",
+				Phones:    []string{"+15559999999"},
+				Emails:    []string{"self@example.com"},
+			}},
+			portalIDs: []string{"mailto:self@example.com", "tel:+15559999999"},
+			selfIDs: map[string]bool{
+				"mailto:self@example.com": true,
+				"tel:+15559999999":        true,
+			},
+			wantIDs:  []string{"mailto:self@example.com", "tel:+15559999999"},
+			wantSkip: map[int]bool{},
 		},
 		{
 			name: "unrelated contacts stay separate",
@@ -545,6 +575,50 @@ func TestExistingDMPortalIDVariantsPreserveExactAndLegacyForms(t *testing.T) {
 	}
 }
 
+func TestPreferredExistingDMPortalSpellingChoosesPopulatedLegacyRoom(t *testing.T) {
+	tests := []struct {
+		name              string
+		identifier        string
+		normalizedMatches []string
+		existing          map[string]existingDMPortalCandidate
+		want              existingDMPortalCandidate
+	}{
+		{
+			name:              "phone spelling",
+			identifier:        "tel:+15550000013",
+			normalizedMatches: []string{"tel:+15550000013", "tel:15550000013", "tel:5550000013"},
+			existing: map[string]existingDMPortalCandidate{
+				"tel:+15550000013": {ID: "tel:+15550000013"},
+				"tel:15550000013":  {ID: "tel:15550000013", HasMessages: true},
+				"tel:5550000013":   {ID: "tel:5550000013"},
+			},
+			want: existingDMPortalCandidate{ID: "tel:15550000013", HasMessages: true},
+		},
+		{
+			name:              "email case spelling",
+			identifier:        "mailto:person@example.com",
+			normalizedMatches: []string{"mailto:person@example.com", "mailto:Person@Example.com"},
+			existing: map[string]existingDMPortalCandidate{
+				"mailto:person@example.com": {ID: "mailto:person@example.com"},
+				"mailto:Person@Example.com": {ID: "mailto:Person@Example.com", HasMessages: true},
+			},
+			want: existingDMPortalCandidate{ID: "mailto:Person@Example.com", HasMessages: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preferredExistingDMPortalSpelling(
+				tt.identifier,
+				tt.normalizedMatches,
+				func(candidate string) existingDMPortalCandidate { return tt.existing[candidate] },
+			)
+			if got != tt.want {
+				t.Fatalf("preferred legacy spelling = %#v, want populated room %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestChatDBInfoToBridgev2UsesCanonicalDMIdentity(t *testing.T) {
 	client := &IMClient{
 		handle: "tel:+15559999999",
@@ -592,8 +666,13 @@ func TestInitialSyncMixedAliasesUseRetainedRepresentativeSMSState(t *testing.T) 
 	// The older discarded alias previously marked the canonical portal SMS.
 	// Applying the newer retained iMessage representative must clear both the
 	// flag and its stale SMS destination.
+	exactGUIDs := []string{"iMessage;-;mixed@example.com", "SMS;-;+15550000021(smsft)"}
 	meta, changed := portalMetadataWithSMSRouting(
-		&PortalMetadata{IsSms: true, SMSDestination: "tel:+15550000021"},
+		&PortalMetadata{
+			IsSms:          true,
+			SMSDestination: "tel:+15550000021",
+			ChatDBGUIDs:    exactGUIDs,
+		},
 		false,
 		"",
 	)
@@ -602,6 +681,9 @@ func TestInitialSyncMixedAliasesUseRetainedRepresentativeSMSState(t *testing.T) 
 	}
 	if meta.IsSms || meta.SMSDestination != "" {
 		t.Fatalf("retained iMessage metadata = %+v, want non-SMS with no destination", meta)
+	}
+	if !reflect.DeepEqual(meta.ChatDBGUIDs, exactGUIDs) {
+		t.Fatalf("SMS routing update changed exact GUIDs: %#v", meta.ChatDBGUIDs)
 	}
 }
 
@@ -1049,6 +1131,200 @@ func TestPortalToConversationUsesPersistedSMSDestination(t *testing.T) {
 	want := []string{self, destination}
 	if !reflect.DeepEqual(conv.Participants, want) {
 		t.Fatalf("SMS participants = %#v, want %#v", conv.Participants, want)
+	}
+}
+
+func TestMergeChatDBInitialSyncEntriesUsesNewestServiceState(t *testing.T) {
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID("tel:+15550000001"),
+		Receiver: networkid.UserLoginID("login"),
+	}
+	iMessageInfo := &imessage.ChatInfo{JSONChatGUID: "iMessage;-;alias@example.com"}
+	smsInfo := &imessage.ChatInfo{JSONChatGUID: "SMS;-;+15550000001(smsft)"}
+
+	tests := []struct {
+		name            string
+		entries         []chatDBInitialSyncEntry
+		wantRep         *imessage.ChatInfo
+		wantIDs         []string
+		wantSMS         bool
+		wantDestination string
+	}{
+		{
+			name: "newer iMessage after SMS upgrade",
+			entries: []chatDBInitialSyncEntry{
+				{chatGUIDs: []string{iMessageInfo.JSONChatGUID}, portalKey: portalKey, info: iMessageInfo},
+				{
+					chatGUIDs:      []string{smsInfo.JSONChatGUID},
+					portalKey:      portalKey,
+					info:           smsInfo,
+					isSms:          true,
+					smsDestination: "tel:+15550000001",
+				},
+			},
+			wantRep: iMessageInfo,
+			wantIDs: []string{iMessageInfo.JSONChatGUID, smsInfo.JSONChatGUID},
+		},
+		{
+			name: "newer SMS after iMessage fallback",
+			entries: []chatDBInitialSyncEntry{
+				{
+					chatGUIDs:      []string{smsInfo.JSONChatGUID},
+					portalKey:      portalKey,
+					info:           smsInfo,
+					isSms:          true,
+					smsDestination: "tel:+15550000001",
+				},
+				{chatGUIDs: []string{iMessageInfo.JSONChatGUID}, portalKey: portalKey, info: iMessageInfo},
+			},
+			wantRep:         smsInfo,
+			wantIDs:         []string{smsInfo.JSONChatGUID, iMessageInfo.JSONChatGUID},
+			wantSMS:         true,
+			wantDestination: "tel:+15550000001",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			merged := mergeChatDBInitialSyncEntries(tt.entries)
+			if len(merged) != 1 {
+				t.Fatalf("merged entry count = %d, want 1", len(merged))
+			}
+			if merged[0].isSms != tt.wantSMS {
+				t.Fatalf("merged IsSms = %v, want %v from newest exact GUID", merged[0].isSms, tt.wantSMS)
+			}
+			if merged[0].info != tt.wantRep {
+				t.Fatalf("representative ChatInfo = %p, want first entry %p", merged[0].info, tt.wantRep)
+			}
+			if !reflect.DeepEqual(merged[0].chatGUIDs, tt.wantIDs) {
+				t.Fatalf("merged exact GUIDs = %#v, want %#v", merged[0].chatGUIDs, tt.wantIDs)
+			}
+			if merged[0].smsDestination != tt.wantDestination {
+				t.Fatalf("merged SMS destination = %q, want retained representative %q", merged[0].smsDestination, tt.wantDestination)
+			}
+
+			client := &IMClient{
+				handle:     "tel:+15559999999",
+				smsPortals: map[string]bool{string(portalKey.ID): !tt.wantSMS},
+			}
+			client.updatePortalSMS(string(merged[0].portalKey.ID), merged[0].isSms)
+			if got := client.isPortalSMS(string(portalKey.ID)); got != tt.wantSMS {
+				t.Fatalf("canonical portal live SMS routing = %v, want %v", got, tt.wantSMS)
+			}
+			portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: portalKey}}
+			if got := client.portalToConversation(portal).IsSms; got != tt.wantSMS {
+				t.Fatalf("outbound conversation IsSms = %v, want %v", got, tt.wantSMS)
+			}
+		})
+	}
+}
+
+func TestMergeChatDBInitialSyncEntriesKeepsSMSStatePortalScoped(t *testing.T) {
+	receiver := networkid.UserLoginID("login")
+	iMessageKey := networkid.PortalKey{ID: networkid.PortalID("mailto:person@example.com"), Receiver: receiver}
+	smsKey := networkid.PortalKey{ID: networkid.PortalID("tel:242733"), Receiver: receiver}
+	entries := []chatDBInitialSyncEntry{
+		{
+			chatGUIDs: []string{"iMessage;-;person@example.com"},
+			portalKey: iMessageKey,
+			info:      &imessage.ChatInfo{JSONChatGUID: "iMessage;-;person@example.com"},
+		},
+		{
+			chatGUIDs: []string{"SMS;-;242733"},
+			portalKey: smsKey,
+			info:      &imessage.ChatInfo{JSONChatGUID: "SMS;-;242733"},
+			isSms:     true,
+		},
+	}
+
+	merged := mergeChatDBInitialSyncEntries(entries)
+	if len(merged) != 2 {
+		t.Fatalf("merged entry count = %d, want 2", len(merged))
+	}
+	if merged[0].isSms {
+		t.Fatal("unrelated iMessage portal inherited SMS routing state")
+	}
+	if !merged[1].isSms {
+		t.Fatal("SMS portal lost its routing state")
+	}
+}
+
+func TestUpdateInitialSyncPortalMetadataUnionsRetriesAndIsIdempotent(t *testing.T) {
+	oldGUID := "SMS;-;+15550000001(sms)"
+	newGUID := "SMS;-;+15550000001(smsft)"
+	originalMetadata := &PortalMetadata{
+		ThreadID:       "keep",
+		IsSms:          true,
+		SMSDestination: "tel:+15550000001",
+		ChatDBGUIDs:    []string{oldGUID},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{Metadata: originalMetadata}}
+
+	saveCalls := 0
+	changed, err := updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return errors.New("temporary database failure")
+		},
+	)
+	if err == nil || changed {
+		t.Fatalf("failed metadata update = changed %v err %v, want false and error", changed, err)
+	}
+	if saveCalls != 1 {
+		t.Fatalf("failed metadata update save calls = %d, want 1", saveCalls)
+	}
+	if portal.Metadata != originalMetadata {
+		t.Fatal("failed metadata update did not restore the original metadata object")
+	}
+	if originalMetadata.ThreadID != "keep" || !originalMetadata.IsSms ||
+		originalMetadata.SMSDestination != "tel:+15550000001" ||
+		!reflect.DeepEqual(originalMetadata.ChatDBGUIDs, []string{oldGUID}) {
+		t.Fatalf("failed metadata update mutated original metadata: %#v", originalMetadata)
+	}
+
+	changed, err = updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return nil
+		},
+	)
+	if err != nil || !changed {
+		t.Fatalf("retry metadata update = changed %v err %v, want true and nil", changed, err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("successful metadata retry lost unrelated fields or retained stale SMS routing: %#v", meta)
+	}
+	if want := []string{oldGUID, newGUID}; !reflect.DeepEqual(meta.ChatDBGUIDs, want) {
+		t.Fatalf("successful metadata retry GUIDs = %#v, want %#v", meta.ChatDBGUIDs, want)
+	}
+
+	changed, err = updateInitialSyncPortalMetadata(
+		context.Background(),
+		portal,
+		false,
+		"",
+		[]string{newGUID, oldGUID},
+		func(context.Context, *bridgev2.Portal) error {
+			saveCalls++
+			return nil
+		},
+	)
+	if err != nil || changed {
+		t.Fatalf("idempotent metadata update = changed %v err %v, want false and nil", changed, err)
+	}
+	if saveCalls != 2 {
+		t.Fatalf("metadata update save calls = %d, want 2 with idempotent retry unsaved", saveCalls)
 	}
 }
 

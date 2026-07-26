@@ -85,7 +85,51 @@ func newTestMacMessagesDB(t *testing.T) *macOSDatabase {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mac.recentChatsQuery, err = rawDB.Prepare(recentChatsQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return mac
+}
+
+func TestGetChatsWithMessagesAfterOrdersByLatestActivity(t *testing.T) {
+	mac := newTestMacMessagesDB(t)
+	if _, err := mac.chatDB.Exec(`
+		INSERT INTO chat (ROWID, guid) VALUES
+			(1, 'SMS;-;+15550000001'),
+			(2, 'iMessage;-;+15550000001'),
+			(3, 'SMS;-;+15550000002'),
+			(4, 'iMessage;-;+15550000002');
+		INSERT INTO handle (ROWID, id, service) VALUES (1, '+15551111111', 'iMessage');
+		INSERT INTO message (ROWID, guid, date, subject, text, attributedBody, handle_id, is_from_me, item_type, associated_message_guid)
+		VALUES
+			(1, 'older-sms', 1000, '', 'older SMS', NULL, 1, 0, 0, ''),
+			(2, 'newer-imessage', 2000, '', 'newer iMessage', NULL, 1, 0, 0, ''),
+			(3, 'tied-sms', 500, '', 'tied SMS', NULL, 1, 0, 0, ''),
+			(4, 'tied-imessage', 500, '', 'tied iMessage', NULL, 1, 0, 0, '');
+		INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	chats, err := mac.GetChatsWithMessagesAfter(imessage.AppleEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"iMessage;-;+15550000001",
+		"SMS;-;+15550000001",
+		"iMessage;-;+15550000002",
+		"SMS;-;+15550000002",
+	}
+	if len(chats) != len(want) {
+		t.Fatalf("chat count = %d, want %d: %#v", len(chats), len(want), chats)
+	}
+	for i := range want {
+		if chats[i].ChatGUID != want[i] {
+			t.Fatalf("chat order[%d] = %q, want %q", i, chats[i].ChatGUID, want[i])
+		}
+	}
 }
 
 func TestHasBackfillableMessagesBeforeRespectsInitialWindow(t *testing.T) {

@@ -12679,13 +12679,54 @@ func ptrUint64Or(v *uint64, def uint64) uint64 {
 // Chat.db initial sync
 // ============================================================================
 
+type chatDBInitialSyncEntry struct {
+	chatGUIDs      []string
+	portalKey      networkid.PortalKey
+	info           *imessage.ChatInfo
+	isSms          bool
+	smsDestination string
+}
+
+// mergeChatDBInitialSyncEntries combines chat.db rows that resolved to the
+// same final portal. GetChatsWithMessagesAfter orders exact GUIDs by their
+// newest message descending, so the first row is authoritative for current
+// routing and representative ChatInfo. Later rows contribute historical exact
+// GUIDs for backfill, but must not turn an upgraded iMessage chat back into SMS.
+// Keying by the complete PortalKey keeps state isolated between user logins.
+func mergeChatDBInitialSyncEntries(entries []chatDBInitialSyncEntry) []chatDBInitialSyncEntry {
+	merged := make([]chatDBInitialSyncEntry, 0, len(entries))
+	indexByPortal := make(map[networkid.PortalKey]int, len(entries))
+	for _, entry := range entries {
+		if index, exists := indexByPortal[entry.portalKey]; exists {
+			merged[index].chatGUIDs = append(merged[index].chatGUIDs, entry.chatGUIDs...)
+			continue
+		}
+		indexByPortal[entry.portalKey] = len(merged)
+		entry.chatGUIDs = append([]string(nil), entry.chatGUIDs...)
+		merged = append(merged, entry)
+	}
+	for i := range merged {
+		merged[i].chatGUIDs = uniqueStrings(merged[i].chatGUIDs)
+	}
+	return merged
+}
+
 // runChatDBInitialSync creates portals and backfills messages for all recent
-// chats found in chat.db. Runs once on first login, then marks ChatsSynced.
+// chats found in chat.db. On later connects it performs a non-destructive exact
+// GUID metadata refresh for existing rooms instead of simply returning.
 func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	ctx := log.WithContext(context.Background())
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if meta.ChatsSynced {
-		log.Info().Msg("Initial sync already completed, skipping")
+		updated, unchanged, err := c.refreshChatDBGUIDMetadata(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Exact chat.db GUID metadata refresh incomplete; will retry on next connect")
+			return
+		}
+		log.Info().
+			Int("updated_portals", updated).
+			Int("unchanged_portals", unchanged).
+			Msg("Refreshed exact chat.db GUID metadata for existing portals")
 		return
 	}
 
@@ -12695,14 +12736,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		return
 	}
 
-	type chatEntry struct {
-		chatGUID       string
-		portalKey      networkid.PortalKey
-		info           *imessage.ChatInfo
-		isSms          bool
-		smsDestination string
-	}
-	var entries []chatEntry
+	var entries []chatDBInitialSyncEntry
 	maxInitialMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
 	for _, chat := range chats {
 		hasMessages, err := c.chatDB.hasBackfillableMessages(chat.ChatGUID, maxInitialMessages)
@@ -12745,8 +12779,8 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			// phone/email alias that is not the SMS transport destination.
 			smsDestination = string(portalKey.ID)
 		}
-		entries = append(entries, chatEntry{
-			chatGUID:       chat.ChatGUID,
+		entries = append(entries, chatDBInitialSyncEntry{
+			chatGUIDs:      []string{chat.ChatGUID},
 			portalKey:      portalKey,
 			info:           info,
 			isSms:          isSms,
@@ -12762,6 +12796,8 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		for i, entry := range entries {
 			portalIDs[i] = string(entry.portalKey.ID)
 		}
+		canonicalIDs := append([]string(nil), portalIDs...)
+		skip := make(map[int]bool)
 
 		inspectExistingRoom := func(portal *bridgev2.Portal) (existingDMPortalCandidate, error) {
 			firstMessage, err := c.Main.Bridge.DB.Message.GetFirstPortalMessage(ctx, portal.PortalKey)
@@ -12798,16 +12834,16 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
 		}
 
-		if len(skip) > 0 {
-			var merged []chatEntry
-			for i, entry := range entries {
-				if !skip[i] {
-					merged = append(merged, entry)
-				}
-			}
-			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db DM entries by contact aliases")
-			entries = merged
+		// Multiple exact chat.db GUIDs may normalize or canonicalize to one
+		// portal. Keep their complete GUID set on the surviving entry so the
+		// same sources that passed eligibility are used for forward and
+		// backward backfill. This must also run when the existing-portal lookup
+		// failed, because suffix normalization alone can produce duplicate keys.
+		merged := mergeChatDBInitialSyncEntries(entries)
+		if len(merged) != len(entries) {
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db entries while preserving exact GUID variants")
 		}
+		entries = merged
 
 		// Seed retained chat.db representatives only after portal inspection
 		// succeeds. A live route already observed in this session wins.
@@ -12834,7 +12870,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	for _, entry := range entries {
 		done := make(chan error, 1)
 		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
-		chatGUID := entry.chatGUID
+		chatGUIDs := append([]string(nil), entry.chatGUIDs...)
 		portalID := string(entry.portalKey.ID)
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
@@ -12842,33 +12878,38 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					_, err := c.persistCurrentPortalSMSRouting(
-						portalID,
+					c.smsRoutePersistMu.Lock()
+					routing := c.getPortalSMSRouting(portalID, portal.Metadata)
+					_, err := updateInitialSyncPortalMetadata(
+						ctx,
 						portal,
-						func() error {
+						routing.IsSMS,
+						routing.Destination,
+						chatGUIDs,
+						func(ctx context.Context, portal *bridgev2.Portal) error {
 							return portal.Save(ctx)
 						},
 					)
-					if err != nil {
-						done <- err
-						return
-					}
-					done <- nil
+					c.smsRoutePersistMu.Unlock()
+					done <- err
 				},
 				LogContext: func(lc zerolog.Context) zerolog.Context {
-					return lc.Str("chat_guid", chatGUID).Str("source", "initial_sync")
+					return lc.Strs("chat_guids", chatGUIDs).Str("source", "initial_sync")
 				},
 			},
 			ChatInfo:        chatInfo,
 			LatestMessageTS: time.Now(),
+			BundledBackfillData: chatDBBackfillGUIDBundle{
+				ChatGUIDs: append([]string(nil), entry.chatGUIDs...),
+			},
 		})
 
 		select {
 		case persistErr := <-done:
 			if persistErr != nil {
 				log.Error().Err(persistErr).
-					Str("chat_guid", entry.chatGUID).
-					Msg("Initial sync: failed to persist SMS routing metadata; leaving sync incomplete for retry")
+					Strs("chat_guids", chatGUIDs).
+					Msg("Initial sync: failed to persist chat.db metadata; leaving sync incomplete for retry")
 				return
 			}
 			synced++
@@ -12880,7 +12921,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 			}
 		case <-time.After(30 * time.Minute):
 			log.Warn().
-				Str("chat_guid", entry.chatGUID).
+				Strs("chat_guids", entry.chatGUIDs).
 				Msg("Initial sync: timeout waiting for chat; leaving sync incomplete for retry")
 			return
 		case <-c.stopChan:
@@ -12904,6 +12945,8 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo. For
 // DMs, portalID is the canonical contact handle selected by initial sync and
 // must also be used as OtherUserID so the room and ghost identities agree.
+// Exact chat.db GUIDs travel in BundledBackfillData for the in-flight fetch and
+// are persisted explicitly by the post-handler so save failures can roll back.
 func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networkid.PortalID) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
@@ -13009,4 +13052,23 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, portalID networ
 	}
 
 	return chatInfo
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func appendUniqueStrings(existing []string, additions ...string) []string {
+	combined := make([]string, 0, len(existing)+len(additions))
+	combined = append(combined, existing...)
+	combined = append(combined, additions...)
+	return uniqueStrings(combined)
 }
