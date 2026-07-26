@@ -5,7 +5,7 @@
 // setup-beeper, start, stop, restart, status, logs, bbctl, reset, uninstall.
 //
 // Design:
-//   - setup / setup-beeper / reset run the project's existing shell scripts,
+//   - setup / setup-beeper / reset run the project's embedded shell scripts,
 //     embedded into the binary (so behaviour matches what users know today).
 //   - start / stop / restart / status / logs / bbctl are handled natively
 //     (launchd on macOS, systemd --user on Linux).
@@ -148,7 +148,28 @@ func runEmbeddedScript(name string, args ...string) {
 	}
 	tmp.Close()
 	_ = os.Chmod(tmp.Name(), 0o755)
-	exitWith("/bin/bash", append([]string{tmp.Name()}, args...)...)
+	c := embeddedScriptCommand(tmp.Name(), args, os.Geteuid(), os.Getenv("SUDO_USER"))
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := c.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		fmt.Fprintf(os.Stderr, "corten-matrix: reset: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// embeddedScriptCommand keeps destructive management scripts in the target
+// user's account context when the CLI was launched through sudo. In particular,
+// bbctl must read that user's credentials rather than root's config directory.
+func embeddedScriptCommand(scriptPath string, args []string, euid int, sudoUser string) *exec.Cmd {
+	bashArgs := append([]string{scriptPath}, args...)
+	if euid == 0 && sudoUser != "" && sudoUser != "root" {
+		sudoArgs := []string{"-u", sudoUser, "-H", "/bin/bash"}
+		return exec.Command("sudo", append(sudoArgs, bashArgs...)...)
+	}
+	return exec.Command("/bin/bash", bashArgs...)
 }
 
 // serviceCtl runs a lifecycle action on THE bridge service. There is ONE service
@@ -671,7 +692,7 @@ func PrintHelp() {
 		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
-		{"reset", "reset bridge state"},
+		{"reset [options]", "rebuild local + Beeper state (preserves iMessage state)"},
 		{"uninstall", "remove the service"},
 		{"login", "re-run the iMessage login flow"},
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
@@ -694,7 +715,8 @@ func IsManagementCommand(cmd string) bool {
 	switch cmd {
 	case "setup", "setup-beeper", "start", "stop", "restart",
 		"status", "logs", "bbctl", "reset", "uninstall",
-		"install-service", "uninstall-service":
+		"install-service", "uninstall-service", "reset-config-kind",
+		"reset-config-value", "reset-merge-database":
 		return true
 	}
 	return false
@@ -715,10 +737,40 @@ func RunManagement(cmd string, args []string) {
 		}
 		runSetup(true)
 	case "reset":
-		if runtime.GOOS == "darwin" {
-			runEmbeddedScript("reset-bridge.sh", cortenBundleID)
+		runEmbeddedScript("reset-bridge.sh", append([]string{
+			selfPath(), cortenDataDir(), secondDataDir(), cortenBundleID,
+		}, args...)...)
+	case "reset-config-kind":
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-kind requires a config path")
+			os.Exit(2)
 		}
-		runEmbeddedScript("reset-bridge.sh")
+		kind, err := resetConfigKind(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-kind: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(kind)
+	case "reset-config-value":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-value requires a config path and value name")
+			os.Exit(2)
+		}
+		value, err := resetConfigValue(args[0], args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-value: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(value)
+	case "reset-merge-database":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "corten-matrix: reset-merge-database requires backup and fresh config paths")
+			os.Exit(2)
+		}
+		if err := mergeResetDatabaseConfig(args[0], args[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: reset-merge-database: %v\n", err)
+			os.Exit(1)
+		}
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":

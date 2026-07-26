@@ -173,8 +173,13 @@ config YAML is loaded. Keep existing overrides such as
 - Structured bridge logs live under each data dir's `logs/bridge.log`.
 - macOS services use `launchd` with `com.lrhodin.corten-matrix`; Linux services
   use `systemd` as `corten-matrix`.
-- `corten-matrix reset` is the preferred interactive reset path. Manual reset
-  removes the service plus the relevant `~/.local/share/corten-matrix*` data dir.
+- `corten-matrix reset` is the preferred interactive reset path. For Beeper it
+  rebuilds the remote registration and local bridge database by default while
+  preserving Apple/iMessage identity state; use `--local-only` to keep remote
+  state or `--delete-imessage-state` for the separately confirmed Apple-state
+  wipe. Manual reset removes the service plus the relevant
+  `~/.local/share/corten-matrix*` data dir and therefore also destroys Apple
+  state, so do not use it for ordinary duplicate-room recovery.
 
 ## Reset-Risk Changes
 
