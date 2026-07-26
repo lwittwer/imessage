@@ -403,6 +403,31 @@ On the **first** install (before the bridge database exists), setup asks whether
 
 The cap can't be changed on later re-runs once the database is in place — edit `~/.local/share/corten-matrix/config.yaml` directly to change it.
 
+### chat.db identity and routing
+
+When `backfill_source: chatdb` is enabled, the bridge treats portal identity,
+Apple's literal chat GUIDs, and the current delivery service as separate state.
+This prevents several similar-looking handles from producing duplicate rooms or
+silently dropping parts of a conversation:
+
+- Phone and email aliases for the same contact are folded into one stable DM
+  portal. An existing populated portal is preserved; a new contact uses a
+  deterministic phone-first choice. Existing Matrix rooms and their history are
+  never merged or deleted automatically.
+- The bridge keeps the complete chat.db GUIDs, including Apple service and
+  suffix variants such as `(smsft)`. Existing-room metadata can grow by union at
+  the next backfill session without creating or re-keying rooms, so discovering
+  a new exact variant does not itself require a reset.
+- The newest chat.db state determines whether the portal currently uses SMS or
+  iMessage. Older exact GUIDs remain available for backfill history but cannot
+  revert a later SMS-to-iMessage upgrade. Messages visible through more than
+  one exact GUID are deduplicated by message GUID.
+
+If an older install already created duplicate Matrix rooms, fixing identity
+selection cannot merge their server-side history. Follow
+[Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery) only
+after verifying the affected rooms and reading the destructive-action warning.
+
 ## Privacy
 
 The bridge's design goal is the same as every other bridgev2 bridge: **message content lives in Matrix, and the bridge's own database holds only the routing metadata needed to correlate messages, edits, reactions, and deletes.** The bridgev2 `message` table never had a body column to begin with — it stores IDs, timestamps, and sender references, nothing else.
@@ -513,6 +538,11 @@ Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`, `max
 
 The default reset **preserves** Apple/iMessage login and session state, cryptographic keys, and trusted-peers data. The selected bridge must be running when reset begins: during shutdown it acknowledges a nonce-matched fresh session export, and reset then validates that export and its keystore before deleting anything. An already-stopped bridge or a failed/unwritable export fails closed; start the bridge successfully and retry.
 
+Use the `corten-matrix reset` entrypoint. `scripts/reset-bridge.sh` is its
+embedded implementation, not a standalone recovery interface, and manually
+deleting `~/.local/share/corten-matrix*` also destroys the Apple state that the
+supported reset flow preserves.
+
 ```bash
 corten-matrix reset                         # the only configured account
 corten-matrix reset --account 0             # primary account only
@@ -616,6 +646,10 @@ From there it behaves exactly like a downloaded release — the binary is both t
 
 Other targets: `make clean` (remove the binary and Rust build artifacts), and `make rust` / `make bindings` to build just the Rust static library or the UniFFI Go bindings.
 
+Before changing portal identity, chat.db backfill, SMS routing, reset behavior,
+or stacked pull requests, read the contributor
+[engineering invariants](docs/ENGINEERING.md).
+
 ## Source layout
 
 ```
@@ -650,7 +684,8 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── cloud_contacts.go                     #   iCloud CardDAV contact sync (DSID + mmeAuthToken)
   ├── contacts_local_darwin.go / _other.go  #   macOS Contacts framework lookups + non-Darwin stub
   ├── contact_merge.go                      #   dedupes portals across multiple handles per contact
-  ├── chatdb.go / chatdb_darwin.go          #   chat.db backfill + contacts (macOS)
+  ├── chatdb.go / chatdb_guid_refresh.go    #   chat.db backfill + exact-GUID lifecycle
+  ├── chatdb_darwin.go                      #   macOS chat.db + contacts implementation
   ├── permissions_darwin.go / _other.go     #   macOS Full Disk Access checks/prompts + stub
   ├── bridgeadapter.go                      #   adapter to the legacy `imessage.Bridge` interface
   ├── identity_store.go                     #   persists APSState / IDSUsers / IDSIdentity

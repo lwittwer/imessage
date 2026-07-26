@@ -197,6 +197,14 @@ Relevant files include `pkg/connector/ids.go`, `pkg/connector/dbmeta.go`,
 `pkg/connector/identity_store.go`, `pkg/cli/cli.go`, and migration-sensitive
 logic in `pkg/connector/client.go`.
 
+## Engineering Invariants
+
+Read `docs/ENGINEERING.md` before changing portal/contact identity, exact
+chat.db GUID handling, SMS/iMessage routing, duplicate-insert recovery, reset
+boundaries, or the `main`/`beta-latest` stacked-PR workflow. Those rules are
+lifecycle contracts: preserve them across creation, restart, retry, restore,
+and publication rather than validating only the immediate call path.
+
 ## Documentation Hygiene
 
 If you change a user-facing workflow or hard engineering constraint, update docs
@@ -204,5 +212,7 @@ in the same patch:
 
 - `README.md` for install, release, and operator-facing behavior.
 - `AGENTS.md` for repo-specific agent guidance.
+- `docs/ENGINEERING.md` for durable identity, lifecycle, reset-safety, and
+  release invariants.
 - `CLAUDE.md` only if that file exists on the branch and the longer internal
   engineering notes need to stay aligned.
