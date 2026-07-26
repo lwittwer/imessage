@@ -42,9 +42,11 @@ func TestGetDBMetaTypes(t *testing.T) {
 
 func TestPortalMetadata_JSON(t *testing.T) {
 	pm := &PortalMetadata{
-		ThreadID:   "thread-123",
-		SenderGuid: "sender-456",
-		GroupName:  "My Group",
+		ThreadID:       "thread-123",
+		SenderGuid:     "sender-456",
+		GroupName:      "My Group",
+		IsSms:          true,
+		SMSDestination: "tel:+15551234567",
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
