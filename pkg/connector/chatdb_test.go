@@ -463,11 +463,31 @@ func TestRefreshedChatDBGUIDsPreservesLegacyFallback(t *testing.T) {
 
 func TestNewChatDBRestoreResyncCarriesLiteralGUID(t *testing.T) {
 	exactGUID := "SMS;-;+15550000001(smsft)"
-	resync := newChatDBRestoreResync(
-		networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001"), Receiver: networkid.UserLoginID("login")},
-		exactGUID,
-		&IMClient{},
-	)
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	resync := newChatDBRestoreResync(entry, client)
 	bundle, ok := resync.BundledBackfillData.(chatDBBackfillGUIDBundle)
 	if !ok {
 		t.Fatalf("restore bundle type = %T, want chatDBBackfillGUIDBundle", resync.BundledBackfillData)
@@ -475,17 +495,238 @@ func TestNewChatDBRestoreResyncCarriesLiteralGUID(t *testing.T) {
 	if !stringSlicesEqual(bundle.ChatGUIDs, []string{exactGUID}) {
 		t.Fatalf("restore bundle GUIDs = %#v, want literal %#v", bundle.ChatGUIDs, []string{exactGUID})
 	}
+	if !client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore resync did not seed SMS routing before ChatInfo creation")
+	}
+
+	// A false entry only comes from live handling (startup hydration stores
+	// SMS=true entries), so restore construction must not replace it with the
+	// older chat.db service.
+	client.updatePortalSMS("tel:+15550000001", false)
+	_ = newChatDBRestoreResync(entry, client)
+	if client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore resync replaced a newer live iMessage runtime route")
+	}
 }
 
-func TestChatDBRestoreBundleSeedsExactMetadata(t *testing.T) {
+func TestPreserveExistingChatDBRestoreRoutingKeepsPersistedIMessage(t *testing.T) {
+	entry := chatDBInitialSyncEntry{
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	existing := &bridgev2.Portal{Portal: &database.Portal{
+		Metadata: &PortalMetadata{
+			IsSms:          false,
+			SMSDestination: "",
+		},
+	}}
+
+	got := preserveExistingChatDBRestoreRouting(entry, existing)
+
+	if got.isSms || got.smsDestination != "" {
+		t.Fatalf("existing iMessage route was overwritten by stale chat.db route: %#v", got)
+	}
+}
+
+func TestChatDBRestorePostHandleRetriesTransientMetadataSave(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	oldMetadata := &PortalMetadata{ThreadID: "keep"}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: entry.portalKey,
+		Metadata:  oldMetadata,
+	}}
+	saveAttempts := 0
+	resync := newChatDBRestoreResyncWithSave(
+		entry,
+		client,
+		func(context.Context, *bridgev2.Portal) error {
+			saveAttempts++
+			if saveAttempts == 1 {
+				return errors.New("temporary save failure")
+			}
+			return nil
+		},
+	)
+
+	resync.PostHandle(context.Background(), portal)
+
+	if saveAttempts != 2 {
+		t.Fatalf("restore post-handler save attempts = %d, want 2", saveAttempts)
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok {
+		t.Fatalf("restore post-handler metadata type = %T, want *PortalMetadata", portal.Metadata)
+	}
+	if meta.ThreadID != "keep" || !meta.IsSms || meta.SMSDestination != "tel:+15550000001" {
+		t.Fatalf("restore post-handler metadata lost routing or unrelated state: %#v", meta)
+	}
+	if !stringSlicesEqual(meta.ChatDBGUIDs, []string{exactGUID}) {
+		t.Fatalf("restore post-handler GUIDs = %#v, want %#v", meta.ChatDBGUIDs, []string{exactGUID})
+	}
+}
+
+func TestChatDBRestoreRetryPreservesNewerLiveRoute(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: entry.portalKey,
+		Metadata:  &PortalMetadata{ThreadID: "keep"},
+	}}
+
+	liveCallStarted := make(chan struct{})
+	liveDone := make(chan error, 1)
+	restoreAttempts := 0
+	resync := newChatDBRestoreResyncWithSave(
+		entry,
+		client,
+		func(context.Context, *bridgev2.Portal) error {
+			restoreAttempts++
+			if restoreAttempts == 1 {
+				go func() {
+					close(liveCallStarted)
+					_, err := client.persistPortalSMSRoutingWithSave(
+						portal,
+						false,
+						"",
+						func() error { return nil },
+					)
+					liveDone <- err
+				}()
+				<-liveCallStarted
+				return errors.New("temporary restore save failure")
+			}
+			return nil
+		},
+	)
+
+	resync.PostHandle(context.Background(), portal)
+
+	if err := <-liveDone; err != nil {
+		t.Fatalf("live route persistence failed: %v", err)
+	}
+	if restoreAttempts != 2 {
+		t.Fatalf("restore post-handler save attempts = %d, want 2", restoreAttempts)
+	}
+	if client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore retry reverted the newer live runtime route to SMS")
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok {
+		t.Fatalf("restore retry metadata type = %T, want *PortalMetadata", portal.Metadata)
+	}
+	if meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("restore retry reverted newer live persisted routing: %#v", meta)
+	}
+	if meta.ThreadID != "keep" || !stringSlicesEqual(meta.ChatDBGUIDs, []string{exactGUID}) {
+		t.Fatalf("restore retry lost unrelated metadata or exact GUID union: %#v", meta)
+	}
+}
+
+func TestPersistChatDBRestoreMetadataRetriesRoutingAndGUIDUnion(t *testing.T) {
+	oldMetadata := &PortalMetadata{ThreadID: "keep"}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000001"},
+		Metadata:  oldMetadata,
+	}}
+	entry := chatDBInitialSyncEntry{
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	exactGUIDs := []string{"SMS;-;+15550000001(smsft)"}
+	client := &IMClient{}
+
+	err := client.persistChatDBRestoreMetadata(
+		context.Background(),
+		portal,
+		entry,
+		exactGUIDs,
+		func(context.Context, *bridgev2.Portal) error {
+			return errors.New("temporary save failure")
+		},
+	)
+	if err == nil {
+		t.Fatal("failed restore metadata save returned nil error")
+	}
+	if portal.Metadata != oldMetadata {
+		t.Fatal("failed restore metadata save did not restore original metadata pointer")
+	}
+
+	err = client.persistChatDBRestoreMetadata(
+		context.Background(),
+		portal,
+		entry,
+		exactGUIDs,
+		func(context.Context, *bridgev2.Portal) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("restore metadata retry failed: %v", err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || !meta.IsSms || meta.SMSDestination != "tel:+15550000001" {
+		t.Fatalf("restore metadata retry lost routing or unrelated metadata: %#v", meta)
+	}
+	if !stringSlicesEqual(meta.ChatDBGUIDs, exactGUIDs) {
+		t.Fatalf("restore metadata GUIDs = %#v, want %#v", meta.ChatDBGUIDs, exactGUIDs)
+	}
+}
+
+func TestChatDBRestoreBundleAvoidsRescanAndDefersMetadataPersistence(t *testing.T) {
 	exactGUID := "SMS;-;+15550000001(smsft)"
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		PortalKey: networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001")},
 		Metadata:  &PortalMetadata{},
 	}}
-	db := &chatDB{api: &recordingExactChatDBAPI{
+	api := &recordingExactChatDBAPI{
 		chats: []imessage.ChatIdentifier{{ChatGUID: exactGUID}},
-	}}
+	}
+	db := &chatDB{api: api}
 	got, err := db.chatGUIDsForPortal(
 		context.Background(),
 		portal,
@@ -499,8 +740,11 @@ func TestChatDBRestoreBundleSeedsExactMetadata(t *testing.T) {
 	if !stringSlicesEqual(got, []string{exactGUID}) {
 		t.Fatalf("restore GUIDs = %#v, want literal %#v", got, []string{exactGUID})
 	}
-	if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; !stringSlicesEqual(persisted, []string{exactGUID}) {
-		t.Fatalf("seeded exact metadata = %#v, want %#v", persisted, []string{exactGUID})
+	if api.enumerationCalls != 0 {
+		t.Fatalf("bundled restore enumerated chat.db %d times, want 0", api.enumerationCalls)
+	}
+	if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; len(persisted) != 0 {
+		t.Fatalf("bundled fetch persisted metadata before post-handler: %#v", persisted)
 	}
 }
 

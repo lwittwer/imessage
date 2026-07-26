@@ -11313,6 +11313,23 @@ func (c *IMClient) persistCurrentPortalSMSRouting(
 	return persistPortalSMSRouting(portal, routing.IsSMS, routing.Destination, save)
 }
 
+// persistPortalSMSRoutingWithSave keeps the exact-GUID lifecycle tests and
+// restore path on the same live-route transaction used by message delivery.
+func (c *IMClient) persistPortalSMSRoutingWithSave(
+	portal *bridgev2.Portal,
+	isSms bool,
+	smsDestination string,
+	save func() error,
+) (bool, error) {
+	return c.updateAndPersistPortalSMSRouting(
+		string(portal.ID),
+		portal,
+		isSms,
+		smsDestination,
+		save,
+	)
+}
+
 // smsDestinationForDM returns the concrete remote handle carried by an SMS DM
 // envelope before contact alias canonicalization rewrites its portal key.
 func (c *IMClient) smsDestinationForDM(participants []string, sender *string) string {
@@ -12687,6 +12704,60 @@ type chatDBInitialSyncEntry struct {
 	smsDestination string
 }
 
+// makeChatDBInitialSyncEntry resolves one literal chat.db row into the portal
+// identity and current routing state shared by initial sync and restore-chat.
+// Newer macOS versions may use an "any" GUID prefix, so chat.service_name from
+// ChatInfo is authoritative when available.
+func (c *IMClient) makeChatDBInitialSyncEntry(
+	chat imessage.ChatIdentifier,
+	info *imessage.ChatInfo,
+	receiver networkid.UserLoginID,
+) (chatDBInitialSyncEntry, bool) {
+	if info == nil {
+		return chatDBInitialSyncEntry{}, false
+	}
+	parsed := imessage.ParseIdentifier(chat.ChatGUID)
+	if parsed.LocalID == "" {
+		return chatDBInitialSyncEntry{}, false
+	}
+
+	var portalID networkid.PortalID
+	if parsed.IsGroup {
+		members := make([]string, 0, len(info.Members)+1)
+		members = append(members, addIdentifierPrefix(c.handle))
+		for _, member := range info.Members {
+			members = append(members, addIdentifierPrefix(stripSmsSuffix(member)))
+		}
+		sort.Strings(members)
+		portalID = networkid.PortalID(strings.Join(members, ","))
+	} else {
+		portalID = identifierToPortalID(parsed)
+	}
+	if portalID == "" {
+		return chatDBInitialSyncEntry{}, false
+	}
+
+	service := parsed.Service
+	if info.Identifier.Service != "" {
+		service = info.Identifier.Service
+	}
+	isSms := isCarrierService(service)
+	smsDestination := ""
+	if isSms && !parsed.IsGroup {
+		smsDestination = string(portalID)
+	}
+	return chatDBInitialSyncEntry{
+		chatGUIDs: []string{chat.ChatGUID},
+		portalKey: networkid.PortalKey{
+			ID:       portalID,
+			Receiver: receiver,
+		},
+		info:           info,
+		isSms:          isSms,
+		smsDestination: smsDestination,
+	}, true
+}
+
 // mergeChatDBInitialSyncEntries combines chat.db rows that resolved to the
 // same final portal. GetChatsWithMessagesAfter orders exact GUIDs by their
 // newest message descending, so the first row is authoritative for current
@@ -12709,6 +12780,29 @@ func mergeChatDBInitialSyncEntries(entries []chatDBInitialSyncEntry) []chatDBIni
 		merged[i].chatGUIDs = uniqueStrings(merged[i].chatGUIDs)
 	}
 	return merged
+}
+
+func canonicalizeAndMergeChatDBEntries(
+	entries []chatDBInitialSyncEntry,
+	lookupContact func(string) *imessage.Contact,
+	isSelf func(string) bool,
+	findExistingRoom func(string) existingDMPortalCandidate,
+) (merged []chatDBInitialSyncEntry, canonicalIDs []string, skip map[int]bool) {
+	portalIDs := make([]string, len(entries))
+	for i, entry := range entries {
+		portalIDs[i] = string(entry.portalKey.ID)
+	}
+	canonicalIDs, skip = canonicalizeChatDBInitialSyncDMPortalIDs(
+		portalIDs,
+		lookupContact,
+		isSelf,
+		findExistingRoom,
+	)
+	canonicalEntries := append([]chatDBInitialSyncEntry(nil), entries...)
+	for i := range canonicalEntries {
+		canonicalEntries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
+	}
+	return mergeChatDBInitialSyncEntries(canonicalEntries), canonicalIDs, skip
 }
 
 // runChatDBInitialSync creates portals and backfills messages for all recent
@@ -12752,40 +12846,11 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		if err != nil || info == nil {
 			continue
 		}
-		parsed := imessage.ParseIdentifier(chat.ChatGUID)
-		var portalKey networkid.PortalKey
-		isSms := parsed.Service == "SMS"
-		if parsed.IsGroup {
-			members := make([]string, 0, len(info.Members)+1)
-			members = append(members, addIdentifierPrefix(c.handle))
-			for _, m := range info.Members {
-				members = append(members, addIdentifierPrefix(stripSmsSuffix(m)))
-			}
-			sort.Strings(members)
-			portalKey = networkid.PortalKey{
-				ID:       networkid.PortalID(strings.Join(members, ",")),
-				Receiver: c.UserLogin.ID,
-			}
-		} else {
-			portalKey = networkid.PortalKey{
-				ID:       identifierToPortalID(parsed),
-				Receiver: c.UserLogin.ID,
-			}
+		entry, ok := c.makeChatDBInitialSyncEntry(chat, info, c.UserLogin.ID)
+		if !ok {
+			continue
 		}
-		smsDestination := ""
-		if isSms && !parsed.IsGroup {
-			// Keep the concrete chat.db recipient separate from the portal ID:
-			// contact canonicalization below may map this chat onto a sibling
-			// phone/email alias that is not the SMS transport destination.
-			smsDestination = string(portalKey.ID)
-		}
-		entries = append(entries, chatDBInitialSyncEntry{
-			chatGUIDs:      []string{chat.ChatGUID},
-			portalKey:      portalKey,
-			info:           info,
-			isSms:          isSms,
-			smsDestination: smsDestination,
-		})
+		entries = append(entries, entry)
 	}
 
 	// Canonicalize and deduplicate DM entries for contacts with multiple
@@ -12831,15 +12896,18 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 					Bool("duplicate", skip[i]).
 					Msg("Canonicalized chat.db DM portal by contact aliases")
 			}
-			entries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
 		}
+
+		canonicalEntries := append([]chatDBInitialSyncEntry(nil), entries...)
+		for i := range canonicalEntries {
+			canonicalEntries[i].portalKey.ID = networkid.PortalID(canonicalIDs[i])
+		}
+		merged := mergeChatDBInitialSyncEntries(canonicalEntries)
 
 		// Multiple exact chat.db GUIDs may normalize or canonicalize to one
 		// portal. Keep their complete GUID set on the surviving entry so the
 		// same sources that passed eligibility are used for forward and
-		// backward backfill. This must also run when the existing-portal lookup
-		// failed, because suffix normalization alone can produce duplicate keys.
-		merged := mergeChatDBInitialSyncEntries(entries)
+		// backward backfill.
 		if len(merged) != len(entries) {
 			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated chat.db entries while preserving exact GUID variants")
 		}
@@ -12878,19 +12946,15 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 				PortalKey:    entry.portalKey,
 				CreatePortal: true,
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					c.smsRoutePersistMu.Lock()
-					routing := c.getPortalSMSRouting(portalID, portal.Metadata)
-					_, err := updateInitialSyncPortalMetadata(
+					_, err := c.updateInitialSyncPortalMetadata(
 						ctx,
+						portalID,
 						portal,
-						routing.IsSMS,
-						routing.Destination,
 						chatGUIDs,
 						func(ctx context.Context, portal *bridgev2.Portal) error {
 							return portal.Save(ctx)
 						},
 					)
-					c.smsRoutePersistMu.Unlock()
 					done <- err
 				},
 				LogContext: func(lc zerolog.Context) zerolog.Context {

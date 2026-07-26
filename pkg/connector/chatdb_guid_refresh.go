@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 
 	"github.com/lrhodin/corten-matrix/imessage"
@@ -26,7 +27,7 @@ type chatDBGUIDRefreshEntry struct {
 // another exact GUID variant later, and any failed pass must retry on the next
 // connect instead of being mistaken for a completed migration.
 func (c *IMClient) refreshChatDBGUIDMetadata(ctx context.Context) (updated, unchanged int, err error) {
-	entries, err := c.enumerateChatDBGUIDRefreshEntries()
+	entries, err := c.enumerateChatDBGUIDRefreshEntries(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -85,31 +86,50 @@ func (c *IMClient) refreshChatDBGUIDMetadata(ctx context.Context) (updated, unch
 	if resolveErr != nil {
 		return 0, 0, resolveErr
 	}
-	return applyChatDBGUIDMetadataRefresh(ctx, assignments, portalByID, func(ctx context.Context, portal *bridgev2.Portal) error {
-		return portal.Save(ctx)
-	})
+	return applyChatDBGUIDMetadataRefreshWithUpdate(
+		ctx,
+		assignments,
+		portalByID,
+		func(ctx context.Context, portal *bridgev2.Portal, additions []string) (bool, error) {
+			return c.updatePortalChatDBGUIDMetadata(ctx, portal, additions, func(ctx context.Context, portal *bridgev2.Portal) error {
+				return portal.Save(ctx)
+			})
+		},
+	)
 }
 
-func (c *IMClient) enumerateChatDBGUIDRefreshEntries() ([]chatDBGUIDRefreshEntry, error) {
+func (c *IMClient) enumerateChatDBGUIDRefreshEntries(ctx context.Context) ([]chatDBGUIDRefreshEntry, error) {
 	chats, err := c.chatDB.api.GetChatsWithMessagesAfter(time.Time{})
 	if err != nil {
 		return nil, fmt.Errorf("enumerate chat.db chats: %w", err)
 	}
 
+	log := zerolog.Ctx(ctx)
 	entries := make([]chatDBGUIDRefreshEntry, 0, len(chats))
-	for _, chat := range chats {
+	for index, chat := range chats {
 		parsed := imessage.ParseIdentifier(chat.ChatGUID)
 		if parsed.LocalID == "" {
-			return nil, fmt.Errorf("chat.db returned a chat with an empty GUID")
+			log.Warn().
+				Int("chat_index", index).
+				Str("chat_guid", logSafeHandle(chat.ChatGUID)).
+				Msg("Skipping malformed chat.db row during exact GUID metadata refresh")
+			continue
 		}
 		portalID := string(identifierToPortalID(parsed))
 		if parsed.IsGroup {
 			info, infoErr := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
 			if infoErr != nil {
-				return nil, fmt.Errorf("read chat.db group info: %w", infoErr)
+				log.Warn().
+					Str("chat_guid", logSafeHandle(chat.ChatGUID)).
+					Str("error_id", logSafeHandle(infoErr.Error())).
+					Msg("Skipping chat.db group with unreadable info during exact GUID metadata refresh")
+				continue
 			}
 			if info == nil {
-				return nil, fmt.Errorf("chat.db returned empty group info")
+				log.Warn().
+					Str("chat_guid", logSafeHandle(chat.ChatGUID)).
+					Msg("Skipping chat.db group with empty info during exact GUID metadata refresh")
+				continue
 			}
 			members := make([]string, 0, len(info.Members)+1)
 			members = append(members, addIdentifierPrefix(c.handle))
@@ -185,6 +205,25 @@ func updatePortalChatDBGUIDMetadata(
 	return true, nil
 }
 
+func (c *IMClient) updatePortalChatDBGUIDMetadata(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	additions []string,
+	save func(context.Context, *bridgev2.Portal) error,
+) (bool, error) {
+	c.smsRoutePersistMu.Lock()
+	defer c.smsRoutePersistMu.Unlock()
+	routing := c.getPortalSMSRouting(string(portal.ID), portal.Metadata)
+	return updateInitialSyncPortalMetadata(
+		ctx,
+		portal,
+		routing.IsSMS,
+		routing.Destination,
+		additions,
+		save,
+	)
+}
+
 // updateInitialSyncPortalMetadata persists the exact GUID bundle together with
 // the retained chat's SMS routing state. The bundle already supplies the
 // in-flight forward fetch, so this explicit post-handler save can roll back on
@@ -219,11 +258,47 @@ func updateInitialSyncPortalMetadata(
 	return true, nil
 }
 
+func (c *IMClient) updateInitialSyncPortalMetadata(
+	ctx context.Context,
+	portalID string,
+	portal *bridgev2.Portal,
+	chatGUIDs []string,
+	save func(context.Context, *bridgev2.Portal) error,
+) (bool, error) {
+	c.smsRoutePersistMu.Lock()
+	defer c.smsRoutePersistMu.Unlock()
+	routing := c.getPortalSMSRouting(portalID, portal.Metadata)
+	return updateInitialSyncPortalMetadata(
+		ctx,
+		portal,
+		routing.IsSMS,
+		routing.Destination,
+		chatGUIDs,
+		save,
+	)
+}
+
 func applyChatDBGUIDMetadataRefresh(
 	ctx context.Context,
 	assignments map[string][]string,
 	portalByID map[string]*bridgev2.Portal,
 	save func(context.Context, *bridgev2.Portal) error,
+) (updated, unchanged int, err error) {
+	return applyChatDBGUIDMetadataRefreshWithUpdate(
+		ctx,
+		assignments,
+		portalByID,
+		func(ctx context.Context, portal *bridgev2.Portal, additions []string) (bool, error) {
+			return updatePortalChatDBGUIDMetadata(ctx, portal, additions, save)
+		},
+	)
+}
+
+func applyChatDBGUIDMetadataRefreshWithUpdate(
+	ctx context.Context,
+	assignments map[string][]string,
+	portalByID map[string]*bridgev2.Portal,
+	update func(context.Context, *bridgev2.Portal, []string) (bool, error),
 ) (updated, unchanged int, err error) {
 	portalIDs := make([]string, 0, len(assignments))
 	for portalID := range assignments {
@@ -237,7 +312,7 @@ func applyChatDBGUIDMetadataRefresh(
 		if portal == nil {
 			continue
 		}
-		changed, saveErr := updatePortalChatDBGUIDMetadata(ctx, portal, sortedUniqueStrings(assignments[portalID]), save)
+		changed, saveErr := update(ctx, portal, sortedUniqueStrings(assignments[portalID]))
 		if saveErr != nil {
 			saveErrs = append(saveErrs, fmt.Errorf("save exact chat.db GUID metadata: %w", saveErr))
 			continue

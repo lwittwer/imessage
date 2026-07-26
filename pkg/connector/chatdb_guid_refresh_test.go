@@ -5,11 +5,47 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/lrhodin/corten-matrix/imessage"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
+
+type partiallyUnreadableChatDBRefreshAPI struct {
+	imessage.API
+}
+
+func (partiallyUnreadableChatDBRefreshAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	return []imessage.ChatIdentifier{
+		{ChatGUID: ""},
+		{ChatGUID: "iMessage;+;chat-broken"},
+		{ChatGUID: "SMS;-;+15550000006(smsft)"},
+	}, nil
+}
+
+func (partiallyUnreadableChatDBRefreshAPI) GetChatInfo(chatID, _ string) (*imessage.ChatInfo, error) {
+	if chatID == "iMessage;+;chat-broken" {
+		return nil, errors.New("unreadable group row")
+	}
+	return nil, nil
+}
+
+func TestEnumerateChatDBGUIDRefreshEntriesSkipsUnreadableRows(t *testing.T) {
+	client := &IMClient{chatDB: &chatDB{api: partiallyUnreadableChatDBRefreshAPI{}}}
+	entries, err := client.enumerateChatDBGUIDRefreshEntries(context.Background())
+	if err != nil {
+		t.Fatalf("enumeration failed on per-row error: %v", err)
+	}
+	want := []chatDBGUIDRefreshEntry{{
+		PortalID: "tel:+15550000006",
+		ChatGUID: "SMS;-;+15550000006(smsft)",
+	}}
+	if !reflect.DeepEqual(entries, want) {
+		t.Fatalf("refresh entries = %#v, want %#v", entries, want)
+	}
+}
 
 func TestMatchChatDBGUIDsToExistingPortalPreservesSuffixVariants(t *testing.T) {
 	entries := []chatDBGUIDRefreshEntry{
@@ -136,5 +172,193 @@ func TestApplyChatDBGUIDMetadataRefreshDoesNotCreatePortals(t *testing.T) {
 	)
 	if err != nil || updated != 0 || unchanged != 0 {
 		t.Fatalf("nonexistent portal refresh = updated %d unchanged %d err %v, want no-op", updated, unchanged, err)
+	}
+}
+
+func TestPortalMetadataPersistenceSerializesExactGUIDAndLiveRoute(t *testing.T) {
+	client := &IMClient{smsPortals: make(map[string]bool)}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000007"},
+		Metadata:  &PortalMetadata{ThreadID: "keep"},
+	}}
+	exactSaveEntered := make(chan struct{})
+	releaseExactSave := make(chan struct{})
+	exactDone := make(chan error, 1)
+	go func() {
+		_, err := client.updatePortalChatDBGUIDMetadata(
+			context.Background(),
+			portal,
+			[]string{"SMS;-;+15550000007(smsft)"},
+			func(context.Context, *bridgev2.Portal) error {
+				close(exactSaveEntered)
+				<-releaseExactSave
+				return nil
+			},
+		)
+		exactDone <- err
+	}()
+	<-exactSaveEntered
+
+	routeCallStarted := make(chan struct{})
+	routeSaveEntered := make(chan struct{})
+	routeDone := make(chan error, 1)
+	go func() {
+		close(routeCallStarted)
+		_, err := client.persistPortalSMSRoutingWithSave(
+			portal,
+			true,
+			"tel:+15550000007",
+			func() error {
+				close(routeSaveEntered)
+				return nil
+			},
+		)
+		routeDone <- err
+	}()
+	<-routeCallStarted
+	select {
+	case <-routeSaveEntered:
+		t.Fatal("live route metadata save entered before exact-GUID transaction completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if client.isPortalSMS("tel:+15550000007") {
+		t.Fatal("live runtime route updated before exact-GUID transaction completed")
+	}
+
+	close(releaseExactSave)
+	if err := <-exactDone; err != nil {
+		t.Fatalf("exact-GUID metadata save failed: %v", err)
+	}
+	if err := <-routeDone; err != nil {
+		t.Fatalf("live route metadata save failed: %v", err)
+	}
+	if !client.isPortalSMS("tel:+15550000007") {
+		t.Fatal("serialized live route did not update runtime routing")
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || !meta.IsSms || meta.SMSDestination != "tel:+15550000007" {
+		t.Fatalf("serialized metadata lost route or unrelated state: %#v", meta)
+	}
+	wantGUIDs := []string{"SMS;-;+15550000007(smsft)"}
+	if !reflect.DeepEqual(meta.ChatDBGUIDs, wantGUIDs) {
+		t.Fatalf("serialized metadata GUIDs = %#v, want %#v", meta.ChatDBGUIDs, wantGUIDs)
+	}
+}
+
+func TestPortalMetadataPersistencePreservesNewerLiveRouteBeforeExactGUIDSave(t *testing.T) {
+	client := &IMClient{smsPortals: make(map[string]bool)}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000008"},
+		Metadata: &PortalMetadata{
+			IsSms:          true,
+			SMSDestination: "tel:+15550000008",
+		},
+	}}
+	routeSaveEntered := make(chan struct{})
+	releaseRouteSave := make(chan struct{})
+	routeDone := make(chan error, 1)
+	go func() {
+		_, err := client.persistPortalSMSRoutingWithSave(
+			portal,
+			false,
+			"",
+			func() error {
+				close(routeSaveEntered)
+				<-releaseRouteSave
+				return nil
+			},
+		)
+		routeDone <- err
+	}()
+	<-routeSaveEntered
+	if client.isPortalSMS("tel:+15550000008") {
+		t.Fatal("live iMessage route did not update runtime routing inside transaction")
+	}
+
+	exactCallStarted := make(chan struct{})
+	exactSaveEntered := make(chan struct{})
+	exactDone := make(chan error, 1)
+	go func() {
+		close(exactCallStarted)
+		_, err := client.updatePortalChatDBGUIDMetadata(
+			context.Background(),
+			portal,
+			[]string{"iMessage;-;+15550000008"},
+			func(context.Context, *bridgev2.Portal) error {
+				close(exactSaveEntered)
+				return nil
+			},
+		)
+		exactDone <- err
+	}()
+	<-exactCallStarted
+	select {
+	case <-exactSaveEntered:
+		t.Fatal("exact-GUID metadata save entered before live route transaction completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseRouteSave)
+	if err := <-routeDone; err != nil {
+		t.Fatalf("live route metadata save failed: %v", err)
+	}
+	if err := <-exactDone; err != nil {
+		t.Fatalf("exact-GUID metadata save failed: %v", err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("exact-GUID save restored stale SMS route: %#v", meta)
+	}
+	wantGUIDs := []string{"iMessage;-;+15550000008"}
+	if !reflect.DeepEqual(meta.ChatDBGUIDs, wantGUIDs) {
+		t.Fatalf("serialized metadata GUIDs = %#v, want %#v", meta.ChatDBGUIDs, wantGUIDs)
+	}
+}
+
+func TestExactGUIDSavePersistsRuntimeRouteAfterLiveRouteSaveFailure(t *testing.T) {
+	const portalID = "tel:+15550000009"
+	client := &IMClient{smsPortals: make(map[string]bool)}
+	originalMetadata := &PortalMetadata{
+		ThreadID:       "keep",
+		IsSms:          true,
+		SMSDestination: portalID,
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: portalID},
+		Metadata:  originalMetadata,
+	}}
+
+	_, err := client.persistPortalSMSRoutingWithSave(
+		portal,
+		false,
+		"",
+		func() error { return errors.New("temporary route save failure") },
+	)
+	if err == nil {
+		t.Fatal("failed live route save returned nil error")
+	}
+	if client.isPortalSMS(portalID) {
+		t.Fatal("failed live save did not retain newer runtime iMessage route")
+	}
+	if portal.Metadata != originalMetadata {
+		t.Fatal("failed live save did not roll portal metadata back")
+	}
+
+	exactGUID := "iMessage;-;+15550000009"
+	_, err = client.updatePortalChatDBGUIDMetadata(
+		context.Background(),
+		portal,
+		[]string{exactGUID},
+		func(context.Context, *bridgev2.Portal) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("exact-GUID save failed: %v", err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("exact-GUID save did not persist current runtime route: %#v", meta)
+	}
+	if !reflect.DeepEqual(meta.ChatDBGUIDs, []string{exactGUID}) {
+		t.Fatalf("exact-GUID save persisted GUIDs %#v, want %#v", meta.ChatDBGUIDs, []string{exactGUID})
 	}
 }

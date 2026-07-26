@@ -1219,6 +1219,106 @@ func TestMergeChatDBInitialSyncEntriesUsesNewestServiceState(t *testing.T) {
 	}
 }
 
+func TestMakeChatDBInitialSyncEntryUsesChatInfoCarrierService(t *testing.T) {
+	client := &IMClient{handle: "tel:+15559999999"}
+	receiver := networkid.UserLoginID("login")
+	tests := []struct {
+		name        string
+		guid        string
+		infoService string
+		wantSMS     bool
+	}{
+		{
+			name:        "Tahoe any GUID with SMS service",
+			guid:        "any;-;+15550000001",
+			infoService: "SMS",
+			wantSMS:     true,
+		},
+		{
+			name:        "RCS service",
+			guid:        "any;-;+15550000001",
+			infoService: "RCS",
+			wantSMS:     true,
+		},
+		{
+			name:        "ChatInfo iMessage overrides stale SMS GUID prefix",
+			guid:        "SMS;-;+15550000001",
+			infoService: "iMessage",
+			wantSMS:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry, ok := client.makeChatDBInitialSyncEntry(
+				imessage.ChatIdentifier{ChatGUID: tt.guid},
+				&imessage.ChatInfo{
+					Identifier: imessage.Identifier{
+						LocalID: "+15550000001",
+						Service: tt.infoService,
+					},
+				},
+				receiver,
+			)
+			if !ok {
+				t.Fatal("makeChatDBInitialSyncEntry rejected valid chat")
+			}
+			if entry.isSms != tt.wantSMS {
+				t.Fatalf("entry IsSms = %v, want %v", entry.isSms, tt.wantSMS)
+			}
+			wantDestination := ""
+			if tt.wantSMS {
+				wantDestination = "tel:+15550000001"
+			}
+			if entry.smsDestination != wantDestination {
+				t.Fatalf("entry SMS destination = %q, want %q", entry.smsDestination, wantDestination)
+			}
+		})
+	}
+}
+
+func TestCanonicalizeAndMergeChatDBEntriesKeepsCompleteAliasGUIDUnion(t *testing.T) {
+	contact := &imessage.Contact{
+		FirstName: "Person",
+		Phones:    []string{"+15550000001"},
+		Emails:    []string{"person@example.com"},
+	}
+	receiver := networkid.UserLoginID("login")
+	entries := []chatDBInitialSyncEntry{
+		{
+			chatGUIDs: []string{"iMessage;-;person@example.com"},
+			portalKey: networkid.PortalKey{ID: "mailto:person@example.com", Receiver: receiver},
+		},
+		{
+			chatGUIDs:      []string{"SMS;-;+15550000001(smsft)"},
+			portalKey:      networkid.PortalKey{ID: "tel:+15550000001", Receiver: receiver},
+			isSms:          true,
+			smsDestination: "tel:+15550000001",
+		},
+	}
+	existing := map[string]existingDMPortalCandidate{
+		"mailto:person@example.com": {ID: "mailto:person@example.com", HasMessages: true},
+	}
+	merged, canonical, _ := canonicalizeAndMergeChatDBEntries(
+		entries,
+		contactLookupForTests(contact),
+		nil,
+		func(portalID string) existingDMPortalCandidate { return existing[portalID] },
+	)
+	if len(merged) != 1 {
+		t.Fatalf("merged entry count = %d, want 1", len(merged))
+	}
+	if got := string(merged[0].portalKey.ID); got != "mailto:person@example.com" {
+		t.Fatalf("merged portal ID = %q, want populated alias", got)
+	}
+	wantGUIDs := []string{"iMessage;-;person@example.com", "SMS;-;+15550000001(smsft)"}
+	if !reflect.DeepEqual(merged[0].chatGUIDs, wantGUIDs) {
+		t.Fatalf("merged exact GUIDs = %#v, want %#v", merged[0].chatGUIDs, wantGUIDs)
+	}
+	if !reflect.DeepEqual(canonical, []string{"mailto:person@example.com", "mailto:person@example.com"}) {
+		t.Fatalf("canonical IDs = %#v", canonical)
+	}
+}
+
 func TestMergeChatDBInitialSyncEntriesKeepsSMSStatePortalScoped(t *testing.T) {
 	receiver := networkid.UserLoginID("login")
 	iMessageKey := networkid.PortalKey{ID: networkid.PortalID("mailto:person@example.com"), Receiver: receiver}

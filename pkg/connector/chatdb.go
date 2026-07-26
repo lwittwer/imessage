@@ -305,8 +305,10 @@ func (db *chatDB) chatGUIDsForPortal(
 	refreshExact bool,
 ) ([]string, error) {
 	var exactGUIDs []string
+	bundleSuppliedExactGUIDs := false
 	if bundle, ok := bundledData.(chatDBBackfillGUIDBundle); ok && len(bundle.ChatGUIDs) > 0 {
 		exactGUIDs = uniqueStrings(bundle.ChatGUIDs)
+		bundleSuppliedExactGUIDs = len(exactGUIDs) > 0
 	}
 	if portal != nil {
 		if meta, ok := portal.Metadata.(*PortalMetadata); ok && len(meta.ChatDBGUIDs) > 0 {
@@ -314,13 +316,16 @@ func (db *chatDB) chatGUIDsForPortal(
 		}
 	}
 	if len(exactGUIDs) > 0 {
-		if refreshExact {
+		if refreshExact && !bundleSuppliedExactGUIDs {
 			var err error
-			exactGUIDs, err = db.refreshExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs)
+			exactGUIDs, err = db.refreshExactChatDBGUIDsForPortal(ctx, portal, exactGUIDs, c)
 			if err != nil {
 				return nil, err
 			}
 		}
+		// Initial sync and restore-chat bundles come from the same complete
+		// enumeration that queued the resync. Their post-handlers own
+		// persistence, so a transient save cannot block the bundled fetch.
 		return exactGUIDs, nil
 	}
 
@@ -350,6 +355,7 @@ func (db *chatDB) refreshExactChatDBGUIDsForPortal(
 	ctx context.Context,
 	portal *bridgev2.Portal,
 	existing []string,
+	c *IMClient,
 ) ([]string, error) {
 	merged := uniqueStrings(existing)
 	var added []string
@@ -367,7 +373,7 @@ func (db *chatDB) refreshExactChatDBGUIDsForPortal(
 				return portal.Save(ctx)
 			}
 		}
-		changed, updateErr := updatePortalChatDBGUIDMetadata(ctx, portal, merged, save)
+		changed, updateErr := c.updatePortalChatDBGUIDMetadata(ctx, portal, merged, save)
 		if updateErr != nil {
 			err = updateErr
 			return nil, fmt.Errorf("persist refreshed exact chat.db GUID metadata: %w", err)
