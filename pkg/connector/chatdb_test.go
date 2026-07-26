@@ -20,6 +20,81 @@ type failingMergedChatDBAPI struct {
 	imessage.API
 }
 
+type recordingExactChatDBAPI struct {
+	imessage.API
+	calls            []string
+	chats            []imessage.ChatIdentifier
+	enumerationCalls int
+}
+
+type duplicateMergedChatDBAPI struct {
+	imessage.API
+}
+
+func (duplicateMergedChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	return []imessage.ChatIdentifier{
+		{ChatGUID: "SMS;-;+15550000001(smsft)"},
+		{ChatGUID: "SMS;-;+15550000001(sms)"},
+	}, nil
+}
+
+func (d duplicateMergedChatDBAPI) GetMessagesBeforeWithLimit(chatID string, _ time.Time, _ int) ([]*imessage.Message, error) {
+	shared := &imessage.Message{
+		GUID:     "shared-message-guid",
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "shared",
+		Time:     time.Unix(100, 0),
+	}
+	unique := &imessage.Message{
+		GUID:     "unique-" + chatID,
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "unique",
+		Time:     time.Unix(200, 0),
+	}
+	return []*imessage.Message{shared, unique}, nil
+}
+
+func (r *recordingExactChatDBAPI) GetMessagesBeforeWithLimit(chatID string, _ time.Time, _ int) ([]*imessage.Message, error) {
+	r.calls = append(r.calls, "backward:"+chatID)
+	return []*imessage.Message{{
+		GUID:     "message-guid-backward",
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "backward",
+		Time:     time.Unix(100, 0),
+	}}, nil
+}
+
+func (r *recordingExactChatDBAPI) GetMessagesSinceDate(chatID string, _ time.Time, _ string) ([]*imessage.Message, error) {
+	r.calls = append(r.calls, "forward:"+chatID)
+	return []*imessage.Message{{
+		GUID:     "message-guid-forward",
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "forward",
+		Time:     time.Unix(200, 0),
+	}}, nil
+}
+
+func (r *recordingExactChatDBAPI) GetMessagesBeforeCursor(chatID string, _ time.Time, _ int, _ int) ([]*imessage.Message, error) {
+	r.calls = append(r.calls, "cursor:"+chatID)
+	return []*imessage.Message{{
+		GUID:     "message-guid-cursor",
+		RowID:    1,
+		ItemType: imessage.ItemTypeMessage,
+		Sender:   imessage.Identifier{LocalID: "+15550000001"},
+		Text:     "cursor",
+		Time:     time.Unix(50, 0),
+	}}, nil
+}
+
+func (r *recordingExactChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	r.enumerationCalls++
+	return append([]imessage.ChatIdentifier(nil), r.chats...), nil
+}
+
 func (f failingMergedChatDBAPI) GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) ([]*imessage.Message, error) {
 	if chatID == "iMessage;-;+15550000001" {
 		return nil, errors.New("temporary chat.db read failure")
@@ -158,6 +233,544 @@ func TestChatDBFetchMessagesFailsWholePageOnMergedGUIDError(t *testing.T) {
 	}
 }
 
+func TestChatDBFetchMessagesUsesPersistedExactGUIDForBothDirections(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID("tel:+15550000001"),
+		Receiver: networkid.UserLoginID("login"),
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: portalKey,
+		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{exactGUID}},
+	}}
+	client := &IMClient{Main: &IMConnector{Bridge: &bridgev2.Bridge{
+		Config: &bridgeconfig.BridgeConfig{},
+	}}}
+	api := &recordingExactChatDBAPI{chats: []imessage.ChatIdentifier{{ChatGUID: exactGUID}}}
+	db := &chatDB{api: api}
+
+	backward, err := db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal: portal,
+		Count:  10,
+	}, client)
+	if err != nil {
+		t.Fatalf("backward FetchMessages failed: %v", err)
+	}
+	if len(backward.Messages) != 1 {
+		t.Fatalf("backward FetchMessages returned %d messages, want 1", len(backward.Messages))
+	}
+
+	forward, err := db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal:        portal,
+		Forward:       true,
+		AnchorMessage: &database.Message{Timestamp: time.Unix(150, 0)},
+		Count:         10,
+		BundledData:   chatDBBackfillGUIDBundle{ChatGUIDs: []string{exactGUID}},
+	}, client)
+	if err != nil {
+		t.Fatalf("forward FetchMessages failed: %v", err)
+	}
+	if len(forward.Messages) != 1 {
+		t.Fatalf("forward FetchMessages returned %d messages, want 1", len(forward.Messages))
+	}
+	if !forward.AggressiveDeduplication {
+		t.Fatal("forward FetchMessages did not enable database-level aggressive deduplication")
+	}
+
+	wantCalls := []string{"backward:" + exactGUID, "forward:" + exactGUID}
+	if len(api.calls) != len(wantCalls) {
+		t.Fatalf("chat.db calls = %#v, want %#v", api.calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if api.calls[i] != wantCalls[i] {
+			t.Fatalf("chat.db calls = %#v, want %#v", api.calls, wantCalls)
+		}
+	}
+}
+
+func TestChatDBFetchMessagesDeduplicatesMessagesAcrossExactGUIDs(t *testing.T) {
+	exactGUIDs := []string{
+		"SMS;-;+15550000001(smsft)",
+		"SMS;-;+15550000001(sms)",
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		Metadata: &PortalMetadata{ChatDBGUIDs: exactGUIDs},
+	}}
+	client := &IMClient{Main: &IMConnector{Bridge: &bridgev2.Bridge{
+		Config: &bridgeconfig.BridgeConfig{},
+	}}}
+
+	resp, err := (&chatDB{api: duplicateMergedChatDBAPI{}}).FetchMessages(
+		context.Background(),
+		bridgev2.FetchMessagesParams{Portal: portal, Count: 2},
+		client,
+	)
+	if err != nil {
+		t.Fatalf("FetchMessages failed: %v", err)
+	}
+	if len(resp.Messages) != 3 {
+		t.Fatalf("FetchMessages returned %d messages, want shared message once plus two unique messages", len(resp.Messages))
+	}
+	if !resp.AggressiveDeduplication {
+		t.Fatal("multi-GUID backward backfill did not enable database-level aggressive deduplication")
+	}
+	seen := make(map[networkid.MessageID]bool)
+	for _, message := range resp.Messages {
+		if seen[message.ID] {
+			t.Fatalf("FetchMessages returned duplicate message ID %q", message.ID)
+		}
+		seen[message.ID] = true
+	}
+	if resp.Cursor == "" {
+		t.Fatal("FetchMessages returned no cursor for full raw pages")
+	}
+	cursor := decodeChatDBBackfillCursor(resp.Cursor, exactGUIDs)
+	for _, exactGUID := range exactGUIDs {
+		if _, ok := cursor[exactGUID]; !ok {
+			t.Fatalf("cursor %#v does not track exact GUID %q", cursor, exactGUID)
+		}
+	}
+}
+
+func TestChatDBGUIDsForPortalFallsBackForLegacyMetadata(t *testing.T) {
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001")},
+		Metadata:  &PortalMetadata{},
+	}}
+	got, err := (&chatDB{}).chatGUIDsForPortal(context.Background(), portal, &IMClient{}, nil, false)
+	if err != nil {
+		t.Fatalf("legacy GUID fallback failed: %v", err)
+	}
+	want := portalIDToChatGUIDs("tel:+15550000001")
+	if len(got) != len(want) {
+		t.Fatalf("legacy GUID fallback = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("legacy GUID fallback = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestChatDBFetchMessagesRefreshesOnlyAtSessionBoundaries(t *testing.T) {
+	existingGUID := "SMS;-;+15550000001(smsft)"
+	newGUID := "any;-;+15550000001"
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		Metadata: &PortalMetadata{ChatDBGUIDs: []string{existingGUID}},
+	}}
+	client := &IMClient{Main: &IMConnector{Bridge: &bridgev2.Bridge{
+		Config: &bridgeconfig.BridgeConfig{},
+	}}}
+	api := &recordingExactChatDBAPI{chats: []imessage.ChatIdentifier{
+		{ChatGUID: existingGUID},
+		{ChatGUID: newGUID},
+		{ChatGUID: "SMS;-;+15550000002(smsft)"},
+	}}
+	db := &chatDB{api: api}
+
+	firstBackward, err := db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal: portal,
+		Count:  1,
+	}, client)
+	if err != nil {
+		t.Fatalf("first backward FetchMessages failed: %v", err)
+	}
+	if api.enumerationCalls != 1 {
+		t.Fatalf("first backward page enumerated chat.db %d times, want 1", api.enumerationCalls)
+	}
+	if firstBackward.Cursor == "" {
+		t.Fatal("first backward page returned no cursor")
+	}
+	wantMetadata := []string{existingGUID, newGUID}
+	if got := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; !stringSlicesEqual(got, wantMetadata) {
+		t.Fatalf("refreshed metadata = %#v, want %#v", got, wantMetadata)
+	}
+
+	_, err = db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal: portal,
+		Cursor: firstBackward.Cursor,
+		Count:  1,
+	}, client)
+	if err != nil {
+		t.Fatalf("resumed backward FetchMessages failed: %v", err)
+	}
+	if api.enumerationCalls != 1 {
+		t.Fatalf("resumed backward page enumerated chat.db; calls = %d, want 1", api.enumerationCalls)
+	}
+
+	_, err = db.FetchMessages(context.Background(), bridgev2.FetchMessagesParams{
+		Portal:        portal,
+		Forward:       true,
+		AnchorMessage: &database.Message{Timestamp: time.Unix(25, 0)},
+		Count:         1,
+	}, client)
+	if err != nil {
+		t.Fatalf("forward FetchMessages failed: %v", err)
+	}
+	if api.enumerationCalls != 2 {
+		t.Fatalf("forward fetch enumeration calls = %d, want 2", api.enumerationCalls)
+	}
+}
+
+func TestRefreshedChatDBGUIDsIsUnionOnlyAndIdentityScoped(t *testing.T) {
+	existing := []string{
+		"SMS;-;+15550000001(smsft)",
+		"iMessage;-;known@example.com",
+	}
+	chats := []imessage.ChatIdentifier{
+		{ChatGUID: "any;-;+15550000001"},
+		{ChatGUID: "SMS;-;+15550000001(sms)"},
+		{ChatGUID: "SMS;-;+15550000002(smsft)"},
+		{ChatGUID: "iMessage;-;other@example.com"},
+	}
+
+	merged, added := refreshedChatDBGUIDs(existing, chats)
+	wantMerged := []string{
+		"SMS;-;+15550000001(smsft)",
+		"iMessage;-;known@example.com",
+		"any;-;+15550000001",
+		"SMS;-;+15550000001(sms)",
+	}
+	if !stringSlicesEqual(merged, wantMerged) {
+		t.Fatalf("refreshed GUIDs = %#v, want %#v", merged, wantMerged)
+	}
+	if !stringSlicesEqual(added, wantMerged[len(existing):]) {
+		t.Fatalf("added GUIDs = %#v, want %#v", added, wantMerged[len(existing):])
+	}
+
+	merged, added = refreshedChatDBGUIDs(merged, []imessage.ChatIdentifier{{ChatGUID: merged[len(merged)-1]}})
+	if !stringSlicesEqual(merged, wantMerged) || len(added) != 0 {
+		t.Fatalf("idempotent refresh = merged %#v added %#v, want unchanged", merged, added)
+	}
+}
+
+func TestRefreshedChatDBGUIDsPreservesLegacyFallback(t *testing.T) {
+	merged, added := refreshedChatDBGUIDs(nil, []imessage.ChatIdentifier{{
+		ChatGUID: "SMS;-;+15550000001(smsft)",
+	}})
+	if len(merged) != 0 || len(added) != 0 {
+		t.Fatalf("legacy refresh = merged %#v added %#v, want empty metadata", merged, added)
+	}
+}
+
+func TestNewChatDBRestoreResyncCarriesLiteralGUID(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	resync := newChatDBRestoreResync(entry, client)
+	bundle, ok := resync.BundledBackfillData.(chatDBBackfillGUIDBundle)
+	if !ok {
+		t.Fatalf("restore bundle type = %T, want chatDBBackfillGUIDBundle", resync.BundledBackfillData)
+	}
+	if !stringSlicesEqual(bundle.ChatGUIDs, []string{exactGUID}) {
+		t.Fatalf("restore bundle GUIDs = %#v, want literal %#v", bundle.ChatGUIDs, []string{exactGUID})
+	}
+	if !client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore resync did not seed SMS routing before ChatInfo creation")
+	}
+
+	// A false entry only comes from live handling (startup hydration stores
+	// SMS=true entries), so restore construction must not replace it with the
+	// older chat.db service.
+	client.updatePortalSMS("tel:+15550000001", false)
+	_ = newChatDBRestoreResync(entry, client)
+	if client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore resync replaced a newer live iMessage runtime route")
+	}
+}
+
+func TestPreserveExistingChatDBRestoreRoutingKeepsPersistedIMessage(t *testing.T) {
+	entry := chatDBInitialSyncEntry{
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	existing := &bridgev2.Portal{Portal: &database.Portal{
+		Metadata: &PortalMetadata{
+			IsSms:          false,
+			SMSDestination: "",
+		},
+	}}
+
+	got := preserveExistingChatDBRestoreRouting(entry, existing)
+
+	if got.isSms || got.smsDestination != "" {
+		t.Fatalf("existing iMessage route was overwritten by stale chat.db route: %#v", got)
+	}
+}
+
+func TestChatDBRestorePostHandleRetriesTransientMetadataSave(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	oldMetadata := &PortalMetadata{ThreadID: "keep"}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: entry.portalKey,
+		Metadata:  oldMetadata,
+	}}
+	saveAttempts := 0
+	resync := newChatDBRestoreResyncWithSave(
+		entry,
+		client,
+		func(context.Context, *bridgev2.Portal) error {
+			saveAttempts++
+			if saveAttempts == 1 {
+				return errors.New("temporary save failure")
+			}
+			return nil
+		},
+	)
+
+	resync.PostHandle(context.Background(), portal)
+
+	if saveAttempts != 2 {
+		t.Fatalf("restore post-handler save attempts = %d, want 2", saveAttempts)
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok {
+		t.Fatalf("restore post-handler metadata type = %T, want *PortalMetadata", portal.Metadata)
+	}
+	if meta.ThreadID != "keep" || !meta.IsSms || meta.SMSDestination != "tel:+15550000001" {
+		t.Fatalf("restore post-handler metadata lost routing or unrelated state: %#v", meta)
+	}
+	if !stringSlicesEqual(meta.ChatDBGUIDs, []string{exactGUID}) {
+		t.Fatalf("restore post-handler GUIDs = %#v, want %#v", meta.ChatDBGUIDs, []string{exactGUID})
+	}
+}
+
+func TestChatDBRestoreRetryPreservesNewerLiveRoute(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	client := &IMClient{
+		Main: &IMConnector{
+			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
+		},
+		handle:     "tel:+15559999999",
+		allHandles: []string{"tel:+15559999999"},
+		smsPortals: make(map[string]bool),
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{
+			ID: networkid.UserLoginID("login"),
+		}},
+	}
+	entry := chatDBInitialSyncEntry{
+		chatGUIDs: []string{exactGUID},
+		portalKey: networkid.PortalKey{
+			ID:       networkid.PortalID("tel:+15550000001"),
+			Receiver: networkid.UserLoginID("login"),
+		},
+		info: &imessage.ChatInfo{
+			Identifier:   imessage.Identifier{LocalID: "+15550000001", Service: "SMS"},
+			JSONChatGUID: exactGUID,
+		},
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: entry.portalKey,
+		Metadata:  &PortalMetadata{ThreadID: "keep"},
+	}}
+
+	liveCallStarted := make(chan struct{})
+	liveDone := make(chan error, 1)
+	restoreAttempts := 0
+	resync := newChatDBRestoreResyncWithSave(
+		entry,
+		client,
+		func(context.Context, *bridgev2.Portal) error {
+			restoreAttempts++
+			if restoreAttempts == 1 {
+				go func() {
+					close(liveCallStarted)
+					_, err := client.persistPortalSMSRoutingWithSave(
+						portal,
+						false,
+						"",
+						func() error { return nil },
+					)
+					liveDone <- err
+				}()
+				<-liveCallStarted
+				return errors.New("temporary restore save failure")
+			}
+			return nil
+		},
+	)
+
+	resync.PostHandle(context.Background(), portal)
+
+	if err := <-liveDone; err != nil {
+		t.Fatalf("live route persistence failed: %v", err)
+	}
+	if restoreAttempts != 2 {
+		t.Fatalf("restore post-handler save attempts = %d, want 2", restoreAttempts)
+	}
+	if client.isPortalSMS("tel:+15550000001") {
+		t.Fatal("restore retry reverted the newer live runtime route to SMS")
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok {
+		t.Fatalf("restore retry metadata type = %T, want *PortalMetadata", portal.Metadata)
+	}
+	if meta.IsSms || meta.SMSDestination != "" {
+		t.Fatalf("restore retry reverted newer live persisted routing: %#v", meta)
+	}
+	if meta.ThreadID != "keep" || !stringSlicesEqual(meta.ChatDBGUIDs, []string{exactGUID}) {
+		t.Fatalf("restore retry lost unrelated metadata or exact GUID union: %#v", meta)
+	}
+}
+
+func TestPersistChatDBRestoreMetadataRetriesRoutingAndGUIDUnion(t *testing.T) {
+	oldMetadata := &PortalMetadata{ThreadID: "keep"}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000001"},
+		Metadata:  oldMetadata,
+	}}
+	entry := chatDBInitialSyncEntry{
+		isSms:          true,
+		smsDestination: "tel:+15550000001",
+	}
+	exactGUIDs := []string{"SMS;-;+15550000001(smsft)"}
+	client := &IMClient{}
+
+	err := client.persistChatDBRestoreMetadata(
+		context.Background(),
+		portal,
+		entry,
+		exactGUIDs,
+		func(context.Context, *bridgev2.Portal) error {
+			return errors.New("temporary save failure")
+		},
+	)
+	if err == nil {
+		t.Fatal("failed restore metadata save returned nil error")
+	}
+	if portal.Metadata != oldMetadata {
+		t.Fatal("failed restore metadata save did not restore original metadata pointer")
+	}
+
+	err = client.persistChatDBRestoreMetadata(
+		context.Background(),
+		portal,
+		entry,
+		exactGUIDs,
+		func(context.Context, *bridgev2.Portal) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("restore metadata retry failed: %v", err)
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if meta.ThreadID != "keep" || !meta.IsSms || meta.SMSDestination != "tel:+15550000001" {
+		t.Fatalf("restore metadata retry lost routing or unrelated metadata: %#v", meta)
+	}
+	if !stringSlicesEqual(meta.ChatDBGUIDs, exactGUIDs) {
+		t.Fatalf("restore metadata GUIDs = %#v, want %#v", meta.ChatDBGUIDs, exactGUIDs)
+	}
+}
+
+func TestChatDBRestoreBundleAvoidsRescanAndDefersMetadataPersistence(t *testing.T) {
+	exactGUID := "SMS;-;+15550000001(smsft)"
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001")},
+		Metadata:  &PortalMetadata{},
+	}}
+	api := &recordingExactChatDBAPI{
+		chats: []imessage.ChatIdentifier{{ChatGUID: exactGUID}},
+	}
+	db := &chatDB{api: api}
+	got, err := db.chatGUIDsForPortal(
+		context.Background(),
+		portal,
+		&IMClient{},
+		chatDBBackfillGUIDBundle{ChatGUIDs: []string{exactGUID}},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("restore bundle selection failed: %v", err)
+	}
+	if !stringSlicesEqual(got, []string{exactGUID}) {
+		t.Fatalf("restore GUIDs = %#v, want literal %#v", got, []string{exactGUID})
+	}
+	if api.enumerationCalls != 0 {
+		t.Fatalf("bundled restore enumerated chat.db %d times, want 0", api.enumerationCalls)
+	}
+	if persisted := portal.Metadata.(*PortalMetadata).ChatDBGUIDs; len(persisted) != 0 {
+		t.Fatalf("bundled fetch persisted metadata before post-handler: %#v", persisted)
+	}
+}
+
+func TestChatDBGUIDSelectionUnionsBundleWithPersistedMetadata(t *testing.T) {
+	bundledGUID := "SMS;-;+15550000001(smsft)"
+	persistedGUID := "SMS;-;+15550000001(sms)"
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID("tel:+15550000001")},
+		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{persistedGUID}},
+	}}
+	got, err := (&chatDB{}).chatGUIDsForPortal(
+		context.Background(),
+		portal,
+		&IMClient{},
+		chatDBBackfillGUIDBundle{ChatGUIDs: []string{bundledGUID}},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("exact GUID selection failed: %v", err)
+	}
+	want := []string{bundledGUID, persistedGUID}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("selected exact GUIDs = %#v, want bundled and persisted union %#v", got, want)
+	}
+}
+
 func TestChatDBAttachmentNoticeUsesNonCollidingMessageID(t *testing.T) {
 	notice := &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 		Type: event.EventMessage,
@@ -235,8 +848,8 @@ func TestChatDBBackfillCursorAdvancesPastFilteredPage(t *testing.T) {
 }
 
 func TestChatDBBackfillCursorTracksMergedChatGUIDsIndependently(t *testing.T) {
-	chatA := "iMessage;-;+15550000001"
-	chatB := "iMessage;-;+15550000002"
+	chatA := "SMS;-;+15550000001(smsft)"
+	chatB := "SMS;-;+15550000001(sms)"
 	aBoundary := time.Unix(100, 0)
 	bBoundary := time.Unix(500, 0)
 

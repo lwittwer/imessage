@@ -33,8 +33,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2/provisionutil"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/id"
-
-	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // Help sections for Apple-service commands added by this bridge. Orders slot
@@ -614,47 +612,94 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 		return
 	}
 
-	type chatDBEntry struct {
-		portalID string
-		name     string
+	type chatDBRestoreCandidate struct {
+		entry chatDBInitialSyncEntry
+		name  string
 	}
-	var candidates []chatDBEntry
+	var entries []chatDBInitialSyncEntry
 	maxInitialMessages := client.Main.Bridge.Config.Backfill.MaxInitialMessages
 
 	for _, chat := range chats {
-		parsed := imessage.ParseIdentifier(chat.ChatGUID)
-		if parsed.LocalID == "" {
-			continue
-		}
-
-		var portalID string
-		if parsed.IsGroup {
-			info, err := client.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
-			if err != nil || info == nil {
-				continue
-			}
-			members := []string{client.handle}
-			for _, m := range info.Members {
-				members = append(members, addIdentifierPrefix(m))
-			}
-			sort.Strings(members)
-			portalID = strings.Join(members, ",")
-		} else {
-			portalID = string(identifierToPortalID(parsed))
-		}
-
-		portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: login.ID}
-		existing, _ := ce.Bridge.GetExistingPortalByKey(ce.Ctx, portalKey)
-		if existing != nil && existing.MXID != "" {
-			continue // room already exists
-		}
 		hasMessages, err := client.chatDB.hasBackfillableMessages(chat.ChatGUID, maxInitialMessages)
 		if err != nil || !hasMessages {
 			continue
 		}
+		info, err := client.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			continue
+		}
+		entry, ok := client.makeChatDBInitialSyncEntry(chat, info, login.ID)
+		if ok {
+			entries = append(entries, entry)
+		}
+	}
 
-		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
-		candidates = append(candidates, chatDBEntry{portalID: portalID, name: name})
+	existingPortals, err := ce.Bridge.GetAllPortalsWithMXID(ce.Ctx)
+	if err != nil {
+		ce.Reply("Failed to inspect existing chat rooms: %v", err)
+		return
+	}
+	existingByID := make(map[string]*bridgev2.Portal)
+	existingByNormalizedID := make(map[string][]string)
+	for _, portal := range existingPortals {
+		if portal.Receiver != "" && portal.Receiver != login.ID {
+			continue
+		}
+		portalID := string(portal.ID)
+		existingByID[portalID] = portal
+		if !strings.Contains(portalID, ",") {
+			normalized := normalizeIdentifierForPortalID(portalID)
+			existingByNormalizedID[normalized] = append(existingByNormalizedID[normalized], portalID)
+		}
+	}
+	for normalized := range existingByNormalizedID {
+		sort.Strings(existingByNormalizedID[normalized])
+	}
+	messageState := make(map[string]existingDMPortalCandidate)
+	var resolveErr error
+	findExistingRoom := func(portalID string) existingDMPortalCandidate {
+		if resolveErr != nil {
+			return existingDMPortalCandidate{}
+		}
+		normalized := normalizeIdentifierForPortalID(portalID)
+		return preferredExistingDMPortalSpelling(portalID, existingByNormalizedID[normalized], func(candidate string) existingDMPortalCandidate {
+			if cached, ok := messageState[candidate]; ok {
+				return cached
+			}
+			portal := existingByID[candidate]
+			if portal == nil {
+				return existingDMPortalCandidate{}
+			}
+			firstMessage, queryErr := ce.Bridge.DB.Message.GetFirstPortalMessage(ce.Ctx, portal.PortalKey)
+			if queryErr != nil {
+				resolveErr = queryErr
+				return existingDMPortalCandidate{}
+			}
+			resolved := existingDMPortalCandidate{ID: candidate, HasMessages: firstMessage != nil}
+			messageState[candidate] = resolved
+			return resolved
+		})
+	}
+	merged, _, _ := canonicalizeAndMergeChatDBEntries(entries, client.lookupContact, client.isMyHandle, findExistingRoom)
+	if resolveErr != nil {
+		ce.Reply("Failed to inspect existing chat messages: %v", resolveErr)
+		return
+	}
+
+	var candidates []chatDBRestoreCandidate
+	for _, entry := range merged {
+		existing, lookupErr := ce.Bridge.GetExistingPortalByKey(ce.Ctx, entry.portalKey)
+		if lookupErr != nil {
+			ce.Reply("Failed to inspect existing chat room: %v", lookupErr)
+			return
+		}
+		if existing != nil && existing.MXID != "" {
+			continue
+		}
+		entry = preserveExistingChatDBRestoreRouting(entry, existing)
+		portalID := string(entry.portalKey.ID)
+		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, entry.portalKey, portalID)
+		candidates = append(candidates, chatDBRestoreCandidate{entry: entry, name: name})
 	}
 
 	if len(candidates) == 0 {
@@ -682,27 +727,173 @@ func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, clie
 			commands.StoreCommandState(ce.User, nil)
 
 			chosen := candidates[n-1]
-			portalKey := networkid.PortalKey{ID: networkid.PortalID(chosen.portalID), Receiver: login.ID}
+			portalID := string(chosen.entry.portalKey.ID)
 
 			// Remove from recentlyDeletedPortals so recreation isn't blocked.
 			client.recentlyDeletedPortalsMu.Lock()
-			delete(client.recentlyDeletedPortals, chosen.portalID)
+			delete(client.recentlyDeletedPortals, portalID)
 			client.recentlyDeletedPortalsMu.Unlock()
 
-			client.Main.Bridge.QueueRemoteEvent(login, &simplevent.ChatResync{
-				EventMeta: simplevent.EventMeta{
-					Type:         bridgev2.RemoteEventChatResync,
-					PortalKey:    portalKey,
-					CreatePortal: true,
-					Timestamp:    time.Now(),
-				},
-				GetChatInfoFunc: client.GetChatInfo,
-			})
+			client.Main.Bridge.QueueRemoteEvent(login, newChatDBRestoreResync(chosen.entry, client))
 
 			ce.Reply("Restoring **%s** — the room will appear shortly with history from chat.db.", chosen.name)
 		}),
 		Cancel: func() {},
 	})
+}
+
+func preserveExistingChatDBRestoreRouting(
+	entry chatDBInitialSyncEntry,
+	portal *bridgev2.Portal,
+) chatDBInitialSyncEntry {
+	if portal == nil {
+		return entry
+	}
+	meta, ok := portal.Metadata.(*PortalMetadata)
+	if !ok {
+		return entry
+	}
+	entry.isSms = meta.IsSms
+	entry.smsDestination = meta.SMSDestination
+	if !entry.isSms {
+		entry.smsDestination = ""
+	}
+	return entry
+}
+
+const chatDBRestoreMetadataMaxAttempts = 3
+
+var chatDBRestoreMetadataRetryDelays = [...]time.Duration{
+	50 * time.Millisecond,
+	250 * time.Millisecond,
+}
+
+func newChatDBRestoreResync(entry chatDBInitialSyncEntry, client *IMClient) *simplevent.ChatResync {
+	return newChatDBRestoreResyncWithSave(entry, client, nil)
+}
+
+func newChatDBRestoreResyncWithSave(
+	entry chatDBInitialSyncEntry,
+	client *IMClient,
+	save func(context.Context, *bridgev2.Portal) error,
+) *simplevent.ChatResync {
+	exactGUIDs := append([]string(nil), entry.chatGUIDs...)
+	client.seedPortalSMSRoutingIfAbsent(
+		string(entry.portalKey.ID),
+		entry.isSms,
+		entry.smsDestination,
+	)
+	chatInfo := client.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
+	return &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    entry.portalKey,
+			CreatePortal: true,
+			Timestamp:    time.Now(),
+			PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				persist := func() error {
+					return client.persistChatDBRestoreMetadata(ctx, portal, entry, exactGUIDs, save)
+				}
+				retryChatDBRestoreMetadata(ctx, portal, persist)
+			},
+		},
+		ChatInfo:        chatInfo,
+		LatestMessageTS: time.Now(),
+		BundledBackfillData: chatDBBackfillGUIDBundle{
+			ChatGUIDs: append([]string(nil), exactGUIDs...),
+		},
+	}
+}
+
+func retryChatDBRestoreMetadata(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	persist func() error,
+) {
+	for attempt := 1; attempt <= chatDBRestoreMetadataMaxAttempts; attempt++ {
+		if err := persist(); err == nil {
+			return
+		} else if attempt == chatDBRestoreMetadataMaxAttempts {
+			portalID := ""
+			if portal != nil {
+				portalID = string(portal.ID)
+			}
+			zerolog.Ctx(ctx).Error().
+				Err(err).
+				Int("attempts", attempt).
+				Str("source", "restore_chat").
+				Str("portal_id", logSafeHandle(portalID)).
+				Msg("Failed to persist restored chat.db routing and exact GUID metadata after bounded retries")
+			return
+		}
+
+		delay := chatDBRestoreMetadataRetryDelays[attempt-1]
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *IMClient) persistChatDBRestoreMetadata(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	entry chatDBInitialSyncEntry,
+	exactGUIDs []string,
+	save func(context.Context, *bridgev2.Portal) error,
+) error {
+	if save == nil && portal != nil && portal.Bridge != nil {
+		save = func(ctx context.Context, portal *bridgev2.Portal) error {
+			return portal.Save(ctx)
+		}
+	}
+
+	c.smsRoutePersistMu.Lock()
+	defer c.smsRoutePersistMu.Unlock()
+
+	// The room creation and bounded retry delays leave time for a newer live
+	// APNs route to arrive. Re-read the runtime route under the same lock used
+	// by live persistence on every attempt so a retry only adds the restore's
+	// exact GUIDs and never re-applies stale carrier routing.
+	isSms := entry.isSms
+	smsDestination := entry.smsDestination
+	if portal != nil {
+		c.smsPortalsLock.RLock()
+		runtimeIsSms, hasRuntimeRoute := c.smsPortals[string(portal.ID)]
+		runtimeDestination := c.smsDestinations[string(portal.ID)]
+		c.smsPortalsLock.RUnlock()
+		if hasRuntimeRoute {
+			isSms = runtimeIsSms
+			smsDestination = runtimeDestination
+		}
+	}
+	if !isSms {
+		smsDestination = ""
+	}
+
+	_, err := updateInitialSyncPortalMetadata(
+		ctx,
+		portal,
+		isSms,
+		smsDestination,
+		exactGUIDs,
+		save,
+	)
+	if err != nil {
+		portalID := ""
+		if portal != nil {
+			portalID = string(portal.ID)
+		}
+		zerolog.Ctx(ctx).Error().
+			Err(err).
+			Str("source", "restore_chat").
+			Str("portal_id", logSafeHandle(portalID)).
+			Msg("Failed to persist restored chat.db routing and exact GUID metadata")
+	}
+	return err
 }
 
 // restoreChatCandidate represents a chat that can be restored.
