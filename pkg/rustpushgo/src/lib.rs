@@ -3,6 +3,7 @@ pub mod util;
 pub mod local_config;
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub mod anisette;
+mod ids_guard;
 mod statuskitgo;
 mod statuskit_cloudkit;
 #[cfg(test)]
@@ -1044,6 +1045,12 @@ pub enum WrappedError {
     // rename nor a wrapper refactor can silently break the anti-pound cache.
     #[error("peer not registered for the StatusKit keysharing sub-service")]
     NoStatusKitTargets,
+    // Typed signal that a send could only go over the text-message relay and no
+    // device on this account is registered to relay. Matched in Go by errors.Is
+    // on THIS variant rather than by string, so a rename cannot silently turn a
+    // visible failure back into a checkmark for a message nothing delivered.
+    #[error("no device on this account forwards text messages")]
+    NoSmsRelay,
 }
 
 impl From<rustpush::PushError> for WrappedError {
@@ -4851,6 +4858,16 @@ pub fn init_logger() {
     // modules still surface normally.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // `catch_unwind` runs after the panic hook, so guarded IDS lookup
+        // panics must be intercepted here as well or their payload (which may
+        // contain an Apple handle) reaches stderr before ids_guard can redact
+        // it. The Tokio task-local marker is scoped to polling guarded
+        // attempts only; unrelated panics continue to the existing handling
+        // below.
+        if ids_guard::is_guarded_attempt_active() {
+            eprintln!("ids_guard: upstream IDS lookup panicked; details redacted");
+            return;
+        }
         if let Some(loc) = info.location() {
             let file = loc.file();
             // Match both Unix and Windows path separators. Files listed
@@ -8026,7 +8043,37 @@ pub async fn new_client(
                 let mut backoff = INITIAL_BACKOFF;
 
                 loop {
-                    match client_for_recv.handle(msg.clone()).await {
+                    // handle() decrypts inbound messages, which routes through
+                    // IdentityManager::get_key_for_sender — a lookup for a
+                    // SINGLE sender URI (identity_manager.rs:834). That is the
+                    // shape that trips the upstream chunks(0) panic in
+                    // ids/user.rs:984, and unlike the bridge's own lookup call
+                    // sites this one is internal to rustpush, so ids_guard
+                    // cannot wrap it — meaning no bisection and no quarantine
+                    // here, just the catch. Matches how the StatusKit path is
+                    // protected (spawn → JoinError, above).
+                    //
+                    // Tradeoff, stated honestly: the bridge survives, but the
+                    // frame is dropped, and a sender that panics the lookup
+                    // will do so on every message it sends. Whether those
+                    // messages resurface depends on CloudKit backfill picking
+                    // them up, which is not guaranteed. Staying up and losing
+                    // one sender's messages beats losing every sender's.
+                    use futures::FutureExt;
+                    let handled = std::panic::AssertUnwindSafe(
+                        client_for_recv.handle(msg.clone())
+                    ).catch_unwind().await;
+                    let handled = match handled {
+                        Ok(res) => res,
+                        Err(_) => {
+                            error!(
+                                "iMessage handle() panicked (likely an IDS key lookup for the sender) \
+                                 — dropping this frame to keep the receive loop alive"
+                            );
+                            break;
+                        }
+                    };
+                    match handled {
                         Ok(Some(msg_inst)) => {
                             // Certify delivery back to the sender when the
                             // incoming message carries a certified context.
@@ -9183,19 +9230,39 @@ impl Client {
             // empty for is filtered out of the HTTP fetch and never re-queried.
             // refresh=true drops the cutoff to REFRESH_MIN (60s). The resolver's
             // rate gate caps how often this runs, so we don't pound Apple.
-            match tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                self.client.identity.cache_keys(
-                    service,
-                    &targets,
-                    &my_handle,
-                    true,
-                    &QueryOptions::default(),
-                ),
-            ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => info!("resolve_handle: cache_keys({}, n={}) failed: {:?}", service, targets.len(), e),
-                Err(_) => info!("resolve_handle: cache_keys({}, n={}) timed out after {}s", service, targets.len(), timeout_secs),
+            //
+            // Routed through ids_guard: for services after Madrid this queries a
+            // single URI, which is one of the two shapes that trips the upstream
+            // chunks(0) panic (ids/user.rs:984).
+            //
+            // Quarantine ENFORCED, and it matters most here. The madrid pass
+            // above is not a single-URI lookup: it is this handle plus every
+            // ghost in the bridge DB (client.go's `SELECT id FROM ghost`), so
+            // ONE poison handle anywhere in that set rides along in every
+            // resolution. A poison handle also never reaches put_keys, so it
+            // never gets a cache entry, so `does_not_need_refresh` never
+            // filters it out — without the quarantine it would trigger a full
+            // bisection on every presence update, forever. The per-handle rate
+            // gate (statusKitIDSAttemptCooldown) does not help: it paces calls
+            // between handles, not the attempts inside one bisection.
+            //
+            // Cost of enforcing: a contact whose lookup is quarantined has
+            // presence resolution suppressed until the TTL expires. That TTL
+            // (6h) matches the gate's own attempt cooldown (6h), so in the
+            // common case the negative-attempt stamp already suppresses a
+            // re-query for the same window and enforcing costs nothing extra.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                timeout_secs,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("resolve_handle: cache_keys({}, n={}) failed: {}", service, targets.len(), err);
             }
 
             let cache = self.client.identity.cache.lock().await;
@@ -9351,25 +9418,33 @@ impl Client {
             // 1. Force-fresh fetch for the unknowns. refresh=true bypasses the
             //    EMPTY_REFRESH cache filter so Apple is re-queried even if a
             //    prior empty result is cached within the 1h window.
-            match tokio::time::timeout(
-                Duration::from_secs(unknown_timeout),
-                self.client.identity.cache_keys(
-                    service,
-                    &unknown_targets,
-                    &my_handle,
-                    true,
-                    &QueryOptions::default(),
-                ),
-            ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {:?}", service, unknown_targets.len(), e);
+            //
+            //    Routed through ids_guard so one unanswerable handle can no
+            //    longer take down the process (or, once caught, abort the rest
+            //    of the pass): it is isolated by bisection, quarantined, and
+            //    every other handle in the list still resolves.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &unknown_targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                unknown_timeout,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {}", service, unknown_targets.len(), err);
+                if !report.systemic {
+                    // Ordinary failure: skip this service entirely, exactly as
+                    // this loop did before the guard existed.
                     continue;
                 }
-                Err(_) => {
-                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) timed out after {}s", service, unknown_targets.len(), unknown_timeout);
-                    continue;
-                }
+                // Systemic panic (broken registration, bad cache state). Skip
+                // the sibling query — it would walk into the same instant
+                // panic — but still run the correlation scan below: it is
+                // in-memory, issues no queries, and can only add results from
+                // entries earlier passes already cached.
             }
 
             // 2. Cache-only top-up for known siblings. refresh=false means each
@@ -9377,24 +9452,19 @@ impl Client {
             //    case is cache hit for everyone (siblings have been queried
             //    during normal message traffic). Only siblings with truly
             //    missing/stale entries hit Apple.
-            if !sibling_targets.is_empty() {
-                match tokio::time::timeout(
-                    Duration::from_secs(sibling_timeout),
-                    self.client.identity.cache_keys(
-                        service,
-                        &sibling_targets,
-                        &my_handle,
-                        false,
-                        &QueryOptions::default(),
-                    ),
-                ).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {:?}", service, sibling_targets.len(), e);
-                    }
-                    Err(_) => {
-                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) timed out after {}s (continuing with cached entries)", service, sibling_targets.len(), sibling_timeout);
-                    }
+            if report.error.is_none() && !sibling_targets.is_empty() {
+                let sib = ids_guard::guarded_cache_keys(
+                    &self.client.identity,
+                    service,
+                    &sibling_targets,
+                    &my_handle,
+                    false,
+                    &QueryOptions::default(),
+                    sibling_timeout,
+                    ids_guard::QuarantinePolicy::Enforce,
+                ).await;
+                if let Some(err) = &sib.error {
+                    info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {}", service, sibling_targets.len(), err);
                 }
             }
 
@@ -9608,16 +9678,136 @@ impl Client {
         self.get_or_init_sharedstreams_client().await
     }
 
+    /// Reports whether any device on this Apple account OTHER than us is
+    /// registered to relay text messages — Apple's Text Message Forwarding.
+    ///
+    /// This mirrors, exactly, how a carrier send resolves its targets
+    /// (aps_client.rs `send`): an SMS-flagged message is retargeted to our OWN
+    /// handle, queried on the `com.apple.private.alloy.sms` topic with the same
+    /// QueryOptions the send uses, and the resulting delivery handles then have
+    /// our own push token removed ("do not send to self",
+    /// identity_manager.rs:922-926). Whatever remains is the set of devices that
+    /// would actually carry the text. If that set is empty the send still returns
+    /// Ok with an empty target list, and the message is silently discarded — which
+    /// is the failure this predicate exists to detect.
+    ///
+    /// Deliberately NOT keyed off PrivateDeviceInfo::sub_services. That field is
+    /// populated from the dependent-registration response (user.rs:870) but is
+    /// never consulted by rustpush for routing — the only routing uses of
+    /// sub_services are on the static IDSService definition, describing which
+    /// topics we register for. Reading relay capability out of it would be our own
+    /// invention rather than what Apple actually routes on.
+    ///
+    /// Errs toward TRUE on every failure shape — lookup error, caught panic, and
+    /// an absent or stale cache entry. Claiming a relay exists only preserves
+    /// today's behaviour, whereas a wrong FALSE refuses a deliverable message.
+    /// Only a fresh IDS answer that names no other device returns false.
+    pub async fn has_sms_relay(&self, handle: String) -> bool {
+        const SMS_TOPIC: &str = "com.apple.private.alloy.sms";
+
+        // Prime the cache through the guarded seam, as validate_targets does, so a
+        // panicking lookup cannot take the process down. Same QueryOptions the send
+        // uses, so we are asking the question the send asks.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            SMS_TOPIC,
+            std::slice::from_ref(&handle),
+            &handle,
+            false,
+            &rustpush::ids::user::QueryOptions { required_for_message: true, result_expected: true },
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        )
+        .await;
+        // Both failure shapes, not just `error`. A one-element target list can
+        // never exceed MAX_QUARANTINE_PER_PASS, so a caught panic lands in
+        // `poisoned` with `error` left None (ids_guard.rs classify_and_record) —
+        // reading only `error` would take a panicked lookup as a definitive "no
+        // relay" and refuse a deliverable message.
+        if let Some(err) = &report.error {
+            info!("has_sms_relay: relay lookup failed, assuming a relay exists: {}", err);
+            return true;
+        }
+        if !report.poisoned.is_empty() {
+            info!("has_sms_relay: relay lookup panicked and was quarantined, assuming a relay exists");
+            return true;
+        }
+
+        let my_token = self.conn.get_token().await;
+        let cache = self.client.identity.cache.lock().await;
+
+        // An empty get_keys cannot tell "IDS says there are no relay devices" from
+        // "nothing was cached" — no entry, expired entry, or a response that named
+        // no URIs all read the same. Only a FRESH entry licenses a negative answer;
+        // anything else means the question went unanswered. This also closes the
+        // race where a "devices changed" APS notification invalidates the cache
+        // between the lookup and this read — which is exactly when a user has just
+        // switched text forwarding on.
+        if !cache.does_not_need_refresh(SMS_TOPIC, &handle, &handle, false) {
+            info!("has_sms_relay: no fresh relay entry cached, assuming a relay exists");
+            return true;
+        }
+
+        let relays = cache
+            .get_keys(SMS_TOPIC, &handle, &handle)
+            .into_iter()
+            .filter(|data| data.push_token != my_token)
+            .count();
+        drop(cache);
+
+        if relays == 0 {
+            info!("has_sms_relay: IDS reports no text-message relay on this account");
+            return false;
+        }
+        true
+    }
+
     pub async fn validate_targets(
         &self,
         targets: Vec<String>,
         handle: String,
     ) -> Vec<String> {
-        self.client
-            .identity
-            .validate_targets(&targets, "com.apple.madrid", &handle)
-            .await
-            .unwrap_or_default()
+        // Callers pass a single identifier here (contact_merge.go:86), which is
+        // one of the shapes that trips the upstream chunks(0) panic. Prime the
+        // cache through the guarded seam first, then read it back with the same
+        // filter upstream applies (identity_manager.rs:866-870).
+        //
+        // Two deliberate deltas from the old `identity.validate_targets(..)
+        // .unwrap_or_default()` call, both safer at this call site:
+        //   * On a failed lookup this returns whatever is already cached
+        //     instead of empty. Empty means "not reachable on iMessage" to
+        //     resolveSendTarget (contact_merge.go:108), which reroutes the
+        //     message to an alternate number — a worse outcome during a
+        //     transient IDS outage than answering from cache.
+        //   * A 30s per-attempt timeout where there was none. The old call
+        //     could block the send path indefinitely.
+        //
+        // Quarantine BYPASSED here on purpose. This backs resolveSendTarget on
+        // the outbound path (contact_merge.go:108): a suppressed handle reads
+        // as "not reachable on iMessage" and silently reroutes the message to
+        // an alternate number for the quarantine window. The quarantine buys
+        // no safety at this call site anyway — a single-target lookup that
+        // panics is caught, returns empty, and costs exactly one attempt with
+        // or without an entry.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            "com.apple.madrid",
+            &targets,
+            &handle,
+            false,
+            &rustpush::ids::user::QueryOptions::default(),
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        ).await;
+        if let Some(err) = &report.error {
+            info!("validate_targets: cache_keys(n={}) failed: {}", targets.len(), err);
+        }
+        let cache = self.client.identity.cache.lock().await;
+        targets
+            .iter()
+            .filter(|t| !cache.get_keys("com.apple.madrid", &handle, t).is_empty())
+            .cloned()
+            .collect()
     }
 
     pub async fn send_message(
@@ -9737,7 +9927,14 @@ impl Client {
         match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
-                // iMessage failed — no IDS targets. Retry as SMS (without rich link).
+                // iMessage failed — no IDS targets. Falling back to SMS is what an
+                // iPhone does, but it only delivers if a device on this account
+                // relays text messages. Without one the retry is accepted by Apple
+                // and silently discarded, and we would return Ok for a message that
+                // never went anywhere. Fail instead so the bridge can surface it.
+                if !self.has_sms_relay(handle.clone()).await {
+                    return Err(WrappedError::NoSmsRelay);
+                }
                 info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
                 let sms_service = MessageType::SMS {
                     is_phone: false,
@@ -10504,6 +10701,11 @@ impl Client {
         match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+                // See send_message: an SMS fallback with no relay on the account is
+                // accepted by Apple and discarded, so fail rather than report Ok.
+                if !self.has_sms_relay(handle.clone()).await {
+                    return Err(WrappedError::NoSmsRelay);
+                }
                 info!("No IDS targets for attachment, falling back to SMS for {:?}", conv.participants);
                 let sms_service = MessageType::SMS {
                     is_phone: false,

@@ -41,12 +41,12 @@ func TestConnectorBridgeInfoUsesCanonicalIMessageProtocol(t *testing.T) {
 	}
 }
 
-func TestBridgeInfoVersionBumpedForProtocolIDChange(t *testing.T) {
+func TestBridgeInfoVersionsIncludeProtocolAndCapabilityChanges(t *testing.T) {
 	info, capabilities := (&IMConnector{}).GetBridgeInfoVersion()
 	if info < 2 {
 		t.Fatalf("bridge info version = %d, want at least 2", info)
 	}
-	if capabilities != 1 {
-		t.Fatalf("capabilities version = %d, want 1", capabilities)
+	if capabilities != 2 {
+		t.Fatalf("capabilities version = %d, want 2", capabilities)
 	}
 }

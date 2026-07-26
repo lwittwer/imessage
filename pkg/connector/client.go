@@ -33,6 +33,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "image/gif"
 	_ "image/png"
@@ -239,6 +240,12 @@ type IMClient struct {
 	// without this canonical dedup the bridge fires N notices per state
 	// change for a peer with N registered handles.
 	statusKitPresenceByPortal sync.Map // map[networkid.PortalID]string
+	// Serializes canonical presence dedup with its persisted KV mirror. The
+	// owner token lets a panicking handler roll back only the value it installed
+	// without erasing a newer alias update for the same portal.
+	statusKitPresenceByPortalMu     sync.Mutex
+	statusKitPresenceByPortalOwner  map[networkid.PortalID]uint64
+	statusKitPresenceByPortalSerial uint64
 
 	// statusKitPortalCache memoizes the resolved DM portal ID for a StatusKit
 	// presence handle. Populated after a successful IDS correlation lookup
@@ -253,6 +260,36 @@ type IMClient struct {
 	// validate_targets in parallel — keeping the bridge's IDS traffic
 	// indistinguishable from a single user catching up on chats.
 	statusKitIDSGate idsRateGate
+
+	// carrierCheckedAt is the last time an outbound carrier-route check issued an
+	// IDS lookup for a portal that came back unreachable. It bounds Apple traffic
+	// to at most one lookup per portal per carrierCheckTTL no matter how many
+	// messages the user sends, independently of the Rust-side KeyCache — so an
+	// invalidation there (APNs "devices changed", a cache reset) cannot turn a
+	// burst of sends into a burst of lookups.
+	carrierCheckedAt map[carrierRouteMemoKey]time.Time
+	// carrierVerifiedAt records portals IDS has confirmed reachable on iMessage.
+	// Because the routing decision is per-send and nothing is persisted, this is
+	// what stops repeat sends to the same portal re-querying Apple.
+	carrierVerifiedAt map[carrierRouteMemoKey]time.Time
+	// carrierCheckLog holds the timestamps of recent carrier-route lookups so an
+	// absolute per-hour ceiling can be enforced across all portals at once.
+	carrierCheckLog []time.Time
+	// smsRelay* memoize whether this ACCOUNT has a text-message relay. Account
+	// scope, not portal scope, so one entry serves every portal.
+	smsRelayCheckedAt time.Time
+	smsRelayValue     bool
+	carrierCheckedMu  sync.Mutex
+
+	// sendPathIDSGate paces the carrier-flag re-verification lookup that
+	// checkCarrierRoute runs before an outbound send is routed to the SMS
+	// relay. Kept separate from statusKitIDSGate so a noisy background
+	// presence sweep can never stall a user-initiated send behind its
+	// backoff (or vice versa). Volume here is inherently tiny: the lookup
+	// only fires for carrier-flagged 1:1 DMs, and the Rust KeyCache absorbs
+	// repeats (an empty answer for an hour, a non-empty one until Apple's
+	// session token expires, normally much longer).
+	sendPathIDSGate idsRateGate
 
 	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
 	// album for this session. The Shared Streams watcher uses it to suppress
@@ -1912,6 +1949,46 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
 	go func() {
+		var (
+			canonicalPortalID    networkid.PortalID
+			canonicalDedupMode   string
+			canonicalDedupOwner  uint64
+			canonicalDedupStored bool
+		)
+		// This goroutine calls into the IDS FFI (ResolveHandleCached /
+		// ResolveHandle) to map a presence update onto a portal. A Rust panic
+		// surfaced by uniffi re-panics in the generated binding, and this
+		// goroutine is spawned per presence update — dropping one notice is
+		// the correct degradation, crashing the bridge is not.
+		defer func() {
+			if r := recover(); r != nil {
+				// Roll back the optimistic dedup stored above. Without this,
+				// the mode key is already committed, so a re-delivery of the
+				// same state is suppressed and this user's presence stays
+				// stale until it changes again — a panic would silently cost
+				// the update rather than just this attempt.
+				if c.statusKitPresence.CompareAndDelete(user, modeKey) &&
+					c.Main.Bridge.DB.KV.Get(context.Background(), kvKeyFor(user)) == modeKey {
+					c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), "")
+				}
+				if canonicalDedupStored {
+					c.rollbackStatusKitPortalDedup(
+						context.Background(),
+						canonicalPortalID,
+						canonicalDedupMode,
+						canonicalDedupOwner,
+						func(ctx context.Context) string {
+							return c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(canonicalPortalID)))
+						},
+						func(ctx context.Context, value string) {
+							c.Main.Bridge.DB.KV.Set(ctx, database.Key("statuskit.presence.portal."+string(canonicalPortalID)), value)
+						},
+					)
+				}
+				log.Error().Interface("panic", r).
+					Msg("StatusKit presence handler panicked — dropping this update and clearing dedup so a re-delivery retries")
+			}
+		}()
 		ctx := context.Background()
 
 		// Apple sends available=true for both DND-on and DND-off; the mode
@@ -2094,32 +2171,35 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// as the canonical key so only the first alias of each state
 		// change actually sends the notice. Persisted to KV under a
 		// distinct prefix so the dedup survives bridge restarts.
-		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
 		// We successfully decrypted and resolved a presence event for this portal —
 		// refresh the moon-TTL freshness clock BEFORE the dedup early-returns, so a
 		// same-state re-confirmation still counts as "still hearing valid presence"
 		// and keeps a legitimate moon alive. A moon only goes stale when these stop.
 		c.touchPresenceAt(ctx, portal.ID)
-		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
-			if prev.(string) == modeKey {
-				log.Debug().
-					Str("portal_id", string(portal.ID)).
-					Str("alias", user).
-					Str("mode", modeKey).
-					Msg("StatusKit: presence unchanged for canonical portal, skipping duplicate alias notice")
-				return
-			}
-		} else if c.Main.Bridge.DB.KV.Get(ctx, portalKey) == modeKey {
-			c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
+		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
+		installed, owner := c.installStatusKitPortalDedup(
+			ctx,
+			portal.ID,
+			modeKey,
+			func(ctx context.Context) string {
+				return c.Main.Bridge.DB.KV.Get(ctx, portalKey)
+			},
+			func(ctx context.Context, value string) {
+				c.Main.Bridge.DB.KV.Set(ctx, portalKey, value)
+			},
+		)
+		if !installed {
 			log.Debug().
-				Str("portal_id", string(portal.ID)).
-				Str("alias", user).
+				Str("portal_id", logSafeHandle(string(portal.ID))).
+				Str("alias", logSafeHandle(user)).
 				Str("mode", modeKey).
-				Msg("StatusKit: presence unchanged for canonical portal (restored from DB), skipping duplicate alias notice")
+				Msg("StatusKit: presence unchanged for canonical portal, skipping duplicate alias notice")
 			return
 		}
-		c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
-		c.Main.Bridge.DB.KV.Set(ctx, portalKey, modeKey)
+		canonicalPortalID = portal.ID
+		canonicalDedupMode = modeKey
+		canonicalDedupOwner = owner
+		canonicalDedupStored = true
 
 		// Use the ghost keyed to the portal's handle — for a tel: portal this
 		// is the tel: ghost which has an MXID and is a member of the room.
@@ -2552,12 +2632,34 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 
 	// Slow path: validate_targets queries Apple IDS. Can block or hang;
 	// caller is responsible for applying a timeout.
-	aliases, err := c.client.ResolveHandle(user, knownHandles)
+	aliases, err := c.resolveHandleSafe(user, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).Str("user", logSafeHandle(user)).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
 	return c.findPortalForAliases(ctx, log, user, aliases)
+}
+
+// resolveHandleSafe wraps Client.ResolveHandle with a recover guard, mirroring
+// validateTargetsSafe. Rust-side ids_guard isolates lookup panics before they
+// reach uniffi; this is the backstop, because a panic surfaced through the
+// generated Go binding would otherwise take the bridge down from a presence
+// update.
+func (c *IMClient) resolveHandleSafe(user string, knownHandles []string) (aliases []string, err error) {
+	if c.client == nil {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).
+				Str("user", logSafeHandle(user)).
+				Int("known_handles", len(knownHandles)).
+				Msg("ResolveHandle panicked in FFI path")
+			aliases = nil
+			err = fmt.Errorf("ResolveHandle panicked: %v", r)
+		}
+	}()
+	return c.client.ResolveHandle(user, knownHandles)
 }
 
 // findPortalForAliases iterates aliases returned by IDS correlation and
@@ -3564,20 +3666,45 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 		ID:            makeMessageID(msg.Uuid),
 		TargetMessage: makeMessageID(targetGUID),
 		ConvertEditFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, text string) (*bridgev2.ConvertedEdit, error) {
-			var targetPart *database.Message
-			if len(existing) > 0 {
-				targetPart = existing[0]
+			// Only the text parts of the target may be rewritten — attachment
+			// parts (att0, att1, …) belong to the same message and must not be
+			// clobbered by an edit of its text.
+			textParts := make([]*database.Message, 0, len(existing))
+			for _, part := range existing {
+				if isTextPartID(part.PartID) {
+					textParts = append(textParts, part)
+				}
 			}
-			return &bridgev2.ConvertedEdit{
-				ModifiedParts: []*bridgev2.ConvertedEditPart{{
-					Part: targetPart,
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    text,
-					},
-				}},
-			}, nil
+			// GetAllPartsByID has no ORDER BY, so the rows arrive in whatever
+			// order the covering index yields. Sort explicitly rather than
+			// relying on that — mapping new parts onto the wrong stored rows
+			// would redact the wrong events. Compare the ordinal numerically:
+			// lexical order breaks the moment the zero padding overflows
+			// ("text1000" < "text999"), and padding width should not be
+			// load-bearing.
+			sort.Slice(textParts, func(i, j int) bool {
+				return textPartIndex(textParts[i].PartID) < textPartIndex(textParts[j].PartID)
+			})
+			newParts := buildTextParts(event.MsgText, "", text, nil, true)
+			edit := &bridgev2.ConvertedEdit{}
+			for i, part := range newParts {
+				if i < len(textParts) {
+					edit.ModifiedParts = append(edit.ModifiedParts, part.ToEditPart(textParts[i]))
+					continue
+				}
+				// The edit needs more parts than the message already had.
+				// bridgev2 appends these at the end of the room rather than
+				// beside the original, but dropping them would lose text.
+				if edit.AddedParts == nil {
+					edit.AddedParts = &bridgev2.ConvertedMessage{}
+				}
+				edit.AddedParts.Parts = append(edit.AddedParts.Parts, part)
+			}
+			// The edit shrank: redact the continuation parts it no longer needs.
+			if len(textParts) > len(newParts) {
+				edit.DeletedParts = textParts[len(newParts):]
+			}
+			return edit, nil
 		},
 	})
 }
@@ -6297,6 +6424,40 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	conv := c.portalToConversation(msg.Portal)
 
+	// A stale carrier flag would route this into the SMS relay, where a bridge
+	// with no forwarding device silently drops it. Override for THIS send only:
+	// the evidence (the peer is registered on iMessage now) does not justify
+	// changing what retro-active operations on older messages do, so nothing here
+	// writes the portal's stored flag.
+	//
+	// The flag may still change later, by a different and better-evidenced route:
+	// the iMessage this produces becomes a CloudKit chat record, and
+	// resolvePortalIDForCloudChat keys a DM purely on the handle, so ingestCloudChats
+	// can settle the portal on iMessage via the pre-existing a96678a3 path. That is
+	// driven by "Apple accepted and recorded an iMessage", not by our lookup.
+	//
+	// Set before the file branch so it covers attachments too; handleMatrixFile
+	// takes conv as a parameter.
+	if c.checkCarrierRoute(ctx, msg.Portal, conv) {
+		conv.IsSms = false
+	}
+
+	// Still headed for the text-message relay after the check above. If no device
+	// on this account is registered to relay, Apple accepts the push and discards
+	// it, so reporting a checkmark would be a lie — fail visibly instead. Asked of
+	// IDS rather than inferred or configured, and memoized per account in
+	// hasSMSRelay. Placed after the repair, so a portal that just routed over
+	// iMessage is unaffected, and before the file branch so it covers attachments.
+	//
+	// Deliberately has no group exclusion, unlike the repair above. A carrier
+	// GROUP send with no relay is exactly as undeliverable as a DM one, and
+	// failing it is honest; the repair excludes groups only because re-keying one
+	// is a portal re-ID rather than a flag flip. Groups have no repair path, so
+	// this is their only protection.
+	if conv.IsSms && !c.hasSMSRelay() {
+		return nil, errNoCarrierRoute
+	}
+
 	// File/image messages
 	if msg.Content.URL != "" || msg.Content.File != nil {
 		return c.handleMatrixFile(ctx, msg, conv)
@@ -6305,23 +6466,87 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	// Bodies large enough to need splitting do reach us: 45,000 bytes of content
+	// still encrypts to well under the homeserver's 65,536-byte PDU cap, and an
+	// unencrypted room has more room still. Measured after the link-preview
+	// envelope is prepended, since that also counts against the wire size.
+	outbound := splitTextChunks(textToSend, maxOutboundTextBytes)
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
-	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
+		// rustpush retried an unreachable iMessage as SMS and found no relay to
+		// carry it. Surface the same explanation as the pre-send guard rather than
+		// a bare wrapped error, which would reach the user with no message at all.
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
 	zerolog.Ctx(ctx).Info().
 		Str("uuid", uuid).
 		Str("portal_id", string(msg.Portal.ID)).
-		Bool("is_sms", c.isPortalSMS(string(msg.Portal.ID))).
+		Bool("is_sms", conv.IsSms).
 		Msg("Message sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
 		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
+		}
+	}
+
+	// Continuation chunks follow the first, once the primary UUID is persisted.
+	// The first UUID stays the bridge message ID so replies, echo dedup and
+	// unsends keep targeting one message; a failed continuation is logged rather
+	// than failing the whole send, since the first chunk has already been
+	// delivered and cannot be recalled. Every UUID that does land is recorded so
+	// a later redaction can unsend all of them — otherwise Matrix would show the
+	// message deleted while the tail stayed on the recipient's device.
+	var continuationUUIDs []string
+	for i, chunk := range outbound[1:] {
+		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.handle, nil, nil, nil)
+		if contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("uuid", uuid).
+				Int("chunk", i+1).
+				Int("chunks", len(outbound)).
+				Msg("Failed to send continuation chunk of oversized outbound message")
+			break
+		}
+		continuationUUIDs = append(continuationUUIDs, contUUID)
+		if c.cloudStore != nil {
+			if err := c.cloudStore.persistMessageUUID(ctx, contUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", contUUID).Msg("Failed to persist continuation UUID; echo may be delivered as duplicate")
+			}
+			// A continuation is a real iMessage, so CloudKit will eventually
+			// return a record for it and upsertMessageBatch will promote the
+			// stub (record_name goes non-empty), at which point the backfill
+			// list queries stop filtering it out. Its text already lives in the
+			// single Matrix event, so bridging it back would duplicate the tail.
+			// Soft-delete is the existing, race-safe way to say "never bridge
+			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
+			//
+			// Known residual, deliberately not worked around. Nothing here can
+			// lose message content: the row is a contentless stub from
+			// persistMessageUUID, and the chunk's text lives in the Matrix event.
+			// The risk is the reverse — the row coming back. The pre-existing
+			// tombstone reaper (deleteOrphanedMessages) removes rows that are
+			// already deleted=TRUE and whose portal has no cloud_chat row yet,
+			// which clears the flag this relies on; a later CloudKit sync then
+			// re-inserts the row deleted=FALSE with a record_name and the chunk
+			// becomes backfillable again, showing up as a duplicate tail under a
+			// message that already contains that text. Every flag we could set
+			// lives in cloud_message so the reap takes all of them, and a
+			// bridgev2 message row would not help because CloudKit backfill
+			// dedups on the anchor cursor rather than per row. The window needs
+			// an outbound send over maxOutboundTextBytes into a portal whose chat
+			// has not synced yet, plus a reap landing inside it.
+			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); err != nil {
+				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
+					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
+			}
 		}
 	}
 
@@ -6341,7 +6566,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			ID:        makeMessageID(uuid),
 			SenderID:  makeUserID(c.handle),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{},
+			Metadata:  &MessageMetadata{ContinuationUUIDs: continuationUUIDs},
 		},
 	}, nil
 }
@@ -6510,6 +6735,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// UUID — no Go-side retry here (would orphan delivery receipts).
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
 	// Persist UUID immediately so echo detection works even if the portal
@@ -6679,11 +6907,33 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
 	}
 	targetGUID := string(msg.EditTarget.ID)
+
+	// An iMessage edit replaces one message, so a Matrix message that had to go
+	// out as several iMessages can only have its first chunk edited; the
+	// continuations keep their original text. Log it rather than inventing a
+	// mechanism — this needs an outbound body over maxOutboundTextBytes, which
+	// no ordinary client produces.
+	if meta, ok := msg.EditTarget.Metadata.(*MessageMetadata); ok && meta != nil && len(meta.ContinuationUUIDs) > 0 {
+		zerolog.Ctx(ctx).Warn().
+			Str("target_uuid", targetGUID).
+			Int("continuations", len(meta.ContinuationUUIDs)).
+			Msg("Editing only the first chunk of a message that was split across several iMessages")
+	}
 
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
@@ -6699,6 +6949,16 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
@@ -6709,8 +6969,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// so unsend it first to keep the same wire ordering — some peers ignore unsends
 	// that arrive out of timeline order for an attachment.
 	var siblingUUID string
+	var continuationUUIDs []string
 	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
 		siblingUUID = meta.SiblingUUID
+		continuationUUIDs = meta.ContinuationUUIDs
 	}
 
 	// Track scrub failures so we can fail-closed at the end after both
@@ -6729,6 +6991,26 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
 					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
+				scrubErrs = append(scrubErrs, scrubErr)
+			}
+		}
+	}
+
+	// An oversized Matrix message was sent as several iMessages. Unsend the
+	// continuations before the primary, mirroring the sibling ordering above:
+	// the tail was sent last, so retracting it first keeps the recipient from
+	// briefly seeing a message whose head is gone but whose tail remains.
+	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
+		contUUID := continuationUUIDs[i]
+		c.trackOutboundUnsend(contUUID)
+		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle); contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("continuation_uuid", contUUID).
+				Msg("Failed to unsend continuation chunk on redact of split message")
+		} else if c.cloudStore != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); scrubErr != nil {
+				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("continuation_uuid", contUUID).
+					Msg("Failed to soft-delete continuation cloud_message on redact of split message")
 				scrubErrs = append(scrubErrs, scrubErr)
 			}
 		}
@@ -6776,6 +7058,16 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		return nil, bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
 
@@ -6835,6 +7127,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check; see HandleMatrixReaction.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
 
@@ -8517,28 +8810,12 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 	// Text message — trim OBJ placeholders before building body.
 	body := rowText
-	var formattedBody string
-	if rowSubject != "" {
-		if body != "" {
-			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(rowSubject), html.EscapeString(body))
-			body = fmt.Sprintf("**%s**\n%s", rowSubject, body)
-		} else {
-			body = rowSubject
-		}
-	}
-	hasText := strings.TrimSpace(body) != ""
+	hasText := body != "" || rowSubject != ""
 	if hasText {
-		textContent := &event.MessageEventContent{
-			MsgType: event.MsgText,
-			Body:    body,
-		}
-		if formattedBody != "" {
-			textContent.Format = event.FormatHTML
-			textContent.FormattedBody = formattedBody
-		}
+		var previews []*event.BeeperLinkPreview
 		if c.Main.Config.URLPreviewsInBackfill {
 			if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
-				textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				previews = []*event.BeeperLinkPreview{
 					fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
 				}
 			}
@@ -8548,10 +8825,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			ID:        makeMessageID(row.GUID),
 			Timestamp: ts,
 			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: textContent,
-				}},
+				Parts: buildTextParts(event.MsgText, rowSubject, body, previews, false),
 			},
 		})
 	}
@@ -11676,30 +11950,290 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 	return nil
 }
 
-func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
-	subject := strings.TrimSpace(ptrStringOr(msg.Subject, ""))
-	content := &event.MessageEventContent{
-		MsgType: event.MsgText,
-		Body:    text,
+// Matrix caps a PDU at 65,536 bytes, and mautrix encrypts every event before
+// submitting it, so the marshaled event content has to leave room for megolm
+// padding, base64 expansion (~4/3) and the PDU envelope. Measured against a real
+// megolm session the cliff sits just under 48,000 bytes of content; 40,000 keeps
+// roughly 15% margin. Text above this is split across several Matrix events
+// instead of being rejected by the server, which used to drop live messages
+// silently and wedge a portal's backfill permanently.
+const maxTextContentBytes = 40000
+
+// maxOutboundTextBytes bounds text travelling the other way, to iMessage. Bodies
+// in the 45,000-47,000 range do reach the bridge from Matrix (that much content
+// still encrypts to under 65,536), so this path is live, if narrow.
+const maxOutboundTextBytes = 45000
+
+// Fixed per-message overhead that rides on the first part and cannot be reduced
+// by splitting the text. Without a bound the shrink loop below can never reach
+// its budget, because shrinking the chunk does nothing about a 60 KB og:
+// description or subject. Neither field is meaningful at these sizes, so
+// truncating loses nothing real. Note this caps the maximum overhead, it does
+// not make the part count deterministic: fetchURLPreview does a live HTTP fetch,
+// so a preview that succeeds on one backfill pass and fails on the next shifts
+// the first chunk boundary and can change the part count.
+const (
+	maxSubjectBytes      = 2048
+	maxPreviewFieldBytes = 2048
+)
+
+// truncateBytes cuts s to at most max bytes on a rune boundary.
+func truncateBytes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// firstChunk returns the leading chunk of text that splitTextChunks would emit,
+// without building the rest of the list. The shrink loop calls this on every
+// iteration, so materialising every chunk each time would be quadratic.
+func firstChunk(text string, max int) string {
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	cut := max
+	// Never cut inside a multi-byte rune.
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if i := strings.LastIndexByte(text[:cut], '\n'); i > max*3/4 {
+		cut = i + 1
+	} else if i := strings.LastIndexByte(text[:cut], ' '); i > max*3/4 {
+		cut = i + 1
+	}
+	if cut <= 0 {
+		// Unreachable for any sane max, but the caller must always advance.
+		cut = max
+	}
+	return text[:cut]
+}
+
+// splitTextChunks cuts text into UTF-8-safe pieces of at most max bytes,
+// preferring a newline and then a space in the last quarter of the window so
+// chunks break at paragraph boundaries rather than mid-word. The chunks always
+// concatenate back to the exact input — nothing is dropped or rewritten.
+func splitTextChunks(text string, max int) []string {
+	if max <= 0 || len(text) <= max {
+		return []string{text}
+	}
+	var out []string
+	for len(text) > max {
+		chunk := firstChunk(text, max)
+		out = append(out, chunk)
+		text = text[len(chunk):]
+	}
+	if text != "" {
+		out = append(out, text)
+	}
+	return out
+}
+
+// boundPreviews returns copies of the previews with their free-text fields
+// capped. Nothing upstream bounds them: urlpreview.go takes og:title and
+// og:description verbatim from a remote page, limited only by the 512 KB body
+// read, and inbound rich links come straight off the wire.
+func boundPreviews(previews []*event.BeeperLinkPreview) []*event.BeeperLinkPreview {
+	if len(previews) == 0 {
+		return nil
+	}
+	out := make([]*event.BeeperLinkPreview, 0, len(previews))
+	for _, p := range previews {
+		if p == nil {
+			continue
+		}
+		bounded := *p
+		// Every free-text field, not just the obvious two: any one of them can
+		// exceed the whole budget on its own, and leaving one uncapped means the
+		// fit loop sheds the entire preview instead of trimming it.
+		bounded.Title = truncateBytes(bounded.Title, maxPreviewFieldBytes)
+		bounded.Description = truncateBytes(bounded.Description, maxPreviewFieldBytes)
+		bounded.SiteName = truncateBytes(bounded.SiteName, maxPreviewFieldBytes)
+		bounded.Type = truncateBytes(bounded.Type, maxPreviewFieldBytes)
+		bounded.ImageType = truncateBytes(bounded.ImageType, maxPreviewFieldBytes)
+		bounded.CanonicalURL = truncateBytes(bounded.CanonicalURL, maxPreviewFieldBytes)
+		bounded.MatchedURL = truncateBytes(bounded.MatchedURL, maxPreviewFieldBytes)
+		bounded.ImageBlurhash = truncateBytes(bounded.ImageBlurhash, maxPreviewFieldBytes)
+		bounded.ImageURL = id.ContentURIString(truncateBytes(string(bounded.ImageURL), maxPreviewFieldBytes))
+		out = append(out, &bounded)
+	}
+	return out
+}
+
+// buildTextContent builds the Matrix content for one chunk of an iMessage's text.
+// Only the first chunk carries the subject, HTML formatting and link previews,
+// so the body/formatted_body duplication is paid once rather than per part.
+func buildTextContent(msgType event.MessageType, subject, chunk string, previews []*event.BeeperLinkPreview, first bool) *event.MessageEventContent {
+	content := &event.MessageEventContent{MsgType: msgType, Body: chunk}
+	if !first {
+		return content
 	}
 	if subject != "" {
-		if text != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", subject, text)
+		if chunk != "" {
+			content.Body = fmt.Sprintf("**%s**\n%s", subject, chunk)
 			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", subject, text)
+			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s",
+				html.EscapeString(subject), html.EscapeString(chunk))
 		} else {
 			content.Body = subject
 		}
 	}
+	content.BeeperLinkPreviews = previews
+	return content
+}
 
-	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
+// editProbeEventID stands in for the real target when measuring what an edit
+// will marshal to. Only its length matters.
+var editProbeEventID = id.EventID("$" + strings.Repeat("A", 43))
 
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
+// measuredSize reports what this content will marshal to on the wire. For an
+// edit that is not the content itself: sendConvertedEdit calls SetEdit after the
+// converter returns, which copies the whole content into m.new_content. SetEdit
+// only drops the duplicated fallback once the *raw* body passes 10,000 bytes,
+// which never happens for heavily escaped text, so the doubling has to be
+// measured rather than assumed away. SetEdit assigns fresh pointers for every
+// field it changes, so probing a shallow copy cannot disturb the original.
+func measuredSize(content *event.MessageEventContent, forEdit bool) int {
+	target := content
+	if forEdit {
+		probe := *content
+		probe.SetEdit(editProbeEventID)
+		target = &probe
+	}
+	encoded, err := json.Marshal(target)
+	if err != nil {
+		// Treat an unmarshalable part as over budget so it degrades rather than
+		// being emitted unmeasured.
+		return maxTextContentBytes + 1
+	}
+	return len(encoded)
+}
+
+// shedOverhead removes the per-part extras that splitting cannot shrink, in
+// increasing order of what dropping them costs the reader. Level 0 keeps
+// everything.
+func shedOverhead(content *event.MessageEventContent, level int) {
+	if level >= 1 {
+		content.Format = ""
+		content.FormattedBody = ""
+	}
+	if level >= 2 {
+		content.BeeperLinkPreviews = nil
+	}
+}
+
+// maxShedLevel is the highest level shedOverhead understands.
+const maxShedLevel = 2
+
+// fitPart returns the largest leading chunk of text whose content fits the
+// budget, together with that content. It shrinks the chunk first and sheds
+// overhead only once shrinking has bottomed out, because the excess is then
+// fixed cost — a subject or a link preview — that no amount of chunking reduces.
+//
+// It never truncates. The caller advances by len(chunk), so a byte dropped here
+// would be lost outright, which is the exact failure this change exists to
+// prevent.
+func fitPart(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, first, forEdit bool) (string, *event.MessageEventContent) {
+	for level := 0; ; level++ {
+		limit := maxTextContentBytes
+		for {
+			chunk := firstChunk(text, limit)
+			content := buildTextContent(msgType, subject, chunk, previews, first)
+			shedOverhead(content, level)
+			size := measuredSize(content, forEdit)
+			if size <= maxTextContentBytes {
+				return chunk, content
+			}
+			if limit <= 512 {
+				if level >= maxShedLevel {
+					// Unreachable rather than a silent fallthrough: with the
+					// subject bounded to maxSubjectBytes, formatting and
+					// previews shed, and the chunk down at 512 bytes, the body
+					// is at most ~2.5 KB raw. Even at JSON escaping's 6x worst
+					// case, doubled for an edit, that is far under the budget.
+					return chunk, content
+				}
+				break // shed one more level and restart the shrink
+			}
+			// Shrink in proportion to the overshoot. Halving would land the
+			// chunk at half the budget instead of just under it, roughly
+			// doubling the event count for no benefit.
+			next := limit * maxTextContentBytes / size * 98 / 100
+			if next >= limit {
+				next = limit / 2
+			}
+			limit = next
+		}
+	}
+}
+
+// buildTextParts converts one iMessage's text into the Matrix message parts for
+// it. Anything that fits in a single event produces exactly one part with the
+// empty part ID, which is what replies, tapbacks, edits and deduplication
+// already target; only oversized text produces continuation parts.
+//
+// Every emitted part is measured, never assumed, and the split is lossless: the
+// parts' text concatenates back to the input exactly.
+func buildTextParts(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, forEdit bool) []*bridgev2.ConvertedMessagePart {
+	subject = truncateBytes(subject, maxSubjectBytes)
+	previews = boundPreviews(previews)
+
+	var parts []*bridgev2.ConvertedMessagePart
+	for first := true; ; first = false {
+		chunk, content := fitPart(msgType, subject, text, previews, first, forEdit)
+		partID := networkid.PartID("")
+		if !first {
+			// Zero-padded so lexical ordering matches emission ordering:
+			// GetAllPartsByID has no ORDER BY, and the edit path maps new parts
+			// onto stored parts positionally.
+			partID = networkid.PartID(fmt.Sprintf("text%03d", len(parts)))
+		}
+		parts = append(parts, &bridgev2.ConvertedMessagePart{
+			ID:      partID,
 			Type:    event.EventMessage,
 			Content: content,
-		}},
+		})
+		text = text[len(chunk):]
+		if text == "" {
+			return parts
+		}
+	}
+}
+
+// textPartIndex returns the ordinal encoded in a text part ID: the default part
+// ("") is 0 and "textNNN" is NNN. Anything unparseable sorts last, so a
+// malformed row cannot shift the positions of the valid ones — sorting it first
+// would push every real part down by one and make the edit path rewrite and
+// redact the wrong events. No current code path emits such an ID; this is a
+// guard, not a live case.
+func textPartIndex(id networkid.PartID) int {
+	if id == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(string(id), "text"))
+	if err != nil || n < 0 {
+		return math.MaxInt
+	}
+	return n
+}
+
+// isTextPartID reports whether a stored part belongs to the text of a message
+// (the default part, or a continuation emitted by buildTextParts) rather than
+// to an attachment.
+func isTextPartID(id networkid.PartID) bool {
+	return id == "" || strings.HasPrefix(string(id), "text")
+}
+
+func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
+	subject := strings.TrimSpace(ptrStringOr(msg.Subject, ""))
+
+	cm := &bridgev2.ConvertedMessage{
+		Parts: buildTextParts(event.MsgText, subject, text,
+			convertURLPreviewToBeeper(ctx, portal, intent, msg, text), false),
 	}
 
 	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
@@ -11730,7 +12264,18 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 	if contact == nil {
 		return nil
 	}
-	name := strings.TrimSpace(contact.Name())
+	// vCard values come straight off a peer-supplied .vcf and parseVCard applies
+	// no length or count limit, so this notice can exceed Matrix's PDU limit —
+	// the same silent-drop-and-wedge failure the text splitter exists to
+	// prevent, and reachable on the CloudKit backfill path too.
+	//
+	// A per-field cap is not enough: the notice assembles up to seven values
+	// into both body and formatted_body, and each input byte can cost 16 bytes
+	// on the wire ('&' becomes "&amp;" via html.EscapeString, then "&amp;"
+	// via encoding/json). Two escape-heavy 2 KB fields already blow the limit.
+	// The only bound that holds for every input is measuring what we built, so
+	// assemble first and then drop lines until it fits.
+	name := truncateBytes(strings.TrimSpace(contact.Name()), maxSubjectBytes)
 	if name == "" && len(contact.Phones) == 0 && len(contact.Emails) == 0 {
 		return nil
 	}
@@ -11745,7 +12290,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		phone = strings.TrimSpace(phone)
+		phone = truncateBytes(strings.TrimSpace(phone), maxSubjectBytes)
 		if phone == "" {
 			continue
 		}
@@ -11756,7 +12301,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		email = strings.TrimSpace(email)
+		email = truncateBytes(strings.TrimSpace(email), maxSubjectBytes)
 		if email == "" {
 			continue
 		}
@@ -11764,13 +12309,26 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		htmlLines = append(htmlLines, "Email: "+html.EscapeString(email))
 	}
 
-	return &event.MessageEventContent{
-		MsgType:       event.MsgNotice,
-		Body:          strings.Join(bodyLines, "\n"),
-		Format:        event.FormatHTML,
-		FormattedBody: strings.Join(htmlLines, "<br/>"),
-		Mentions:      &event.Mentions{},
+	build := func() *event.MessageEventContent {
+		return &event.MessageEventContent{
+			MsgType:       event.MsgNotice,
+			Body:          strings.Join(bodyLines, "\n"),
+			Format:        event.FormatHTML,
+			FormattedBody: strings.Join(htmlLines, "<br/>"),
+			Mentions:      &event.Mentions{},
+		}
 	}
+	content := build()
+	// Drop detail lines from the end — emails first, then phones, then the name —
+	// until the assembled event fits. The "Shared contact" header is a constant,
+	// so this always terminates with something bridgeable rather than an event
+	// the server will reject.
+	for len(bodyLines) > 1 && measuredSize(content, false) > maxTextContentBytes {
+		bodyLines = bodyLines[:len(bodyLines)-1]
+		htmlLines = htmlLines[:len(htmlLines)-1]
+		content = build()
+	}
+	return content
 }
 
 const (
@@ -12552,6 +13110,71 @@ func (c *IMClient) getPortalSMSRouting(portalID string, metadata any) portalSMSR
 
 func (c *IMClient) isPortalSMS(portalID string) bool {
 	return c.getPortalSMSRouting(portalID, nil).IsSMS
+}
+
+// installStatusKitPortalDedup atomically mirrors a canonical presence mode into
+// memory and persistent KV. The returned owner token identifies this exact
+// installation so panic recovery cannot erase a newer alias update.
+func (c *IMClient) installStatusKitPortalDedup(
+	ctx context.Context,
+	portalID networkid.PortalID,
+	modeKey string,
+	loadPersisted func(context.Context) string,
+	storePersisted func(context.Context, string),
+) (installed bool, owner uint64) {
+	c.statusKitPresenceByPortalMu.Lock()
+	defer c.statusKitPresenceByPortalMu.Unlock()
+
+	if prev, loaded := c.statusKitPresenceByPortal.Load(portalID); loaded {
+		if prev.(string) == modeKey {
+			return false, 0
+		}
+	} else if loadPersisted != nil && loadPersisted(ctx) == modeKey {
+		c.statusKitPresenceByPortal.Store(portalID, modeKey)
+		if c.statusKitPresenceByPortalOwner != nil {
+			delete(c.statusKitPresenceByPortalOwner, portalID)
+		}
+		return false, 0
+	}
+
+	if c.statusKitPresenceByPortalOwner == nil {
+		c.statusKitPresenceByPortalOwner = make(map[networkid.PortalID]uint64)
+	}
+	c.statusKitPresenceByPortalSerial++
+	owner = c.statusKitPresenceByPortalSerial
+	c.statusKitPresenceByPortal.Store(portalID, modeKey)
+	c.statusKitPresenceByPortalOwner[portalID] = owner
+	if storePersisted != nil {
+		storePersisted(ctx, modeKey)
+	}
+	return true, owner
+}
+
+// rollbackStatusKitPortalDedup removes a mode only when both its value and
+// installation owner still match. Calls are serialized with installation and
+// the KV compare, so a newer alias update cannot be erased between the checks.
+func (c *IMClient) rollbackStatusKitPortalDedup(
+	ctx context.Context,
+	portalID networkid.PortalID,
+	modeKey string,
+	owner uint64,
+	loadPersisted func(context.Context) string,
+	storePersisted func(context.Context, string),
+) bool {
+	c.statusKitPresenceByPortalMu.Lock()
+	defer c.statusKitPresenceByPortalMu.Unlock()
+
+	if owner == 0 || c.statusKitPresenceByPortalOwner[portalID] != owner {
+		return false
+	}
+	if !c.statusKitPresenceByPortal.CompareAndDelete(portalID, modeKey) {
+		return false
+	}
+	delete(c.statusKitPresenceByPortalOwner, portalID)
+	if loadPersisted != nil && storePersisted != nil && loadPersisted(ctx) == modeKey {
+		storePersisted(ctx, "")
+	}
+	return true
 }
 
 func (c *IMClient) trackUnsend(uuid string) {
