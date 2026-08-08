@@ -93,7 +93,7 @@ func cmdConfig(ctx *cli.Context) error {
 			// on some runs → full re-sync + attachment re-upload loop.
 			DatabaseFileName: "corten-matrix",
 			BridgeTypeName:   "iMessage",
-			BridgeTypeIcon:   "mxc://beeper.com/imessage",
+			BridgeTypeIcon:   "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX",
 			DefaultPickleKey: "beeper",
 		},
 	}

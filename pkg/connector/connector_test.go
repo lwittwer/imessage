@@ -11,16 +11,16 @@ func TestConnectorBridgeInfoUsesCanonicalIMessageProtocol(t *testing.T) {
 	if name.NetworkID != "imessage" {
 		t.Fatalf("NetworkID = %q, want imessage", name.NetworkID)
 	}
-	if name.BeeperBridgeType != "imessagego" {
-		t.Fatalf("BeeperBridgeType = %q, want imessagego", name.BeeperBridgeType)
+	if name.BeeperBridgeType != "imessage" {
+		t.Fatalf("BeeperBridgeType = %q, want imessage", name.BeeperBridgeType)
 	}
 	if name.NetworkIcon != "mxc://maunium.net/tManJEpANASZvDVzvRvhILdX" {
-		t.Fatalf("NetworkIcon = %q, want old iMessage bridge avatar", name.NetworkIcon)
+		t.Fatalf("NetworkIcon = %q, want official Mautrix bridge avatar", name.NetworkIcon)
 	}
 
 	content := event.BridgeEventContent{Protocol: name.AsBridgeInfoSection()}
-	if content.Protocol.ID != "imessagego" {
-		t.Fatalf("pre-fill bridge info protocol ID = %q, want imessagego", content.Protocol.ID)
+	if content.Protocol.ID != "imessage" {
+		t.Fatalf("pre-fill bridge info protocol ID = %q, want imessage", content.Protocol.ID)
 	}
 	displayName := content.Protocol.DisplayName
 	avatarURL := content.Protocol.AvatarURL
