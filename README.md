@@ -127,7 +127,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
-| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
+| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If a unit is already there it refuses and tells you to use `uninstall-service` first. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
 | `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
 | `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
 | `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
@@ -147,7 +147,7 @@ corten-matrix can bridge **two Apple IDs** on the same machine (max two), each a
 - **Add it any time** with `corten-matrix setup 1` (self-hosted) or `corten-matrix setup-beeper 1` (Beeper). You get the same configuration prompts and iMessage login, scoped to the second bridge.
 - **Reconfigure it later** by re-running the same command — e.g. to flip a toggle like CloudKit backfill.
 
-**How it works.** The two accounts never share login state. The first lives in `~/.local/share/corten-matrix`, the second in `~/.local/share/corten-matrix-1`. A single service runs *both* bridge processes (`bridge-all`), so `start` / `stop` / `restart` / `status` act on both at once; `corten-matrix logs` tails the first account and `corten-matrix logs 1` the second.
+**How it works.** The two accounts never share login state. The first lives in `~/.local/share/corten-matrix`, the second in `~/.local/share/corten-matrix-1`. A single service runs *both* bridge processes (`bridge-all`), supervising them independently: if one account crashes, it restarts that account without taking the other down. `start` / `stop` / `restart` / `status` act on both at once; `corten-matrix logs` tails the first account and `corten-matrix logs 1` the second.
 
 **macOS history-backfill caveat.** Each account backfills message history from either **CloudKit** (iCloud sync) or the local **chat.db** (the Mac's Messages database). chat.db only ever holds the messages of the *one* Apple ID signed into Messages on that Mac, so the two accounts can't both use it:
 

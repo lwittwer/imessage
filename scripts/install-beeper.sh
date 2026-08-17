@@ -23,6 +23,20 @@ if [ ! -f "$CONFIG" ] && [ -f "$RESET_CONFIG_BACKUP" ]; then
     fi
 fi
 
+# ── Back up an existing config before anything rewrites it ────
+# Re-running setup is a supported, routine thing to do, and several blocks
+# below rewrite config values in place on every run: the CloudKit backfill
+# toggle, the transcoding / HEIC / FaceTime / StatusKit prompts, and
+# preferred_handle. Accepting a default at a prompt writes that default.
+# Nothing else in this script keeps a copy, so a re-run used to be able to
+# take a hand-edited setting with no way back. Take one before the first
+# write, not after.
+if [ -f "$CONFIG" ]; then
+    CONFIG_BACKUP="$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CONFIG" "$CONFIG_BACKUP"
+    echo "✓ Backed up existing config to $CONFIG_BACKUP"
+fi
+
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 
 echo ""
@@ -384,31 +398,41 @@ if [ "$CURRENT_SOURCE_CHECK" != "chatdb" ] && [ -f "$CARDDAV_BACKUP" ]; then
     if [ -z "$CHECK_EMAIL" ]; then
         source "$CARDDAV_BACKUP"
         if [ -n "${SAVED_CARDDAV_EMAIL:-}" ] && [ -n "${SAVED_CARDDAV_ENC:-}" ]; then
-            python3 -c "
-import re
-text = open('$CONFIG').read()
-if 'carddav:' not in text:
-    lines = text.split('\\n')
+            CM_CONFIG="$CONFIG" CM_EMAIL="$SAVED_CARDDAV_EMAIL" \
+            CM_URL="$SAVED_CARDDAV_URL" CM_USERNAME="$SAVED_CARDDAV_USERNAME" \
+            CM_ENC="$SAVED_CARDDAV_ENC" \
+            python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+if "carddav:" not in text:
+    lines = text.split("\n")
     insert_at = len(lines)
     in_network = False
     for i, line in enumerate(lines):
-        if line.startswith('network:'):
+        if line.startswith("network:"):
             in_network = True
             continue
-        if in_network and line and not line[0].isspace() and not line.startswith('#'):
+        if in_network and line and not line[0].isspace() and not line.startswith("#"):
             insert_at = i
             break
-    carddav = ['    carddav:', '        email: \"\"', '        url: \"\"', '        username: \"\"', '        password_encrypted: \"\"']
+    carddav = ["    carddav:", "        email: \"\"", "        url: \"\"", "        username: \"\"", "        password_encrypted: \"\""]
     lines = lines[:insert_at] + carddav + lines[insert_at:]
-    text = '\\n'.join(lines)
+    text = "\n".join(lines)
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$SAVED_CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$SAVED_CARDDAV_URL\"')
-text = patch(text, 'username', '\"$SAVED_CARDDAV_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$SAVED_CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+text = patch(text, "email", "\"" + os.environ["CM_EMAIL"] + "\"")
+text = patch(text, "url", "\"" + os.environ["CM_URL"] + "\"")
+text = patch(text, "username", "\"" + os.environ["CM_USERNAME"] + "\"")
+text = patch(text, "password_encrypted", "\"" + os.environ["CM_ENC"] + "\"")
+open(cfg, "w").write(text)
+'
             echo "✓ Restored CardDAV config: $SAVED_CARDDAV_EMAIL"
         fi
     fi
@@ -464,17 +488,22 @@ elif [ -t 0 ]; then
 
         if [ "${CONTACT_CHOICE:-}" = "1" ]; then
             # Remove external CardDAV — clear the config fields
-            python3 -c "
-import re
-text = open('$CONFIG').read()
+            CM_CONFIG="$CONFIG" python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"\"')
-text = patch(text, 'url', '\"\"')
-text = patch(text, 'username', '\"\"')
-text = patch(text, 'password_encrypted', '\"\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+for key in ("email", "url", "username", "password_encrypted"):
+    text = patch(text, key, "\"\"")
+open(cfg, "w").write(text)
+'
             rm -f "$CARDDAV_BACKUP"
             echo "✓ Switched to iCloud contacts"
         elif [ -n "${CONTACT_CHOICE:-}" ]; then
@@ -516,11 +545,18 @@ open('$CONFIG', 'w').write(text)
             fi
 
             # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
+            CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+                CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$("$BINARY" carddav-setup "${CARDDAV_ARGS[@]}" 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -528,31 +564,41 @@ open('$CONFIG', 'w').write(text)
                 CARDDAV_RESOLVED_URL=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
                 CARDDAV_ENC=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password_encrypted'])")
                 EFFECTIVE_USERNAME="${CARDDAV_USERNAME:-$CARDDAV_EMAIL}"
-                python3 -c "
-import re
-text = open('$CONFIG').read()
-if 'carddav:' not in text:
-    lines = text.split('\\n')
+                CM_CONFIG="$CONFIG" CM_EMAIL="$CARDDAV_EMAIL" \
+                CM_URL="$CARDDAV_RESOLVED_URL" CM_USERNAME="$EFFECTIVE_USERNAME" \
+                CM_ENC="$CARDDAV_ENC" \
+                python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+if "carddav:" not in text:
+    lines = text.split("\n")
     insert_at = len(lines)
     in_network = False
     for i, line in enumerate(lines):
-        if line.startswith('network:'):
+        if line.startswith("network:"):
             in_network = True
             continue
-        if in_network and line and not line[0].isspace() and not line.startswith('#'):
+        if in_network and line and not line[0].isspace() and not line.startswith("#"):
             insert_at = i
             break
-    carddav = ['    carddav:', '        email: \"\"', '        url: \"\"', '        username: \"\"', '        password_encrypted: \"\"']
+    carddav = ["    carddav:", "        email: \"\"", "        url: \"\"", "        username: \"\"", "        password_encrypted: \"\""]
     lines = lines[:insert_at] + carddav + lines[insert_at:]
-    text = '\\n'.join(lines)
+    text = "\n".join(lines)
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$CARDDAV_RESOLVED_URL\"')
-text = patch(text, 'username', '\"$EFFECTIVE_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+text = patch(text, "email", "\"" + os.environ["CM_EMAIL"] + "\"")
+text = patch(text, "url", "\"" + os.environ["CM_URL"] + "\"")
+text = patch(text, "username", "\"" + os.environ["CM_USERNAME"] + "\"")
+text = patch(text, "password_encrypted", "\"" + os.environ["CM_ENC"] + "\"")
+open(cfg, "w").write(text)
+'
                 echo "✓ CardDAV configured: $CARDDAV_EMAIL → $CARDDAV_RESOLVED_URL"
                 cat > "$CARDDAV_BACKUP" << BKEOF
 SAVED_CARDDAV_EMAIL="$CARDDAV_EMAIL"
@@ -625,8 +671,21 @@ FORCE_CLEAR_STATE=false
 # Trust-circle only applies to CloudKit backfill — chatdb never creates
 # trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
 # must be true AND backfill_source must not be "chatdb".
-CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
-BF_SOURCE=$(awk '/backfill_source:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+#
+# Anchored so a commented-out key sitting above the live one cannot win,
+# and tolerant of quoted values, inline comments and CRLF.  The colon must
+# be followed by whitespace: `key:value` is not a YAML mapping — go-yaml
+# rejects the whole file — so treating it as a value would arm the guard
+# on a config the bridge cannot even load.
+# A misread backfill_source is the dangerous direction — it re-arms the
+# guard and wipes a login the bridge itself treats as backfill-disabled.
+cfg_scalar() {
+    awk -F: -v k="$1" '$0 ~ "^[[:space:]]*" k "[[:space:]]*:[[:space:]]" {
+        sub(/#.*/, ""); gsub(/[[:space:]"\047\r]/, "", $2); print $2; exit
+    }' "$CONFIG" 2>/dev/null || true
+}
+CK_ENABLED=$(cfg_scalar cloudkit_backfill)
+BF_SOURCE=$(cfg_scalar backfill_source)
 if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
@@ -874,8 +933,11 @@ fi
 # Runs before Apple login so that iCloud is fully synced before APNs first
 # connects.  This ensures CloudKit backfill can deduplicate any messages that
 # Apple buffers and delivers the moment the bridge registers with APNs.
-_ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+# Same UseCloudKitBackfill() test as the trust-circle guard above, so read the
+# keys the same way — a raw grep|sed leaves quotes and inline comments in place
+# and would offer the sync to a chatdb config.
+_ck_backfill=$(cfg_scalar cloudkit_backfill)
+_ck_source=$(cfg_scalar backfill_source)
 if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────────────────┐"
@@ -1202,9 +1264,14 @@ echo "════════════════════════�
 echo "  Setup Complete"
 echo "═══════════════════════════════════════════════"
 echo ""
-echo "  Logs:    tail -f $LOG_OUT"
-echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
+# Prefer the corten-matrix CLI over raw launchctl: it renders the structured
+# JSON log readably, and start/stop/restart/status work the same here as on
+# Linux. Raw launchctl equivalents are in the README under Management.
+echo "  Status:  corten-matrix status"
+echo "  Logs:    corten-matrix logs"
+echo "  Start:   corten-matrix start"
+echo "  Stop:    corten-matrix stop"
+echo "  Restart: corten-matrix restart"
 fi
 
 # ── Add to PATH (optional; symlink only, no shell-rc edits) ────

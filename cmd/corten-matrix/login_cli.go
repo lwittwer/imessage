@@ -105,7 +105,9 @@ func promptMultiline(label string) string {
 func runInteractiveLogin(br *mxmain.BridgeMain) {
 	// Initialize the bridge (DB, connector, etc.) without starting Matrix.
 	br.PreInit()
+	ensureSecureDeleteDSN(br)
 	repairPermissions(br)
+	migrateDatabaseOwner(br)
 	br.Init()
 
 	ctx := br.Log.WithContext(context.Background())
@@ -119,8 +121,13 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 
 	// Initialize BackgroundCtx (normally set in StartConnectors).
 	// NewLogin needs this for LoadUserLogin.
-	br.Bridge.BackgroundCtx, _ = context.WithCancel(context.Background())
-	br.Bridge.BackgroundCtx = br.Log.WithContext(br.Bridge.BackgroundCtx)
+	//
+	// This used to wrap context.Background() in context.WithCancel and discard
+	// the cancel func, which go vet flags as a context leak. Since the cancel
+	// was never called the context could never be cancelled, so it behaved
+	// exactly as its parent — dropping WithCancel is behaviour-identical and
+	// leaks nothing.
+	br.Bridge.BackgroundCtx = br.Log.WithContext(context.Background())
 
 	// Find the admin user from permissions config.
 	userMXID := findAdminUser(br)

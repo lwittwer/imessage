@@ -131,6 +131,34 @@ must fail closed before local deletion. Keep these boundaries covered by
 `pkg/cli/reset_test.go`; do not use `scripts/reset-bridge.sh` as a
 login-preserving shortcut.
 
+## Service supervision and unit ownership
+
+`corten-matrix bridge-all` is the single service entrypoint for both configured
+accounts. It supervises them independently: one account exiting must restart
+only that account while the other continues running. Service shutdown is the
+opposite boundary and must be coordinated across all children: propagate the
+signal, bound graceful shutdown, kill only after the timeout, and reap every
+child before the supervisor exits.
+
+- Release the parent copy of each account's `bridge.stdout.log` descriptor on
+  every successful exit and failed start so a crash loop cannot exhaust file
+  descriptors.
+- Keep supervisor diagnostics useful without logging full account data paths.
+  The account index and sanitized process error are sufficient.
+- On Linux, resolve service scope from where the unit actually exists, not only
+  from user-bus reachability. A system unit can coexist with a reachable user
+  bus.
+- `install-service` may overwrite only units bearing its managed marker and
+  must preserve their runtime identity and XDG data directory. Uninstall must
+  inspect and verify both user and system scopes.
+- Reset may reuse scope-aware stop detection, but only in its existing
+  post-confirmation stop phase. Service discovery must never move destructive
+  work ahead of reset's session, remote-target, and database checks.
+
+The primary implementation and lifecycle tests are in `pkg/cli/cli.go`,
+`pkg/cli/supervisor_test.go`, `pkg/cli/unit_test.go`, and
+`scripts/reset-bridge.sh`.
+
 ## Branch and stacked-PR publication
 
 `main` is a clean mirror of upstream master. Active repository automation,

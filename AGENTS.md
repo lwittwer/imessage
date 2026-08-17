@@ -172,7 +172,9 @@ config YAML is loaded. Keep existing overrides such as
   second.
 - Structured bridge logs live under each data dir's `logs/bridge.log`.
 - macOS services use `launchd` with `com.lrhodin.corten-matrix`; Linux services
-  use `systemd` as `corten-matrix`.
+  use `systemd` as `corten-matrix`. The single `bridge-all` service supervises
+  configured accounts independently, so one account may restart without
+  interrupting the other; service stop still terminates and reaps both.
 - `corten-matrix reset` is the preferred interactive reset path. For Beeper it
   rebuilds the remote registration and local bridge database by default while
   preserving Apple/iMessage identity state; use `--local-only` to keep remote

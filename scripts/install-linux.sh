@@ -15,6 +15,20 @@ BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 REGISTRATION="$DATA_DIR/registration.yaml"
 
+# ── Back up an existing config before anything rewrites it ────
+# Re-running setup is a supported, routine thing to do, and several blocks
+# below rewrite config values in place on every run: the CloudKit backfill
+# toggle, the transcoding / HEIC / FaceTime / StatusKit prompts, and
+# preferred_handle. Accepting a default at a prompt writes that default.
+# Nothing else in this script keeps a copy, so a re-run used to be able to
+# take a hand-edited setting with no way back. Take one before the first
+# write, not after.
+if [ -f "$CONFIG" ]; then
+    CONFIG_BACKUP="$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CONFIG" "$CONFIG_BACKUP"
+    echo "✓ Backed up existing config to $CONFIG_BACKUP"
+fi
+
 # sudo prefix for SYSTEM-mode systemd calls. Root (e.g. LXC, where sudo often
 # isn't even installed) drives the system manager directly; a non-root sudo user
 # needs sudo to touch root-owned /etc/systemd/system and the system manager bus.
@@ -70,36 +84,47 @@ else
     "$BINARY" -c "$CONFIG" -e 2>/dev/null
     echo "✓ Generated config"
 
-    python3 -c "
-import re, sys
-text = open('$CONFIG').read()
+    # Values are passed through the ENVIRONMENT, never spliced into the Python
+    # source. Interpolating them into '...' literals meant a value containing a
+    # quote or a backslash — a Postgres URI with a password, a domain someone
+    # typo'd — either broke config generation or ran as Python. os.environ
+    # keeps them as data.
+    CM_CONFIG="$CONFIG" CM_ADDRESS="$HS_ADDRESS" CM_DOMAIN="$HS_DOMAIN" \
+    CM_DBTYPE="$DB_TYPE" CM_DBURI="$DB_URI" CM_ADMIN="$ADMIN_USER" \
+    python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
 
 def patch(text, key, val):
+    # re.sub expands backreferences in the REPLACEMENT, so a value containing
+    # a backslash would corrupt the output — pass it through a function to
+    # disable that.
     return re.sub(
-        r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$',
-        r'\1 ' + val,
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
         text, count=1, flags=re.MULTILINE
     )
 
-text = patch(text, 'address', '$HS_ADDRESS')
-text = patch(text, 'domain', '$HS_DOMAIN')
-text = patch(text, 'type', '$DB_TYPE')
-text = patch(text, 'uri', '$DB_URI')
+text = patch(text, "address", os.environ["CM_ADDRESS"])
+text = patch(text, "domain",  os.environ["CM_DOMAIN"])
+text = patch(text, "type",    os.environ["CM_DBTYPE"])
+text = patch(text, "uri",     os.environ["CM_DBURI"])
 
-lines = text.split('\n')
+lines = text.split("\n")
 in_perms = False
 for i, line in enumerate(lines):
-    if 'permissions:' in line and not line.strip().startswith('#'):
+    if "permissions:" in line and not line.strip().startswith("#"):
         in_perms = True
         continue
-    if in_perms and line.strip() and not line.strip().startswith('#'):
+    if in_perms and line.strip() and not line.strip().startswith("#"):
         indent = len(line) - len(line.lstrip())
-        lines[i] = ' ' * indent + '\"$ADMIN_USER\": admin'
+        lines[i] = " " * indent + "\"" + os.environ["CM_ADMIN"] + "\": admin"
         break
-text = '\n'.join(lines)
+text = "\n".join(lines)
 
-open('$CONFIG', 'w').write(text)
-"
+open(cfg, "w").write(text)
+'
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
     sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
@@ -109,11 +134,6 @@ open('$CONFIG', 'w').write(text)
     # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
     sed -i 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
-fi
-
-# ── Ensure backfill_source key exists in config ───────────────
-if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
-    sed -i '/cloudkit_backfill:/a\    backfill_source: cloudkit' "$CONFIG"
 fi
 
 # ── CloudKit backfill toggle (runs every time) ────────────────
@@ -253,17 +273,27 @@ if [ -f "$CARDDAV_BACKUP" ]; then
     if [ -z "$CHECK_EMAIL" ]; then
         source "$CARDDAV_BACKUP"
         if [ -n "${SAVED_CARDDAV_EMAIL:-}" ] && [ -n "${SAVED_CARDDAV_ENC:-}" ]; then
-            python3 -c "
-import re
-text = open('$CONFIG').read()
+            CM_CONFIG="$CONFIG" CM_EMAIL="$SAVED_CARDDAV_EMAIL" \
+            CM_URL="$SAVED_CARDDAV_URL" CM_USERNAME="$SAVED_CARDDAV_USERNAME" \
+            CM_ENC="$SAVED_CARDDAV_ENC" \
+            python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$SAVED_CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$SAVED_CARDDAV_URL\"')
-text = patch(text, 'username', '\"$SAVED_CARDDAV_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$SAVED_CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+text = patch(text, "email", "\"" + os.environ["CM_EMAIL"] + "\"")
+text = patch(text, "url", "\"" + os.environ["CM_URL"] + "\"")
+text = patch(text, "username", "\"" + os.environ["CM_USERNAME"] + "\"")
+text = patch(text, "password_encrypted", "\"" + os.environ["CM_ENC"] + "\"")
+open(cfg, "w").write(text)
+'
             echo "✓ Restored CardDAV config: $SAVED_CARDDAV_EMAIL"
         fi
     fi
@@ -315,17 +345,22 @@ if [ -t 0 ]; then
 
         if [ "${CONTACT_CHOICE:-}" = "1" ]; then
             # Remove external CardDAV — clear the config fields
-            python3 -c "
-import re
-text = open('$CONFIG').read()
+            CM_CONFIG="$CONFIG" python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"\"')
-text = patch(text, 'url', '\"\"')
-text = patch(text, 'username', '\"\"')
-text = patch(text, 'password_encrypted', '\"\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+for key in ("email", "url", "username", "password_encrypted"):
+    text = patch(text, key, "\"\"")
+open(cfg, "w").write(text)
+'
             rm -f "$CARDDAV_BACKUP"
             echo "✓ Switched to iCloud contacts"
         elif [ -n "${CONTACT_CHOICE:-}" ]; then
@@ -367,11 +402,18 @@ open('$CONFIG', 'w').write(text)
             fi
 
             # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
+            CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+                CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$("$BINARY" carddav-setup "${CARDDAV_ARGS[@]}" 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -379,17 +421,27 @@ open('$CONFIG', 'w').write(text)
                 CARDDAV_RESOLVED_URL=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
                 CARDDAV_ENC=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password_encrypted'])")
                 EFFECTIVE_USERNAME="${CARDDAV_USERNAME:-$CARDDAV_EMAIL}"
-                python3 -c "
-import re
-text = open('$CONFIG').read()
+                CM_CONFIG="$CONFIG" CM_EMAIL="$CARDDAV_EMAIL" \
+                CM_URL="$CARDDAV_RESOLVED_URL" CM_USERNAME="$EFFECTIVE_USERNAME" \
+                CM_ENC="$CARDDAV_ENC" \
+                python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
+
 def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$CARDDAV_RESOLVED_URL\"')
-text = patch(text, 'username', '\"$EFFECTIVE_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
+    return re.sub(
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+text = patch(text, "email", "\"" + os.environ["CM_EMAIL"] + "\"")
+text = patch(text, "url", "\"" + os.environ["CM_URL"] + "\"")
+text = patch(text, "username", "\"" + os.environ["CM_USERNAME"] + "\"")
+text = patch(text, "password_encrypted", "\"" + os.environ["CM_ENC"] + "\"")
+open(cfg, "w").write(text)
+'
                 echo "✓ CardDAV configured: $CARDDAV_EMAIL → $CARDDAV_RESOLVED_URL"
                 cat > "$CARDDAV_BACKUP" << BKEOF
 SAVED_CARDDAV_EMAIL="$CARDDAV_EMAIL"
@@ -425,7 +477,25 @@ fi
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
-if [ "$NEEDS_LOGIN" = "false" ]; then
+# Trust-circle only applies to CloudKit backfill — chatdb never creates
+# trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
+# must be true AND backfill_source must not be "chatdb".
+#
+# Anchored so a commented-out key sitting above the live one cannot win,
+# and tolerant of quoted values, inline comments and CRLF.  The colon must
+# be followed by whitespace: `key:value` is not a YAML mapping — go-yaml
+# rejects the whole file — so treating it as a value would arm the guard
+# on a config the bridge cannot even load.
+# A misread backfill_source is the dangerous direction — it re-arms the
+# guard and wipes a login the bridge itself treats as backfill-disabled.
+cfg_scalar() {
+    awk -F: -v k="$1" '$0 ~ "^[[:space:]]*" k "[[:space:]]*:[[:space:]]" {
+        sub(/#.*/, ""); gsub(/[[:space:]"\047\r]/, "", $2); print $2; exit
+    }' "$CONFIG" 2>/dev/null || true
+}
+CK_ENABLED=$(cfg_scalar cloudkit_backfill)
+BF_SOURCE=$(cfg_scalar backfill_source)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
@@ -467,24 +537,11 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 fi
 
 if [ -z "${IN_DOCKER:-}" ]; then
-# ── Optional shell shortcuts (asked before preferred handle so the
-#    handle prompt remains the last interactive step) ─────────────
-# Detect existing systemd scope from installed unit files. If neither
-# scope has the unit yet (first-time install before systemd setup),
-# default to --user (the common path for non-root installs).
-_SHORTCUT_SYSCTL=""
-_SHORTCUT_JCTL=""
-if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    _SHORTCUT_SYSCTL="systemctl --user"
-    _SHORTCUT_JCTL="journalctl --user"
-elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    _SHORTCUT_SYSCTL="${SUDO:+$SUDO }systemctl"
-    _SHORTCUT_JCTL="${SUDO:+$SUDO }journalctl"
-else
-    _SHORTCUT_SYSCTL="systemctl --user"
-    _SHORTCUT_JCTL="journalctl --user"
-fi
-
+# ── Management tip (printed before the preferred-handle prompt so that
+#    prompt remains the last interactive step) ────────────────────
+# No systemd scope detection here: the corten-matrix CLI resolves which scope
+# actually holds the unit at run time, which is the whole reason to point
+# people at it rather than at a spelling frozen at install time.
 echo ""
 echo ""
 echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
@@ -964,16 +1021,20 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo "  Registration: $REGISTRATION"
 echo ""
-if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl --user status "$SERVICE_NAME""
-    echo "  Logs:    journalctl --user -u "$SERVICE_NAME" -f"
-    echo "  Stop:    systemctl --user stop "$SERVICE_NAME""
-    echo "  Restart: systemctl --user restart "$SERVICE_NAME""
-elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl status "$SERVICE_NAME""
-    echo "  Logs:    journalctl -u "$SERVICE_NAME" -f"
-    echo "  Stop:    systemctl stop "$SERVICE_NAME""
-    echo "  Restart: systemctl restart "$SERVICE_NAME""
+if { [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; } \
+   || { [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; }; then
+    # Use the corten-matrix CLI rather than raw systemctl/journalctl. It works
+    # out whether the unit is a --user unit or a system one and whether sudo is
+    # needed, which the raw commands cannot do for you — printing one fixed
+    # spelling here sends half of all installs the wrong one.
+    echo "  Status:  corten-matrix status"
+    echo "  Logs:    corten-matrix logs"
+    echo "  Start:   corten-matrix start"
+    echo "  Stop:    corten-matrix stop"
+    echo "  Restart: corten-matrix restart"
+    echo ""
+    echo "  (Raw systemctl/journalctl equivalents are in the README under"
+    echo "   Management, if you are wiring your own tooling.)"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"

@@ -14,6 +14,11 @@ SECOND_DIR="$3"
 BUNDLE_ID="$4"
 shift 4
 
+# One systemd service runs both configured accounts. Keep the environment
+# override for callers that install a differently named unit, but make the
+# default explicit so the stop path is safe under `set -u`.
+SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
+
 ACCOUNT="all"
 ACCOUNT_SPECIFIED=false
 KEEP_REMOTE=false
@@ -600,13 +605,24 @@ if [ "$UNAME_S" = "Darwin" ]; then
     launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || \
         launchctl unload "$HOME/Library/LaunchAgents/$BUNDLE_ID.plist" 2>/dev/null || true
 else
-    if systemctl --user show-environment >/dev/null 2>&1; then
-        systemctl --user stop corten-matrix 2>/dev/null || true
-    elif [ "$(id -u)" = "0" ]; then
-        systemctl stop corten-matrix 2>/dev/null || true
+    # Resolve the unit's actual systemd scope. A reachable user bus does not
+    # prove that this bridge is a user unit: `systemctl --user stop` silently
+    # no-ops for a service installed in the system manager, leaving the bridge
+    # alive and correctly triggering the fail-closed process check below.
+    SYSTEMCTL_SCOPE=""   # "--user", or "" for the system manager
+    SYSTEMCTL_SUDO=""    # "sudo" when driving the system manager as non-root
+    if systemctl --user cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
+        SYSTEMCTL_SCOPE="--user"
+    elif systemctl cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
+        if [ "$(id -u)" != "0" ]; then
+            SYSTEMCTL_SUDO="sudo"
+        fi
     else
-        sudo systemctl stop corten-matrix 2>/dev/null || true
+        # No unit is installed in either scope; preserve the historical no-op
+        # and let the process check determine whether anything is still live.
+        SYSTEMCTL_SCOPE="--user"
     fi
+    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} systemctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} stop "$SERVICE_NAME" 2>/dev/null || true
 fi
 
 # Never remove state while another process from this corten-matrix executable

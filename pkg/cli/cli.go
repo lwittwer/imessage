@@ -20,16 +20,21 @@ package cli
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -183,13 +188,62 @@ func serviceCtl(action string) {
 	os.Exit(0)
 }
 
-// linuxSystemctl picks the systemctl mode: --user when a user session bus is
-// reachable (a normal login), else system. Containers (LXC) and SSH-without-
-// lingering have no user bus — `systemctl --user` there dies with "Failed to
-// connect to bus", and the install scripts fall back to a SYSTEM unit
-// (SYSTEMD_MODE=system) in that case, which this drives instead.
+// userBusReachable reports whether a systemd user session bus is available.
+// Containers (LXC) and SSH-without-lingering have none — `systemctl --user`
+// there dies with "Failed to connect to bus".
+func userBusReachable() bool {
+	return exec.Command("systemctl", "--user", "show-environment").Run() == nil
+}
+
+// systemdUnitExists reports whether `unit` is installed in the given scope.
+// Probed with plain `systemctl` (never sudo): reading unit state needs no
+// privileges, and we must not prompt for a password just to locate a unit.
+func systemdUnitExists(userScope bool, unit string) bool {
+	args := []string{}
+	if userScope {
+		args = append(args, "--user")
+	}
+	args = append(args, "cat", "--no-pager", unit)
+	cmd := exec.Command("systemctl", args...)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Run() == nil
+}
+
+// linuxSystemctl picks the systemctl mode with no particular unit in mind:
+// --user when a user session bus is reachable (a normal login), else system.
+// Prefer linuxSystemctlFor when the unit is known — bus reachability alone
+// does not tell you where the unit actually lives.
 func linuxSystemctl() (base []string, system bool) {
-	if exec.Command("systemctl", "--user", "show-environment").Run() == nil {
+	return linuxSystemctlFor("")
+}
+
+// linuxSystemctlFor picks the systemctl mode for a SPECIFIC unit.
+//
+// Bus reachability on its own is the wrong question, and getting it wrong is
+// silent. `corten-matrix setup` run under sudo re-execs the install script via
+// `sudo -u $SUDO_USER -H env ...`, an environment with no XDG_RUNTIME_DIR or
+// DBUS_SESSION_BUS_ADDRESS — so the script's own `systemctl --user` probe
+// fails and it installs a SYSTEM unit. Later, from a normal login shell, the
+// user bus IS reachable, so a reachability-only check would pick `--user` and
+// report "Unit corten-matrix.service could not be found" for a service that is
+// installed and running.
+//
+// So: ask where the unit actually is, and only fall back to bus reachability
+// when it is nowhere to be found (e.g. before install).
+func linuxSystemctlFor(unit string) (base []string, system bool) {
+	hasUserBus := userBusReachable()
+	if unit != "" {
+		if hasUserBus && systemdUnitExists(true, unit) {
+			return []string{"systemctl", "--user"}, false
+		}
+		if systemdUnitExists(false, unit) {
+			if os.Geteuid() == 0 {
+				return []string{"systemctl"}, true
+			}
+			return []string{"sudo", "systemctl"}, true
+		}
+	}
+	if hasUserBus {
 		return []string{"systemctl", "--user"}, false
 	}
 	if os.Geteuid() == 0 {
@@ -202,6 +256,18 @@ func linuxSystemctl() (base []string, system bool) {
 func sysctl(args ...string) error {
 	b, _ := linuxSystemctl()
 	return streamRun(b[0], append(append([]string{}, b[1:]...), args...)...)
+}
+
+// sysctlUnit streams a systemctl action against a known unit, in whichever
+// scope actually has that unit. `status` is downgraded to run without sudo:
+// reading a system unit's state is unprivileged, and prompting for a password
+// to answer "is it running?" is a good way to make people stop asking.
+func sysctlUnit(action, unit string) error {
+	b, _ := linuxSystemctlFor(unit)
+	if action == "status" && len(b) > 0 && b[0] == "sudo" {
+		b = b[1:]
+	}
+	return streamRun(b[0], append(append([]string{}, b[1:]...), action, unit)...)
 }
 
 // serviceCtlOne runs one action against a single account's service label
@@ -221,12 +287,13 @@ func serviceCtlOne(action, label string) error {
 		}
 		return nil
 	}
-	// Linux: drive the systemd unit the install scripts created, in whichever mode
-	// has a bus — user normally, system in LXC/containers (see linuxSystemctl).
+	// Linux: drive the systemd unit the install scripts created, in whichever
+	// scope actually HAS that unit — not merely whichever has a bus. See
+	// linuxSystemctlFor for why the difference matters.
 	unit := label + ".service"
 	switch action {
 	case "start", "stop", "restart", "status":
-		return sysctl(action, unit)
+		return sysctlUnit(action, unit)
 	}
 	return nil
 }
@@ -371,26 +438,202 @@ func startAfterSetup() {
 			return
 		}
 	}
-	startOneNow(0) // one service runs every configured account (bridge-all)
+	// one service runs every configured account (bridge-all)
+	if err := startOneNow(0); err != nil {
+		fmt.Printf("\n%s!%s Service installed, but starting it failed: %v\n", cRed, cReset, err)
+		fmt.Println("  Try: corten-matrix start   (then: corten-matrix status)")
+		return
+	}
 	fmt.Printf("\n%s✓%s Bridge started — view logs with: corten-matrix logs\n", cGreen, cReset)
 }
 
 // RunAllBridges is the ExecStart of the ONE service: it runs every configured
 // account's bridge — account 0 always, plus the optional second account — each
-// logging to its own data dir. If any bridge exits, the rest are signalled and we
-// exit non-zero so systemd/launchd restarts the whole service (both) together.
+// logging to its own data dir. Accounts are supervised independently, so one
+// broken account can restart without taking a healthy account down with it.
 func RunAllBridges() {
 	self := selfPath()
 	dirs := []string{cortenDataDir()}
 	if hasSecondAccount() {
 		dirs = append(dirs, secondDataDir())
 	}
-	var cmds []*exec.Cmd
+	var configured []struct {
+		i int
+		d string
+	}
 	for i, d := range dirs {
-		cfg := filepath.Join(d, "config.yaml")
-		if _, err := os.Stat(cfg); err != nil {
+		if _, err := os.Stat(filepath.Join(d, "config.yaml")); err != nil {
 			continue // account not configured yet — skip
 		}
+		configured = append(configured, struct {
+			i int
+			d string
+		}{i: i, d: d})
+	}
+	if len(configured) == 0 {
+		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
+		os.Exit(1)
+	}
+
+	// Catch service shutdown so the children get a chance to terminate cleanly
+	// before bridge-all returns. Without this, stopping the parent can orphan a
+	// child until systemd's later cgroup cleanup (and makes direct invocations
+	// leave bridges running after the supervisor is gone).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var wg sync.WaitGroup
+	for _, account := range configured {
+		wg.Add(1)
+		go func(i int, d string) {
+			defer wg.Done()
+			superviseAccountContext(ctx, self, i, d)
+		}(account.i, account.d)
+	}
+	<-ctx.Done()
+	wg.Wait()
+}
+
+// superviseAccountContext is the testable/lifecycle-aware implementation of
+// independent account supervision. A canceled context stops the current child,
+// waits for it to be reaped, and returns without entering another restart
+// cycle. Sensitive data-directory paths are intentionally omitted from its
+// diagnostics.
+func superviseAccountContext(ctx context.Context, self string, i int, d string) {
+	superviseAccountContextWithDelay(ctx, self, i, d, 5*time.Second)
+}
+
+func superviseAccountContextWithDelay(ctx context.Context, self string, i int, d string, restartDelay time.Duration) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		c, releaseOutput := accountCmdWithOutput(self, i, d)
+		waitErr, started, stopping := runAccountProcess(ctx, c)
+		// accountCmdWithOutput opens a parent-owned descriptor. It must be
+		// closed after both successful waits and failed starts; otherwise every
+		// restart leaks another bridge.stdout.log descriptor in bridge-all.
+		releaseOutput()
+		if !started {
+			fmt.Fprintf(os.Stderr, "corten-matrix: account %d: start failed (%s); retrying in %s\n",
+				i, safeStartError(waitErr), restartDelay)
+			if !waitRestart(ctx, restartDelay) {
+				return
+			}
+			continue
+		}
+		if stopping {
+			return
+		}
+		state := "exited with unknown status"
+		if ps := c.ProcessState; ps != nil {
+			state = ps.String()
+		}
+		// bridge-all's own stderr — the service's stdout, i.e. the journal —
+		// not the per-account bridge.stdout.log the child is redirected into.
+		// `journalctl --user -u corten-matrix.service` is where someone
+		// watching a restart loop looks first.
+		fmt.Fprintf(os.Stderr, "corten-matrix: account %d %s; restarting it in %s\n",
+			i, state, restartDelay)
+		if !waitRestart(ctx, restartDelay) {
+			return
+		}
+	}
+}
+
+// runAccountProcess starts c, waits for it to exit, and reports whether the
+// process started and whether shutdown canceled it. Waiting happens in a
+// goroutine so a service stop can signal the child while still retaining the
+// normal Wait() reaping guarantee.
+func runAccountProcess(ctx context.Context, c *exec.Cmd) (waitErr error, started, stopping bool) {
+	if err := c.Start(); err != nil {
+		return err, false, false
+	}
+	started = true
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- c.Wait() }()
+	select {
+	case waitErr = <-waitDone:
+		return waitErr, true, false
+	case <-ctx.Done():
+		stopChild(c, waitDone)
+		return nil, true, true
+	}
+}
+
+// stopChild gives a running bridge a graceful TERM, then escalates after a
+// bounded interval so bridge-all itself can shut down even if a child wedges.
+// The wait channel is consumed on every path, which both reaps the child and
+// prevents a goroutine from being stranded after a service stop.
+func stopChild(c *exec.Cmd, waitDone <-chan error) {
+	if c.Process == nil {
+		<-waitDone
+		return
+	}
+	_ = c.Process.Signal(syscall.SIGTERM)
+	const childShutdownTimeout = 5 * time.Second
+	timer := time.NewTimer(childShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-waitDone:
+		return
+	case <-timer.C:
+		_ = c.Process.Kill()
+		<-waitDone
+	}
+}
+
+// waitRestart waits for the normal restart delay without making service
+// shutdown wait out the full delay.
+func waitRestart(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// safeStartError keeps process-start diagnostics useful without printing a
+// PathError's full path. In particular, a failed chdir can otherwise expose
+// the user's complete data directory in the service journal.
+func safeStartError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	// Classify common failures before looking at the wrapper type. Returning
+	// Err.Error() would be tempting, but custom PathError values can carry an
+	// arbitrary path in Err too; the supervisor's journal should never echo it.
+	if errors.Is(err, os.ErrNotExist) {
+		return "not found"
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return "permission denied"
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		switch pathErr.Op {
+		case "chdir":
+			return "working directory unavailable"
+		case "fork/exec":
+			return "exec failed"
+		}
+		return "path operation failed"
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return "exec failed"
+	}
+	return "process could not be started"
+}
+
+// accountCmdWithOutput builds a bridge command and returns a release function
+// for the optional parent-owned stdout/stderr file. The child inherits the file
+// during Start; the parent must close its copy after Start/Wait completes.
+func accountCmdWithOutput(self string, i int, d string) (*exec.Cmd, func()) {
+	{
+		cfg := filepath.Join(d, "config.yaml")
 		// Beeper accounts run via their generated start.sh (permission-fix + the
 		// right flags); a self-hosted account runs the binary against its config.
 		var c *exec.Cmd
@@ -424,30 +667,12 @@ func RunAllBridges() {
 		}
 		if f, err := os.OpenFile(soPath, soMode, 0o644); err == nil {
 			c.Stdout, c.Stderr = f, f
+			return c, func() { _ = f.Close() }
 		} else {
 			c.Stdout, c.Stderr = os.Stdout, os.Stderr
 		}
-		if err := c.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "corten-matrix: start account %d: %v\n", i, err)
-			continue
-		}
-		cmds = append(cmds, c)
+		return c, func() {}
 	}
-	if len(cmds) == 0 {
-		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
-		os.Exit(1)
-	}
-	exited := make(chan struct{}, len(cmds))
-	for _, c := range cmds {
-		go func(c *exec.Cmd) { _ = c.Wait(); exited <- struct{}{} }(c)
-	}
-	<-exited // first bridge to stop takes the service down → restart as a unit
-	for _, c := range cmds {
-		if c.Process != nil {
-			_ = c.Process.Signal(syscall.SIGTERM)
-		}
-	}
-	os.Exit(1)
 }
 
 // setEnv returns env with key set to val (replacing any existing entry).
@@ -462,7 +687,9 @@ func setEnv(env []string, key, val string) []string {
 }
 
 // startOneNow loads (and force-starts) one account's already-installed service.
-func startOneNow(idx int) {
+// Returns the start error so the caller can avoid announcing a success that did
+// not happen — a sudo prompt can be declined, and a unit can fail to start.
+func startOneNow(idx int) error {
 	label := serviceLabel(idx)
 	if runtime.GOOS == "darwin" {
 		uid := strconv.Itoa(os.Getuid())
@@ -470,10 +697,11 @@ func startOneNow(idx int) {
 		if exec.Command("launchctl", "bootstrap", "gui/"+uid, plist).Run() != nil {
 			_ = exec.Command("launchctl", "load", "-w", plist).Run()
 		}
-		_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
-		return
+		return exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
 	}
-	_ = sysctl("start", label+".service")
+	// Unit-aware: the unit may live in the system scope even when a user bus
+	// is reachable (see linuxSystemctlFor).
+	return sysctlUnit("start", label+".service")
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`
@@ -506,14 +734,202 @@ func offerAddToPath(self string) {
 	fmt.Printf("  run manually: sudo ln -sf %s %s\n", self, target)
 }
 
+// systemdUnitBody renders the bridge's systemd unit. Pure, so it can be tested
+// on any platform — the body is the part that cannot be exercised without a
+// systemd box, and it is the part whose mistakes are silent (a unit that fails
+// to find its config still returns 0 from `enable --now`, because Type=simple
+// reports success as soon as the fork succeeds).
+//
+// Must stay field-equivalent to install_systemd_user / install_systemd_system
+// in scripts/install-linux.sh and scripts/install-beeper-linux.sh, because
+// `install-service` overwrites units those scripts wrote. See
+// TestSystemdUnitBodyMatchesInstallScripts.
+func systemdUnitBody(system bool, owner, xdgDataHome, self, data, wantedBy string) string {
+	identity := ""
+	if system && owner != "" {
+		identity += "User=" + owner + "\n"
+	}
+	if xdgDataHome != "" {
+		identity += "Environment=XDG_DATA_HOME=" + xdgDataHome + "\n"
+	}
+	return fmt.Sprintf(`%s
+[Unit]
+Description=corten-matrix iMessage bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+%sExecStart=%s bridge-all
+WorkingDirectory=%s
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=%s
+`, managedUnitMarker, identity, self, data, wantedBy)
+}
+
+// managedUnitMarker is written as the first line of every unit this command
+// authors, and is the ONLY thing that licenses overwriting one.
+//
+// Five review rounds went into preserving identity fields out of an arbitrary
+// existing unit, and each round closed one spelling and exposed another —
+// multi-assignment `Environment=A=1 B=2`, line continuations, EnvironmentFile=,
+// `systemctl edit` drop-ins, truncated files. That surface is unbounded, so the
+// strategy was wrong rather than the implementation. Parsing is now confined to
+// units this code wrote itself, which are always in the single canonical form
+// below, and anything else is refused rather than rewritten.
+const managedUnitMarker = "# Managed by corten-matrix install-service. Do not hand-edit; this file is overwritten."
+
+// userUnitDir is where systemd loads user units from. Per systemd.unit(5) the
+// search path is $XDG_CONFIG_HOME/systemd/user when that variable is set, and
+// ~/.config/systemd/user otherwise — the two are NOT both searched, so
+// hardcoding .config writes units into a directory systemd never reads.
+//
+// Takes the home directory explicitly so callers can pass effectiveHome()
+// (which resolves SUDO_USER) rather than root's.
+func userUnitDir(home string) string {
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return filepath.Join(x, "systemd", "user")
+	}
+	return filepath.Join(home, ".config", "systemd", "user")
+}
+
+// unitState reports whether a unit file exists and whether this command wrote
+// it. A file that exists without the marker was authored by the install
+// scripts, an admin, or a config-management tool, and must not be overwritten.
+// A truncated or empty file also lacks the marker, so a half-written unit is
+// refused rather than treated as ours.
+func unitState(path string) (exists, managed bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	return true, strings.Contains(string(b), managedUnitMarker)
+}
+
+// existingUnitIdentity reads User= and Environment=XDG_DATA_HOME= out of an
+// already-installed unit file so an overwrite can carry them forward instead of
+// re-deriving them from whatever environment happens to be running the command.
+//
+// `found` distinguishes "there is no unit to preserve" from "there is a unit and
+// it does not set this field". They are NOT the same: a system unit with no
+// User= deliberately runs as root, so deriving one would silently re-point it at
+// whoever happened to run install-service. Callers must only derive when
+// `found` is false.
+//
+// Key matching tolerates space around `=` because systemd strips both sides
+// (its config parser strstrip()s key and value), and strips one layer of quotes
+// from the value for the same reason. It does not attempt full systemd
+// semantics — multi-assignment Environment= lines, continuations, and
+// EnvironmentFile= all yield "" here, which is safe: with `found` true the
+// caller preserves the absence rather than inventing a value.
+func existingUnitIdentity(path string) (owner, xdgDataHome string, found bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		switch key {
+		case "User":
+			// Last one wins, matching systemd.
+			owner = val
+		case "Environment":
+			if v, ok := strings.CutPrefix(val, "XDG_DATA_HOME="); ok {
+				xdgDataHome = strings.Trim(strings.TrimSpace(v), `"'`)
+			}
+		}
+	}
+	return owner, xdgDataHome, true
+}
+
+// resolveUnitIdentity decides the three coupled fields of a unit write: who it
+// runs as, which XDG_DATA_HOME it pins, and which directory it chdirs into.
+// Pure, so the decision itself is testable — the previous versions of this were
+// inline in serviceInstall, which shells out and os.Exit()s, and every defect
+// so far has been in this decision rather than in the rendering.
+//
+// Preserve-or-derive turns on whether a unit EXISTS (`found`), not on whether a
+// field is empty: a system unit with no User= runs as root deliberately, and
+// deriving one would silently re-point the service at whoever ran the command.
+//
+// The returned data dir is ALWAYS derived from the resolved xdg. Preserving the
+// identity while deriving the working directory from the calling process is how
+// a re-install kills a working unit — systemd chdir()s after switching
+// credentials, and the preserved user usually cannot traverse the caller's home
+// (0750 on Debian/Ubuntu, 0700 on RHEL), which is a fatal 200/CHDIR that
+// Restart=always then loops to the start limit.
+// Every refusal returns an error rather than exiting, so all three decisions are
+// testable. Rounds 3-6 each shipped a defect in a decision that could only be
+// reached through a code path ending in os.Exit.
+func resolveUnitIdentity(system bool, exists, managed bool, preservedOwner, preservedXDG string,
+	sudoUser, currentUser, fallbackXDG string) (owner, xdg, data string, err error) {
+	// Refuse to touch a unit this command did not author. The install scripts
+	// write a richer unit than this does, and admins and config management
+	// write their own; five rounds of trying to preserve arbitrary spellings
+	// safely produced a defect every time.
+	if exists && !managed {
+		return "", "", "", fmt.Errorf("not created by this command")
+	}
+	if exists {
+		owner, xdg = preservedOwner, preservedXDG
+		if xdg == "" {
+			// Only reachable for a unit THIS code wrote, and every such unit
+			// pins XDG_DATA_HOME — so this is a corrupted-own-unit path.
+			//
+			// Substituting the CALLER's fallback here is what round 6 caught:
+			// keeping a preserved User=corten while pinning david's data dir
+			// gives the unit a WorkingDirectory inside another user's home,
+			// which is a fatal 200/CHDIR. An owner with no directory to go
+			// with it is not an identity — refuse rather than invent half.
+			if owner != "" {
+				return "", "", "", fmt.Errorf("it sets User=%s but no XDG_DATA_HOME, so the data directory cannot be determined", owner)
+			}
+			xdg = fallbackXDG
+		}
+	} else {
+		owner = sudoUser
+		if owner == "" {
+			owner = currentUser
+		}
+		if system && owner == "" {
+			// user.Current() fails for a uid with no passwd entry (a container
+			// run as --user 12345). An empty owner emits no User= at all, which
+			// is NOT the same as root — see systemdUnitBody.
+			owner = "root"
+		}
+		xdg = fallbackXDG
+	}
+	// A relative XDG_DATA_HOME reaches here when HOME and XDG_DATA_HOME are
+	// both unset — cortenDataDir() then yields ".local/share/corten-matrix".
+	// systemd ignores a non-absolute WorkingDirectory= (starting the service in
+	// /) but still applies the relative Environment= pin, so the bridge looks
+	// for its config under /. Refuse rather than write that.
+	if !filepath.IsAbs(xdg) {
+		return "", "", "", fmt.Errorf("cannot determine an absolute data directory (%q): set HOME or XDG_DATA_HOME", xdg)
+	}
+	return owner, xdg, filepath.Join(xdg, "corten-matrix"), nil
+}
+
 // serviceInstall installs (and starts) the bridge as a user service pointing at
 // this binary. setup/setup-beeper call this; it's also exposed as a manual command.
 func serviceInstall() {
 	self := selfPath()
 	offerAddToPath(self)
 	data := cortenDataDir()
-	_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
 	if runtime.GOOS == "darwin" {
+		_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
 		dir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
 		_ = os.MkdirAll(dir, 0o755)
 		plist := filepath.Join(dir, cortenBundleID+".plist")
@@ -537,28 +953,85 @@ func serviceInstall() {
 	}
 	// Linux: systemd unit — a user unit normally, a system unit in LXC/containers
 	// (no user bus), matching the install scripts' SYSTEMD_MODE fallback.
-	_, system := linuxSystemctl()
-	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
+	//
+	// Resolve against the EXISTING unit when there is one, and only fall back
+	// to bus reachability on a genuinely fresh install.
+	//
+	// Re-install is the case that matters. `sudo corten-matrix setup` has no
+	// user bus and writes a SYSTEM unit; running `install-service` later from a
+	// login shell does have one, so a bus-only choice would write a SECOND,
+	// user-scope unit and enable it. Two units, same ExecStart, same data dir
+	// and database — and since scope resolution checks user scope first, every
+	// later status/stop/uninstall would then address the user unit while the
+	// system one kept running. Resolving by location makes a re-install
+	// overwrite the unit that is already there.
+	//
+	// Resolve once and reuse `base` for the daemon-reload and enable below, so
+	// those cannot land in a different scope than the one just written.
+	base, system := linuxSystemctlFor("corten-matrix.service")
+	dir := userUnitDir(effectiveHome())
 	wantedBy := "default.target"
 	if system {
 		dir = "/etc/systemd/system"
 		wantedBy = "multi-user.target"
 	}
 	unit := filepath.Join(dir, "corten-matrix.service")
-	body := fmt.Sprintf(`[Unit]
-Description=corten-matrix iMessage bridge
-After=network-online.target
-Wants=network-online.target
 
-[Service]
-ExecStart=%s bridge-all
-WorkingDirectory=%s
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=%s
-`, self, data, wantedBy)
+	// Resolving by location means this OVERWRITES whatever unit is already
+	// there, including one the install scripts authored. So the identity
+	// fields are PRESERVED from that file rather than re-derived: the process
+	// running `install-service` is not necessarily the one the unit runs as
+	// (`su -`, a different login, a cron-ish context), and every attempt to
+	// guess it from the ambient environment has been wrong in a different way.
+	// Derivation is only for a genuinely fresh install, where there is nothing
+	// to preserve.
+	//
+	// Why these two fields specifically:
+	//
+	//   User=  — a system unit without it runs as root, and per systemd.exec's
+	//   SetLoginEnvironment=, $HOME/$LOGNAME/$SHELL default to being set only
+	//   when User= is present. So OMITTING it is not the same as User=root:
+	//   omitted leaves $HOME unset, and os.UserConfigDir() then returns an
+	//   error that pkg/bbctl/main.go discards into a relative path. Write it
+	//   explicitly, root included.
+	//
+	//   Environment=XDG_DATA_HOME= — the bridge resolves its data dir from the
+	//   runtime environment (cortenDataDir), and a systemd user manager is
+	//   started by logind, so it never sees a login shell's exports. Both the
+	//   user AND system units the scripts write pin this; dropping it sends a
+	//   user with a custom XDG_DATA_HOME back to the default path, where
+	//   config.yaml does not exist and the bridge exits 1 on every start.
+	//
+	// User= is still system-scope only — it is not valid in a user unit.
+	//
+	// Preserve-or-derive is decided by whether a unit EXISTS, not by whether
+	// the field is empty. A system unit with no User= deliberately runs as
+	// root; treating that absence as "derive one" would silently re-point it at
+	// whoever ran install-service.
+	exists, managed := unitState(unit)
+	preservedOwner, preservedXDG, _ := existingUnitIdentity(unit)
+	currentUser := ""
+	if u, err := user.Current(); err == nil {
+		currentUser = u.Username
+	}
+	owner, xdg, data, err := resolveUnitIdentity(system, exists, managed, preservedOwner, preservedXDG,
+		os.Getenv("SUDO_USER"), currentUser, filepath.Dir(data))
+	if err != nil {
+		fmt.Printf("%s!%s Not writing %s: %v.\n", cRed, cReset, unit, err)
+		fmt.Println("  Replacing a unit this command did not author has broken working installs before,")
+		fmt.Println("  so it refuses rather than guess.")
+		fmt.Println()
+		fmt.Println("  To manage the existing service: corten-matrix start | stop | restart | status")
+		fmt.Println("  To replace it deliberately:      corten-matrix uninstall-service && corten-matrix install-service")
+		os.Exit(1)
+	}
+	if !exists {
+		// Only create the tree when we derived it: on the preserve path it
+		// already exists, and MkdirAll as root inside another user's home would
+		// leave root-owned directories the service then cannot write.
+		_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
+	}
+	body := systemdUnitBody(system, owner, xdg, self, data, wantedBy)
 	if system && os.Geteuid() != 0 {
 		// system unit needs root: write it via sudo tee.
 		_ = exec.Command("sudo", "mkdir", "-p", dir).Run()
@@ -574,8 +1047,11 @@ WantedBy=%s
 			die("write systemd unit: %v", err)
 		}
 	}
-	_ = sysctl("daemon-reload")
-	if err := sysctl("enable", "--now", "corten-matrix.service"); err != nil {
+	run := func(args ...string) error {
+		return streamRun(base[0], append(append([]string{}, base[1:]...), args...)...)
+	}
+	_ = run("daemon-reload")
+	if err := run("enable", "--now", "corten-matrix.service"); err != nil {
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -587,22 +1063,112 @@ func serviceUninstall() {
 		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", cortenBundleID+".plist")
 		_ = exec.Command("launchctl", "unload", "-w", plist).Run()
 		_ = os.Remove(plist)
+		// Report what is true, same as the Linux path below: if the plist is
+		// still there the LaunchAgent reloads at login, so "removed" would be
+		// a lie.
+		if _, err := os.Stat(plist); err == nil {
+			fmt.Printf("corten-matrix service could NOT be removed — %s still exists.\n", plist)
+			fmt.Printf("Remove it manually:\n  launchctl bootout gui/%d/%s ; rm -f %s\n",
+				os.Getuid(), cortenBundleID, plist)
+			os.Exit(1)
+		}
 		fmt.Println("corten-matrix service removed.")
 		os.Exit(0)
 	}
-	_, system := linuxSystemctl()
-	_ = sysctl("disable", "--now", "corten-matrix.service")
-	if system {
-		unit := "/etc/systemd/system/corten-matrix.service"
-		if os.Geteuid() != 0 {
-			_ = exec.Command("sudo", "rm", "-f", unit).Run()
-		} else {
-			_ = os.Remove(unit)
+	// Resolve the scope ONCE, from where the unit actually is, and use that
+	// same answer for both the disable and the file removal. Deciding with a
+	// bus-reachability probe is how this used to fail silently: a system unit
+	// installed by `sudo corten-matrix setup` would be "disabled" via
+	// `systemctl --user` (error discarded), then we would delete a user unit
+	// file that was never there and print "service removed" while the real
+	// unit stayed enabled and running.
+	unit := "corten-matrix.service"
+	// Loop, because there can legitimately be a unit in BOTH scopes: the
+	// install scripts and `install-service` pick their scope by bus
+	// reachability, so a setup run under sudo (system unit) followed by one
+	// from a login shell (user unit) leaves two. Removing only the one that
+	// resolves first is how "removed" can be true and the bridge still runs.
+	removedAny := false
+	for _, userScope := range []bool{true, false} {
+		if !systemdUnitExists(userScope, unit) {
+			continue
 		}
-	} else {
-		_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "corten-matrix.service"))
+		removedAny = true
+		base := []string{"systemctl"}
+		if userScope {
+			base = append(base, "--user")
+		} else if os.Geteuid() != 0 {
+			base = []string{"sudo", "systemctl"}
+		}
+		_ = streamRun(base[0], append(append([]string{}, base[1:]...), "disable", "--now", unit)...)
+		if userScope {
+			_ = os.Remove(filepath.Join(userUnitDir(effectiveHome()), unit))
+		} else {
+			path := "/etc/systemd/system/" + unit
+			if os.Geteuid() != 0 {
+				_ = exec.Command("sudo", "rm", "-f", path).Run()
+			} else {
+				_ = os.Remove(path)
+			}
+		}
+		// daemon-reload in the same scope we just modified.
+		_ = streamRun(base[0], append(append([]string{}, base[1:]...), "daemon-reload")...)
 	}
-	_ = sysctl("daemon-reload")
+
+	// Say what is actually true. Every command above discards its error —
+	// sudo can be declined or absent, a system unit can refuse to disable —
+	// so the only trustworthy signal is whether the unit is still there.
+	// Printing unconditional success was the other half of the bug this
+	// function had: right scope, still a lie when the removal failed.
+	var leftover []string
+	for _, userScope := range []bool{true, false} {
+		if !systemdUnitExists(userScope, unit) {
+			continue
+		}
+		if userScope {
+			leftover = append(leftover, "user")
+		} else {
+			leftover = append(leftover, "system")
+		}
+	}
+	if len(leftover) > 0 {
+		fmt.Printf("corten-matrix service could NOT be fully removed — still present in the %s scope.\n",
+			strings.Join(leftover, " and "))
+		fmt.Println("Remove it manually, e.g.:")
+		for _, scope := range leftover {
+			if scope == "user" {
+				fmt.Printf("  systemctl --user disable --now %s && rm -f ~/.config/systemd/user/%s\n", unit, unit)
+			} else {
+				fmt.Printf("  sudo systemctl disable --now %s && sudo rm -f /etc/systemd/system/%s\n", unit, unit)
+			}
+		}
+		os.Exit(1)
+	}
+	// "Nothing found" and "couldn't look" are different answers, and the probe
+	// above cannot tell them apart on its own: `systemctl --user cat` fails
+	// identically when the unit is absent and when no user bus is reachable
+	// (under sudo, env_reset drops XDG_RUNTIME_DIR; in a container there is no
+	// user manager at all). Gating on euid==0 was wrong in both directions —
+	// it fired on every LXC-root run where no user unit can exist, and stayed
+	// silent for a non-root user with no user manager.
+	//
+	// Ask the filesystem instead. effectiveHome() resolves SUDO_USER, so this
+	// finds the invoking user's unit even when the probe could not. Narrow by
+	// design: it reports only when a user unit is on disk AND the bus is
+	// unreachable. A reachable bus belonging to the WRONG manager (root with
+	// its own session) still goes unreported — pre-existing, not closed here.
+	userUnitPath := filepath.Join(userUnitDir(effectiveHome()), unit)
+	_, statErr := os.Stat(userUnitPath)
+	userUnitOnDisk := statErr == nil
+	if !userBusReachable() && userUnitOnDisk {
+		fmt.Printf("Could not remove the user-scope unit: %s exists, but no user session bus is reachable from here.\n", userUnitPath)
+		fmt.Println("Remove it as that user, from a normal login session:")
+		fmt.Printf("  systemctl --user disable --now %s && rm -f %s\n", unit, userUnitPath)
+		os.Exit(1)
+	} else if !removedAny {
+		fmt.Println("No corten-matrix service unit was installed; nothing to remove.")
+		os.Exit(0)
+	}
 	fmt.Println("corten-matrix service removed.")
 	os.Exit(0)
 }
