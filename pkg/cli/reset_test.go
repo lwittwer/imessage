@@ -95,18 +95,6 @@ esac
 		"uname": "#!/bin/sh\nprintf '%s\\n' Linux\n",
 		"systemctl": `#!/bin/sh
 printf '%s\n' "$*" >> "$RESET_TEST_SERVICE_LOG"
-case " $* " in
-  *" stop "*)
-    if [ "${RESET_TEST_REFRESH_SESSION:-0}" = "1" ] && [ -f "$RESET_TEST_STATE_DIR/session.json" ]; then
-      cp "$RESET_TEST_STATE_DIR/session.json" "$RESET_TEST_STATE_DIR/.session.refresh"
-      mv "$RESET_TEST_STATE_DIR/.session.refresh" "$RESET_TEST_STATE_DIR/session.json"
-      if [ "${RESET_TEST_SKIP_SESSION_ACK:-0}" != "1" ]; then
-        rm -f "$RESET_TEST_STATE_DIR/.session-save-ok"
-        ln "$RESET_TEST_STATE_DIR/session.json" "$RESET_TEST_STATE_DIR/.session-save-ok"
-      fi
-    fi
-    ;;
-esac
 exit 0
 `,
 		"pgrep": `#!/bin/sh
@@ -129,7 +117,10 @@ exit "${RESET_TEST_PGREP_STATUS:-1}"
 if [ "${RESET_TEST_SQLITE_FAIL:-0}" = "1" ]; then
   exit 1
 fi
-printf '%s\n' "${RESET_TEST_LOGIN_COUNT:-0}"
+case "${2:-}" in
+  *sqlite_master*) printf '%s\n' "${RESET_TEST_LOGIN_TABLE_PRESENT:-1}" ;;
+  *) printf '%s\n' "${RESET_TEST_LOGIN_COUNT:-0}" ;;
+esac
 `,
 		"sleep": "#!/bin/sh\nexit 0\n",
 	} {
@@ -251,18 +242,29 @@ func (f *resetTestFixture) environment() []string {
 
 func (f *resetTestFixture) runPTY(t *testing.T, interactions []resetPTYInteraction, args ...string) ([]byte, error) {
 	t.Helper()
-	if runtime.GOOS != "darwin" {
-		t.Skip("PTY confirmation coverage uses macOS /usr/bin/script")
-	}
-	if _, err := os.Stat("/usr/bin/script"); err != nil {
-		t.Skipf("/usr/bin/script unavailable: %v", err)
+	scriptPath, err := exec.LookPath("script")
+	if err != nil {
+		t.Skipf("script utility unavailable: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmdArgs := []string{"-q", "-e", "/dev/null", "/bin/bash", f.script, f.binary, resetTestBundleID}
-	cmdArgs = append(cmdArgs, args...)
-	cmd := exec.CommandContext(ctx, "/usr/bin/script", cmdArgs...)
+	commandArgs := []string{"/bin/bash", f.script, f.binary, resetTestBundleID}
+	commandArgs = append(commandArgs, args...)
+	var scriptArgs []string
+	switch runtime.GOOS {
+	case "darwin":
+		scriptArgs = append([]string{"-q", "-e", "/dev/null"}, commandArgs...)
+	case "linux":
+		quoted := make([]string, len(commandArgs))
+		for i, arg := range commandArgs {
+			quoted[i] = quoteResetTestShellArg(arg)
+		}
+		scriptArgs = []string{"-q", "-e", "-c", strings.Join(quoted, " "), "/dev/null"}
+	default:
+		t.Skipf("PTY confirmation coverage is unsupported on %s", runtime.GOOS)
+	}
+	cmd := exec.CommandContext(ctx, scriptPath, scriptArgs...)
 	cmd.Dir = f.root
 	cmd.Env = f.environment()
 	stdin, err := cmd.StdinPipe()
@@ -300,6 +302,10 @@ func (f *resetTestFixture) runPTY(t *testing.T, interactions []resetPTYInteracti
 	_ = stdin.Close()
 	_, _ = io.Copy(&output, reader)
 	return output.Bytes(), cmd.Wait()
+}
+
+func quoteResetTestShellArg(arg string) string {
+	return "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
 }
 
 func filteredResetTestEnvironment() []string {
@@ -549,65 +555,18 @@ func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
 		}
 	})
 
-	t.Run("running bridge must refresh session", func(t *testing.T) {
+	t.Run("running bridge may use validated existing session", func(t *testing.T) {
 		f := newResetTestFixture(t)
 		f.seedState(t)
 		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
-
-		output, err := f.run(t, "", "--yes")
-		if err == nil {
-			t.Fatalf("reset accepted a stale pre-shutdown session\n%s", output)
-		}
-		if !strings.Contains(string(output), "session.json was not refreshed") {
-			t.Fatalf("reset did not report the stale shutdown export:\n%s", output)
-		}
-		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
-		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran with a stale shutdown export")
-	})
-
-	t.Run("running bridge accepts atomic session refresh", func(t *testing.T) {
-		f := newResetTestFixture(t)
-		f.seedState(t)
-		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
-		t.Setenv("RESET_TEST_REFRESH_SESSION", "1")
 
 		output, err := f.run(t, "", "--yes")
 		if err != nil {
-			t.Fatalf("reset rejected an atomically refreshed shutdown export: %v\n%s", err, output)
+			t.Fatalf("reset rejected a valid existing session after stopping a running bridge: %v\n%s", err, output)
 		}
-	})
-
-	t.Run("running bridge requires durable save acknowledgement", func(t *testing.T) {
-		f := newResetTestFixture(t)
-		f.seedState(t)
-		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
-		t.Setenv("RESET_TEST_REFRESH_SESSION", "1")
-		t.Setenv("RESET_TEST_SKIP_SESSION_ACK", "1")
-
-		output, err := f.run(t, "", "--yes")
-		if err == nil {
-			t.Fatalf("reset accepted a session replacement without a durable acknowledgement\n%s", output)
+		if got := readResetTestLog(t, f.restoreLog, "restore validation log"); got != "check-restore" {
+			t.Fatalf("reset did not validate the preserved session after shutdown: %q", got)
 		}
-		if !strings.Contains(string(output), "not durably acknowledged") {
-			t.Fatalf("reset did not report the missing save acknowledgement:\n%s", output)
-		}
-		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
-		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran without a durable save acknowledgement")
-	})
-
-	t.Run("explicit full wipe does not require session refresh", func(t *testing.T) {
-		f := newResetTestFixture(t)
-		f.seedState(t)
-		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
-
-		output, err := f.run(t, "", "--yes", "--delete-imessage-state")
-		if err != nil {
-			t.Fatalf("explicit full wipe was blocked by the preservation-only export proof: %v\n%s", err, output)
-		}
-		if strings.Contains(string(output), "session.json was not refreshed") {
-			t.Fatalf("explicit full wipe unexpectedly required a fresh session export:\n%s", output)
-		}
-		assertResetPathAbsent(t, filepath.Join(f.stateDir, "session.json"), "explicit full wipe preserved session state")
 	})
 }
 
@@ -650,6 +609,23 @@ func TestResetCloudKitRequiresTrustCircleValidation(t *testing.T) {
 }
 
 func TestResetNeverLoggedInState(t *testing.T) {
+	t.Run("unmigrated database can reset", func(t *testing.T) {
+		f := newResetTestFixture(t)
+		f.seedState(t)
+		if err := os.Remove(filepath.Join(f.stateDir, "session.json")); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("RESET_TEST_LOGIN_TABLE_PRESENT", "0")
+
+		output, err := f.run(t, "", "--yes")
+		if err != nil {
+			t.Fatalf("unmigrated never-logged-in database could not reset: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "No saved Apple/iMessage login exists") {
+			t.Fatalf("unmigrated database reset did not explain the state:\n%s", output)
+		}
+	})
+
 	t.Run("zero logins can reset", func(t *testing.T) {
 		f := newResetTestFixture(t)
 		f.seedState(t)

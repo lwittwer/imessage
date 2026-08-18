@@ -546,14 +546,12 @@ artifacts, so `session.json`, keystore and trusted-peers data, anisette/state
 directories, config backup files, and unknown future Apple-state files remain
 in place. The bridge also refreshes `session.json` during shutdown, durably
 syncs the replacement, and waits for that final atomic save before disconnect
-completes. After shutdown, reset
-requires a running bridge to have atomically replaced the saved session, then
-requires its same-inode durability acknowledgement and validates the session
-against its keystore before deleting the Beeper registration or
-local bridge database. It also requires restorable token-provider credentials,
-a saved MobileMe delegate, and trust-circle state when the config uses CloudKit
-backfill. A never-logged-in database may proceed only after reset
-confirms that it contains no Apple login.
+completes. After shutdown, reset validates the complete saved session against
+its keystore before deleting the Beeper registration or local bridge database;
+if the final refresh failed, the previous atomic backup remains eligible. It
+also requires restorable token-provider credentials, a saved MobileMe delegate,
+and trust-circle state when the config uses CloudKit backfill. A never-logged-in
+database may proceed only after reset confirms that it contains no Apple login.
 
 ```bash
 corten-matrix reset

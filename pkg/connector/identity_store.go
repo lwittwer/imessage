@@ -75,14 +75,6 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
 }
 
-func sessionSaveAckPath() (string, error) {
-	path, err := sessionFilePath()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(path), ".session-save-ok"), nil
-}
-
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
 // ~/.local/share/corten-matrix/identity.plist
 func legacyIdentityFilePath() (string, error) {
@@ -223,24 +215,6 @@ func writeSessionFileAtomically(path string, data []byte) error {
 	defer dirHandle.Close()
 	if err = dirHandle.Sync(); err != nil {
 		return fmt.Errorf("sync session directory: %w", err)
-	}
-
-	// Publish a success acknowledgement only after the replacement and its
-	// directory entry are durable. The acknowledgement is a hard link to the
-	// exact session inode, allowing reset to distinguish a completed final save
-	// from a rename whose directory sync failed.
-	ackPath := filepath.Join(dir, ".session-save-ok")
-	ackTempPath := ackPath + ".tmp"
-	_ = os.Remove(ackTempPath)
-	defer os.Remove(ackTempPath)
-	if err = os.Link(path, ackTempPath); err != nil {
-		return fmt.Errorf("link session save acknowledgement: %w", err)
-	}
-	if err = os.Rename(ackTempPath, ackPath); err != nil {
-		return fmt.Errorf("replace session save acknowledgement: %w", err)
-	}
-	if err = dirHandle.Sync(); err != nil {
-		return fmt.Errorf("sync session acknowledgement: %w", err)
 	}
 	return nil
 }

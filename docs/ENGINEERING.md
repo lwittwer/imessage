@@ -134,12 +134,9 @@ saved session against its keystore. When the config selects CloudKit backfill,
 also require restorable token-provider credentials, a MobileMe delegate, and
 trust-circle state. Verify the
 bridge process stopped with a required, error-aware process check and a bounded
-shutdown wait before deletion. When the bridge was running, require proof that
-its atomic shutdown save replaced `session.json`; an older valid backup is not
-a fresh export. Require the post-sync `.session-save-ok` hard link to reference
-that exact replacement inode before treating the save as durable. This
-fresh-export proof is preservation-only and must not block
-an explicitly confirmed `--delete-imessage-state` full wipe. A Beeper deletion
+shutdown wait before deletion. A valid existing atomic backup remains usable
+when the best-effort final refresh fails; do not make reset depend on a
+one-invocation freshness proof that a retry silently bypasses. A Beeper deletion
 error must leave local bridge state intact;
 `bbctl delete` already treats verified not-found endpoints as success. Reject
 unknown options, self-hosted installs, PostgreSQL, and custom SQLite paths

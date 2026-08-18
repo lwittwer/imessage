@@ -228,18 +228,9 @@ if [ "$ASSUME_YES" -ne 1 ]; then
     fi
 fi
 
-# When preserving Apple state, a running bridge must atomically replace
-# session.json during shutdown. Capture the inode immediately before stopping,
-# after all interactive waits. Comparing inodes proves that the final save
-# completed even when the serialized state is byte-for-byte unchanged. The
-# explicitly authorized full-wipe path does not need a restorable export.
-BRIDGE_WAS_RUNNING=0
-SESSION_INODE_BEFORE=""
+# Check pgrep itself before stopping; only status 1 means no bridge is running.
 if pgrep -f "corten-matrix bridge-all" >/dev/null 2>&1; then
-    BRIDGE_WAS_RUNNING=1
-    if [ "$DELETE_IMESSAGE_STATE" -ne 1 ] && [ -f "$STATE_DIR/session.json" ]; then
-        SESSION_INODE_BEFORE=$(ls -di "$STATE_DIR/session.json" | awk '{print $1}')
-    fi
+    :
 else
     PGR_STATUS=$?
     if [ "$PGR_STATUS" -ne 1 ]; then
@@ -303,37 +294,12 @@ if [ "$BRIDGE_STOPPED" -ne 1 ]; then
     echo "ERROR: bridge process still running after 35 seconds" >&2
     exit 1
 fi
-if [ "$DELETE_IMESSAGE_STATE" -ne 1 ] && [ "$BRIDGE_WAS_RUNNING" -eq 1 ] && [ -n "$SESSION_INODE_BEFORE" ]; then
-    if [ ! -f "$STATE_DIR/session.json" ]; then
-        echo "ERROR: final shutdown did not preserve session.json." >&2
-        echo "No registration or local state was deleted." >&2
-        exit 1
-    fi
-    SESSION_INODE_AFTER=$(ls -di "$STATE_DIR/session.json" | awk '{print $1}')
-    if [ "$SESSION_INODE_AFTER" = "$SESSION_INODE_BEFORE" ]; then
-        echo "ERROR: session.json was not refreshed during final bridge shutdown." >&2
-        echo "No registration or local state was deleted." >&2
-        exit 1
-    fi
-    SESSION_ACK="$STATE_DIR/.session-save-ok"
-    if [ ! -f "$SESSION_ACK" ]; then
-        echo "ERROR: final session save was not durably acknowledged." >&2
-        echo "No registration or local state was deleted." >&2
-        exit 1
-    fi
-    SESSION_ACK_INODE=$(ls -di "$SESSION_ACK" | awk '{print $1}')
-    if [ "$SESSION_ACK_INODE" != "$SESSION_INODE_AFTER" ]; then
-        echo "ERROR: final session save acknowledgement does not match session.json." >&2
-        echo "No registration or local state was deleted." >&2
-        exit 1
-    fi
-fi
-
 # A normal reset deletes the bridge database, so the saved Apple session must
-# already be independently restorable. The bridge refreshes session.json during
-# shutdown; validate that file against the keystore before deleting either the
-# remote registration or any local bridge state. The explicit full-wipe path
-# deliberately skips this check because it requires a new Apple login.
+# already be independently restorable. Validate the atomically maintained
+# backup after shutdown before deleting either remote registration or local
+# bridge state. If the final save failed, the previous complete backup remains
+# in place and must still pass this validation. The explicit full-wipe path
+# skips the check because it requires a new Apple login.
 if [ "$DELETE_IMESSAGE_STATE" -ne 1 ]; then
     if [ -f "$STATE_DIR/session.json" ]; then
         echo "Validating preserved Apple/iMessage session state..."
@@ -353,17 +319,34 @@ if [ "$DELETE_IMESSAGE_STATE" -ne 1 ]; then
             echo "The bridge remains stopped, but no registration or local state was deleted." >&2
             exit 1
         fi
-        if ! LOGIN_COUNT=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM user_login;" 2>/dev/null); then
-            echo "ERROR: could not verify login state in $DB_PATH." >&2
+        if ! LOGIN_TABLE_PRESENT=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_login';" 2>/dev/null); then
+            echo "ERROR: could not inspect login state in $DB_PATH." >&2
             echo "The bridge remains stopped, but no registration or local state was deleted." >&2
             exit 1
         fi
-        case "$LOGIN_COUNT" in
-            0) echo "No saved Apple/iMessage login exists; continuing with bridge-state reset." ;;
+        case "$LOGIN_TABLE_PRESENT" in
+            0)
+                echo "No saved Apple/iMessage login exists; continuing with bridge-state reset."
+                ;;
+            1)
+                if ! LOGIN_COUNT=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM user_login;" 2>/dev/null); then
+                    echo "ERROR: could not verify login state in $DB_PATH." >&2
+                    echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+                    exit 1
+                fi
+                case "$LOGIN_COUNT" in
+                    0) echo "No saved Apple/iMessage login exists; continuing with bridge-state reset." ;;
+                    *)
+                        echo "ERROR: the database contains an Apple login but session.json is missing." >&2
+                        echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+                        echo "Recover session.json, or use --delete-imessage-state only if a fresh Apple login is acceptable." >&2
+                        exit 1
+                        ;;
+                esac
+                ;;
             *)
-                echo "ERROR: the database contains an Apple login but session.json is missing." >&2
+                echo "ERROR: unexpected user_login table count '$LOGIN_TABLE_PRESENT' in $DB_PATH." >&2
                 echo "The bridge remains stopped, but no registration or local state was deleted." >&2
-                echo "Recover session.json, or use --delete-imessage-state only if a fresh Apple login is acceptable." >&2
                 exit 1
                 ;;
         esac

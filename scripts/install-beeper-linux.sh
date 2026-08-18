@@ -1077,7 +1077,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
         echo "Clearing stale local state before login..."
         rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
-        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/.session-save-ok" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
     fi
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)

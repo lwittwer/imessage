@@ -126,56 +126,12 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	if gotMode := info.Mode().Perm(); gotMode != 0600 {
 		t.Fatalf("session file mode = %o, want 600", gotMode)
 	}
-	ackInfo, err := os.Stat(filepath.Join(filepath.Dir(path), ".session-save-ok"))
-	if err != nil {
-		t.Fatalf("stat session save acknowledgement: %v", err)
-	}
-	if !os.SameFile(info, ackInfo) {
-		t.Fatal("session save acknowledgement does not refer to the saved session inode")
-	}
 	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".session.json-*"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary session files were not cleaned up: %v", matches)
-	}
-}
-
-func TestClearLocalSessionBackupRemovesSaveAcknowledgement(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	log := zerolog.Nop()
-	if err := saveSessionState(log, PersistedSessionState{IDSIdentity: "synthetic-identity"}); err != nil {
-		t.Fatal(err)
-	}
-	legacyPath, err := legacyIdentityFilePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	trustedPeersPath, err := trustedPeersFilePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{legacyPath, trustedPeersPath} {
-		if err = os.WriteFile(path, []byte("synthetic-state"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if removed := clearLocalSessionBackup(nil); removed != 4 {
-		t.Fatalf("removed backup count = %d, want 4", removed)
-	}
-	sessionPath, err := sessionFilePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ackPath, err := sessionSaveAckPath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{sessionPath, ackPath, legacyPath, trustedPeersPath} {
-		if _, err = os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("logout cleanup left session state at %s (err=%v)", path, err)
-		}
 	}
 }
 
