@@ -536,6 +536,7 @@ func fnLogout(ce *commands.Event) {
 func clearLocalSessionBackup(log *zerolog.Logger) int {
 	pathFns := []func() (string, error){
 		sessionFilePath,
+		sessionSaveAckPath,
 		legacyIdentityFilePath,
 		trustedPeersFilePath,
 	}

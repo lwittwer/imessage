@@ -75,6 +75,14 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
 }
 
+func sessionSaveAckPath() (string, error) {
+	path, err := sessionFilePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(path), ".session-save-ok"), nil
+}
+
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
 // ~/.local/share/corten-matrix/identity.plist
 func legacyIdentityFilePath() (string, error) {
@@ -207,6 +215,32 @@ func writeSessionFileAtomically(path string, data []byte) error {
 	}
 	if err = os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace session file: %w", err)
+	}
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open session directory for sync: %w", err)
+	}
+	defer dirHandle.Close()
+	if err = dirHandle.Sync(); err != nil {
+		return fmt.Errorf("sync session directory: %w", err)
+	}
+
+	// Publish a success acknowledgement only after the replacement and its
+	// directory entry are durable. The acknowledgement is a hard link to the
+	// exact session inode, allowing reset to distinguish a completed final save
+	// from a rename whose directory sync failed.
+	ackPath := filepath.Join(dir, ".session-save-ok")
+	ackTempPath := ackPath + ".tmp"
+	_ = os.Remove(ackTempPath)
+	defer os.Remove(ackTempPath)
+	if err = os.Link(path, ackTempPath); err != nil {
+		return fmt.Errorf("link session save acknowledgement: %w", err)
+	}
+	if err = os.Rename(ackTempPath, ackPath); err != nil {
+		return fmt.Errorf("replace session save acknowledgement: %w", err)
+	}
+	if err = dirHandle.Sync(); err != nil {
+		return fmt.Errorf("sync session acknowledgement: %w", err)
 	}
 	return nil
 }
@@ -367,11 +401,48 @@ func CheckSessionRestore(requireKeychain bool) bool {
 	if !session.validate(log) {
 		return false
 	}
-	if requireKeychain && !hasKeychainCliqueState(log) {
-		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
-		return false
+	if requireKeychain {
+		if err := validateCloudKitRestoreState(state); err != nil {
+			log.Info().Err(err).Msg("Session restore check failed: CloudKit account state is not restorable")
+			return false
+		}
+		if !hasKeychainCliqueState(log) {
+			log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
+			return false
+		}
 	}
 	return true
+}
+
+// validateCloudKitRestoreState checks the persisted inputs consumed by
+// RestoreTokenProvider after reset recreates the user_login row. IDS session
+// state and a trusted-peers file alone are not enough: without these values the
+// restored bridge can message, but CloudKit remains unavailable until a fresh
+// Apple login.
+func validateCloudKitRestoreState(state PersistedSessionState) error {
+	required := []struct {
+		name  string
+		value string
+	}{
+		{"account username", state.AccountUsername},
+		{"account hashed password", state.AccountHashedPasswordHex},
+		{"account PET", state.AccountPET},
+		{"account SPD", state.AccountSPDBase64},
+		{"MobileMe delegate", state.MmeDelegateJSON},
+	}
+	for _, field := range required {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("%s is missing", field.name)
+		}
+	}
+	if err := rustpushgo.ValidateTokenProviderRestoreState(
+		state.AccountHashedPasswordHex,
+		state.AccountSPDBase64,
+		state.MmeDelegateJSON,
+	); err != nil {
+		return fmt.Errorf("token-provider restore state is invalid: %w", err)
+	}
+	return nil
 }
 
 // validateSessionRestorePlatformConfig exercises the same hardware-config

@@ -228,16 +228,16 @@ if [ "$ASSUME_YES" -ne 1 ]; then
     fi
 fi
 
-# If a bridge is running, its shutdown must atomically replace session.json.
-# Capture the inode immediately before stopping, after all interactive waits.
-# Comparing inodes proves that the final save completed even when the serialized
-# state is byte-for-byte unchanged. A stopped bridge may use its already
-# validated saved session without manufacturing a new export.
+# When preserving Apple state, a running bridge must atomically replace
+# session.json during shutdown. Capture the inode immediately before stopping,
+# after all interactive waits. Comparing inodes proves that the final save
+# completed even when the serialized state is byte-for-byte unchanged. The
+# explicitly authorized full-wipe path does not need a restorable export.
 BRIDGE_WAS_RUNNING=0
 SESSION_INODE_BEFORE=""
 if pgrep -f "corten-matrix bridge-all" >/dev/null 2>&1; then
     BRIDGE_WAS_RUNNING=1
-    if [ -f "$STATE_DIR/session.json" ]; then
+    if [ "$DELETE_IMESSAGE_STATE" -ne 1 ] && [ -f "$STATE_DIR/session.json" ]; then
         SESSION_INODE_BEFORE=$(ls -di "$STATE_DIR/session.json" | awk '{print $1}')
     fi
 else
@@ -303,7 +303,7 @@ if [ "$BRIDGE_STOPPED" -ne 1 ]; then
     echo "ERROR: bridge process still running after 35 seconds" >&2
     exit 1
 fi
-if [ "$BRIDGE_WAS_RUNNING" -eq 1 ] && [ -n "$SESSION_INODE_BEFORE" ]; then
+if [ "$DELETE_IMESSAGE_STATE" -ne 1 ] && [ "$BRIDGE_WAS_RUNNING" -eq 1 ] && [ -n "$SESSION_INODE_BEFORE" ]; then
     if [ ! -f "$STATE_DIR/session.json" ]; then
         echo "ERROR: final shutdown did not preserve session.json." >&2
         echo "No registration or local state was deleted." >&2
@@ -312,6 +312,18 @@ if [ "$BRIDGE_WAS_RUNNING" -eq 1 ] && [ -n "$SESSION_INODE_BEFORE" ]; then
     SESSION_INODE_AFTER=$(ls -di "$STATE_DIR/session.json" | awk '{print $1}')
     if [ "$SESSION_INODE_AFTER" = "$SESSION_INODE_BEFORE" ]; then
         echo "ERROR: session.json was not refreshed during final bridge shutdown." >&2
+        echo "No registration or local state was deleted." >&2
+        exit 1
+    fi
+    SESSION_ACK="$STATE_DIR/.session-save-ok"
+    if [ ! -f "$SESSION_ACK" ]; then
+        echo "ERROR: final session save was not durably acknowledged." >&2
+        echo "No registration or local state was deleted." >&2
+        exit 1
+    fi
+    SESSION_ACK_INODE=$(ls -di "$SESSION_ACK" | awk '{print $1}')
+    if [ "$SESSION_ACK_INODE" != "$SESSION_INODE_AFTER" ]; then
+        echo "ERROR: final session save acknowledgement does not match session.json." >&2
         echo "No registration or local state was deleted." >&2
         exit 1
     fi
@@ -325,14 +337,11 @@ fi
 if [ "$DELETE_IMESSAGE_STATE" -ne 1 ]; then
     if [ -f "$STATE_DIR/session.json" ]; then
         echo "Validating preserved Apple/iMessage session state..."
+        RESTORE_ARGS=(check-restore)
         if [ "$REQUIRE_KEYCHAIN" -eq 1 ]; then
-            RESTORE_OK=0
-            "$BINARY" check-restore --require-keychain && RESTORE_OK=1
-        else
-            RESTORE_OK=0
-            "$BINARY" check-restore && RESTORE_OK=1
+            RESTORE_ARGS+=(--require-keychain)
         fi
-        if [ "$RESTORE_OK" -ne 1 ]; then
+        if ! "$BINARY" "${RESTORE_ARGS[@]}"; then
             echo "ERROR: preserved Apple/iMessage session state is not safely restorable." >&2
             echo "The bridge remains stopped, but no registration or local state was deleted." >&2
             echo "Repair the saved session, or use --delete-imessage-state only if a fresh Apple login is acceptable." >&2
@@ -370,42 +379,23 @@ fi
 # authenticate to Beeper, fail before local cleanup rather than guessing that
 # the registration is absent.
 echo ""
-if [ -n "$BINARY" ] && [ -x "$BINARY" ]; then
-    # Check whoami first: a registration the server has already dropped can
-    # linger in bbctl whoami, and `bbctl delete` then fails with M_NOT_FOUND
-    # (HTTP 404). Under set -e that aborts the reset with a confusing error,
-    # even though there's nothing left to delete.
-    if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then
-        echo "ERROR: could not revalidate the Beeper registration; local state was not deleted." >&2
-        exit 1
-    fi
-    if printf '%s\n' "$WHOAMI_OUTPUT" | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
-        echo "Deleting and verifying the Beeper registration (this can take up to a minute)..."
-        echo ""
-        if ! "$BINARY" bbctl delete "$BRIDGE_NAME"; then
-            echo "ERROR: Beeper registration deletion failed; local state was not deleted." >&2
-            echo "Resolve the Beeper error and run reset again." >&2
-            exit 1
-        fi
-    else
-        echo "✓ No '$BRIDGE_NAME' registration on server — skipping delete."
-    fi
-else
-    echo "ERROR: corten-matrix binary not available; local state was not deleted." >&2
+# Check whoami first: a registration the server has already dropped can linger
+# there while `bbctl delete` returns M_NOT_FOUND. Revalidation distinguishes
+# that idempotent case from authentication and connectivity failures.
+if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then
+    echo "ERROR: could not revalidate the Beeper registration; local state was not deleted." >&2
     exit 1
 fi
-
-# ── Clear journal logs ───────────────────────────────────────
-echo ""
-echo "Clearing bridge journal logs..."
-if [ "$UNAME_S" != "Darwin" ]; then
-    # Same scope the stop above resolved — a system unit's journal is not in
-    # the user journal, so `--user` here would silently clear nothing.
-    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} journalctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} --unit="$SERVICE_NAME" --rotate 2>/dev/null || true
-    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} journalctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} --unit="$SERVICE_NAME" --vacuum-time=1s 2>/dev/null || true
-    echo "✓ Logs cleared"
+if printf '%s\n' "$WHOAMI_OUTPUT" | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
+    echo "Deleting and verifying the Beeper registration (this can take up to a minute)..."
+    echo ""
+    if ! "$BINARY" bbctl delete "$BRIDGE_NAME"; then
+        echo "ERROR: Beeper registration deletion failed; local state was not deleted." >&2
+        echo "Resolve the Beeper error and run reset again." >&2
+        exit 1
+    fi
 else
-    echo "  (macOS — logs managed by launchd, skipping)"
+    echo "✓ No '$BRIDGE_NAME' registration on server — skipping delete."
 fi
 
 # ── Remove local bridge state ─────────────────────────────────

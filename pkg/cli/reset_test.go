@@ -100,12 +100,15 @@ case " $* " in
     if [ "${RESET_TEST_REFRESH_SESSION:-0}" = "1" ] && [ -f "$RESET_TEST_STATE_DIR/session.json" ]; then
       cp "$RESET_TEST_STATE_DIR/session.json" "$RESET_TEST_STATE_DIR/.session.refresh"
       mv "$RESET_TEST_STATE_DIR/.session.refresh" "$RESET_TEST_STATE_DIR/session.json"
+      if [ "${RESET_TEST_SKIP_SESSION_ACK:-0}" != "1" ]; then
+        rm -f "$RESET_TEST_STATE_DIR/.session-save-ok"
+        ln "$RESET_TEST_STATE_DIR/session.json" "$RESET_TEST_STATE_DIR/.session-save-ok"
+      fi
     fi
     ;;
 esac
 exit 0
 `,
-		"journalctl": "#!/bin/sh\nexit 0\n",
 		"pgrep": `#!/bin/sh
 count=0
 if [ -f "$RESET_TEST_PGREP_LOG" ]; then
@@ -572,6 +575,39 @@ func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reset rejected an atomically refreshed shutdown export: %v\n%s", err, output)
 		}
+	})
+
+	t.Run("running bridge requires durable save acknowledgement", func(t *testing.T) {
+		f := newResetTestFixture(t)
+		f.seedState(t)
+		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
+		t.Setenv("RESET_TEST_REFRESH_SESSION", "1")
+		t.Setenv("RESET_TEST_SKIP_SESSION_ACK", "1")
+
+		output, err := f.run(t, "", "--yes")
+		if err == nil {
+			t.Fatalf("reset accepted a session replacement without a durable acknowledgement\n%s", output)
+		}
+		if !strings.Contains(string(output), "not durably acknowledged") {
+			t.Fatalf("reset did not report the missing save acknowledgement:\n%s", output)
+		}
+		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran without a durable save acknowledgement")
+	})
+
+	t.Run("explicit full wipe does not require session refresh", func(t *testing.T) {
+		f := newResetTestFixture(t)
+		f.seedState(t)
+		t.Setenv("RESET_TEST_PGREP_PRE_STATUS", "0")
+
+		output, err := f.run(t, "", "--yes", "--delete-imessage-state")
+		if err != nil {
+			t.Fatalf("explicit full wipe was blocked by the preservation-only export proof: %v\n%s", err, output)
+		}
+		if strings.Contains(string(output), "session.json was not refreshed") {
+			t.Fatalf("explicit full wipe unexpectedly required a fresh session export:\n%s", output)
+		}
+		assertResetPathAbsent(t, filepath.Join(f.stateDir, "session.json"), "explicit full wipe preserved session state")
 	})
 }
 

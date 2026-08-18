@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -125,12 +126,56 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	if gotMode := info.Mode().Perm(); gotMode != 0600 {
 		t.Fatalf("session file mode = %o, want 600", gotMode)
 	}
+	ackInfo, err := os.Stat(filepath.Join(filepath.Dir(path), ".session-save-ok"))
+	if err != nil {
+		t.Fatalf("stat session save acknowledgement: %v", err)
+	}
+	if !os.SameFile(info, ackInfo) {
+		t.Fatal("session save acknowledgement does not refer to the saved session inode")
+	}
 	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".session.json-*"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary session files were not cleaned up: %v", matches)
+	}
+}
+
+func TestClearLocalSessionBackupRemovesSaveAcknowledgement(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	log := zerolog.Nop()
+	if err := saveSessionState(log, PersistedSessionState{IDSIdentity: "synthetic-identity"}); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath, err := legacyIdentityFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedPeersPath, err := trustedPeersFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{legacyPath, trustedPeersPath} {
+		if err = os.WriteFile(path, []byte("synthetic-state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if removed := clearLocalSessionBackup(nil); removed != 4 {
+		t.Fatalf("removed backup count = %d, want 4", removed)
+	}
+	sessionPath, err := sessionFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath, err := sessionSaveAckPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{sessionPath, ackPath, legacyPath, trustedPeersPath} {
+		if _, err = os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("logout cleanup left session state at %s (err=%v)", path, err)
+		}
 	}
 }
 
@@ -144,6 +189,62 @@ func TestValidateSessionRestorePlatformConfig(t *testing.T) {
 	rustpushgo.InitLogger()
 	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "linux"); err == nil {
 		t.Fatal("Linux restore accepted a malformed hardware key")
+	}
+}
+
+func TestValidateCloudKitRestoreState(t *testing.T) {
+	validSPD := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>DsPrsId</key><integer>12345</integer>
+<key>adsid</key><string>synthetic-adsid</string>
+</dict></plist>`
+	validDelegate := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>tokens</key><dict><key>com.apple.mobileme</key><string>synthetic-token</string></dict>
+<key>config</key><dict>
+<key>com.apple.Dataclass.KeychainSync</key><dict>
+<key>escrowProxyUrl</key><string>https://escrow.example.invalid</string>
+</dict></dict>
+</dict></plist>`
+	valid := PersistedSessionState{
+		AccountUsername:          "user@example.invalid",
+		AccountHashedPasswordHex: "aabbccdd",
+		AccountPET:               "pet",
+		AccountSPDBase64:         base64.StdEncoding.EncodeToString([]byte(validSPD)),
+		MmeDelegateJSON:          validDelegate,
+	}
+	if err := validateCloudKitRestoreState(valid); err != nil {
+		t.Fatalf("valid CloudKit restore state was rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*PersistedSessionState)
+	}{
+		{"missing username", func(state *PersistedSessionState) { state.AccountUsername = "" }},
+		{"invalid hashed password", func(state *PersistedSessionState) { state.AccountHashedPasswordHex = "not-hex" }},
+		{"missing PET", func(state *PersistedSessionState) { state.AccountPET = "" }},
+		{"invalid SPD base64", func(state *PersistedSessionState) { state.AccountSPDBase64 = "not-base64" }},
+		{"invalid SPD plist", func(state *PersistedSessionState) {
+			state.AccountSPDBase64 = base64.StdEncoding.EncodeToString([]byte("not-a-plist"))
+		}},
+		{"SPD missing account identifiers", func(state *PersistedSessionState) {
+			state.AccountSPDBase64 = base64.StdEncoding.EncodeToString([]byte(`<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>`))
+		}},
+		{"missing delegate", func(state *PersistedSessionState) { state.MmeDelegateJSON = "" }},
+		{"invalid delegate plist", func(state *PersistedSessionState) { state.MmeDelegateJSON = "not-a-plist" }},
+		{"delegate missing keychain config", func(state *PersistedSessionState) {
+			state.MmeDelegateJSON = `<?xml version="1.0"?><plist version="1.0"><dict><key>tokens</key><dict><key>token</key><string>value</string></dict><key>config</key><dict></dict></dict></plist>`
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := valid
+			test.mutate(&state)
+			if err := validateCloudKitRestoreState(state); err == nil {
+				t.Fatal("invalid CloudKit restore state was accepted")
+			}
+		})
 	}
 }
 

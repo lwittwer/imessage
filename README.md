@@ -544,12 +544,15 @@ The fork's one policy change is that the default reset **preserves**
 Apple/iMessage login state. Cleanup enumerates only known disposable bridge
 artifacts, so `session.json`, keystore and trusted-peers data, anisette/state
 directories, config backup files, and unknown future Apple-state files remain
-in place. The bridge also refreshes `session.json` during shutdown and waits
-for that final atomic save before disconnect completes. After shutdown, reset
+in place. The bridge also refreshes `session.json` during shutdown, durably
+syncs the replacement, and waits for that final atomic save before disconnect
+completes. After shutdown, reset
 requires a running bridge to have atomically replaced the saved session, then
-validates it against its keystore before deleting the Beeper registration or
-local bridge database. It also requires trust-circle state when the config uses
-CloudKit backfill. A never-logged-in database may proceed only after reset
+requires its same-inode durability acknowledgement and validates the session
+against its keystore before deleting the Beeper registration or
+local bridge database. It also requires restorable token-provider credentials,
+a saved MobileMe delegate, and trust-circle state when the config uses CloudKit
+backfill. A never-logged-in database may proceed only after reset
 confirms that it contains no Apple login.
 
 ```bash
