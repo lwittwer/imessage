@@ -177,9 +177,11 @@ config YAML is loaded. Keep existing overrides such as
   interrupting the other; service stop still terminates and reaps both.
 - `corten-matrix reset` is the preferred interactive reset path. For Beeper it
   rebuilds the remote registration and local bridge database by default while
-  preserving Apple/iMessage identity state; use `--local-only` to keep remote
-  state or `--delete-imessage-state` for the separately confirmed Apple-state
-  wipe. Manual reset removes the service plus the relevant
+  preserving Apple/iMessage identity state. `--delete-imessage-state` is the
+  explicit, separately confirmed full-wipe exception. The reset intentionally
+  follows the upstream primary-account/default-SQLite flow; second-account and
+  external-PostgreSQL resets are not coordinated by this command. Manual reset
+  removes the service plus the relevant
   `~/.local/share/corten-matrix*` data dir and therefore also destroys Apple
   state, so do not use it for ordinary duplicate-room recovery.
 

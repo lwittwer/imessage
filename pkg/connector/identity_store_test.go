@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
-
-	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 func TestPersistedSessionStateFromMetadata(t *testing.T) {
@@ -85,16 +83,20 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	log := zerolog.Nop()
 
-	saveSessionState(log, PersistedSessionState{
+	if err := saveSessionState(log, PersistedSessionState{
 		IDSIdentity: "old-identity",
 		IDSKeyCache: "opaque-key-cache",
-	})
-	saveSessionState(log, persistedSessionStateFromMetadata(&UserLoginMetadata{
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionState(log, persistedSessionStateFromMetadata(&UserLoginMetadata{
 		IDSIdentity:     "new-identity",
 		APSState:        "new-aps",
 		IDSUsers:        "new-users",
 		PreferredHandle: "tel:+15555550123",
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 
 	path, err := sessionFilePath()
 	if err != nil {
@@ -127,87 +129,6 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary session files were not cleaned up: %v", matches)
-	}
-}
-
-func TestCheckSessionRestoreKeychainRequirementDefaultsStrict(t *testing.T) {
-	if !sessionRestoreRequiresKeychain(nil) {
-		t.Fatal("default restore validation must require keychain state")
-	}
-	if sessionRestoreRequiresKeychain([]bool{false}) {
-		t.Fatal("explicit false must disable only the keychain requirement")
-	}
-	if !sessionRestoreRequiresKeychain([]bool{true}) {
-		t.Fatal("explicit true must require keychain state")
-	}
-}
-
-func TestSessionRestoreRequiresHardwareKeyOutsideMacOS(t *testing.T) {
-	withoutKey := PersistedSessionState{}
-	withKey := PersistedSessionState{HardwareKey: "hardware"}
-	if !sessionRestoreHasRequiredPlatformState(withoutKey, "darwin") {
-		t.Fatal("Darwin restore unexpectedly required a hardware key")
-	}
-	if sessionRestoreHasRequiredPlatformState(withoutKey, "linux") {
-		t.Fatal("Linux restore accepted a session without a hardware key")
-	}
-	if !sessionRestoreHasRequiredPlatformState(withKey, "linux") {
-		t.Fatal("Linux restore rejected a session with a hardware key")
-	}
-	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "darwin"); err != nil {
-		t.Fatalf("Darwin restore unexpectedly parsed a hardware key: %v", err)
-	}
-	rustpushgo.InitLogger()
-	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "linux"); err == nil {
-		t.Fatal("Linux restore accepted a malformed hardware key")
-	}
-}
-
-func TestSessionExportAcknowledgementUsesRequestedNonce(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	log := zerolog.Nop()
-	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = os.MkdirAll(filepath.Dir(requestPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(requestPath, []byte("nonce-123\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err = saveSessionState(log, PersistedSessionState{IDSIdentity: "identity"}); err != nil {
-		t.Fatal(err)
-	}
-	if err = acknowledgeSessionExport(log); err != nil {
-		t.Fatal(err)
-	}
-	if request, readErr := os.ReadFile(requestPath); readErr != nil || string(request) != "nonce-123\n" {
-		t.Fatalf("request marker was consumed by acknowledgement: %q, %v", request, readErr)
-	}
-	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ack, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(ack) != "nonce-123\n" {
-		t.Fatalf("acknowledged nonce = %q, want exact request", ack)
-	}
-	if err = clearSessionExportAcknowledgement(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = os.Stat(ackPath); !os.IsNotExist(err) {
-		t.Fatalf("ack marker still exists after clearing: %v", err)
-	}
-	if err = acknowledgeSessionExport(log); err != nil {
-		t.Fatalf("request could not be re-acknowledged by a later disconnect: %v", err)
-	}
-	ack, err = os.ReadFile(ackPath)
-	if err != nil || string(ack) != "nonce-123\n" {
-		t.Fatalf("later acknowledgement = %q, %v", ack, err)
 	}
 }
 

@@ -14,8 +14,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -73,51 +71,6 @@ func sessionFilePath() (string, error) {
 		dataDir = filepath.Join(home, ".local", "share")
 	}
 	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
-}
-
-func sessionExportMarkerPath(name string) (string, error) {
-	path, err := sessionFilePath()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(path), name), nil
-}
-
-func acknowledgeSessionExport(log zerolog.Logger) error {
-	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
-	if err != nil {
-		return err
-	}
-	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
-	if err != nil {
-		return err
-	}
-	request, err := os.ReadFile(requestPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read reset session export request: %w", err)
-	}
-	if len(bytes.TrimSpace(request)) == 0 {
-		return fmt.Errorf("reset session export request is empty")
-	}
-	if err = writeSessionFileAtomically(ackPath, request); err != nil {
-		return fmt.Errorf("acknowledge reset session export: %w", err)
-	}
-	log.Info().Str("path", ackPath).Msg("Acknowledged fresh reset session export")
-	return nil
-}
-
-func clearSessionExportAcknowledgement() error {
-	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
-	if err != nil {
-		return err
-	}
-	if err = os.Remove(ackPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear reset session export acknowledgement: %w", err)
-	}
-	return nil
 }
 
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
@@ -387,12 +340,9 @@ func ListHandles() []string {
 // keystore) exists and the IDS user keys are present in the keystore.
 // Returns true if login can be auto-restored without re-authentication.
 // This is intended to be called from the CLI (check-restore subcommand)
-// before starting the bridge. By default it also requires the trusted-peers
-// keychain state used by contacts and CloudKit; callers that have confirmed
-// those features are disabled may pass false.
-func CheckSessionRestore(requireKeychain ...bool) bool {
+// before starting the bridge.
+func CheckSessionRestore() bool {
 	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
-	mustHaveKeychain := sessionRestoreRequiresKeychain(requireKeychain)
 
 	// Initialize keystore (loads from XDG path, migrates if needed)
 	rustpushgo.InitLogger()
@@ -401,15 +351,6 @@ func CheckSessionRestore(requireKeychain ...bool) bool {
 	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
 		return false
 	}
-	if !sessionRestoreHasRequiredPlatformState(state, runtime.GOOS) {
-		log.Info().Str("platform", runtime.GOOS).Msg("Session restore check failed: hardware key is required on this platform")
-		return false
-	}
-	if err := validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
-		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Session restore check failed: platform configuration is not restorable")
-		return false
-	}
-
 	session := &cachedSessionState{
 		IDSIdentity: state.IDSIdentity,
 		APSState:    state.APSState,
@@ -419,49 +360,9 @@ func CheckSessionRestore(requireKeychain ...bool) bool {
 	if !session.validate(log) {
 		return false
 	}
-	if mustHaveKeychain && !hasKeychainCliqueState(log) {
+	if !hasKeychainCliqueState(log) {
 		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
 		return false
 	}
 	return true
-}
-
-func sessionRestoreRequiresKeychain(option []bool) bool {
-	return len(option) == 0 || option[0]
-}
-
-func sessionRestoreHasRequiredPlatformState(state PersistedSessionState, goos string) bool {
-	return goos == "darwin" || strings.TrimSpace(state.HardwareKey) != ""
-}
-
-// validateSessionRestorePlatformConfig exercises the same hardware-config
-// constructor LoadUserLogin will use after reset. A merely non-empty but
-// malformed hardware key must not authorize deletion of the database on
-// non-macOS systems.
-func validateSessionRestorePlatformConfig(state PersistedSessionState, goos string) (err error) {
-	if goos == "darwin" {
-		return nil
-	}
-	if strings.TrimSpace(state.HardwareKey) == "" {
-		return fmt.Errorf("hardware key is empty")
-	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("hardware key validation panicked: %v", recovered)
-		}
-	}()
-	var config *rustpushgo.WrappedOsConfig
-	if state.DeviceID != "" {
-		config, err = rustpushgo.CreateConfigFromHardwareKeyWithDeviceId(state.HardwareKey, state.DeviceID)
-	} else {
-		config, err = rustpushgo.CreateConfigFromHardwareKey(state.HardwareKey)
-	}
-	if err != nil {
-		return fmt.Errorf("invalid hardware key: %w", err)
-	}
-	if config == nil {
-		return fmt.Errorf("hardware key produced no platform configuration")
-	}
-	config.Destroy()
-	return nil
 }

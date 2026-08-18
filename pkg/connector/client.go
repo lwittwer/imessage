@@ -10180,14 +10180,13 @@ func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfil
 // State persistence
 // ============================================================================
 
-func (c *IMClient) persistState(log zerolog.Logger) (success bool) {
+func (c *IMClient) persistState(log zerolog.Logger) {
 	// Guard against panics crossing the FFI boundary from any of the four
 	// rustpushgo calls below. A panic here would otherwise kill the bridge
 	// on a non-essential periodic persist; skipping one cycle is strictly
 	// safer than crashing the process.
 	defer func() {
 		if r := recover(); r != nil {
-			success = false
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
@@ -10213,7 +10212,7 @@ func (c *IMClient) persistState(log zerolog.Logger) (success bool) {
 	}
 	if cur, _ := c.UserLogin.Client.(*IMClient); cur != c {
 		log.Debug().Msg("Dropping state save from a replaced client")
-		return false
+		return
 	}
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if haveAPS {
@@ -10230,15 +10229,14 @@ func (c *IMClient) persistState(log zerolog.Logger) (success bool) {
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
-		return false
+		return
 	}
 	// Keep the reset-safe file backup synchronized with the same snapshot that
 	// was just committed to the bridge database. In particular, the final save
 	// on shutdown now refreshes session.json before a DB-only reset proceeds.
 	if err := saveSessionState(log, persistedSessionStateFromMetadata(meta)); err != nil {
-		return false
+		return
 	}
-	return true
 }
 
 func (c *IMClient) periodicStateSave(log zerolog.Logger, stopChan <-chan struct{}, stateSaveDone chan<- struct{}) {
@@ -10251,15 +10249,7 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger, stopChan <-chan struct{
 			c.persistState(log)
 			log.Debug().Msg("Periodic state save completed")
 		case <-stopChan:
-			clearErr := clearSessionExportAcknowledgement()
-			if clearErr != nil {
-				log.Error().Err(clearErr).Msg("Failed to clear prior reset session export acknowledgement")
-			}
-			if c.persistState(log) && clearErr == nil {
-				if err := acknowledgeSessionExport(log); err != nil {
-					log.Error().Err(err).Msg("Failed to acknowledge fresh reset session export")
-				}
-			}
+			c.persistState(log)
 			log.Debug().Msg("Final state save on disconnect")
 			return
 		}
