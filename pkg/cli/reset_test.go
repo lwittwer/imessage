@@ -31,6 +31,11 @@ type resetTestFixture struct {
 	script     string
 }
 
+type resetPTYInteraction struct {
+	prompt string
+	reply  string
+}
+
 func embeddedResetScript(t *testing.T) string {
 	t.Helper()
 	data, err := scripts.Files.ReadFile("reset-bridge.sh")
@@ -241,10 +246,7 @@ func (f *resetTestFixture) environment() []string {
 	)
 }
 
-func (f *resetTestFixture) runPTY(t *testing.T, interactions []struct {
-	prompt string
-	reply  string
-}, args ...string) ([]byte, error) {
+func (f *resetTestFixture) runPTY(t *testing.T, interactions []resetPTYInteraction, args ...string) ([]byte, error) {
 	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("PTY confirmation coverage uses macOS /usr/bin/script")
@@ -326,6 +328,40 @@ func assertResetPathExists(t *testing.T, root, name string, want bool) {
 	}
 }
 
+func assertResetPaths(t *testing.T, root string, want bool, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		assertResetPathExists(t, root, name, want)
+	}
+}
+
+func assertResetPathAbsent(t *testing.T, path, action string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s: %v", action, err)
+	}
+}
+
+func readResetTestLog(t *testing.T, path, description string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", description, err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func (f *resetTestFixture) assertBridgeStatePreserved(t *testing.T) {
+	t.Helper()
+	assertResetPaths(t, f.stateDir, true,
+		"config.yaml",
+		"corten-matrix.db",
+		"session.json",
+		"keystore.plist",
+		"logs",
+	)
+}
+
 func TestResetDefaultRemovesBridgeArtifactsAndPreservesAppleState(t *testing.T) {
 	f := newResetTestFixture(t)
 	f.seedState(t)
@@ -335,7 +371,7 @@ func TestResetDefaultRemovesBridgeArtifactsAndPreservesAppleState(t *testing.T) 
 		t.Fatalf("default reset failed: %v\n%s", err, output)
 	}
 
-	for _, name := range []string{
+	assertResetPaths(t, f.stateDir, false,
 		"config.yaml",
 		"config.reset-backup.yaml",
 		".config.reset-new.yaml",
@@ -346,10 +382,8 @@ func TestResetDefaultRemovesBridgeArtifactsAndPreservesAppleState(t *testing.T) 
 		"bridge.stdout.log",
 		"bridge.stderr.log",
 		"logs",
-	} {
-		assertResetPathExists(t, f.stateDir, name, false)
-	}
-	for _, name := range []string{
+	)
+	assertResetPaths(t, f.stateDir, true,
 		"config.yaml.bak.20260818120000",
 		"session.json",
 		"keystore.plist",
@@ -358,9 +392,7 @@ func TestResetDefaultRemovesBridgeArtifactsAndPreservesAppleState(t *testing.T) 
 		"future-apple-state.sentinel",
 		"state",
 		"anisette",
-	} {
-		assertResetPathExists(t, f.stateDir, name, true)
-	}
+	)
 	for _, name := range []string{
 		"config.yaml.bak.20260818120000",
 		"session.json",
@@ -378,18 +410,10 @@ func TestResetDefaultRemovesBridgeArtifactsAndPreservesAppleState(t *testing.T) 
 		}
 	}
 
-	deleteArgs, readErr := os.ReadFile(f.deleteLog)
-	if readErr != nil {
-		t.Fatalf("read fake Beeper delete log: %v", readErr)
-	}
-	if got := strings.TrimSpace(string(deleteArgs)); got != "sh-imessage" {
+	if got := readResetTestLog(t, f.deleteLog, "fake Beeper delete log"); got != "sh-imessage" {
 		t.Fatalf("Beeper delete target = %q, want exact upstream bridge name sh-imessage", got)
 	}
-	restoreArgs, readErr := os.ReadFile(f.restoreLog)
-	if readErr != nil {
-		t.Fatalf("read restore validation log: %v", readErr)
-	}
-	if got := strings.TrimSpace(string(restoreArgs)); got != "check-restore" {
+	if got := readResetTestLog(t, f.restoreLog, "restore validation log"); got != "check-restore" {
 		t.Fatalf("chat.db reset restore args = %q, want check-restore without keychain requirement", got)
 	}
 }
@@ -407,14 +431,9 @@ func TestResetRejectsUnknownAndRemovedOptionsBeforeMutation(t *testing.T) {
 			if !strings.Contains(string(output), "unknown reset option") {
 				t.Fatalf("reset did not reject %s clearly:\n%s", option, output)
 			}
-			assertResetPathExists(t, f.stateDir, "config.yaml", true)
-			assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-			if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-				t.Fatalf("service action ran for rejected option %s: %v", option, statErr)
-			}
-			if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-				t.Fatalf("remote deletion ran for rejected option %s: %v", option, statErr)
-			}
+			assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+			assertResetPathAbsent(t, f.serviceLog, fmt.Sprintf("service action ran for rejected option %s", option))
+			assertResetPathAbsent(t, f.deleteLog, fmt.Sprintf("remote deletion ran for rejected option %s", option))
 		})
 	}
 }
@@ -428,9 +447,7 @@ func TestResetHelpDoesNotRequireStateOrMutate(t *testing.T) {
 	if !strings.Contains(string(output), "Usage: corten-matrix reset") {
 		t.Fatalf("reset --help did not print usage:\n%s", output)
 	}
-	if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-		t.Fatalf("service action ran for --help: %v", statErr)
-	}
+	assertResetPathAbsent(t, f.serviceLog, "service action ran for --help")
 }
 
 func TestResetRejectsUnsupportedDatabaseBeforeMutation(t *testing.T) {
@@ -466,11 +483,8 @@ func TestResetRejectsUnsupportedDatabaseBeforeMutation(t *testing.T) {
 			if !strings.Contains(string(output), tt.want) {
 				t.Fatalf("reset reported the wrong %s error:\n%s", tt.name, output)
 			}
-			assertResetPathExists(t, f.stateDir, "config.yaml", true)
-			assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-			if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-				t.Fatalf("service action ran for unsupported %s: %v", tt.name, statErr)
-			}
+			assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+			assertResetPathAbsent(t, f.serviceLog, fmt.Sprintf("service action ran for unsupported %s", tt.name))
 		})
 	}
 }
@@ -496,14 +510,9 @@ func TestResetRejectsSelfHostedConfigBeforeBeeperOrServiceMutation(t *testing.T)
 	if !strings.Contains(string(output), "Self-hosted installs are out of scope") {
 		t.Fatalf("reset did not explain its self-hosted refusal:\n%s", output)
 	}
-	assertResetPathExists(t, f.stateDir, "config.yaml", true)
-	assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-	if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-		t.Fatalf("service action ran for self-hosted config: %v", statErr)
-	}
-	if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-		t.Fatalf("Beeper deletion ran for self-hosted config: %v", statErr)
-	}
+	assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+	assertResetPathAbsent(t, f.serviceLog, "service action ran for self-hosted config")
+	assertResetPathAbsent(t, f.deleteLog, "Beeper deletion ran for self-hosted config")
 }
 
 func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
@@ -519,11 +528,8 @@ func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
 		if !strings.Contains(string(output), "pgrep failed") {
 			t.Fatalf("reset did not report pgrep failure:\n%s", output)
 		}
-		assertResetPathExists(t, f.stateDir, "config.yaml", true)
-		assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-		if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-			t.Fatalf("remote deletion ran after pgrep failure: %v", statErr)
-		}
+		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran after pgrep failure")
 	})
 
 	t.Run("waits for a slow shutdown", func(t *testing.T) {
@@ -535,11 +541,7 @@ func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reset did not wait for shutdown: %v\n%s", err, output)
 		}
-		attempts, readErr := os.ReadFile(f.pgrepLog)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if got := strings.TrimSpace(string(attempts)); got != "4" {
+		if got := readResetTestLog(t, f.pgrepLog, "pgrep log"); got != "4" {
 			t.Fatalf("pgrep attempts = %q, want 4 (one preflight plus three post-stop)", got)
 		}
 	})
@@ -556,11 +558,8 @@ func TestResetProcessCheckFailsClosedAndRetries(t *testing.T) {
 		if !strings.Contains(string(output), "session.json was not refreshed") {
 			t.Fatalf("reset did not report the stale shutdown export:\n%s", output)
 		}
-		assertResetPathExists(t, f.stateDir, "config.yaml", true)
-		assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-		if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-			t.Fatalf("remote deletion ran with a stale shutdown export: %v", statErr)
-		}
+		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran with a stale shutdown export")
 	})
 
 	t.Run("running bridge accepts atomic session refresh", func(t *testing.T) {
@@ -591,18 +590,11 @@ func TestResetCloudKitRequiresTrustCircleValidation(t *testing.T) {
 			if !strings.Contains(string(output), "session state is not safely restorable") {
 				t.Fatalf("CloudKit reset did not report restore failure:\n%s", output)
 			}
-			restoreArgs, readErr := os.ReadFile(f.restoreLog)
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			if got := strings.TrimSpace(string(restoreArgs)); got != "check-restore --require-keychain" {
+			if got := readResetTestLog(t, f.restoreLog, "restore validation log"); got != "check-restore --require-keychain" {
 				t.Fatalf("CloudKit reset restore args = %q, want keychain requirement", got)
 			}
-			assertResetPathExists(t, f.stateDir, "config.yaml", true)
-			assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-			if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-				t.Fatalf("remote deletion ran after CloudKit restore failure: %v", statErr)
-			}
+			assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+			assertResetPathAbsent(t, f.deleteLog, "remote deletion ran after CloudKit restore failure")
 		})
 	}
 	t.Run("invalid bool fails closed", func(t *testing.T) {
@@ -617,9 +609,7 @@ func TestResetCloudKitRequiresTrustCircleValidation(t *testing.T) {
 		if !strings.Contains(string(output), "invalid cloudkit_backfill") {
 			t.Fatalf("reset did not report invalid CloudKit config:\n%s", output)
 		}
-		if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-			t.Fatalf("service action ran for invalid CloudKit config: %v", statErr)
-		}
+		assertResetPathAbsent(t, f.serviceLog, "service action ran for invalid CloudKit config")
 	})
 }
 
@@ -656,11 +646,8 @@ func TestResetNeverLoggedInState(t *testing.T) {
 		if !strings.Contains(string(output), "--delete-imessage-state") {
 			t.Fatalf("reset omitted the explicit fresh-login escape hatch:\n%s", output)
 		}
-		assertResetPathExists(t, f.stateDir, "config.yaml", true)
-		assertResetPathExists(t, f.stateDir, "corten-matrix.db", true)
-		if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-			t.Fatalf("remote deletion ran without restorable login state: %v", statErr)
-		}
+		assertResetPaths(t, f.stateDir, true, "config.yaml", "corten-matrix.db")
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion ran without restorable login state")
 	})
 }
 
@@ -669,10 +656,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 		f := newResetTestFixture(t)
 		f.seedState(t)
 
-		output, err := f.runPTY(t, []struct {
-			prompt string
-			reply  string
-		}{
+		output, err := f.runPTY(t, []resetPTYInteraction{
 			{prompt: "Type 'reset' to confirm:", reply: "no"},
 		}, "--delete-imessage-state")
 		if err == nil {
@@ -681,7 +665,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 		if !strings.Contains(string(output), "Type 'reset' to confirm:") {
 			t.Fatalf("reset did not reach the primary confirmation prompt:\n%s", output)
 		}
-		for _, name := range []string{
+		assertResetPaths(t, f.stateDir, true,
 			"config.yaml",
 			"corten-matrix.db",
 			"session.json",
@@ -690,22 +674,15 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 			"future-apple-state.sentinel",
 			"state",
 			"anisette",
-		} {
-			assertResetPathExists(t, f.stateDir, name, true)
-		}
-		if _, readErr := os.Stat(f.deleteLog); !os.IsNotExist(readErr) {
-			t.Fatalf("remote deletion occurred after declined confirmation: %v", readErr)
-		}
+		)
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion occurred after declined confirmation")
 	})
 
 	t.Run("declined Apple-state confirmation leaves everything untouched", func(t *testing.T) {
 		f := newResetTestFixture(t)
 		f.seedState(t)
 
-		output, err := f.runPTY(t, []struct {
-			prompt string
-			reply  string
-		}{
+		output, err := f.runPTY(t, []resetPTYInteraction{
 			{prompt: "Type 'reset' to confirm:", reply: "reset"},
 			{prompt: "Type 'DELETE IMESSAGE STATE' to confirm:", reply: "no"},
 		}, "--delete-imessage-state")
@@ -715,7 +692,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 		if !strings.Contains(string(output), "Type 'DELETE IMESSAGE STATE' to confirm:") {
 			t.Fatalf("reset did not reach the Apple-state confirmation prompt:\n%s", output)
 		}
-		for _, name := range []string{
+		assertResetPaths(t, f.stateDir, true,
 			"config.yaml",
 			"corten-matrix.db",
 			"session.json",
@@ -724,12 +701,8 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 			"future-apple-state.sentinel",
 			"state",
 			"anisette",
-		} {
-			assertResetPathExists(t, f.stateDir, name, true)
-		}
-		if _, readErr := os.Stat(f.deleteLog); !os.IsNotExist(readErr) {
-			t.Fatalf("remote deletion occurred after declined Apple-state confirmation: %v", readErr)
-		}
+		)
+		assertResetPathAbsent(t, f.deleteLog, "remote deletion occurred after declined Apple-state confirmation")
 	})
 
 	t.Run("explicit flag wipes Apple state after confirmation", func(t *testing.T) {
@@ -744,7 +717,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("explicit Apple-state reset failed: %v\n%s", err, output)
 		}
-		for _, name := range []string{
+		assertResetPaths(t, f.stateDir, false,
 			"config.yaml",
 			"corten-matrix.db",
 			"corten-matrix.db-wal",
@@ -760,9 +733,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 			"future-apple-state.sentinel",
 			"state",
 			"anisette",
-		} {
-			assertResetPathExists(t, f.stateDir, name, false)
-		}
+		)
 	})
 }
 
@@ -781,18 +752,8 @@ func TestResetRestoreValidationFailurePreservesRemoteAndLocalState(t *testing.T)
 	if !strings.Contains(string(output), "--delete-imessage-state") {
 		t.Fatalf("reset omitted the explicit fresh-login escape hatch:\n%s", output)
 	}
-	for _, name := range []string{
-		"config.yaml",
-		"corten-matrix.db",
-		"session.json",
-		"keystore.plist",
-		"logs",
-	} {
-		assertResetPathExists(t, f.stateDir, name, true)
-	}
-	if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-		t.Fatalf("remote deletion ran after restore validation failed: %v", statErr)
-	}
+	f.assertBridgeStatePreserved(t)
+	assertResetPathAbsent(t, f.deleteLog, "remote deletion ran after restore validation failed")
 }
 
 func TestResetRemoteDeleteFailurePreservesLocalState(t *testing.T) {
@@ -807,20 +768,8 @@ func TestResetRemoteDeleteFailurePreservesLocalState(t *testing.T) {
 	if !strings.Contains(string(output), "registration deletion failed") {
 		t.Fatalf("reset did not report Beeper deletion failure:\n%s", output)
 	}
-	for _, name := range []string{
-		"config.yaml",
-		"corten-matrix.db",
-		"session.json",
-		"keystore.plist",
-		"logs",
-	} {
-		assertResetPathExists(t, f.stateDir, name, true)
-	}
-	deleteArgs, readErr := os.ReadFile(f.deleteLog)
-	if readErr != nil {
-		t.Fatalf("read fake Beeper delete log: %v", readErr)
-	}
-	if got := strings.TrimSpace(string(deleteArgs)); got != "sh-imessage" {
+	f.assertBridgeStatePreserved(t)
+	if got := readResetTestLog(t, f.deleteLog, "fake Beeper delete log"); got != "sh-imessage" {
 		t.Fatalf("failed Beeper delete targeted %q, want sh-imessage", got)
 	}
 }
@@ -840,21 +789,9 @@ func TestResetWhoamiFailurePreservesLocalState(t *testing.T) {
 	if !strings.Contains(string(output), "self-hosted installs are out of scope") {
 		t.Fatalf("reset did not explain its Beeper-only scope:\n%s", output)
 	}
-	for _, name := range []string{
-		"config.yaml",
-		"corten-matrix.db",
-		"session.json",
-		"keystore.plist",
-		"logs",
-	} {
-		assertResetPathExists(t, f.stateDir, name, true)
-	}
-	if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
-		t.Fatalf("remote deletion ran after Beeper verification failed: %v", statErr)
-	}
-	if _, statErr := os.Stat(f.serviceLog); !os.IsNotExist(statErr) {
-		t.Fatalf("service was stopped after Beeper preflight failed: %v", statErr)
-	}
+	f.assertBridgeStatePreserved(t)
+	assertResetPathAbsent(t, f.deleteLog, "remote deletion ran after Beeper verification failed")
+	assertResetPathAbsent(t, f.serviceLog, "service was stopped after Beeper preflight failed")
 }
 
 func TestResetUsesUpstreamBridgeNameWhenEnvironmentIsUnset(t *testing.T) {
@@ -864,11 +801,7 @@ func TestResetUsesUpstreamBridgeNameWhenEnvironmentIsUnset(t *testing.T) {
 	if _, err := f.run(t, "", "--yes"); err != nil {
 		t.Fatalf("reset failed: %v", err)
 	}
-	data, err := os.ReadFile(f.deleteLog)
-	if err != nil {
-		t.Fatalf("read fake Beeper delete log: %v", err)
-	}
-	if got := strings.TrimSpace(string(data)); got != "sh-imessage" {
+	if got := readResetTestLog(t, f.deleteLog, "fake Beeper delete log"); got != "sh-imessage" {
 		t.Fatalf("reset deleted registration %q, want sh-imessage", got)
 	}
 }
