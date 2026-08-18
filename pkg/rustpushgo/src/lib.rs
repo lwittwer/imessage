@@ -2259,6 +2259,50 @@ impl WrappedTokenProvider {
 
 /// Restore a TokenProvider from persisted account credentials.
 /// Used on session restore (when we don't go through the login flow).
+#[uniffi::export]
+pub fn validate_token_provider_restore_state(
+    hashed_password_hex: String,
+    spd_base64: String,
+    mme_delegate: String,
+) -> Result<(), WrappedError> {
+    let hashed_password = decode_hex(&hashed_password_hex)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
+    if hashed_password.is_empty() {
+        return Err(WrappedError::GenericError { msg: "Hashed password is empty".into() });
+    }
+
+    let spd_bytes = BASE64_STANDARD.decode(&spd_base64)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD base64: {}", e) })?;
+    let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+    spd.get("DsPrsId")
+        .and_then(|value| value.as_unsigned_integer())
+        .ok_or(WrappedError::GenericError { msg: "SPD missing numeric DsPrsId".into() })?;
+    spd.get("adsid")
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?;
+
+    let delegate = plist::from_bytes::<plist::Value>(mme_delegate.as_bytes())
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) })?;
+    let delegate = normalize_mme_delegate_dict(delegate);
+    let root = delegate.as_dictionary()
+        .ok_or(WrappedError::GenericError { msg: "MobileMe delegate is not a dictionary".into() })?;
+    root.get("tokens")
+        .and_then(|value| value.as_dictionary())
+        .filter(|tokens| !tokens.is_empty())
+        .ok_or(WrappedError::GenericError { msg: "MobileMe delegate has no tokens".into() })?;
+    root.get("config")
+        .and_then(|value| value.as_dictionary())
+        .and_then(|config| config.get("com.apple.Dataclass.KeychainSync"))
+        .and_then(|value| value.as_dictionary())
+        .and_then(|keychain| keychain.get("escrowProxyUrl"))
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(WrappedError::GenericError { msg: "MobileMe delegate is missing KeychainSync escrowProxyUrl".into() })?;
+    Ok(())
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn restore_token_provider(
     config: &WrappedOSConfig,

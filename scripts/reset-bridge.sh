@@ -1,88 +1,44 @@
 #!/usr/bin/env bash
 #
-# Explicit bridge reset. Apple/iMessage login state is preserved by default.
-# Beeper registrations are rebuilt by default; local-only reset is opt-in.
+# Bridge reset: delete the Beeper registration and rebuild disposable bridge
+# state. Apple/iMessage login state is preserved by default.
 #
-# This script is embedded in corten-matrix and invoked by pkg/cli. The first
-# four arguments are internal, resolved paths/identifiers supplied by Go.
+# Usage: corten-matrix reset [--yes] [--delete-imessage-state]
+#   Prompts for confirmation unless --yes is passed. Refuses to run
+#   non-interactively without --yes, since it deletes the Beeper registration
+#   and local bridge state.
+#
+# Invoked by pkg/cli RunManagement as:
+#   reset-bridge.sh <corten-binary> <bundle-id> [user args...]
 #
 set -euo pipefail
 
-BINARY="$1"
-PRIMARY_DIR="$2"
-SECOND_DIR="$3"
-BUNDLE_ID="$4"
-shift 4
+BINARY="${1:-}"
+[ $# -gt 0 ] && shift
+BUNDLE_ID="${1:-com.lrhodin.corten-matrix}"
+[ $# -gt 0 ] && shift
 
-# One systemd service runs both configured accounts. Keep the environment
-# override for callers that install a differently named unit, but make the
-# default explicit so the stop path is safe under `set -u`.
-SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
-
-ACCOUNT="all"
-ACCOUNT_SPECIFIED=false
-KEEP_REMOTE=false
-FORCE_DELETE_REMOTE=false
-DELETE_REMOTE=false
-DELETE_IMESSAGE_STATE=false
-EXTERNAL_DB_CLEARED=false
-# macOS still ships Bash 3.2, which does not define BASHPID. Combine the
-# portable shell PID with two Bash-3-compatible RANDOM values so per-run
-# marker and staging paths remain distinct without aborting under `set -u`.
-RESET_RUN_ID="$$-$RANDOM-$RANDOM"
-
+ASSUME_YES=0
+DELETE_IMESSAGE_STATE=0
 usage() {
     cat <<'EOF'
-Usage: corten-matrix reset [--account 0|1|all] [--local-only] [--delete-imessage-state] [--external-database-cleared]
+Usage: corten-matrix reset [--yes] [--delete-imessage-state]
 
-Deletes the local bridge database and logs only after an exact confirmation.
-Apple/iMessage state is always preserved unless explicitly deleted. For Beeper
-accounts, reset deletes and rebuilds the remote registration by default. For
-self-hosted accounts, remote cleanup is unavailable and reset is local only.
+Rebuild the primary Beeper registration and default SQLite bridge state while
+preserving Apple/iMessage login state. This intentionally narrow reset does not
+support second accounts, self-hosted homeservers, custom SQLite paths, or
+PostgreSQL databases.
 
-  --account 0|1|all              reset one account or explicitly reset both;
-                                 required when both accounts are configured
-  --local-only, --keep-remote    keep Beeper registration(s) and Matrix rooms;
-                                 only reset the local bridge database and logs
-  --delete-remote                compatibility alias for the Beeper default
-  --delete-imessage-state        also delete Apple/iMessage login, cryptographic
-                                 keys, and session state; requires a separate
-                                 confirmation and a fresh Apple login afterward
-  --external-database-cleared    coordinate a selected PostgreSQL reset; after
-                                 the fresh session export, reset pauses for you
-                                 to clear the database and acknowledge that step
-
-For duplicate-DM recovery, install a binary containing the canonicalization fix
-before resetting. Remote Beeper cleanup and Apple-state deletion are independent:
-the former is the default, while the latter always requires its explicit flag.
-See the README recovery section before using this command.
+  -y, --yes                 confirm non-interactively
+  --delete-imessage-state   also wipe Apple/iMessage login and cryptographic state
+  -h, --help                show this help
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --account)
-            [ "$#" -ge 2 ] || { echo "ERROR: --account requires 0, 1, or all" >&2; exit 2; }
-            ACCOUNT="$2"
-            ACCOUNT_SPECIFIED=true
-            shift 2
-            ;;
-        --delete-remote)
-            FORCE_DELETE_REMOTE=true
-            shift
-            ;;
-        --local-only|--keep-remote)
-            KEEP_REMOTE=true
-            shift
-            ;;
-        --delete-imessage-state)
-            DELETE_IMESSAGE_STATE=true
-            shift
-            ;;
-        --external-database-cleared)
-            EXTERNAL_DB_CLEARED=true
-            shift
-            ;;
+        -y|--yes) ASSUME_YES=1 ;;
+        --delete-imessage-state) DELETE_IMESSAGE_STATE=1 ;;
         -h|--help)
             usage
             exit 0
@@ -93,780 +49,386 @@ while [ "$#" -gt 0 ]; do
             exit 2
             ;;
     esac
+    shift
 done
 
-if [ "$KEEP_REMOTE" = true ] && [ "$FORCE_DELETE_REMOTE" = true ]; then
-    echo "ERROR: --local-only/--keep-remote cannot be combined with --delete-remote" >&2
-    exit 2
-fi
+STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
+CONFIG="$STATE_DIR/config.yaml"
+DB_PATH="$STATE_DIR/corten-matrix.db"
+BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
+UNAME_S=$(uname -s)
 
-if [ "$ACCOUNT_SPECIFIED" != true ]; then
-    if [ -d "$PRIMARY_DIR" ] && [ -d "$SECOND_DIR" ]; then
-        echo "ERROR: both bridge accounts are configured; choose --account 0, 1, or all." >&2
-        echo "Nothing was stopped or deleted." >&2
-        exit 2
-    elif [ -d "$PRIMARY_DIR" ]; then
-        ACCOUNT=0
-    elif [ -d "$SECOND_DIR" ]; then
-        ACCOUNT=1
-    fi
-fi
+# Read one scalar from a top-level YAML section without reserializing the file.
+# Generated configs use simple scalar values for all fields reset needs. Missing
+# or ambiguous values fail closed below.
+config_section_scalar() {
+    awk -v section="$1" -v key="$2" '
+        /^[^[:space:]#][^:]*:/ {
+            top = $0
+            sub(/:.*/, "", top)
+            gsub(/[[:space:]]/, "", top)
+            in_section = (top == section)
+            next
+        }
+        in_section && $0 ~ "^[[:space:]]+" key "[[:space:]]*:[[:space:]]" {
+            value = $0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            sub(/[[:space:]]+#.*/, "", value)
+            gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$CONFIG"
+}
 
-case "$ACCOUNT" in
-    0) DIRS=("$PRIMARY_DIR"); ACCOUNT_IDS=(0) ;;
-    1) DIRS=("$SECOND_DIR"); ACCOUNT_IDS=(1) ;;
-    all) DIRS=("$PRIMARY_DIR" "$SECOND_DIR"); ACCOUNT_IDS=(0 1) ;;
-    *) echo "ERROR: --account must be 0, 1, or all" >&2; exit 2 ;;
+# Fail before confirmation or service stop when this narrow reset cannot safely
+# identify and remove the configured local database.
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: reset requires the primary account config at $CONFIG." >&2
+    echo "No service or local state was changed." >&2
+    exit 1
+fi
+DB_TYPE=$(config_section_scalar database type)
+DB_URI=$(config_section_scalar database uri)
+HOMESERVER_ADDRESS=$(config_section_scalar homeserver address)
+HOMESERVER_DOMAIN=$(config_section_scalar homeserver domain)
+if [ -z "$DB_TYPE" ] || [ -z "$DB_URI" ]; then
+    echo "ERROR: could not read the configured database type and URI from $CONFIG." >&2
+    echo "No service or local state was changed." >&2
+    exit 1
+fi
+case "$DB_TYPE" in
+    sqlite*) ;;
+    postgres)
+        echo "ERROR: reset does not coordinate PostgreSQL databases." >&2
+        echo "No service or local state was changed." >&2
+        exit 1
+        ;;
+    *)
+        echo "ERROR: unsupported database type '$DB_TYPE'; no service or local state was changed." >&2
+        exit 1
+        ;;
+esac
+case "$DB_URI" in
+    file:*) CONFIGURED_DB_PATH=${DB_URI#file:}; CONFIGURED_DB_PATH=${CONFIGURED_DB_PATH%%\?*} ;;
+    *)
+        echo "ERROR: unsupported SQLite URI '$DB_URI'; no service or local state was changed." >&2
+        exit 1
+        ;;
+esac
+case "$CONFIGURED_DB_PATH" in
+    "$DB_PATH"|corten-matrix.db) ;;
+    *)
+        echo "ERROR: reset only supports the default SQLite database at $DB_PATH." >&2
+        echo "Configured database is $CONFIGURED_DB_PATH; no service or local state was changed." >&2
+        exit 1
+        ;;
+esac
+case "$HOMESERVER_DOMAIN" in
+    beeper.com|beeper.local) ;;
+    *)
+        echo "ERROR: reset supports Beeper-generated configs only; homeserver domain is '$HOMESERVER_DOMAIN'." >&2
+        echo "Self-hosted installs are out of scope; no service or local state was changed." >&2
+        exit 1
+        ;;
+esac
+case "$HOMESERVER_ADDRESS" in
+    https://matrix.beeper.com/*) ;;
+    *)
+        echo "ERROR: reset supports Beeper-generated configs only; homeserver address is not Beeper." >&2
+        echo "No service or local state was changed." >&2
+        exit 1
+        ;;
 esac
 
-# Refuse suspicious targets even if a caller bypasses the Go dispatcher. The
-# parent may be a custom XDG_DATA_HOME, but account directory basenames are fixed.
-for dir in "${DIRS[@]}"; do
-    case "$dir" in
-        /*) ;;
-        *) echo "ERROR: refusing non-absolute reset target: $dir" >&2; exit 1 ;;
-    esac
-    case "$(basename "$dir")" in
-        corten-matrix|corten-matrix-1) ;;
-        *) echo "ERROR: refusing unsafe reset target: $dir" >&2; exit 1 ;;
-    esac
-    if [ "$(dirname "$dir")" = "/" ]; then
-        echo "ERROR: refusing reset target directly under /: $dir" >&2
+CLOUDKIT_BACKFILL=$(config_section_scalar network cloudkit_backfill)
+BACKFILL_SOURCE=$(config_section_scalar network backfill_source)
+REQUIRE_KEYCHAIN=0
+NORMALIZED_CLOUDKIT_BACKFILL=$(printf '%s' "$CLOUDKIT_BACKFILL" | tr '[:upper:]' '[:lower:]')
+case "$NORMALIZED_CLOUDKIT_BACKFILL" in
+    true)
+        [ "$BACKFILL_SOURCE" = "chatdb" ] || REQUIRE_KEYCHAIN=1
+        ;;
+    false) ;;
+    *)
+        echo "ERROR: invalid cloudkit_backfill value '$CLOUDKIT_BACKFILL' in $CONFIG." >&2
+        echo "No service or local state was changed." >&2
         exit 1
-    fi
-    # A final-component symlink can make an apparently safe
-    # .../corten-matrix target resolve to an arbitrary directory (including
-    # /), after which paths such as "$dir/logs" cross the intended boundary.
-    if [ -L "$dir" ]; then
-        echo "ERROR: refusing symlinked reset target: $dir" >&2
-        exit 1
-    fi
-done
+        ;;
+esac
 
-if [ ! -t 0 ]; then
-    echo "ERROR: reset requires an interactive terminal; no non-interactive bypass is provided." >&2
+if [ -z "$BINARY" ] || [ ! -x "$BINARY" ]; then
+    echo "ERROR: corten-matrix binary is not available; no service or local state was changed." >&2
     exit 1
 fi
-
-SELECTED=()
-SELECTED_ACCOUNT_IDS=()
-for i in "${!DIRS[@]}"; do
-    if [ -d "${DIRS[$i]}" ]; then
-        dir_real=$(cd "${DIRS[$i]}" && pwd -P)
-        case "$(basename "$dir_real")" in
-            corten-matrix|corten-matrix-1) ;;
-            *) echo "ERROR: refusing reset target with unsafe physical path: $dir_real" >&2; exit 1 ;;
-        esac
-        if [ "$(dirname "$dir_real")" = "/" ]; then
-            echo "ERROR: refusing reset target physically located under /: $dir_real" >&2
-            exit 1
-        fi
-        SELECTED+=("$dir_real")
-        SELECTED_ACCOUNT_IDS+=("${ACCOUNT_IDS[$i]}")
-    fi
-done
-
-if [ "${#SELECTED[@]}" -eq 0 ]; then
-    echo "No local bridge state exists for account '$ACCOUNT'; nothing was changed."
-    exit 0
-fi
-
-# BEGIN RESET PROCESS MATCHER HELPER
-bridge_daemon_pattern() {
-    local binary_name
-    local escaped_binary_name
-    binary_name=$(basename "$1") || return 1
-    [ -n "$binary_name" ] || return 1
-    # pgrep accepts an extended regular expression. Escape the executable's
-    # basename so a renamed development binary cannot widen the match.
-    escaped_binary_name=$(printf '%s\n' "$binary_name" |
-        sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
-    printf '^([^[:space:]]*/)?%s([[:space:]]|$)' \
-        "$escaped_binary_name"
-}
-
-bridge_reset_parent_pattern() {
-    local binary_name
-    local escaped_binary_name
-    binary_name=$(basename "$1") || return 1
-    [ -n "$binary_name" ] || return 1
-    escaped_binary_name=$(printf '%s\n' "$binary_name" |
-        sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
-    printf '^([^[:space:]]*/)?%s[[:space:]]+reset([[:space:]]|$)' \
-        "$escaped_binary_name"
-}
-# END RESET PROCESS MATCHER HELPER
-
-# The post-stop process check is a destructive-boundary guard, not an optional
-# diagnostic. A missing or unusable checker must fail closed instead of being
-# mistaken for "no daemon found" by the negated command below.
 if ! command -v pgrep >/dev/null 2>&1; then
-    echo "ERROR: pgrep is required to verify that the bridge stopped." >&2
-    echo "Nothing was stopped or deleted." >&2
-    exit 1
-fi
-if ! BRIDGE_PROCESS_PATTERN=$(bridge_daemon_pattern "$BINARY"); then
-    echo "ERROR: could not construct the corten-matrix process check." >&2
-    echo "Nothing was stopped or deleted." >&2
-    exit 1
-fi
-if ! RESET_PARENT_PATTERN=$(bridge_reset_parent_pattern "$BINARY"); then
-    echo "ERROR: could not construct the corten-matrix reset-parent check." >&2
-    echo "Nothing was stopped or deleted." >&2
+    echo "ERROR: pgrep is required to prove that the bridge stopped." >&2
+    echo "No service or local state was changed." >&2
     exit 1
 fi
 
-# Resolve each generated SQLite URI before stopping anything. Reset must never
-# claim success while a custom database path still contains the old portal
-# rows, and it must never delete a database outside the selected account dir.
-DB_PATHS=()
-DB_TYPES=()
-DB_URIS=()
-for dir in "${SELECTED[@]}"; do
-    config="$dir/config.yaml"
-    db_path="$dir/corten-matrix.db"
-    db_type="sqlite3-fk-wal"
-    db_uri="file:$db_path"
-    if [ -f "$config" ]; then
-        if ! db_type=$("$BINARY" reset-config-value "$config" database-type 2>/dev/null); then
-            echo "ERROR: cannot read database type from $config." >&2
-            echo "Nothing was stopped or deleted." >&2
-            exit 1
-        fi
-        if ! db_uri=$("$BINARY" reset-config-value "$config" database-uri 2>/dev/null); then
-            echo "ERROR: cannot read database URI from $config." >&2
-            echo "Nothing was stopped or deleted." >&2
-            exit 1
-        fi
+# This command is intentionally Beeper-only. Verify authentication before the
+# confirmation and stop so self-hosted or unauthenticated installs fail without
+# a lifecycle change. Revalidate again at the deletion boundary below.
+if ! "$BINARY" bbctl whoami >/dev/null 2>&1; then
+    echo "ERROR: Beeper registration preflight failed." >&2
+    echo "This reset supports authenticated Beeper installs only; self-hosted installs are out of scope." >&2
+    echo "No service or local state was changed." >&2
+    exit 1
+fi
+
+# ── Confirm BEFORE touching anything ─────────────────────────
+# The normal reset deletes the Beeper registration (tearing down the Matrix
+# rooms) and known disposable bridge files, while retaining Apple/iMessage
+# login state. The explicit Apple-state flag adds a second exact confirmation.
+if [ "$ASSUME_YES" -ne 1 ]; then
+    if [ ! -t 0 ]; then
+        echo "ERROR: refusing to reset non-interactively. Re-run with --yes if you mean it." >&2
+        exit 1
     fi
-    case "$db_type" in
-        postgres)
-            db_path=""
-            ;;
-        sqlite*)
-            if [ -f "$config" ]; then
-                case "$db_uri" in
-                    file:*) db_path=${db_uri#file:}; db_path=${db_path%%\?*} ;;
-                    *)
-                        echo "ERROR: unsupported local database URI in $config: $db_uri" >&2
-                        echo "Nothing was stopped or deleted." >&2
-                        exit 1
-                        ;;
-                esac
-            fi
-            case "$db_path" in
-                /*) ;;
-                *) db_path="$dir/$db_path" ;;
-            esac
-            db_parent=$(cd "$(dirname "$db_path")" 2>/dev/null && pwd -P) || {
-                echo "ERROR: database parent directory does not exist: $(dirname "$db_path")" >&2
-                echo "Nothing was stopped or deleted." >&2
-                exit 1
-            }
-            db_path="$db_parent/$(basename "$db_path")"
-            dir_real=$(cd "$dir" && pwd -P)
-            case "$db_path" in
-                "$dir_real"/*) ;;
-                *)
-                    echo "ERROR: refusing SQLite database outside selected account directory: $db_path" >&2
-                    echo "Nothing was stopped or deleted." >&2
-                    exit 1
-                    ;;
-            esac
-            ;;
-        *)
-            echo "ERROR: unsupported database type in $config: $db_type" >&2
-            echo "Nothing was stopped or deleted." >&2
-            exit 1
-            ;;
-    esac
-    DB_TYPES+=("$db_type")
-    DB_URIS+=("$db_uri")
-    DB_PATHS+=("$db_path")
-done
-
-# BEGIN RESET WHOAMI HELPER
-whoami_has_bridge() {
-    local bridge="$1"
-    awk -v wanted="$bridge" 'NR > 1 && $1 == wanted { found=1 } END { exit(found ? 0 : 1) }'
-}
-# END RESET WHOAMI HELPER
-
-# BEGIN RESET BRIDGE TARGET HELPER
-bridge_target_is_unique() {
-    local wanted="$1"
-    local j
-    for ((j=0; j<${#SELECTED_BRIDGES[@]}; j++)); do
-        if [ -n "${SELECTED_BRIDGES[$j]}" ] && [ "${SELECTED_BRIDGES[$j]}" = "$wanted" ]; then
-            return 1
-        fi
-    done
-    return 0
-}
-# END RESET BRIDGE TARGET HELPER
-
-# BEGIN RESET REMOTE INTENT HELPER
-remote_delete_intent_matches() {
-    local marker="$1"
-    local bridge="$2"
-    local username="$3"
-    local database_type="$4"
-    local database_uri="$5"
-    local marked_bridge=""
-    local marked_username=""
-    local marked_export_token=""
-    local marked_database_type=""
-    local marked_database_uri=""
-    if [ -f "$marker" ]; then
-        {
-            IFS= read -r marked_bridge || true
-            IFS= read -r marked_username || true
-            IFS= read -r marked_export_token || true
-            IFS= read -r marked_database_type || true
-            IFS= read -r marked_database_uri || true
-        } < "$marker"
-    fi
-    [ "$marked_bridge" = "$bridge" ] &&
-        [ "$marked_username" = "$username" ] &&
-        [ "$marked_database_type" = "$database_type" ] &&
-        [ "$marked_database_uri" = "$database_uri" ]
-}
-
-remote_delete_intent_export_token() {
-    local marker="$1"
-    sed -n '3p' "$marker"
-}
-# END RESET REMOTE INTENT HELPER
-
-# BEGIN RESET REMOTE POLICY HELPER
-classify_remote_policy() {
-    local dir="$1"
-    local keep_remote="$2"
-    local config="$dir/config.yaml"
-    local kind
-    if [ "$keep_remote" = true ]; then
-        printf 'local-only'
-        return
-    fi
-    if [ ! -f "$config" ]; then
-        printf 'unknown'
-        return
-    fi
-    if ! kind=$("$BINARY" reset-config-kind "$config" 2>/dev/null); then
-        printf 'unknown'
+    echo "This will:"
+    echo "  • stop the bridge"
+    echo "  • delete the '$BRIDGE_NAME' registration from Beeper (removes the Matrix rooms)"
+    echo "  • delete the local bridge config, database, and logs"
+    if [ "$DELETE_IMESSAGE_STATE" -eq 1 ]; then
+        echo "  • also wipe Apple/iMessage login and cryptographic state"
     else
-        case "$kind" in
-            beeper|self-hosted) printf '%s' "$kind" ;;
-            *) printf 'unknown' ;;
-        esac
+        echo "  • preserve Apple/iMessage login and other non-bridge state"
     fi
-}
-# END RESET REMOTE POLICY HELPER
-
-# A normal Beeper reset rebuilds the registration as well as the local DB.
-# Self-hosted configs are deliberately local-only because bbctl cannot manage
-# their rooms or appservice registration.
-SELECTED_DELETE_REMOTE=()
-SELECTED_REMOTE_POLICY=()
-SELECTED_BRIDGES=()
-SELECTED_REMOTE_INTENTS=()
-SELECTED_RESUME_REMOTE=()
-SELECTED_INTENT_EXPORT_TOKENS=()
-for i in "${!SELECTED[@]}"; do
-    dir="${SELECTED[$i]}"
-    policy=$(classify_remote_policy "$dir" "$KEEP_REMOTE")
-    SELECTED_REMOTE_POLICY+=("$policy")
-    case "$policy" in
-        beeper)
-            config="$dir/config.yaml"
-            if ! bridge=$("$BINARY" reset-config-value "$config" appservice-id 2>/dev/null); then
-                echo "ERROR: cannot determine the Beeper registration from $config." >&2
-                echo "Nothing was stopped or deleted." >&2
-                exit 1
-            fi
-            if ! bridge_target_is_unique "$bridge"; then
-                echo "ERROR: selected accounts resolve to the same Beeper registration '$bridge'." >&2
-                echo "Nothing was stopped or deleted." >&2
-                exit 1
-            fi
-            SELECTED_BRIDGES+=("$bridge")
-            SELECTED_REMOTE_INTENTS+=("$dir/.reset-remote-delete-intent")
-            SELECTED_RESUME_REMOTE+=(false)
-            SELECTED_INTENT_EXPORT_TOKENS+=("")
-            SELECTED_DELETE_REMOTE+=(true)
-            DELETE_REMOTE=true
-            ;;
-        self-hosted|local-only)
-            SELECTED_BRIDGES+=("")
-            SELECTED_REMOTE_INTENTS+=("")
-            SELECTED_RESUME_REMOTE+=(false)
-            SELECTED_INTENT_EXPORT_TOKENS+=("")
-            SELECTED_DELETE_REMOTE+=(false)
-            ;;
-        *)
-            echo "ERROR: cannot determine whether account ${SELECTED_ACCOUNT_IDS[$i]} is Beeper or self-hosted" >&2
-            echo "from $dir/config.yaml. Nothing was stopped or deleted." >&2
-            echo "Repair the config, or use --local-only to explicitly keep remote state." >&2
-            exit 1
-            ;;
-    esac
-done
-
-if [ "$FORCE_DELETE_REMOTE" = true ]; then
-    for i in "${!SELECTED_REMOTE_POLICY[@]}"; do
-        if [ "${SELECTED_REMOTE_POLICY[$i]}" != beeper ]; then
-            echo "ERROR: --delete-remote requires every selected account to be Beeper;" >&2
-            echo "account ${SELECTED_ACCOUNT_IDS[$i]} is ${SELECTED_REMOTE_POLICY[$i]}. Nothing was stopped or deleted." >&2
-            exit 1
-        fi
-    done
-fi
-
-# A local file wipe cannot clear PostgreSQL. Require the operator to perform
-# and acknowledge that separate destructive step instead of claiming a clean
-# rebuild while silently retaining all portal rows.
-HAS_EXTERNAL_DB=false
-for i in "${!SELECTED[@]}"; do
-    if [ "${DB_TYPES[$i]}" = postgres ]; then
-        HAS_EXTERNAL_DB=true
-        if [ "$EXTERNAL_DB_CLEARED" != true ]; then
-            config="${SELECTED[$i]}/config.yaml"
-            echo "ERROR: $config uses PostgreSQL." >&2
-            echo "Local file deletion cannot clear that external database." >&2
-            echo "Back it up, then re-run with the coordinated reset flow:" >&2
-            echo "  corten-matrix reset --account $ACCOUNT --external-database-cleared" >&2
-            echo "Reset will stop the bridge, export its current session, then prompt" >&2
-            echo "you to clear/recreate PostgreSQL before remote or local deletion." >&2
-            echo "Nothing was stopped or deleted." >&2
-            exit 1
-        fi
-    fi
-done
-
-# Verify Beeper credentials and connectivity before confirmations or stopping
-# the bridge. The strict delete still runs after the daemon has stopped.
-if [ "$DELETE_REMOTE" = true ]; then
-    if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then
-        echo "ERROR: could not list Beeper registrations. Nothing was stopped or deleted." >&2
-        echo "Resolve Beeper authentication/network access and retry." >&2
-        exit 1
-    fi
-    WHOAMI_USERNAME=$(printf '%s\n' "$WHOAMI_OUTPUT" | sed -n '1p')
-    if [ -z "$WHOAMI_USERNAME" ] || [ "$WHOAMI_USERNAME" = null ]; then
-        echo "ERROR: Beeper identity is unavailable. Nothing was stopped or deleted." >&2
-        exit 1
-    fi
-    for i in "${!SELECTED_BRIDGES[@]}"; do
-        [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
-        bridge="${SELECTED_BRIDGES[$i]}"
-        intent="${SELECTED_REMOTE_INTENTS[$i]}"
-        if remote_delete_intent_matches "$intent" "$bridge" "$WHOAMI_USERNAME" "${DB_TYPES[$i]}" "${DB_URIS[$i]}"; then
-            SELECTED_RESUME_REMOTE[$i]=true
-            SELECTED_INTENT_EXPORT_TOKENS[$i]=$(remote_delete_intent_export_token "$intent")
-        fi
-        if ! printf '%s\n' "$WHOAMI_OUTPUT" | whoami_has_bridge "$bridge"; then
-            if [ "${SELECTED_RESUME_REMOTE[$i]}" = true ]; then
-                echo "NOTE: Beeper registration '$bridge' is already absent after an earlier" >&2
-                echo "confirmed reset attempt; resuming its local cleanup." >&2
-            else
-                echo "ERROR: selected config names Beeper registration '$bridge'," >&2
-                echo "but bbctl whoami does not list that exact registration." >&2
-                echo "Nothing was stopped or deleted." >&2
-                exit 1
-            fi
-        fi
-    done
-fi
-
-echo ""
-echo "DANGER: this will stop the bridge. Planned actions:"
-for i in "${!SELECTED[@]}"; do
     echo ""
-    echo "  Account ${SELECTED_ACCOUNT_IDS[$i]}: ${SELECTED[$i]}"
-    echo "    - DELETE local bridge database (including portal/backfill mappings) and logs"
-    case "${SELECTED_REMOTE_POLICY[$i]}" in
-        beeper)
-            echo "    - DELETE Beeper bridge registration '${SELECTED_BRIDGES[$i]}'; its Matrix rooms may also be removed"
-            echo "    - DELETE stale local bridge config so setup-beeper can regenerate it"
-            echo "    - PRESERVE its database configuration for setup-beeper"
-            ;;
-        local-only)
-            echo "    - KEEP remote bridge registration, Matrix rooms, and local config (--local-only)"
-            ;;
-        self-hosted)
-            echo "    - KEEP self-hosted remote state and local config (automatic cleanup unavailable)"
-            ;;
-    esac
-    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-        echo "    - DELETE Apple/iMessage login, cryptographic keys, and session state"
+    if [ "$DELETE_IMESSAGE_STATE" -eq 1 ]; then
+        echo "You will need to re-login (2FA) afterwards. This cannot be undone."
     else
-        echo "    - KEEP Apple/iMessage login, cryptographic keys, and session state"
+        echo "Your saved Apple/iMessage login will be reused by setup-beeper."
     fi
-done
-if [ "$DELETE_REMOTE" = true ]; then
     echo ""
-    echo "Deleting a Beeper registration may remove ALL Matrix rooms owned by it,"
-    echo "not only duplicate DMs. This cannot be undone by restoring local files."
-fi
-if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-    echo ""
-    echo "Apple state deletion requires a fresh login and may appear as a new device."
-fi
-echo ""
-read -r -p "Type RESET BRIDGE DATA to continue: " CONFIRM_LOCAL
-if [ "$CONFIRM_LOCAL" != "RESET BRIDGE DATA" ]; then
-    echo "Reset cancelled; nothing was changed."
-    exit 1
-fi
-
-if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-    echo ""
-    read -r -p "Type DELETE IMESSAGE STATE to confirm Apple session deletion: " CONFIRM_IMESSAGE
-    if [ "$CONFIRM_IMESSAGE" != "DELETE IMESSAGE STATE" ]; then
-        echo "Reset cancelled; nothing was changed."
+    read -r -p "Type 'reset' to confirm: " reply || reply=""
+    # Tolerate a trailing CR (CRLF terminals, pty wrappers) and stray spaces;
+    # anything else still has to be exactly "reset".
+    reply=$(printf '%s' "$reply" | tr -d '[:space:]')
+    if [ "$reply" != "reset" ]; then
+        echo "Aborted — nothing was changed."
         exit 1
     fi
-fi
 
-if [ "$DELETE_REMOTE" = true ]; then
-    echo ""
-    read -r -p "Type DELETE BEEPER BRIDGE to confirm Beeper deletion: " CONFIRM_REMOTE
-    if [ "$CONFIRM_REMOTE" != "DELETE BEEPER BRIDGE" ]; then
-        echo "Reset cancelled; nothing was changed."
-        exit 1
-    fi
-fi
-
-# Preserve the database stanza before invalidating the appservice
-# credentials. setup-beeper merges this stanza into the freshly registered
-# config and removes the backup only after a successful merge.
-CONFIG_BACKUPS=()
-SESSION_STATE_DIRS=()
-SESSION_EXPORT_TOKENS=()
-for i in "${!SELECTED[@]}"; do
-    dir="${SELECTED[$i]}"
-    config_backup=""
-    if [ "${SELECTED_DELETE_REMOTE[$i]}" = true ]; then
-        config_backup="$dir/config.reset-backup.yaml"
-        config_backup_tmp="$config_backup.tmp.$RESET_RUN_ID"
-        if ! cp -p -- "$dir/config.yaml" "$config_backup_tmp" ||
-            ! chmod 0600 "$config_backup_tmp" ||
-            ! mv -f -- "$config_backup_tmp" "$config_backup"; then
-            rm -f -- "$config_backup_tmp"
-            echo "ERROR: could not preserve database configuration for $dir." >&2
-            echo "The bridge was not stopped and nothing was deleted." >&2
+    if [ "$DELETE_IMESSAGE_STATE" -eq 1 ]; then
+        echo ""
+        echo "Apple/iMessage login, cryptographic keys, and session state will be deleted."
+        read -r -p "Type 'DELETE IMESSAGE STATE' to confirm: " imessage_reply || imessage_reply=""
+        # Trim only surrounding whitespace so the words and their spacing are
+        # part of the exact confirmation. Command substitution also removes a
+        # trailing newline supplied by an interactive terminal.
+        imessage_reply=$(printf '%s' "$imessage_reply" |
+            sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if [ "$imessage_reply" != "DELETE IMESSAGE STATE" ]; then
+            echo "Aborted — nothing was changed."
             exit 1
         fi
     fi
-    CONFIG_BACKUPS+=("$config_backup")
+fi
 
-    if [ "${SELECTED_ACCOUNT_IDS[$i]}" = 1 ]; then
-        session_state_dir="$dir/corten-matrix"
-    else
-        session_state_dir="$dir"
-    fi
-    SESSION_STATE_DIRS+=("$session_state_dir")
-    export_token=""
-    if [ "$DELETE_IMESSAGE_STATE" != true ]; then
-        if ! mkdir -p "$session_state_dir"; then
-            echo "ERROR: could not prepare session export directory $session_state_dir." >&2
-            echo "The bridge was not stopped and nothing was deleted." >&2
-            exit 1
-        fi
-        request="$session_state_dir/.reset-session-export-request"
-        ack="$session_state_dir/.reset-session-export-ack"
-        if [ "${SELECTED_RESUME_REMOTE[$i]}" = true ]; then
-            export_token="${SELECTED_INTENT_EXPORT_TOKENS[$i]}"
-            if [ -z "$export_token" ]; then
-                echo "ERROR: reset recovery intent for $dir has no validated session export." >&2
-                echo "Nothing was stopped or deleted." >&2
-                exit 1
-            fi
-        else
-            export_token="$RESET_RUN_ID-$RANDOM-$i"
-            request_tmp="$request.tmp.$RESET_RUN_ID"
-            rm -f -- "$request" "$ack" "$request_tmp"
-            if ! (umask 077 && printf '%s\n' "$export_token" > "$request_tmp") ||
-                ! mv -f -- "$request_tmp" "$request"; then
-                rm -f -- "$request_tmp"
-                echo "ERROR: could not request a fresh session export for $dir." >&2
-                echo "The bridge was not stopped and nothing was deleted." >&2
-                exit 1
-            fi
-        fi
-    fi
-    SESSION_EXPORT_TOKENS+=("$export_token")
-done
-
-# Stop only after all required confirmations have succeeded.
-echo "Stopping bridge..."
-UNAME_S=$(uname -s)
-if [ "$UNAME_S" = "Darwin" ]; then
-    launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || \
-        launchctl unload "$HOME/Library/LaunchAgents/$BUNDLE_ID.plist" 2>/dev/null || true
+# Check pgrep itself before stopping; only status 1 means no bridge is running.
+if pgrep -f "corten-matrix bridge-all" >/dev/null 2>&1; then
+    :
 else
-    # Resolve the unit's actual systemd scope. A reachable user bus does not
-    # prove that this bridge is a user unit: `systemctl --user stop` silently
-    # no-ops for a service installed in the system manager, leaving the bridge
-    # alive and correctly triggering the fail-closed process check below.
-    SYSTEMCTL_SCOPE=""   # "--user", or "" for the system manager
-    SYSTEMCTL_SUDO=""    # "sudo" when driving the system manager as non-root
+    PGR_STATUS=$?
+    if [ "$PGR_STATUS" -ne 1 ]; then
+        echo "ERROR: pgrep failed during reset preflight (status $PGR_STATUS)." >&2
+        echo "No service or local state was changed." >&2
+        exit 1
+    fi
+fi
+
+# ── Stop the bridge ──────────────────────────────────────────
+echo "Stopping bridge..."
+SYSTEMCTL_SCOPE=""   # "--user", or "" for the system manager
+SYSTEMCTL_SUDO=""    # "sudo" when driving the system manager as non-root
+if [ "$UNAME_S" = "Darwin" ]; then
+    launchctl unload "$HOME/Library/LaunchAgents/$BUNDLE_ID.plist" 2>/dev/null || true
+else
+    # Pick the scope by where the unit actually IS, not by which bus answers.
+    # `systemctl --user` succeeds whenever a user session bus is reachable —
+    # even when the unit is a SYSTEM unit — so an unconditional `--user stop`
+    # silently no-ops on a bridge installed via `sudo corten-matrix setup`.
     if systemctl --user cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
         SYSTEMCTL_SCOPE="--user"
     elif systemctl cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
-        if [ "$(id -u)" != "0" ]; then
-            SYSTEMCTL_SUDO="sudo"
-        fi
+        [ "$(id -u)" = "0" ] || SYSTEMCTL_SUDO="sudo"
     else
-        # No unit is installed in either scope; preserve the historical no-op
-        # and let the process check determine whether anything is still live.
+        # Nothing installed in either scope; the stop is a no-op either way.
         SYSTEMCTL_SCOPE="--user"
     fi
     ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} systemctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} stop "$SERVICE_NAME" 2>/dev/null || true
 fi
 
-# Never remove state while another process from this corten-matrix executable
-# still appears to be running. This is deliberately based on executable
-# identity rather than enumerating flag spellings accepted by the bridge flag
-# parser. The known `corten-matrix reset` parent is the only excluded process.
-for attempt in 1 2 3 4 5; do
-    if process_pids=$(pgrep -f "$BRIDGE_PROCESS_PATTERN" 2>/dev/null); then
-        process_check_failed=false
-        bridge_process_found=false
-        for process_pid in $process_pids; do
-            if ! process_command=$(ps -p "$process_pid" -o command= 2>/dev/null); then
-                process_check_failed=true
-                break
-            fi
-            if printf '%s\n' "$process_command" | grep -Eq "$RESET_PARENT_PATTERN"; then
-                continue
-            fi
-            bridge_process_found=true
+# Match the service process specifically (`corten-matrix bridge-all`), not any
+# process whose command line contains "corten-matrix" — this script's parent
+# is `corten-matrix reset`, so a broad match would always see itself still
+# running and abort the reset.
+BRIDGE_STOPPED=0
+attempt=1
+while [ "$attempt" -le 35 ]; do
+    if pgrep -f "corten-matrix bridge-all" >/dev/null 2>&1; then
+        PGR_STATUS=0
+    else
+        PGR_STATUS=$?
+    fi
+    case "$PGR_STATUS" in
+        1)
+            BRIDGE_STOPPED=1
             break
-        done
-        if [ "$process_check_failed" = true ]; then
-            pgrep_status=2
-        elif [ "$bridge_process_found" = true ]; then
-            pgrep_status=0
-        else
-            pgrep_status=1
-        fi
-    else
-        pgrep_status=$?
-    fi
-    if [ "$pgrep_status" -eq 1 ]; then
-        break
-    elif [ "$pgrep_status" -ne 0 ]; then
-        echo "ERROR: could not verify whether a corten-matrix bridge process is still running." >&2
-        echo "No state was deleted." >&2
-        exit 1
-    fi
-    if [ "$attempt" -eq 5 ]; then
-        echo "ERROR: a corten-matrix bridge process is still running; no state was deleted." >&2
-        exit 1
-    fi
-    sleep 1
+            ;;
+        0)
+            [ "$attempt" -lt 35 ] && sleep 1
+            attempt=$((attempt + 1))
+            ;;
+        *)
+            echo "ERROR: pgrep failed while verifying bridge shutdown (status $PGR_STATUS)." >&2
+            echo "The bridge may be stopped, but no registration or local state was deleted." >&2
+            exit 1
+            ;;
+    esac
 done
-
-# The bridge's final shutdown save must acknowledge the exact request written
-# above, proving that both the database metadata save and atomic session.json
-# export succeeded during this reset. An already-stopped bridge cannot
-# acknowledge a stale export. Validate that fresh backup and its keystore before
-# deleting the DB. This is intentionally after the daemon has stopped and before
-# any local or remote deletion.
-if [ "$DELETE_IMESSAGE_STATE" != true ]; then
-    echo ""
-    echo "Validating preserved Apple/iMessage session state..."
-    for i in "${!SELECTED[@]}"; do
-        dir="${SELECTED[$i]}"
-        session_state_dir="${SESSION_STATE_DIRS[$i]}"
-        export_token="${SESSION_EXPORT_TOKENS[$i]}"
-        ack="$session_state_dir/.reset-session-export-ack"
-        ack_token=""
-        if [ -f "$ack" ]; then
-            IFS= read -r ack_token < "$ack" || true
+if [ "$BRIDGE_STOPPED" -ne 1 ]; then
+    echo "ERROR: bridge process still running after 35 seconds" >&2
+    exit 1
+fi
+# A normal reset deletes the bridge database, so the saved Apple session must
+# already be independently restorable. Validate the atomically maintained
+# backup after shutdown before deleting either remote registration or local
+# bridge state. If the final save failed, the previous complete backup remains
+# in place and must still pass this validation. The explicit full-wipe path
+# skips the check because it requires a new Apple login.
+if [ "$DELETE_IMESSAGE_STATE" -ne 1 ]; then
+    if [ -f "$STATE_DIR/session.json" ]; then
+        echo "Validating preserved Apple/iMessage session state..."
+        RESTORE_ARGS=(check-restore)
+        if [ "$REQUIRE_KEYCHAIN" -eq 1 ]; then
+            RESTORE_ARGS+=(--require-keychain)
         fi
-        if [ "$ack_token" != "$export_token" ]; then
-            echo "ERROR: the bridge did not acknowledge a fresh session export for $dir." >&2
-            echo "The bridge remains stopped, but no database, logs, config, remote" >&2
-            echo "registration, or Apple/iMessage state was deleted." >&2
-            echo "Start this version of the bridge successfully, then retry reset." >&2
+        if ! "$BINARY" "${RESTORE_ARGS[@]}"; then
+            echo "ERROR: preserved Apple/iMessage session state is not safely restorable." >&2
+            echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+            echo "Repair the saved session, or use --delete-imessage-state only if a fresh Apple login is acceptable." >&2
             exit 1
         fi
-        config="$dir/config.yaml"
-        require_keychain=false
-        if [ -f "$config" ]; then
-            if ! cloudkit=$("$BINARY" reset-config-value "$config" network-cloudkit-backfill 2>/dev/null) ||
-                ! backfill_source=$("$BINARY" reset-config-value "$config" network-backfill-source 2>/dev/null); then
-                echo "ERROR: could not inspect restore requirements in $config." >&2
-                echo "No database, logs, config, remote registration, or Apple/iMessage state was deleted." >&2
+    elif [ -f "$DB_PATH" ]; then
+        if ! command -v sqlite3 >/dev/null 2>&1; then
+            echo "ERROR: sqlite3 is required to verify that the bridge has never logged in." >&2
+            echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+            exit 1
+        fi
+        if ! LOGIN_TABLE_PRESENT=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_login';" 2>/dev/null); then
+            echo "ERROR: could not inspect login state in $DB_PATH." >&2
+            echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+            exit 1
+        fi
+        case "$LOGIN_TABLE_PRESENT" in
+            0)
+                echo "No saved Apple/iMessage login exists; continuing with bridge-state reset."
+                ;;
+            1)
+                if ! LOGIN_COUNT=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM user_login;" 2>/dev/null); then
+                    echo "ERROR: could not verify login state in $DB_PATH." >&2
+                    echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+                    exit 1
+                fi
+                case "$LOGIN_COUNT" in
+                    0) echo "No saved Apple/iMessage login exists; continuing with bridge-state reset." ;;
+                    *)
+                        echo "ERROR: the database contains an Apple login but session.json is missing." >&2
+                        echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+                        echo "Recover session.json, or use --delete-imessage-state only if a fresh Apple login is acceptable." >&2
+                        exit 1
+                        ;;
+                esac
+                ;;
+            *)
+                echo "ERROR: unexpected user_login table count '$LOGIN_TABLE_PRESENT' in $DB_PATH." >&2
+                echo "The bridge remains stopped, but no registration or local state was deleted." >&2
                 exit 1
-            fi
-            if [ "$cloudkit" = "true" ] && [ "$backfill_source" != "chatdb" ]; then
-                require_keychain=true
-            fi
-        fi
-        session_xdg=$(dirname "$session_state_dir")
-        if [ "$require_keychain" = true ]; then
-            restore_args=(check-restore)
-        else
-            restore_args=(check-restore --without-keychain)
-        fi
-        if ! (cd "$dir" && XDG_DATA_HOME="$session_xdg" "$BINARY" "${restore_args[@]}"); then
-            echo "ERROR: preserved Apple/iMessage state for $dir is not safely restorable." >&2
-            echo "The bridge remains stopped, but no database, logs, config, remote" >&2
-            echo "registration, or Apple/iMessage state was deleted." >&2
-            echo "Resolve the session backup problem, or explicitly opt in with" >&2
-            echo "--delete-imessage-state if a fresh Apple login is intended." >&2
-            exit 1
-        fi
-    done
+                ;;
+        esac
+    else
+        echo "No saved Apple/iMessage login exists; continuing with bridge-state reset."
+    fi
 fi
 
-# A remote-deletion intent proves which operation the operator authorized; it
-# does not prove that PostgreSQL stayed empty. The still-registered bridge may
-# have been restarted after an interrupted attempt and repopulated the database.
-# Therefore every attempt clears and reconfirms PostgreSQL after the service is
-# stopped, including recovery attempts that reuse a remote-deletion intent.
-if [ "$HAS_EXTERNAL_DB" = true ]; then
+# ── Delete server-side registration (cleans up Matrix rooms) ──
+# bbctl is compiled into the corten-matrix binary (pkg/bbctl) and is invoked
+# as `corten-matrix bbctl ...` — there is no standalone bbctl to locate.
+# The reset is invoked through the corten-matrix binary. If that binary cannot
+# authenticate to Beeper, fail before local cleanup rather than guessing that
+# the registration is absent.
+echo ""
+# Check whoami first: a registration the server has already dropped can linger
+# there while `bbctl delete` returns M_NOT_FOUND. Revalidation distinguishes
+# that idempotent case from authentication and connectivity failures.
+if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then
+    echo "ERROR: could not revalidate the Beeper registration; local state was not deleted." >&2
+    exit 1
+fi
+if printf '%s\n' "$WHOAMI_OUTPUT" | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
+    echo "Deleting and verifying the Beeper registration (this can take up to a minute)..."
     echo ""
-    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-        echo "The bridge is stopped and Apple/iMessage state deletion was explicitly confirmed."
-    else
-        echo "The bridge is stopped and its fresh Apple/iMessage session export is valid."
-    fi
-    echo "Back up and clear/recreate each selected PostgreSQL database now."
-    echo "No remote registration or local bridge state has been deleted yet."
-    echo "Once cleared, the external database cannot be restored by cancelling this command."
-    read -r -p "Type EXTERNAL DATABASE CLEARED after completing that step: " CONFIRM_EXTERNAL_DB
-    if [ "$CONFIRM_EXTERNAL_DB" != "EXTERNAL DATABASE CLEARED" ]; then
-        echo "Reset stopped before remote or local file cleanup; the bridge remains stopped."
-        echo "Any external database work you already performed is unchanged."
+    if ! "$BINARY" bbctl delete "$BRIDGE_NAME"; then
+        echo "ERROR: Beeper registration deletion failed; local state was not deleted." >&2
+        echo "Resolve the Beeper error and run reset again." >&2
         exit 1
     fi
+else
+    echo "✓ No '$BRIDGE_NAME' registration on server — skipping delete."
 fi
 
-if [ "$DELETE_REMOTE" = true ]; then
-    echo ""
-    NEW_REMOTE_INTENTS=()
-    for i in "${!SELECTED_BRIDGES[@]}"; do
-        [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
-        [ "${SELECTED_RESUME_REMOTE[$i]}" = true ] && continue
-        bridge="${SELECTED_BRIDGES[$i]}"
-        intent="${SELECTED_REMOTE_INTENTS[$i]}"
-        intent_tmp="$intent.tmp.$RESET_RUN_ID"
-        rm -f -- "$intent_tmp"
-        if ! (umask 077 && printf '%s\n%s\n%s\n%s\n%s\n' \
-            "$bridge" "$WHOAMI_USERNAME" "${SESSION_EXPORT_TOKENS[$i]}" \
-            "${DB_TYPES[$i]}" "${DB_URIS[$i]}" > "$intent_tmp") ||
-            ! mv -f -- "$intent_tmp" "$intent"; then
-            rm -f -- "$intent_tmp"
-            if [ "${#NEW_REMOTE_INTENTS[@]}" -gt 0 ]; then
-                for new_intent in "${NEW_REMOTE_INTENTS[@]}"; do
-                    rm -f -- "$new_intent"
-                done
-            fi
-            echo "ERROR: could not record the confirmed remote-deletion intent for '$bridge'." >&2
-            echo "No remote registration or local bridge state was deleted." >&2
+# ── Remove local bridge state ─────────────────────────────────
+echo ""
+if [ "$DELETE_IMESSAGE_STATE" -eq 1 ]; then
+    # This is the exceptional, explicit full wipe. bridge-manager/ is excluded
+    # for compatibility with pre-2026-06 installs that still have a standalone
+    # bbctl (and its Beeper credentials); current installs never create it.
+    echo "Wiping all state in $STATE_DIR/ ..."
+    if [ -d "$STATE_DIR" ]; then
+        find "$STATE_DIR" -maxdepth 1 -not -name bridge-manager -not -path "$STATE_DIR" -exec rm -rf {} +
+
+        # Verify
+        REMAINING=$(find "$STATE_DIR" -maxdepth 1 -not -name bridge-manager -not -path "$STATE_DIR" | wc -l)
+        if [ "$REMAINING" -ne 0 ]; then
+            echo "ERROR: state directory not fully cleaned:" >&2
+            ls -la "$STATE_DIR/"
             exit 1
         fi
-        NEW_REMOTE_INTENTS+=("$intent")
-    done
-    for i in "${!SELECTED_BRIDGES[@]}"; do
-        [ "${SELECTED_DELETE_REMOTE[$i]}" = true ] || continue
-        bridge="${SELECTED_BRIDGES[$i]}"
-        echo "Converging Beeper registration '$bridge' to deleted state..."
-        if ! "$BINARY" bbctl delete "$bridge"; then
-            echo "ERROR: remote deletion failed; local file state was NOT deleted." >&2
-            if [ "$HAS_EXTERNAL_DB" = true ]; then
-                echo "Any selected external database already cleared remains cleared." >&2
-            fi
-            echo "An earlier selected registration may already have been deleted." >&2
-            echo "The bridge remains stopped. Resolve the error and run the same reset again." >&2
-            exit 1
-        fi
-    done
+    else
+        echo "  (no state directory at $STATE_DIR — nothing to wipe)"
+    fi
+else
+    # Keep this list deliberately explicit. In particular, do not enumerate
+    # or remove unknown files: Apple/iMessage state and future state files must
+    # survive the default reset.
+    echo "Removing disposable bridge state from $STATE_DIR/ ..."
+    if [ -d "$STATE_DIR" ]; then
+        rm -f -- \
+            "$STATE_DIR/config.yaml" \
+            "$STATE_DIR/config.reset-backup.yaml" \
+            "$STATE_DIR/.config.reset-new.yaml" \
+            "$STATE_DIR/corten-matrix.db" \
+            "$STATE_DIR/corten-matrix.db-wal" \
+            "$STATE_DIR/corten-matrix.db-shm" \
+            "$STATE_DIR/corten-matrix.db-journal" \
+            "$STATE_DIR/bridge.stdout.log" \
+            "$STATE_DIR/bridge.stderr.log"
+        rm -rf -- "$STATE_DIR/logs"
+    else
+        echo "  (no state directory at $STATE_DIR — nothing to clean)"
+    fi
 fi
 
 echo ""
-# Keep the filesystem mutation in a small argument-driven function so its
-# preservation contract can be exercised against temporary directories.
-# BEGIN RESET FILESYSTEM HELPER
-delete_local_bridge_data() {
-    local dir="$1"
-    local db_path="$2"
-    local delete_remote="$3"
-    local delete_imessage_state="$4"
-
-    echo "Deleting local bridge database and logs: $dir"
-    if [ -n "$db_path" ]; then
-        rm -f -- "$db_path" "$db_path-wal" "$db_path-shm" "$db_path-journal"
-    fi
-    rm -rf -- "$dir/logs"
-    rm -f -- "$dir/bridge.stdout.log" "$dir/bridge.stderr.log"
-
-    if [ "$delete_remote" = true ]; then
-        # The appservice token in this config became invalid when bbctl deleted
-        # the registration. Remove it only after successful remote deletion so
-        # setup-beeper can create a fresh registration safely.
-        rm -f -- "$dir/config.yaml"
-    fi
-
-    if [ "$delete_imessage_state" = true ]; then
-        echo "Deleting Apple/iMessage state as explicitly requested: $dir"
-        # Primary-account state lives directly in the account directory. The
-        # second account sets XDG_DATA_HOME to its account directory, making
-        # its Apple state a nested corten-matrix subtree. Remove both possible
-        # layouts only under the already validated account directory.
-        rm -f -- "$dir/session.json" "$dir/identity.plist" \
-            "$dir/trustedpeers.plist" "$dir/keystore.plist" \
-            "$dir/facetime-state.plist" "$dir/passwords-state.plist" \
-            "$dir/statuskit-state.plist" "$dir/statuskit-channel-dates.plist" \
-            "$dir/statuskit-cloud-channel-map.plist" "$dir/sharedstreams-state.plist"
-        rm -rf -- "$dir/state" "$dir/anisette" "$dir/corten-matrix"
-    fi
-}
-# END RESET FILESYSTEM HELPER
-
-for i in "${!SELECTED[@]}"; do
-    dir="${SELECTED[$i]}"
-    db_path="${DB_PATHS[$i]}"
-    delete_local_bridge_data "$dir" "$db_path" "${SELECTED_DELETE_REMOTE[$i]}" "$DELETE_IMESSAGE_STATE"
-    rm -f -- "${SESSION_STATE_DIRS[$i]}/.reset-session-export-request" \
-        "${SESSION_STATE_DIRS[$i]}/.reset-session-export-ack"
-    if [ -n "${SELECTED_REMOTE_INTENTS[$i]}" ]; then
-        rm -f -- "${SELECTED_REMOTE_INTENTS[$i]}"
-    fi
-done
-
-echo ""
-echo "Bridge reset complete."
-for i in "${!SELECTED[@]}"; do
-    echo ""
-    echo "Account ${SELECTED_ACCOUNT_IDS[$i]}: local database and logs deleted."
-    if [ "${SELECTED_DELETE_REMOTE[$i]}" = true ]; then
-        echo "  Beeper registration deletion completed; local config removed."
-        if [ -n "${CONFIG_BACKUPS[$i]}" ]; then
-            echo "  Database configuration preserved for setup-beeper."
-        fi
-        if [ "${SELECTED_ACCOUNT_IDS[$i]}" = 1 ]; then
-            echo "  Next: run corten-matrix setup-beeper 1."
-        else
-            echo "  Next: run corten-matrix setup-beeper."
-        fi
-    else
-        echo "  Remote state and local config preserved."
-    fi
-    if [ "$DELETE_IMESSAGE_STATE" = true ]; then
-        echo "  Apple/iMessage login and session state deleted as requested."
-    else
-        echo "  Apple/iMessage login and session state preserved."
-    fi
-done
-if [ "$DELETE_REMOTE" != true ] && [ "$DELETE_IMESSAGE_STATE" != true ]; then
-    echo ""
-    echo "Configuration and Apple/iMessage state are ready; run corten-matrix start."
-elif [ "$DELETE_IMESSAGE_STATE" = true ]; then
-    echo ""
-    echo "Complete Apple login for each reset account before starting the bridge."
+echo "✓ Bridge reset complete."
+if [ "$DELETE_IMESSAGE_STATE" -eq 1 ]; then
+    echo "  All local state wiped — you will need to re-login (2FA)."
+else
+    echo "  Apple/iMessage login and other non-bridge state preserved."
 fi
+echo ""
+echo "  Run 'corten-matrix setup-beeper' to re-register and start the bridge."

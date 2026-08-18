@@ -1258,7 +1258,7 @@ func PrintHelp() {
 		{"logs 1", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
-		{"reset [options]", "rebuild local + Beeper state (preserves iMessage state)"},
+		{"reset [options]", "reset bridge state (preserves iMessage login by default)"},
 		{"uninstall", "remove the service"},
 		{"login", "re-run the iMessage login flow"},
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
@@ -1281,8 +1281,7 @@ func IsManagementCommand(cmd string) bool {
 	switch cmd {
 	case "setup", "setup-beeper", "start", "stop", "restart",
 		"status", "logs", "bbctl", "reset", "uninstall",
-		"install-service", "uninstall-service", "reset-config-kind",
-		"reset-config-value", "reset-merge-database":
+		"install-service", "uninstall-service":
 		return true
 	}
 	return false
@@ -1303,40 +1302,12 @@ func RunManagement(cmd string, args []string) {
 		}
 		runSetup(true)
 	case "reset":
-		runEmbeddedScript("reset-bridge.sh", append([]string{
-			selfPath(), cortenDataDir(), secondDataDir(), cortenBundleID,
-		}, args...)...)
-	case "reset-config-kind":
-		if len(args) != 1 {
-			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-kind requires a config path")
-			os.Exit(2)
+		bundleID := ""
+		if runtime.GOOS == "darwin" {
+			bundleID = cortenBundleID
 		}
-		kind, err := resetConfigKind(args[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-kind: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(kind)
-	case "reset-config-value":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "corten-matrix: reset-config-value requires a config path and value name")
-			os.Exit(2)
-		}
-		value, err := resetConfigValue(args[0], args[1])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "corten-matrix: reset-config-value: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(value)
-	case "reset-merge-database":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "corten-matrix: reset-merge-database requires backup and fresh config paths")
-			os.Exit(2)
-		}
-		if err := mergeResetDatabaseConfig(args[0], args[1]); err != nil {
-			fmt.Fprintf(os.Stderr, "corten-matrix: reset-merge-database: %v\n", err)
-			os.Exit(1)
-		}
+		runEmbeddedScript("reset-bridge.sh",
+			append([]string{selfPath(), bundleID}, args...)...)
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":

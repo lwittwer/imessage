@@ -125,11 +125,26 @@ without explicit authorization.
 Use `corten-matrix reset` only as an explicitly confirmed recovery operation.
 Its default contract preserves Apple/iMessage identity while rebuilding
 disposable bridge state. `--delete-imessage-state` is exceptional and requires
-its separate confirmation. Remote target verification, fresh session export,
-keystore validation, running-process checks, and external PostgreSQL handling
-must fail closed before local deletion. Keep these boundaries covered by
-`pkg/cli/reset_test.go`; do not use `scripts/reset-bridge.sh` as a
-login-preserving shortcut.
+its separate confirmation in interactive use. Default cleanup must enumerate known
+disposable artifacts rather than enumerate Apple state: unknown future files
+survive. Keep the upstream fixed registration name (`sh-imessage`), refresh
+`session.json` atomically during final shutdown, sync both the file and parent
+directory, wait for that save before disconnect completes, and validate the
+saved session against its keystore. When the config selects CloudKit backfill,
+also require restorable token-provider credentials, a MobileMe delegate, and
+trust-circle state. Verify the
+bridge process stopped with a required, error-aware process check and a bounded
+shutdown wait before deletion. A valid existing atomic backup remains usable
+when the best-effort final refresh fails; do not make reset depend on a
+one-invocation freshness proof that a retry silently bypasses. A Beeper deletion
+error must leave local bridge state intact;
+`bbctl delete` already treats verified not-found endpoints as success. Reject
+unknown options, self-hosted installs, PostgreSQL, and custom SQLite paths
+before stopping the service. Preserve setup-created config backup files during
+the default cleanup.
+Keep these boundaries covered by behavior tests in `pkg/cli/reset_test.go`.
+The command intentionally targets the upstream primary-account/default-SQLite
+flow; broader database or account orchestration is a separate feature.
 
 ## Service supervision and unit ownership
 
@@ -151,9 +166,8 @@ child before the supervisor exits.
 - `install-service` may overwrite only units bearing its managed marker and
   must preserve their runtime identity and XDG data directory. Uninstall must
   inspect and verify both user and system scopes.
-- Reset may reuse scope-aware stop detection, but only in its existing
-  post-confirmation stop phase. Service discovery must never move destructive
-  work ahead of reset's session, remote-target, and database checks.
+- Reset reuses scope-aware stop detection after confirmation and must verify
+  that the bridge process stopped before deleting state.
 
 The primary implementation and lifecycle tests are in `pkg/cli/cli.go`,
 `pkg/cli/supervisor_test.go`, `pkg/cli/unit_test.go`, and

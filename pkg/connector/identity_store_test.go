@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -85,16 +86,20 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	log := zerolog.Nop()
 
-	saveSessionState(log, PersistedSessionState{
+	if err := saveSessionState(log, PersistedSessionState{
 		IDSIdentity: "old-identity",
 		IDSKeyCache: "opaque-key-cache",
-	})
-	saveSessionState(log, persistedSessionStateFromMetadata(&UserLoginMetadata{
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionState(log, persistedSessionStateFromMetadata(&UserLoginMetadata{
 		IDSIdentity:     "new-identity",
 		APSState:        "new-aps",
 		IDSUsers:        "new-users",
 		PreferredHandle: "tel:+15555550123",
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 
 	path, err := sessionFilePath()
 	if err != nil {
@@ -130,32 +135,12 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	}
 }
 
-func TestCheckSessionRestoreKeychainRequirementDefaultsStrict(t *testing.T) {
-	if !sessionRestoreRequiresKeychain(nil) {
-		t.Fatal("default restore validation must require keychain state")
+func TestValidateSessionRestorePlatformConfig(t *testing.T) {
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{}, "darwin"); err != nil {
+		t.Fatalf("Darwin restore unexpectedly required a hardware key: %v", err)
 	}
-	if sessionRestoreRequiresKeychain([]bool{false}) {
-		t.Fatal("explicit false must disable only the keychain requirement")
-	}
-	if !sessionRestoreRequiresKeychain([]bool{true}) {
-		t.Fatal("explicit true must require keychain state")
-	}
-}
-
-func TestSessionRestoreRequiresHardwareKeyOutsideMacOS(t *testing.T) {
-	withoutKey := PersistedSessionState{}
-	withKey := PersistedSessionState{HardwareKey: "hardware"}
-	if !sessionRestoreHasRequiredPlatformState(withoutKey, "darwin") {
-		t.Fatal("Darwin restore unexpectedly required a hardware key")
-	}
-	if sessionRestoreHasRequiredPlatformState(withoutKey, "linux") {
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{}, "linux"); err == nil {
 		t.Fatal("Linux restore accepted a session without a hardware key")
-	}
-	if !sessionRestoreHasRequiredPlatformState(withKey, "linux") {
-		t.Fatal("Linux restore rejected a session with a hardware key")
-	}
-	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "darwin"); err != nil {
-		t.Fatalf("Darwin restore unexpectedly parsed a hardware key: %v", err)
 	}
 	rustpushgo.InitLogger()
 	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "linux"); err == nil {
@@ -163,51 +148,59 @@ func TestSessionRestoreRequiresHardwareKeyOutsideMacOS(t *testing.T) {
 	}
 }
 
-func TestSessionExportAcknowledgementUsesRequestedNonce(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	log := zerolog.Nop()
-	requestPath, err := sessionExportMarkerPath(".reset-session-export-request")
-	if err != nil {
-		t.Fatal(err)
+func TestValidateCloudKitRestoreState(t *testing.T) {
+	validSPD := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>DsPrsId</key><integer>12345</integer>
+<key>adsid</key><string>synthetic-adsid</string>
+</dict></plist>`
+	validDelegate := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>tokens</key><dict><key>com.apple.mobileme</key><string>synthetic-token</string></dict>
+<key>config</key><dict>
+<key>com.apple.Dataclass.KeychainSync</key><dict>
+<key>escrowProxyUrl</key><string>https://escrow.example.invalid</string>
+</dict></dict>
+</dict></plist>`
+	valid := PersistedSessionState{
+		AccountUsername:          "user@example.invalid",
+		AccountHashedPasswordHex: "aabbccdd",
+		AccountPET:               "pet",
+		AccountSPDBase64:         base64.StdEncoding.EncodeToString([]byte(validSPD)),
+		MmeDelegateJSON:          validDelegate,
 	}
-	if err = os.MkdirAll(filepath.Dir(requestPath), 0o700); err != nil {
-		t.Fatal(err)
+	if err := validateCloudKitRestoreState(valid); err != nil {
+		t.Fatalf("valid CloudKit restore state was rejected: %v", err)
 	}
-	if err = os.WriteFile(requestPath, []byte("nonce-123\n"), 0o600); err != nil {
-		t.Fatal(err)
+
+	tests := []struct {
+		name   string
+		mutate func(*PersistedSessionState)
+	}{
+		{"missing username", func(state *PersistedSessionState) { state.AccountUsername = "" }},
+		{"invalid hashed password", func(state *PersistedSessionState) { state.AccountHashedPasswordHex = "not-hex" }},
+		{"missing PET", func(state *PersistedSessionState) { state.AccountPET = "" }},
+		{"invalid SPD base64", func(state *PersistedSessionState) { state.AccountSPDBase64 = "not-base64" }},
+		{"invalid SPD plist", func(state *PersistedSessionState) {
+			state.AccountSPDBase64 = base64.StdEncoding.EncodeToString([]byte("not-a-plist"))
+		}},
+		{"SPD missing account identifiers", func(state *PersistedSessionState) {
+			state.AccountSPDBase64 = base64.StdEncoding.EncodeToString([]byte(`<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>`))
+		}},
+		{"missing delegate", func(state *PersistedSessionState) { state.MmeDelegateJSON = "" }},
+		{"invalid delegate plist", func(state *PersistedSessionState) { state.MmeDelegateJSON = "not-a-plist" }},
+		{"delegate missing keychain config", func(state *PersistedSessionState) {
+			state.MmeDelegateJSON = `<?xml version="1.0"?><plist version="1.0"><dict><key>tokens</key><dict><key>token</key><string>value</string></dict><key>config</key><dict></dict></dict></plist>`
+		}},
 	}
-	if err = saveSessionState(log, PersistedSessionState{IDSIdentity: "identity"}); err != nil {
-		t.Fatal(err)
-	}
-	if err = acknowledgeSessionExport(log); err != nil {
-		t.Fatal(err)
-	}
-	if request, readErr := os.ReadFile(requestPath); readErr != nil || string(request) != "nonce-123\n" {
-		t.Fatalf("request marker was consumed by acknowledgement: %q, %v", request, readErr)
-	}
-	ackPath, err := sessionExportMarkerPath(".reset-session-export-ack")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ack, err := os.ReadFile(ackPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(ack) != "nonce-123\n" {
-		t.Fatalf("acknowledged nonce = %q, want exact request", ack)
-	}
-	if err = clearSessionExportAcknowledgement(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = os.Stat(ackPath); !os.IsNotExist(err) {
-		t.Fatalf("ack marker still exists after clearing: %v", err)
-	}
-	if err = acknowledgeSessionExport(log); err != nil {
-		t.Fatalf("request could not be re-acknowledged by a later disconnect: %v", err)
-	}
-	ack, err = os.ReadFile(ackPath)
-	if err != nil || string(ack) != "nonce-123\n" {
-		t.Fatalf("later acknowledgement = %q, %v", ack, err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := valid
+			test.mutate(&state)
+			if err := validateCloudKitRestoreState(state); err == nil {
+				t.Fatal("invalid CloudKit restore state was accepted")
+			}
+		})
 	}
 }
 

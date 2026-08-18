@@ -472,6 +472,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_validate_token_provider_restore_state(uniffiStatus)
+		})
+		if checksum != 23493 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_validate_token_provider_restore_state: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_batch_resolve_handles(uniffiStatus)
 		})
 		if checksum != 63113 {
@@ -9794,4 +9803,12 @@ func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnect
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func ValidateTokenProviderRestoreState(hashedPasswordHex string, spdBase64 string, mmeDelegate string) error {
+	_, _uniffiErr := rustCallWithError(FfiConverterTypeWrappedError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_func_validate_token_provider_restore_state(rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)), rustBufferToC(FfiConverterStringINSTANCE.Lower(mmeDelegate)), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr
 }
