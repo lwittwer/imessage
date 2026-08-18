@@ -7259,6 +7259,17 @@ func (c *IMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 	}, nil
 }
 
+func (c *IMClient) matrixReactionToDatabase(msg *bridgev2.MatrixReaction) *database.Reaction {
+	return &database.Reaction{
+		MessageID:     msg.TargetMessage.ID,
+		MessagePartID: msg.TargetMessage.PartID,
+		SenderID:      makeUserID(c.handle),
+		Emoji:         msg.Content.RelatesTo.Key,
+		Metadata:      &MessageMetadata{},
+		MXID:          msg.Event.ID,
+	}
+}
+
 func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
@@ -7319,13 +7330,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
 
-	return &database.Reaction{
-		MessageID: msg.TargetMessage.ID,
-		SenderID:  makeUserID(c.handle),
-		Emoji:     msg.Content.RelatesTo.Key,
-		Metadata:  &MessageMetadata{},
-		MXID:      msg.Event.ID,
-	}, nil
+	return c.matrixReactionToDatabase(msg), nil
 }
 
 func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
