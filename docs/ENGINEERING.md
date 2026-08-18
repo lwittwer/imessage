@@ -129,7 +129,10 @@ its separate confirmation in interactive use. Default cleanup must enumerate kno
 disposable artifacts rather than enumerate Apple state: unknown future files
 survive. Keep the upstream fixed registration name (`sh-imessage`), refresh
 `session.json` atomically during final shutdown, wait for that save before
-disconnect completes, and verify the bridge process stopped before deletion.
+disconnect completes, validate the saved session against its keystore, and
+verify the bridge process stopped before deletion. A Beeper deletion error must
+leave local bridge state intact; `bbctl delete` already treats verified
+not-found endpoints as success.
 Keep these boundaries covered by behavior tests in `pkg/cli/reset_test.go`.
 The command intentionally targets the upstream primary-account/default-SQLite
 flow; broader database or account orchestration is a separate feature.

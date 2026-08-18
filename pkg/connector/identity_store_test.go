@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 func TestPersistedSessionStateFromMetadata(t *testing.T) {
@@ -129,6 +131,19 @@ func TestSaveSessionStateAtomicallyPreservesKeyCache(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary session files were not cleaned up: %v", matches)
+	}
+}
+
+func TestValidateSessionRestorePlatformConfig(t *testing.T) {
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{}, "darwin"); err != nil {
+		t.Fatalf("Darwin restore unexpectedly required a hardware key: %v", err)
+	}
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{}, "linux"); err == nil {
+		t.Fatal("Linux restore accepted a session without a hardware key")
+	}
+	rustpushgo.InitLogger()
+	if err := validateSessionRestorePlatformConfig(PersistedSessionState{HardwareKey: "not-base64"}, "linux"); err == nil {
+		t.Fatal("Linux restore accepted a malformed hardware key")
 	}
 }
 

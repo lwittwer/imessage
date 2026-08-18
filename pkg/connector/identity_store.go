@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -337,7 +339,8 @@ func ListHandles() []string {
 }
 
 // CheckSessionRestore validates that backup session state (session.json +
-// keystore) exists and the IDS user keys are present in the keystore.
+// keystore) exists and the IDS user keys are present in the keystore. CloudKit
+// trust-circle state is validated separately by setup when CloudKit is enabled.
 // Returns true if login can be auto-restored without re-authentication.
 // This is intended to be called from the CLI (check-restore subcommand)
 // before starting the bridge.
@@ -351,6 +354,10 @@ func CheckSessionRestore() bool {
 	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
 		return false
 	}
+	if err := validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
+		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Session restore check failed: platform configuration is not restorable")
+		return false
+	}
 	session := &cachedSessionState{
 		IDSIdentity: state.IDSIdentity,
 		APSState:    state.APSState,
@@ -360,9 +367,36 @@ func CheckSessionRestore() bool {
 	if !session.validate(log) {
 		return false
 	}
-	if !hasKeychainCliqueState(log) {
-		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
-		return false
-	}
 	return true
+}
+
+// validateSessionRestorePlatformConfig exercises the same hardware-config
+// constructor LoadUserLogin uses after restore. macOS supplies its native
+// platform configuration; Linux must carry a valid extracted hardware key.
+func validateSessionRestorePlatformConfig(state PersistedSessionState, goos string) (err error) {
+	if goos == "darwin" {
+		return nil
+	}
+	if strings.TrimSpace(state.HardwareKey) == "" {
+		return fmt.Errorf("hardware key is empty")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("hardware key validation panicked: %v", recovered)
+		}
+	}()
+	var config *rustpushgo.WrappedOsConfig
+	if state.DeviceID != "" {
+		config, err = rustpushgo.CreateConfigFromHardwareKeyWithDeviceId(state.HardwareKey, state.DeviceID)
+	} else {
+		config, err = rustpushgo.CreateConfigFromHardwareKey(state.HardwareKey)
+	}
+	if err != nil {
+		return fmt.Errorf("invalid hardware key: %w", err)
+	}
+	if config == nil {
+		return fmt.Errorf("hardware key produced no platform configuration")
+	}
+	config.Destroy()
+	return nil
 }

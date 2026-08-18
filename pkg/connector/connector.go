@@ -166,6 +166,10 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		return
 	}
 	rustpushgo.InitLogger()
+	if err = validateSessionRestorePlatformConfig(state, runtime.GOOS); err != nil {
+		log.Info().Err(err).Str("platform", runtime.GOOS).Msg("Backup session platform configuration is not restorable")
+		return
+	}
 
 	// Validate against keystore
 	session := &cachedSessionState{

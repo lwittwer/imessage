@@ -114,29 +114,51 @@ if pgrep -f "corten-matrix bridge-all" >/dev/null 2>&1; then
     exit 1
 fi
 
+# A normal reset deletes the bridge database, so the saved Apple session must
+# already be independently restorable. The bridge refreshes session.json during
+# shutdown; validate that file against the keystore before deleting either the
+# remote registration or any local bridge state. The explicit full-wipe path
+# deliberately skips this check because it requires a new Apple login.
+if [ "$DELETE_IMESSAGE_STATE" -ne 1 ]; then
+    echo "Validating preserved Apple/iMessage session state..."
+    if [ -z "$BINARY" ] || [ ! -x "$BINARY" ] || ! "$BINARY" check-restore; then
+        echo "ERROR: preserved Apple/iMessage session state is not safely restorable." >&2
+        echo "The bridge remains stopped, but no registration or local state was deleted." >&2
+        exit 1
+    fi
+fi
+
 # ── Delete server-side registration (cleans up Matrix rooms) ──
 # bbctl is compiled into the corten-matrix binary (pkg/bbctl) and is invoked
 # as `corten-matrix bbctl ...` — there is no standalone bbctl to locate.
-# If the binary isn't usable, skip deregistration rather than aborting: the
-# local cleanup is still useful, and a self-hosted install has no Beeper
-# registration to delete in the first place.
+# The reset is invoked through the corten-matrix binary. If that binary cannot
+# authenticate to Beeper, fail before local cleanup rather than guessing that
+# the registration is absent.
 echo ""
 if [ -n "$BINARY" ] && [ -x "$BINARY" ]; then
     # Check whoami first: a registration the server has already dropped can
     # linger in bbctl whoami, and `bbctl delete` then fails with M_NOT_FOUND
     # (HTTP 404). Under set -e that aborts the reset with a confusing error,
     # even though there's nothing left to delete.
-    if "$BINARY" bbctl whoami 2>/dev/null | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
+    if ! WHOAMI_OUTPUT=$("$BINARY" bbctl whoami 2>/dev/null); then
+        echo "ERROR: could not verify the Beeper registration; local state was not deleted." >&2
+        exit 1
+    fi
+    if printf '%s\n' "$WHOAMI_OUTPUT" | grep -q "^[[:space:]]*$BRIDGE_NAME "; then
         echo "Deleting bridge registration from Beeper..."
         echo "(Answer the confirmation prompt below)"
         echo ""
-        "$BINARY" bbctl delete "$BRIDGE_NAME" || \
-            echo "⚠  Registration already absent on server — continuing with local cleanup."
+        if ! "$BINARY" bbctl delete "$BRIDGE_NAME"; then
+            echo "ERROR: Beeper registration deletion failed; local state was not deleted." >&2
+            echo "Resolve the Beeper error and run reset again." >&2
+            exit 1
+        fi
     else
         echo "✓ No '$BRIDGE_NAME' registration on server — skipping delete."
     fi
 else
-    echo "⚠  corten-matrix binary not available — skipping Beeper deregistration."
+    echo "ERROR: corten-matrix binary not available; local state was not deleted." >&2
+    exit 1
 fi
 
 # ── Clear journal logs ───────────────────────────────────────

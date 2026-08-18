@@ -44,10 +44,21 @@ func newResetTestFixture(t *testing.T) *resetTestFixture {
 set -eu
 case "${1:-} ${2:-}" in
   "bbctl whoami")
+    if [ "${RESET_TEST_WHOAMI_FAIL:-0}" = "1" ]; then
+      exit 1
+    fi
     printf '%s\n' 'test-user' '  sh-imessage imessage RUNNING'
     ;;
   "bbctl delete")
     printf '%s\n' "${3:-}" >> "$RESET_TEST_DELETE_LOG"
+    if [ "${RESET_TEST_DELETE_FAIL:-0}" = "1" ]; then
+      exit 1
+    fi
+    ;;
+  "check-restore ")
+    if [ "${RESET_TEST_RESTORE_FAIL:-0}" = "1" ]; then
+      exit 1
+    fi
     ;;
   *)
     echo "unexpected fake corten-matrix command: $*" >&2
@@ -271,6 +282,7 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 	t.Run("explicit flag wipes Apple state after confirmation", func(t *testing.T) {
 		f := newResetTestFixture(t)
 		f.seedState(t)
+		t.Setenv("RESET_TEST_RESTORE_FAIL", "1")
 
 		// --yes is the upstream non-interactive confirmation. The separate
 		// --delete-imessage-state flag is still required to authorize Apple-state
@@ -299,6 +311,88 @@ func TestResetDeleteAppleStateRequiresExplicitConfirmation(t *testing.T) {
 			assertResetPathExists(t, f.stateDir, name, false)
 		}
 	})
+}
+
+func TestResetRestoreValidationFailurePreservesRemoteAndLocalState(t *testing.T) {
+	f := newResetTestFixture(t)
+	f.seedState(t)
+	t.Setenv("RESET_TEST_RESTORE_FAIL", "1")
+
+	output, err := f.run(t, "", "--yes")
+	if err == nil {
+		t.Fatalf("reset unexpectedly succeeded with an unrestorable session\n%s", output)
+	}
+	if !strings.Contains(string(output), "session state is not safely restorable") {
+		t.Fatalf("reset did not report restore validation failure:\n%s", output)
+	}
+	for _, name := range []string{
+		"config.yaml",
+		"corten-matrix.db",
+		"session.json",
+		"keystore.plist",
+		"logs",
+	} {
+		assertResetPathExists(t, f.stateDir, name, true)
+	}
+	if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
+		t.Fatalf("remote deletion ran after restore validation failed: %v", statErr)
+	}
+}
+
+func TestResetRemoteDeleteFailurePreservesLocalState(t *testing.T) {
+	f := newResetTestFixture(t)
+	f.seedState(t)
+	t.Setenv("RESET_TEST_DELETE_FAIL", "1")
+
+	output, err := f.run(t, "", "--yes")
+	if err == nil {
+		t.Fatalf("reset unexpectedly succeeded after Beeper deletion failed\n%s", output)
+	}
+	if !strings.Contains(string(output), "registration deletion failed") {
+		t.Fatalf("reset did not report Beeper deletion failure:\n%s", output)
+	}
+	for _, name := range []string{
+		"config.yaml",
+		"corten-matrix.db",
+		"session.json",
+		"keystore.plist",
+		"logs",
+	} {
+		assertResetPathExists(t, f.stateDir, name, true)
+	}
+	deleteArgs, readErr := os.ReadFile(f.deleteLog)
+	if readErr != nil {
+		t.Fatalf("read fake Beeper delete log: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(deleteArgs)); got != "sh-imessage" {
+		t.Fatalf("failed Beeper delete targeted %q, want sh-imessage", got)
+	}
+}
+
+func TestResetWhoamiFailurePreservesLocalState(t *testing.T) {
+	f := newResetTestFixture(t)
+	f.seedState(t)
+	t.Setenv("RESET_TEST_WHOAMI_FAIL", "1")
+
+	output, err := f.run(t, "", "--yes")
+	if err == nil {
+		t.Fatalf("reset unexpectedly succeeded when Beeper verification failed\n%s", output)
+	}
+	if !strings.Contains(string(output), "could not verify the Beeper registration") {
+		t.Fatalf("reset did not report Beeper verification failure:\n%s", output)
+	}
+	for _, name := range []string{
+		"config.yaml",
+		"corten-matrix.db",
+		"session.json",
+		"keystore.plist",
+		"logs",
+	} {
+		assertResetPathExists(t, f.stateDir, name, true)
+	}
+	if _, statErr := os.Stat(f.deleteLog); !os.IsNotExist(statErr) {
+		t.Fatalf("remote deletion ran after Beeper verification failed: %v", statErr)
+	}
 }
 
 func TestResetUsesUpstreamBridgeNameWhenEnvironmentIsUnset(t *testing.T) {

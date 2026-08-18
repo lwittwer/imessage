@@ -545,7 +545,9 @@ Apple/iMessage login state. Cleanup enumerates only known disposable bridge
 artifacts, so `session.json`, keystore and trusted-peers data, anisette/state
 directories, and unknown future Apple-state files remain in place. The bridge
 also refreshes `session.json` during shutdown and waits for that final atomic
-save before disconnect completes.
+save before disconnect completes. After shutdown, reset validates the saved
+session against its keystore before deleting the Beeper registration or local
+bridge database.
 
 ```bash
 corten-matrix reset
