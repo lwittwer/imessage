@@ -96,6 +96,13 @@ func TestAppleDeletedMessagePartsFamilyAndAmbiguity(t *testing.T) {
 	}
 }
 
+func TestAppleDeletedMessagePartsEmptyIDSkipsDatabase(t *testing.T) {
+	portal, parts, err := (&IMClient{}).getAppleDeletedMessageParts(context.Background(), "")
+	if err != nil || portal.ID != "" || len(parts) != 0 {
+		t.Fatalf("empty lookup = portal:%v parts:%d err:%v", portal, len(parts), err)
+	}
+}
+
 func TestPrepareDeletedMessageRechecksAfterTombstone(t *testing.T) {
 	ctx := context.Background()
 	client, db := newMessageDeleteTestClient(t)

@@ -4631,6 +4631,9 @@ func (c *IMClient) getAppleDeletedMessageParts(
 	ctx context.Context,
 	baseID networkid.MessageID,
 ) (networkid.PortalKey, []*database.Message, error) {
+	if baseID == "" {
+		return networkid.PortalKey{}, nil, nil
+	}
 	// The half-open range uses the existing (bridge, receiver, id) index. The
 	// exact filter below rejects unrelated IDs that fall between the bounds.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx, `
