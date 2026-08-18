@@ -339,12 +339,12 @@ func ListHandles() []string {
 }
 
 // CheckSessionRestore validates that backup session state (session.json +
-// keystore) exists and the IDS user keys are present in the keystore. CloudKit
-// trust-circle state is validated separately by setup when CloudKit is enabled.
+// keystore) exists and the IDS user keys are present in the keystore. Callers
+// authorizing a CloudKit restore must also require keychain trust-circle state.
 // Returns true if login can be auto-restored without re-authentication.
 // This is intended to be called from the CLI (check-restore subcommand)
 // before starting the bridge.
-func CheckSessionRestore() bool {
+func CheckSessionRestore(requireKeychain bool) bool {
 	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
 
 	// Initialize keystore (loads from XDG path, migrates if needed)
@@ -365,6 +365,10 @@ func CheckSessionRestore() bool {
 		source:      "backup file (check-restore)",
 	}
 	if !session.validate(log) {
+		return false
+	}
+	if requireKeychain && !hasKeychainCliqueState(log) {
+		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
 		return false
 	}
 	return true

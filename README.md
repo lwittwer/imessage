@@ -543,11 +543,14 @@ rooms owned by it and cannot be undone by restoring local files.
 The fork's one policy change is that the default reset **preserves**
 Apple/iMessage login state. Cleanup enumerates only known disposable bridge
 artifacts, so `session.json`, keystore and trusted-peers data, anisette/state
-directories, and unknown future Apple-state files remain in place. The bridge
-also refreshes `session.json` during shutdown and waits for that final atomic
-save before disconnect completes. After shutdown, reset validates the saved
-session against its keystore before deleting the Beeper registration or local
-bridge database.
+directories, config backup files, and unknown future Apple-state files remain
+in place. The bridge also refreshes `session.json` during shutdown and waits
+for that final atomic save before disconnect completes. After shutdown, reset
+requires a running bridge to have atomically replaced the saved session, then
+validates it against its keystore before deleting the Beeper registration or
+local bridge database. It also requires trust-circle state when the config uses
+CloudKit backfill. A never-logged-in database may proceed only after reset
+confirms that it contains no Apple login.
 
 ```bash
 corten-matrix reset
@@ -556,7 +559,10 @@ corten-matrix reset
 Use the command entrypoint rather than invoking `scripts/reset-bridge.sh`
 directly. This intentionally narrow upstream-compatible command targets the
 primary account and default SQLite layout; it does not coordinate a second
-account or clear an external PostgreSQL database.
+account, a self-hosted homeserver, a custom SQLite path, or an external
+PostgreSQL database. Those configurations are rejected before the bridge is
+stopped. Removed and unknown options are rejected rather than silently treated
+as a default reset.
 
 For a clean rebuild after the DM-alias canonicalization fix:
 

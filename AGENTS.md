@@ -180,7 +180,9 @@ config YAML is loaded. Keep existing overrides such as
   preserving Apple/iMessage identity state. `--delete-imessage-state` is the
   explicit, separately confirmed full-wipe exception. The reset intentionally
   follows the upstream primary-account/default-SQLite flow; second-account and
-  external-PostgreSQL resets are not coordinated by this command. Manual reset
+  external-PostgreSQL resets are not coordinated by this command, and
+  unsupported providers, database layouts, and options must fail before the
+  service is stopped. Manual reset
   removes the service plus the relevant
   `~/.local/share/corten-matrix*` data dir and therefore also destroys Apple
   state, so do not use it for ordinary duplicate-room recovery.

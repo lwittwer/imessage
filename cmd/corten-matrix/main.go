@@ -126,8 +126,17 @@ func main() {
 			return
 		case "check-restore":
 			// Validate that backup session state can be restored without
-			// re-authentication. Exits 0 if valid, 1 if not.
-			if connector.CheckSessionRestore() {
+			// re-authentication. CloudKit callers additionally require the
+			// keychain trust circle. Exits 0 if valid, 1 if not, 2 for bad args.
+			requireKeychain := false
+			if len(os.Args) > 2 {
+				if len(os.Args) != 3 || os.Args[2] != "--require-keychain" {
+					fmt.Fprintln(os.Stderr, "Usage: corten-matrix check-restore [--require-keychain]")
+					os.Exit(2)
+				}
+				requireKeychain = true
+			}
+			if connector.CheckSessionRestore(requireKeychain) {
 				fmt.Fprintln(os.Stderr, "[+] Backup session state is valid — login can be auto-restored")
 				os.Exit(0)
 			} else {
