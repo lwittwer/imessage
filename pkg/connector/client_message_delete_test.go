@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -37,6 +38,22 @@ func (i *messageDeleteTestIntent) SendMessage(
 	return &mautrix.RespSendEvent{EventID: "$redaction"}, nil
 }
 
+func newMessageDeleteTestClient(t *testing.T) (*IMClient, *dbutil.Database) {
+	t.Helper()
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	if _, err := db.Exec(ctx, `CREATE TABLE message (
+		rowid INTEGER PRIMARY KEY, bridge_id TEXT, id TEXT, mxid TEXT,
+		room_id TEXT, room_receiver TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	bridgeDB := database.New("bridge", database.MetaTypes{}, db)
+	return &IMClient{
+		Main:      &IMConnector{Bridge: &bridgev2.Bridge{ID: "bridge", DB: bridgeDB}},
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "login"}},
+	}, db
+}
+
 func TestRedactMessagePartsWithBotRetainsRowsOnFailure(t *testing.T) {
 	parts := []*database.Message{{MXID: "$one"}, {MXID: "$two"}}
 	portal := &bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.org"}}
@@ -60,18 +77,8 @@ func TestRedactMessagePartsWithBotRetainsRowsOnFailure(t *testing.T) {
 
 func TestAppleDeletedMessagePartsFamilyAndAmbiguity(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	if _, err := db.Exec(ctx, `CREATE TABLE message (
-		rowid INTEGER PRIMARY KEY, bridge_id TEXT, id TEXT, mxid TEXT,
-		room_id TEXT, room_receiver TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	bridgeDB := database.New("bridge", database.MetaTypes{}, db)
-	client := &IMClient{
-		Main:      &IMConnector{Bridge: &bridgev2.Bridge{ID: "bridge", DB: bridgeDB}},
-		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "login"}},
-	}
-	for i, messageID := range []string{"message", "message_att0", "message_att1_notice", "message_other"} {
+	client, db := newMessageDeleteTestClient(t)
+	for i, messageID := range []string{"message", "message_att0", "message_att1_notice", "messageXatt0", "message_other"} {
 		if _, err := db.Exec(ctx, `INSERT INTO message VALUES ($1,$2,$3,$4,$5,$6)`,
 			i+1, "bridge", messageID, "$event", "portal-a", "login"); err != nil {
 			t.Fatal(err)
@@ -81,11 +88,34 @@ func TestAppleDeletedMessagePartsFamilyAndAmbiguity(t *testing.T) {
 	if err != nil || portal.ID != "portal-a" || len(parts) != 3 {
 		t.Fatalf("family lookup = portal:%v parts:%d err:%v", portal, len(parts), err)
 	}
-	if _, err = db.Exec(ctx, `INSERT INTO message VALUES (5,'bridge','message_att2','$other','portal-b','login')`); err != nil {
+	if _, err = db.Exec(ctx, `INSERT INTO message VALUES (6,'bridge','message_att2','$other','portal-b','login')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err = client.getAppleDeletedMessageParts(ctx, "message"); !errors.Is(err, errAppleDeletedMessagePortalAmbiguous) {
 		t.Fatalf("cross-portal family error = %v", err)
+	}
+}
+
+func TestPrepareDeletedMessageRechecksAfterTombstone(t *testing.T) {
+	ctx := context.Background()
+	client, db := newMessageDeleteTestClient(t)
+	client.cloudStore = newCloudBackfillStore(db, "login")
+	if err := client.cloudStore.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `CREATE TRIGGER materialize_message_after_tombstone
+		AFTER INSERT ON cloud_message WHEN NEW.deleted=TRUE BEGIN
+			INSERT INTO message (bridge_id,id,mxid,room_id,room_receiver)
+			VALUES ('bridge',NEW.guid,'$base','portal-a','login');
+			INSERT INTO message (bridge_id,id,mxid,room_id,room_receiver)
+			VALUES ('bridge',NEW.guid || '_att0','$attachment','portal-a','login');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+
+	portal, parts, err := client.prepareDeletedMessage(ctx, "message")
+	if err != nil || portal.ID != "portal-a" || len(parts) != 2 {
+		t.Fatalf("refreshed handoff = portal:%v parts:%d err:%v", portal, len(parts), err)
 	}
 }
 

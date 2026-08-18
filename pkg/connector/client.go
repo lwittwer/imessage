@@ -4611,7 +4611,19 @@ func (c *IMClient) prepareDeletedMessage(
 	if err != nil {
 		return networkid.PortalKey{}, nil, fmt.Errorf("persist delete tombstone: %w", err)
 	}
-	return portalKey, parts, nil
+	// Close the remaining handoff window: a bridge row inserted after the first
+	// lookup is either visible here or its PostHandle observes the tombstone.
+	refreshedPortalKey, refreshedParts, err := c.getAppleDeletedMessageParts(ctx, makeMessageID(targetUUID))
+	if err != nil {
+		return networkid.PortalKey{}, nil, fmt.Errorf("refresh bridge route: %w", err)
+	}
+	if portalKey.ID != "" && refreshedPortalKey.ID != "" && portalKey != refreshedPortalKey {
+		return networkid.PortalKey{}, nil, errAppleDeletedMessagePortalAmbiguous
+	}
+	if storedPortalID != "" && refreshedPortalKey.ID != "" && storedPortalID != string(refreshedPortalKey.ID) {
+		return networkid.PortalKey{}, nil, fmt.Errorf("%w: bridge portal %s, cloud portal %s", errAppleDeletedMessagePortalAmbiguous, refreshedPortalKey.ID, storedPortalID)
+	}
+	return refreshedPortalKey, refreshedParts, nil
 }
 
 // getAppleDeletedMessageParts resolves only current-login bridge rows.
@@ -4619,13 +4631,15 @@ func (c *IMClient) getAppleDeletedMessageParts(
 	ctx context.Context,
 	baseID networkid.MessageID,
 ) (networkid.PortalKey, []*database.Message, error) {
+	// The half-open range uses the existing (bridge, receiver, id) index. The
+	// exact filter below rejects unrelated IDs that fall between the bounds.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx, `
 		SELECT rowid, id, mxid, room_id, room_receiver
 		FROM message
 		WHERE bridge_id=$1 AND room_receiver=$2
-		  AND (id=$3 OR id LIKE ($3 || '_att%'))
+		  AND id >= $3 AND id < $4
 		ORDER BY id, rowid`,
-		c.Main.Bridge.ID, c.UserLogin.ID, baseID,
+		c.Main.Bridge.ID, c.UserLogin.ID, baseID, string(baseID)+"_atu",
 	)
 	if err != nil {
 		return networkid.PortalKey{}, nil, err
@@ -4638,6 +4652,9 @@ func (c *IMClient) getAppleDeletedMessageParts(
 		part := &database.Message{}
 		if err = rows.Scan(&part.RowID, &part.ID, &part.MXID, &part.Room.ID, &part.Room.Receiver); err != nil {
 			return networkid.PortalKey{}, nil, err
+		}
+		if part.ID != baseID && !strings.HasPrefix(string(part.ID), string(baseID)+"_att") {
+			continue
 		}
 		if portalKey.ID != "" && part.Room != portalKey {
 			return networkid.PortalKey{}, nil, errAppleDeletedMessagePortalAmbiguous
@@ -4726,7 +4743,7 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 		if err != nil {
 			cancel()
 			log.Error().Err(err).Str("target_uuid", targetUUID).
-				Msg("Deleted-message handoff failed; nothing was changed")
+				Msg("Deleted-message handoff failed")
 			continue
 		}
 
