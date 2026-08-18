@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -405,6 +406,8 @@ type IMClient struct {
 
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
+	// Serializes the local DB handoff between live messages and deletes.
+	messageDeleteHandoffMu sync.Mutex
 
 	// Layer-2 MMCS attachment recovery: persists descriptors for attachments
 	// whose push-time download exhausted the rustpushgo retry (Layer 1).
@@ -3431,12 +3434,29 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		}
 	}
 
-	// Persist this message UUID so cross-restart echoes are detected.
-	// hasMessageUUID checks cloud_message regardless of the deleted flag,
-	// so soft-deleted UUIDs from prior portal deletions still match.
+	// Persist the portal route, then check for a delete that arrived first.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
-			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
+		deleted, retriedRoute, persistRouteErr, deleteCheckErr := c.admitLiveMessage(
+			backgroundCtx,
+			func(ctx context.Context) error {
+				return c.cloudStore.persistMessageUUID(ctx, msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe)
+			},
+			func(ctx context.Context) (bool, error) {
+				return c.cloudStore.isMessageDeletedInPortal(ctx, msg.Uuid, portalID)
+			},
+		)
+		if persistRouteErr != nil {
+			log.Error().Err(persistRouteErr).Str("uuid", msg.Uuid).
+				Msg("Dropping message because its durable route could not be persisted after retry")
+			return
+		} else if retriedRoute {
+			log.Warn().Str("uuid", msg.Uuid).Msg("Persisted message route after retry")
+		}
+		if deleteCheckErr != nil {
+			log.Warn().Err(deleteCheckErr).Str("uuid", msg.Uuid).Msg("Failed to check per-message delete tombstone")
+		} else if deleted {
+			log.Info().Str("uuid", msg.Uuid).Msg("Suppressing Apple-deleted message before Matrix delivery")
+			return
 		}
 	}
 	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
@@ -3452,6 +3472,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 
 	hasText := liveMessageHasText(msg)
 	if hasText {
+		messageID := makeMessageID(msg.Uuid)
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:           bridgev2.RemoteEventMessage,
@@ -3459,13 +3480,13 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 				CreatePortal:   createPortal,
 				Sender:         sender,
 				Timestamp:      time.UnixMilli(int64(msg.TimestampMs)),
-				PostHandleFunc: persistCreatedPortalRoute,
+				PostHandleFunc: c.deletedMessagePostHandle(msg.Uuid, messageID, time.UnixMilli(int64(msg.TimestampMs)), persistCreatedPortalRoute, log),
 				LogContext: func(lc zerolog.Context) zerolog.Context {
 					return lc.Str("msg_uuid", msg.Uuid)
 				},
 			},
 			Data:               &msg,
-			ID:                 makeMessageID(msg.Uuid),
+			ID:                 messageID,
 			ConvertMessageFunc: convertMessage,
 		})
 	}
@@ -3492,6 +3513,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Index:          attIndex,
 		}
 		attIndex++
+		attachmentID := makeMessageID(attID)
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*attachmentMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:           bridgev2.RemoteEventMessage,
@@ -3499,13 +3521,13 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 				CreatePortal:   createPortal,
 				Sender:         sender,
 				Timestamp:      time.UnixMilli(int64(msg.TimestampMs)),
-				PostHandleFunc: persistCreatedPortalRoute,
+				PostHandleFunc: c.deletedMessagePostHandle(msg.Uuid, attachmentID, time.UnixMilli(int64(msg.TimestampMs)), persistCreatedPortalRoute, log),
 				LogContext: func(lc zerolog.Context) zerolog.Context {
 					return lc.Str("msg_uuid", attID)
 				},
 			},
 			Data: attMsg,
-			ID:   makeMessageID(attID),
+			ID:   attachmentID,
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
 				// Layer-2 MMCS retry enqueue: when download_mmcs_attachments
 				// (pkg/rustpushgo/src/lib.rs) exhausts the Layer-1 retries,
@@ -4511,6 +4533,198 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 }
 
+func redactMessagePartsWithBot(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	bot bridgev2.MatrixAPI,
+	parts []*database.Message,
+	timestamp time.Time,
+	deleteParts func(context.Context) error,
+) error {
+	if portal == nil || bot == nil || len(parts) == 0 {
+		return errors.New("missing portal, bot intent, or message parts")
+	}
+	result := portal.Internal().RedactMessageParts(ctx, parts, bot, timestamp)
+	if !result.Success {
+		if result.Error != nil {
+			return result.Error
+		}
+		return errors.New("one or more Matrix redactions failed")
+	}
+	return deleteParts(ctx)
+}
+
+var errAppleDeletedMessagePortalAmbiguous = errors.New("deleted message occurs in multiple portals")
+
+const messageDeleteDBTimeout = 10 * time.Second
+
+// admitLiveMessage serializes the live side of the durable delete handoff.
+func (c *IMClient) admitLiveMessage(
+	ctx context.Context,
+	persist func(context.Context) error,
+	checkDeleted func(context.Context) (bool, error),
+) (deleted, retried bool, persistErr, checkErr error) {
+	c.messageDeleteHandoffMu.Lock()
+	defer c.messageDeleteHandoffMu.Unlock()
+
+	firstErr := persist(ctx)
+	if firstErr != nil {
+		retried = true
+		retryCtx, cancel := context.WithTimeout(ctx, messageDeleteDBTimeout)
+		retryErr := persist(retryCtx)
+		cancel()
+		if retryErr != nil {
+			persistErr = fmt.Errorf("initial attempt: %v; retry: %w", firstErr, retryErr)
+			return
+		}
+	}
+	deleted, checkErr = checkDeleted(ctx)
+	return
+}
+
+// prepareDeletedMessage serializes route resolution and the tombstone write.
+// Matrix lookup/redaction happens after this returns and the lock is released.
+func (c *IMClient) prepareDeletedMessage(
+	ctx context.Context,
+	targetUUID string,
+) (networkid.PortalKey, []*database.Message, error) {
+	c.messageDeleteHandoffMu.Lock()
+	defer c.messageDeleteHandoffMu.Unlock()
+
+	portalKey, parts, err := c.getAppleDeletedMessageParts(ctx, makeMessageID(targetUUID))
+	if err != nil {
+		return networkid.PortalKey{}, nil, fmt.Errorf("resolve bridge route: %w", err)
+	}
+	if c.cloudStore == nil {
+		return portalKey, parts, nil
+	}
+	storedPortalID, err := c.cloudStore.getMessagePortalID(ctx, targetUUID)
+	if err != nil {
+		return networkid.PortalKey{}, nil, fmt.Errorf("resolve stored route: %w", err)
+	}
+	if storedPortalID != "" && portalKey.ID != "" && storedPortalID != string(portalKey.ID) {
+		return networkid.PortalKey{}, nil, fmt.Errorf("%w: bridge portal %s, cloud portal %s", errAppleDeletedMessagePortalAmbiguous, portalKey.ID, storedPortalID)
+	}
+	scrubCtx, cancel := context.WithTimeout(ctx, messageDeleteDBTimeout)
+	err = c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+	cancel()
+	if err != nil {
+		return networkid.PortalKey{}, nil, fmt.Errorf("persist delete tombstone: %w", err)
+	}
+	// Close the remaining handoff window: a bridge row inserted after the first
+	// lookup is either visible here or its PostHandle observes the tombstone.
+	refreshedPortalKey, refreshedParts, err := c.getAppleDeletedMessageParts(ctx, makeMessageID(targetUUID))
+	if err != nil {
+		return networkid.PortalKey{}, nil, fmt.Errorf("refresh bridge route: %w", err)
+	}
+	if portalKey.ID != "" && refreshedPortalKey.ID != "" && portalKey != refreshedPortalKey {
+		return networkid.PortalKey{}, nil, errAppleDeletedMessagePortalAmbiguous
+	}
+	if storedPortalID != "" && refreshedPortalKey.ID != "" && storedPortalID != string(refreshedPortalKey.ID) {
+		return networkid.PortalKey{}, nil, fmt.Errorf("%w: bridge portal %s, cloud portal %s", errAppleDeletedMessagePortalAmbiguous, refreshedPortalKey.ID, storedPortalID)
+	}
+	return refreshedPortalKey, refreshedParts, nil
+}
+
+// getAppleDeletedMessageParts resolves only current-login bridge rows.
+func (c *IMClient) getAppleDeletedMessageParts(
+	ctx context.Context,
+	baseID networkid.MessageID,
+) (networkid.PortalKey, []*database.Message, error) {
+	if baseID == "" {
+		return networkid.PortalKey{}, nil, nil
+	}
+	// The half-open range uses the existing (bridge, receiver, id) index. The
+	// exact filter below rejects unrelated IDs that fall between the bounds.
+	rows, err := c.Main.Bridge.DB.Database.Query(ctx, `
+		SELECT rowid, id, mxid, room_id, room_receiver
+		FROM message
+		WHERE bridge_id=$1 AND room_receiver=$2
+		  AND id >= $3 AND id < $4
+		ORDER BY id, rowid`,
+		c.Main.Bridge.ID, c.UserLogin.ID, baseID, string(baseID)+"_atu",
+	)
+	if err != nil {
+		return networkid.PortalKey{}, nil, err
+	}
+	defer rows.Close()
+
+	var portalKey networkid.PortalKey
+	var parts []*database.Message
+	for rows.Next() {
+		part := &database.Message{}
+		if err = rows.Scan(&part.RowID, &part.ID, &part.MXID, &part.Room.ID, &part.Room.Receiver); err != nil {
+			return networkid.PortalKey{}, nil, err
+		}
+		if part.ID != baseID && !strings.HasPrefix(string(part.ID), string(baseID)+"_att") {
+			continue
+		}
+		if portalKey.ID != "" && part.Room != portalKey {
+			return networkid.PortalKey{}, nil, errAppleDeletedMessagePortalAmbiguous
+		}
+		portalKey = part.Room
+		parts = append(parts, part)
+	}
+	return portalKey, parts, rows.Err()
+}
+
+func (c *IMClient) redactAppleDeletedMessageParts(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	parts []*database.Message,
+	timestamp time.Time,
+) error {
+	return redactMessagePartsWithBot(ctx, portal, c.Main.Bridge.Bot, parts, timestamp, func(ctx context.Context) error {
+		return c.Main.Bridge.DB.Database.DoTxn(ctx, nil, func(ctx context.Context) error {
+			for _, part := range parts {
+				if err := c.Main.Bridge.DB.Message.Delete(ctx, part.RowID); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+}
+
+func (c *IMClient) deletedMessagePostHandle(
+	uuid string,
+	messageID networkid.MessageID,
+	timestamp time.Time,
+	previous func(context.Context, *bridgev2.Portal),
+	log zerolog.Logger,
+) func(context.Context, *bridgev2.Portal) {
+	return func(ctx context.Context, portal *bridgev2.Portal) {
+		if previous != nil {
+			previous(ctx, portal)
+		}
+		if c.cloudStore == nil || portal == nil {
+			return
+		}
+		deleted, err := c.cloudStore.isMessageDeletedInPortal(ctx, uuid, string(portal.PortalKey.ID))
+		if err != nil {
+			log.Warn().Err(err).Str("target_uuid", uuid).Msg("Failed to check delete tombstone after bridge persistence")
+			return
+		}
+		if !deleted {
+			return
+		}
+		parts, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, messageID)
+		if err != nil {
+			log.Warn().Err(err).Str("target_uuid", uuid).Msg("Failed to load newly persisted Apple-deleted message")
+			return
+		}
+		parts = slices.DeleteFunc(parts, func(part *database.Message) bool {
+			return part == nil || part.Room != portal.PortalKey || part.ID != messageID
+		})
+		if len(parts) == 0 {
+			return
+		}
+		if err = c.redactAppleDeletedMessageParts(ctx, portal, parts, timestamp); err != nil {
+			log.Warn().Err(err).Str("target_uuid", uuid).Msg("Bot redaction failed after bridge persistence; bridge rows retained")
+		}
+	}
+}
+
 func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	deleteType := "MoveToRecycleBin"
 	if msg.IsPermanentDelete {
@@ -4522,39 +4736,35 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 		Int("uuid_count", len(msg.DeleteMessageUuids)).
 		Msg("Processing per-message delete")
 
+	deleteTimestamp := time.UnixMilli(int64(msg.TimestampMs))
+	if deleteTimestamp.UnixMilli() <= 0 {
+		deleteTimestamp = time.Now()
+	}
 	for _, targetUUID := range msg.DeleteMessageUuids {
-		// Scrub-before-portal-resolve: Apple-side delete can arrive while
-		// the targeted message is still sitting in pendingPortalMsgs for a
-		// not-yet-created portal (CloudKit sync hadn't finished when APNs
-		// delivered it), or before any cloud_message ingest has happened
-		// at all. If we waited for portal resolution we'd skip the scrub
-		// and the message would later bridge to Matrix with the body Apple
-		// has already deleted on the user's devices. softDeleteMessageByGUID
-		// also stub-inserts a deleted=TRUE row for guids not yet in
-		// cloud_message so the future CloudKit upsert preserves the
-		// deletion via its ON CONFLICT CASE.
-		//
-		// Fail-closed: skip the MessageRemove emit on scrub error so we
-		// don't strand plaintext post-bridgev2-row-deletion.
-		if c.cloudStore != nil {
-			// 10s (> the SQLite busy_timeout of 5s) so a one-off lock
-			// contention with the first-boot chunked scrubber doesn't cancel
-			// the write early and strand this Apple-side delete unscrubbed.
-			scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		portalKey, parts, err := c.prepareDeletedMessage(ctx, targetUUID)
+		if err != nil {
 			cancel()
-			if err != nil {
-				log.Error().Err(err).Str("target_uuid", targetUUID).
-					Msg("Skipping MessageRemove emit because cloud_message scrub failed — preserving privacy at the cost of a stale Matrix event")
-				continue
-			}
+			log.Error().Err(err).Str("target_uuid", targetUUID).
+				Msg("Deleted-message handoff failed")
+			continue
 		}
 
-		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
-		if portalKey.ID == "" {
+		// The lock covers only route resolution and the durable tombstone. A
+		// concurrent live event either sees it before queueing or is caught by
+		// this redaction or its post-handle check.
+		if portalKey.ID == "" || len(parts) == 0 {
+			cancel()
 			log.Debug().
 				Str("target_uuid", targetUUID).
-				Msg("Message UUID not found in bridge DB, scrub applied; skipping Matrix MessageRemove emit")
+				Msg("Message not persisted yet; durable delete tombstone will be checked after persistence")
+			continue
+		}
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if err != nil || portal == nil || portal.MXID == "" {
+			cancel()
+			log.Warn().Err(err).Str("target_uuid", targetUUID).
+				Msg("Deleted-message portal is unavailable; bridge rows retained")
 			continue
 		}
 
@@ -4563,15 +4773,11 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 			Str("portal_id", string(portalKey.ID)).
 			Msg("Sending redaction for deleted message")
 
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventMessageRemove,
-				PortalKey: portalKey,
-				Sender:    c.makeEventSender(msg.Sender),
-				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
-			},
-			TargetMessage: makeMessageID(targetUUID),
-		})
+		if err = c.redactAppleDeletedMessageParts(ctx, portal, parts, deleteTimestamp); err != nil {
+			log.Warn().Err(err).Str("target_uuid", targetUUID).
+				Msg("Bot redaction failed; bridge rows retained")
+		}
+		cancel()
 	}
 }
 

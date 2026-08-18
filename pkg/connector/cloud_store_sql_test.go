@@ -112,6 +112,35 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestDeletedMessageLookupUsesFunctionalIndex(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	if err := store.softDeleteMessageByGUID(ctx, "mixed-Case-guid"); err != nil {
+		t.Fatalf("softDeleteMessageByGUID: %v", err)
+	}
+	if err := store.persistMessageUUID(ctx, "mixed-Case-guid", "gid:portal", 1, false); err != nil {
+		t.Fatalf("persistMessageUUID: %v", err)
+	}
+
+	var id, parent, unused int
+	var detail string
+	if err := db.QueryRow(ctx, "EXPLAIN QUERY PLAN "+messageDeletedInPortalQuery,
+		testSQLLoginID, "MIXED-case-GUID", "gid:portal").Scan(&id, &parent, &unused, &detail); err != nil {
+		t.Fatalf("explain deleted-message lookup: %v", err)
+	}
+	if !strings.Contains(detail, "cloud_message_deleted_guid_idx") {
+		t.Fatalf("deleted-message lookup plan = %q", detail)
+	}
+	deleted, err := store.isMessageDeletedInPortal(ctx, "MIXED-case-GUID", "gid:portal")
+	if err != nil || !deleted {
+		t.Fatalf("indexed mixed-case lookup = %v, %v, want true", deleted, err)
+	}
+}
+
 // TestExistingDatabaseSurvivesTheDialectChanges is the upgrade path.
 //
 // Every other test here starts from an empty file, which only proves the new
@@ -355,11 +384,9 @@ func TestBatchUpsertDoesNotSuppressUnexpectedUniqueErrors(t *testing.T) {
 	}
 }
 
-// TestInsertOrIgnoreReplacementsAreNoOpOnConflict covers the four statements
-// that changed from SQLite's INSERT OR IGNORE to the portable
-// ON CONFLICT DO NOTHING. The conflict target has to name the right unique
-// index or the insert errors instead of quietly doing nothing.
-func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
+// TestConflictHandlersPreserveExpectedState covers ON CONFLICT statements and
+// the delete-before-live-message handoff.
+func TestConflictHandlersPreserveExpectedState(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
 	store := newCloudBackfillStore(db, testSQLLoginID)
@@ -387,6 +414,26 @@ func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
 		}
 		// markForwardBackfillDone's synthetic-row fallback.
 		store.markForwardBackfillDone(ctx, "gid:portal-3")
+	}
+	// A delete-created stub has no route. Live UUID persistence may fill that
+	// one field, but must leave the deletion and scrubbed body intact.
+	if err := store.persistMessageUUID(ctx, "uuid-never-synced", "gid:portal-4", now+1, true); err != nil {
+		t.Fatalf("persist route into delete stub: %v", err)
+	}
+	deleted, err := store.isMessageDeletedInPortal(ctx, "uuid-never-synced", "gid:portal-4")
+	if err != nil || !deleted {
+		t.Fatalf("delete tombstone after route fill = %v, %v, want true", deleted, err)
+	}
+	deleted, err = store.isMessageDeletedInPortal(ctx, "uuid-never-synced", "gid:other")
+	if err != nil || deleted {
+		t.Fatalf("delete tombstone in other portal = %v, %v, want false", deleted, err)
+	}
+	var bodyScrubbed bool
+	if err = db.QueryRow(ctx, `
+		SELECT body_scrubbed FROM cloud_message
+		WHERE login_id=$1 AND guid=$2
+	`, testSQLLoginID, "uuid-never-synced").Scan(&bodyScrubbed); err != nil || !bodyScrubbed {
+		t.Fatalf("delete stub body_scrubbed = %v, %v, want true", bodyScrubbed, err)
 	}
 
 	for _, uuid := range []string{"uuid-msg", "uuid-tap", "uuid-never-synced"} {

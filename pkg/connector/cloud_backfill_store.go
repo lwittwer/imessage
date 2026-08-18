@@ -99,6 +99,14 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 // leaves the whole store uninitialized.
 const postgresColumnExistsQuery = `SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name=$1 AND column_name=$2`
 
+const (
+	cloudMessageDeletedGUIDIndex = `CREATE INDEX IF NOT EXISTS cloud_message_deleted_guid_idx
+		ON cloud_message (login_id, portal_id, UPPER(guid)) WHERE deleted=TRUE`
+	messageDeletedInPortalQuery = `SELECT COUNT(*)
+		FROM cloud_message
+		WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND portal_id=$3 AND deleted=TRUE`
+)
+
 func columnExists(ctx context.Context, db *dbutil.Database, tableName, columnName string) (bool, error) {
 	var count int
 	var err error
@@ -258,6 +266,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
 			ON cloud_message (login_id, chat_id, timestamp_ms, guid)`,
+		cloudMessageDeletedGUIDIndex,
 	}
 
 	// Run table creation queries first (without indexes that depend on migrations)
@@ -2340,16 +2349,42 @@ func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, new
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
-// Uses ON CONFLICT DO NOTHING so it's safe to call even if the message
-// already exists.
+// Fill a delete-first tombstone's missing route without reviving its body.
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (login_id, guid) DO NOTHING
+		ON CONFLICT (login_id, guid) DO UPDATE SET
+			portal_id=excluded.portal_id
+		WHERE cloud_message.portal_id IS NULL OR cloud_message.portal_id=''
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, nowMS, nowMS)
 	return err
+}
+
+// Portal matching keeps reused SMS UUIDs from suppressing other conversations.
+func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx, messageDeletedInPortalQuery, s.loginID, guid, portalID).Scan(&count)
+	return count > 0, err
+}
+
+// getMessagePortalID returns the unique stored route for ambiguity checks.
+func (s *cloudBackfillStore) getMessagePortalID(ctx context.Context, guid string) (string, error) {
+	var portalID string
+	var count int
+	err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(MIN(portal_id), ''), COUNT(DISTINCT portal_id)
+		FROM cloud_message
+		WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND portal_id IS NOT NULL AND portal_id<>''
+	`, s.loginID, guid).Scan(&portalID, &count)
+	if err != nil {
+		return "", err
+	}
+	if count > 1 {
+		return "", fmt.Errorf("message %s occurs in multiple cloud portals", guid)
+	}
+	return portalID, nil
 }
 
 // persistTapbackUUID inserts a minimal cloud_message record for a realtime APNs
