@@ -249,31 +249,36 @@ func portalBridgeableSQL(portalCol, loginParam, bridgeFilteredParam string) stri
 // let a filtered sibling's message into sync-status counts whenever another
 // sibling is unfiltered.
 //
-// Known filtered/deleted chat IDs fail closed. Empty or unknown chat IDs also
-// fail closed once the portal has any live cloud_chat metadata. The final
-// fallback is reserved for legacy rows from portals with no live chat metadata
-// at all, matching the connector's backfill predicate.
+// Known filtered/deleted/remapped chat IDs fail closed. Empty or unknown chat
+// IDs retain the connector's legacy fallback only when the portal has no live
+// filtered sibling. That keeps old history visible on all-unfiltered portals
+// without leaking across a mixed sibling set.
 func messageBridgeableSQL(messageCol, loginParam, bridgeFilteredParam string) string {
 	return `EXISTS (
 		  SELECT 1 FROM cloud_chat matched
 		  WHERE matched.login_id=` + loginParam + `
 		    AND LOWER(matched.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		    AND matched.portal_id=` + messageCol + `.portal_id
 		    AND matched.deleted=FALSE
 		    AND (` + bridgeFilteredParam + ` OR COALESCE(matched.is_filtered, 0)=0)
 		)
 		OR (
 		  NOT EXISTS (
-		    SELECT 1 FROM cloud_chat matched
-		    WHERE matched.login_id=` + loginParam + `
-		      AND LOWER(matched.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		    SELECT 1 FROM cloud_chat source
+		    WHERE source.login_id=` + loginParam + `
+		      AND LOWER(source.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
 		  )
-		  AND NOT EXISTS (
-		    SELECT 1 FROM cloud_chat live
-		    WHERE live.login_id=` + loginParam + `
-		      AND live.portal_id=` + messageCol + `.portal_id
-		      AND live.cloud_chat_id NOT LIKE 'synthetic:%'
-		      AND live.cloud_chat_id NOT LIKE 'recycle:%'
-		      AND live.deleted=FALSE
+		  AND (
+		    ` + bridgeFilteredParam + `
+		    OR NOT EXISTS (
+		      SELECT 1 FROM cloud_chat live
+		      WHERE live.login_id=` + loginParam + `
+		        AND live.portal_id=` + messageCol + `.portal_id
+		        AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+		        AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+		        AND live.deleted=FALSE
+		        AND COALESCE(live.is_filtered, 0) <> 0
+		    )
 		  )
 		)`
 }

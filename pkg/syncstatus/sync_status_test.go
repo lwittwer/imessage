@@ -448,6 +448,59 @@ func TestGetSyncStatusSQLiteMixedFilteredSiblingMessageCounts(t *testing.T) {
 	}
 }
 
+func TestGetSyncStatusMatchesLegacyAndRemappedSourceEligibility(t *testing.T) {
+	const (
+		bridgeID = "corten"
+		loginID  = "login-source-parity"
+	)
+	ctx := context.Background()
+	db := newSyncStatusParityDB(t)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("exec %q: %v", strings.TrimSpace(query), err)
+		}
+	}
+
+	exec(`INSERT INTO user_login (bridge_id, id) VALUES ($1, $2)`, bridgeID, loginID)
+	exec(`INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, is_filtered, deleted, display_name)
+		VALUES
+		  ($1, 'all-unfiltered-live', 'all-unfiltered-portal', 0, 0, ''),
+		  ($1, 'mixed-live', 'mixed-portal', 0, 0, ''),
+		  ($1, 'mixed-filtered', 'mixed-portal', 1, 0, ''),
+		  ($1, 'remapped-source', 'new-portal', 0, 0, ''),
+		  ($1, 'old-portal-live', 'old-portal', 0, 0, '')`, loginID)
+
+	for i, row := range []struct {
+		guid   string
+		chatID string
+		portal string
+	}{
+		{guid: "legacy-empty", chatID: "", portal: "all-unfiltered-portal"},
+		{guid: "legacy-unknown", chatID: "unknown-source", portal: "all-unfiltered-portal"},
+		{guid: "mixed-empty", chatID: "", portal: "mixed-portal"},
+		{guid: "mixed-unknown", chatID: "another-unknown", portal: "mixed-portal"},
+		{guid: "stale-remapped", chatID: "remapped-source", portal: "old-portal"},
+	} {
+		exec(`INSERT INTO cloud_message
+			(login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+			 text, subject, deleted, tapback_type, attachments_json, record_name,
+			 body_scrubbed, has_body)
+			VALUES ($1, $2, $3, $4, $5, 'tel:+15550001', 0,
+			 'body', '', 0, NULL, '', $6, 0, 1)`,
+			loginID, row.guid, row.chatID, row.portal, int64(i+1)*1000, "record-"+row.guid)
+	}
+
+	r, err := GetSyncStatus(ctx, db, SyncStatusOptions{BridgeID: bridgeID, LoginID: loginID})
+	if err != nil {
+		t.Fatalf("GetSyncStatus: %v", err)
+	}
+	if r.CandidateMessages != 5 || r.DeliverableMessages != 2 || r.FilteredChatMessages != 3 || r.PendingMessages() != 2 {
+		t.Fatalf("source parity counts = candidates %d deliverable %d filtered %d pending %d, want 5/2/3/2",
+			r.CandidateMessages, r.DeliverableMessages, r.FilteredChatMessages, r.PendingMessages())
+	}
+}
+
 func TestGetSyncStatusCapIgnoresNewerFilteredSibling(t *testing.T) {
 	const (
 		bridgeID = "corten"
