@@ -196,6 +196,46 @@ func TestHasBackfillableMessagesBeforeRespectsInitialWindow(t *testing.T) {
 	}
 }
 
+func TestInitialSyncProbeRejectsContentfulMessagesWithEmptyGUID(t *testing.T) {
+	mac := newTestMacMessagesDB(t)
+	if _, err := mac.chatDB.Exec(`
+		INSERT INTO chat (ROWID, guid) VALUES (1, 'iMessage;-;+15550000009');
+		INSERT INTO handle (ROWID, id, service) VALUES (1, '+15551111111', 'iMessage');
+		INSERT INTO message (ROWID, guid, date, subject, text, attributedBody, handle_id, is_from_me, item_type, associated_message_guid)
+		VALUES (1, '', 1000, '', 'content without a stable message identity', NULL, 1, 0, 0, '');
+		INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	chats, err := mac.GetChatsWithMessagesAfter(imessage.AppleEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chats) != 0 {
+		t.Fatalf("initial-sync chat probe returned %#v for an empty-GUID-only chat", chats)
+	}
+
+	before := imessage.AppleEpoch.Add(10 * time.Second)
+	for _, limit := range []int{1, 1<<31 - 1} {
+		hasMessages, err := mac.HasBackfillableMessagesBefore("iMessage;-;+15550000009", before, limit)
+		if err != nil {
+			t.Fatalf("HasBackfillableMessagesBefore(limit=%d): %v", limit, err)
+		}
+		if hasMessages {
+			t.Fatalf("HasBackfillableMessagesBefore(limit=%d) = true for empty GUID", limit)
+		}
+	}
+
+	decoded, err := mac.hasDecodedBackfillableMessagePage("iMessage;-;+15550000009", before, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded {
+		t.Fatal("decoded initial-sync probe accepted an empty-GUID message that FetchMessages drops")
+	}
+}
+
 func TestHasBackfillableMessagesBeforePagesThroughSQLFalsePositives(t *testing.T) {
 	mac := newTestMacMessagesDB(t)
 	if _, err := mac.chatDB.Exec(`

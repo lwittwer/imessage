@@ -106,6 +106,38 @@ func TestBackfillTriggerTimestampIncludesReactionOnlyActivity(t *testing.T) {
 	}
 }
 
+func TestPendingInitialBackfillsExcludesSkippedReactionOnlyPortal(t *testing.T) {
+	reactionOnly := portalWithNewestMessage{
+		MessageActivityTS:      7000,
+		MessageWriteActivityTS: 7000,
+		MessageCount:           1,
+	}
+	if !shouldForceCloudBackfill(reactionOnly) {
+		t.Fatal("reaction-only candidate no longer requests a catch-up backfill")
+	}
+	ordered := []string{"reaction-only", "queued"}
+	needs := map[string]bool{"reaction-only": true, "queued": true}
+	if got := countInitialBackfillPortals(ordered, needs, map[string]bool{"reaction-only": true}); got != 1 {
+		t.Fatalf("pending initial backfill count = %d, want only the queued portal", got)
+	}
+	if got := countInitialBackfillPortals([]string{"reaction-only"}, needs, map[string]bool{"reaction-only": true}); got != 0 {
+		t.Fatalf("skipped unchanged reaction-only portal kept %d pending backfills, want 0", got)
+	}
+}
+
+func TestGroupDedupSwapCarriesInitialBackfillNeed(t *testing.T) {
+	needs := map[string]bool{"gid:old": true}
+
+	moveInitialBackfillNeed(needs, "gid:old", "gid:room")
+
+	if got := countInitialBackfillPortals([]string{"gid:room"}, needs, nil); got != 1 {
+		t.Fatalf("swapped group portal pending count = %d, want 1", got)
+	}
+	if needs["gid:old"] {
+		t.Fatal("old deduplicated portal retained an initial-backfill need")
+	}
+}
+
 func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
 	tests := []struct {
 		name string

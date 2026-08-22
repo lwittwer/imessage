@@ -205,6 +205,23 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// The same chat_message row can be joined through multiple exact chat GUIDs,
 	// so deduplicate the merged event stream before conversion.
 	messages = deduplicateChatDBMessages(messages)
+	// The API can return nil entries for rows that disappear while a page is
+	// being materialized. Keep nonnil messages with an empty GUID (they are
+	// valid legacy rows and are filtered by chatDBMessageCanBackfill), but never
+	// let a nil entry reach the chronological sort below.
+	if len(messages) > 0 {
+		nonnil := messages[:0]
+		for _, msg := range messages {
+			if msg != nil {
+				nonnil = append(nonnil, msg)
+			}
+		}
+		if dropped := len(messages) - len(nonnil); dropped > 0 {
+			log.Warn().Int("dropped", dropped).
+				Msg("chat.db backfill: dropped nil messages")
+		}
+		messages = nonnil
+	}
 
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
@@ -448,7 +465,10 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 	seen := make(map[string]struct{}, len(messages))
 	result := make([]*imessage.Message, 0, len(messages))
 	for _, message := range messages {
-		if message == nil || message.GUID == "" {
+		if message == nil {
+			continue
+		}
+		if message.GUID == "" {
 			result = append(result, message)
 			continue
 		}
@@ -626,7 +646,7 @@ func normalizeChatDBMessageText(msg *imessage.Message) {
 }
 
 func chatDBMessageCanBackfill(msg *imessage.Message) bool {
-	if msg == nil || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+	if msg == nil || msg.GUID == "" || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
 		return false
 	}
 	if !msg.IsFromMe && msg.Sender.LocalID == "" {

@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"math"
 	"os"
@@ -13,6 +15,7 @@ import (
 	// links it too (via litestream's sqlite3-fk-wal), but pkg/cli itself has
 	// no reason to import a database driver outside a test.
 	_ "github.com/mattn/go-sqlite3"
+	_ "go.mau.fi/util/dbutil/litestream"
 )
 
 // The generated config.yaml carries max_initial_messages TWICE — once at
@@ -105,6 +108,116 @@ func TestEffectiveMaxInitialMessages(t *testing.T) {
 	}
 }
 
+func TestValidateSyncStatusArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "primary", want: true},
+		{name: "second", args: []string{"1"}, want: true},
+		{name: "unknown account", args: []string{"2"}},
+		{name: "unknown option", args: []string{"--json"}},
+		{name: "too many", args: []string{"1", "extra"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateSyncStatusArgs(tc.args) == nil; got != tc.want {
+				t.Errorf("validateSyncStatusArgs(%q) success = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadOnlySQLiteURI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		uri     string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "preserves bridge parameters",
+			uri:  "file:/tmp/bridge.db?_txlock=immediate&_secure_delete=on",
+			want: "file:/tmp/bridge.db?_secure_delete=on&_txlock=immediate&mode=ro",
+		},
+		{name: "rejects memory", uri: ":memory:", wantErr: true},
+		{name: "rejects memory URI", uri: "file::memory:?cache=shared", wantErr: true},
+		{name: "rejects memory mode", uri: "file:/tmp/bridge.db?mode=memory", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := readOnlySQLiteURI(tc.uri)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("readOnlySQLiteURI(%q) error = nil, want error", tc.uri)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readOnlySQLiteURI(%q): %v", tc.uri, err)
+			}
+			if got != tc.want {
+				t.Errorf("readOnlySQLiteURI(%q) = %q, want %q", tc.uri, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenSyncStatusDatabaseDoesNotCreateSQLiteFile(t *testing.T) {
+	for _, dbType := range []string{"sqlite3", "sqlite3-fk-wal"} {
+		t.Run(dbType, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "missing.db")
+			cfg := syncStatusConfig{}
+			cfg.Database.Type = dbType
+			cfg.Database.URI = "file:" + path
+			db, err := openSyncStatusDatabase(cfg)
+			if err != nil {
+				t.Fatalf("openSyncStatusDatabase: %v", err)
+			}
+			defer db.Close()
+			if err := db.RawDB.Ping(); err == nil {
+				t.Fatal("Ping succeeded for a missing read-only database")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("read-only diagnostic created %s (stat error: %v)", path, err)
+			}
+		})
+	}
+}
+
+func TestSyncStatusDatabaseErrorClassNeverExposesDriverDetails(t *testing.T) {
+	secretURL := "postgres://bridge:super-secret@example.invalid:5432/bridge?sslmode=disable"
+	secretPath := "/Users/lucas/.local/share/corten-matrix/bridge.db?mode=ro"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "decoded postgres credentials",
+			err:  errors.New("pq: password authentication failed for bridge at " + secretURL),
+			want: "database operation failed",
+		},
+		{
+			name: "path-shaped sqlite error",
+			err:  errors.New("unable to open " + secretPath + ": no such file or directory"),
+			want: "database operation failed",
+		},
+		{name: "permission class is static", err: errors.Join(errors.New(secretPath), os.ErrPermission), want: "database permission denied"},
+		{name: "not found class is static", err: errors.Join(errors.New(secretPath), os.ErrNotExist), want: "database file not found"},
+		{name: "timeout class is static", err: errors.Join(errors.New(secretURL), context.DeadlineExceeded), want: "database query timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := syncStatusDatabaseErrorClass(tc.err)
+			if got != tc.want {
+				t.Fatalf("syncStatusDatabaseErrorClass() = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "super-secret") || strings.Contains(got, "corten-matrix/bridge.db") || strings.Contains(got, "postgres://") {
+				t.Fatalf("database error class exposed a secret/path: %q", got)
+			}
+		})
+	}
+}
+
 // TestRunSyncStatusEndToEnd drives the whole CLI path — locate config.yaml,
 // open the database it names, run the read-only report — against a database
 // built here. It is the only place the CLI half is exercised as a unit,
@@ -136,13 +249,12 @@ func TestRunSyncStatusEndToEnd(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	config := "database:\n    type: sqlite3\n    uri: file:" + dbPath +
+	config := "database:\n    type: sqlite3-fk-wal\n    uri: file:" + dbPath +
 		"\nbackfill:\n    max_initial_messages: 2147483647\n    threads:\n        max_initial_messages: 50\n" +
 		"network:\n    cloudkit_backfill: true\n"
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-
 	out := captureStdout(t, func() { runSyncStatus(nil) })
 	// A logged-in database whose CloudKit store has never initialized: the
 	// report has to say so rather than showing zeros as if they were progress.

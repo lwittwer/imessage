@@ -44,8 +44,12 @@ type ZoneSyncStatus struct {
 	Present     bool
 	HasToken    bool
 	LastSuccess *time.Time
-	LastError   string
-	UpdatedAt   *time.Time
+	// HasError records only whether the last attempt failed. Persisted driver
+	// and CloudKit error text may contain account identifiers or URLs, so it is
+	// never retained in this report.
+	HasError  bool
+	LastError string
+	UpdatedAt *time.Time
 }
 
 // SyncStatusReport is a point-in-time picture of CloudKit ingestion and Matrix
@@ -180,7 +184,7 @@ func (r *SyncStatusReport) FullyCaughtUp() bool {
 // brand-new database degrades into a shorter report instead of an error. The
 // CLI is expected to be pointed at exactly such a database — someone runs it
 // while setup is still going — so this is the normal path, not an edge case.
-func syncStatusTableExists(ctx context.Context, db *dbutil.Database, table string) bool {
+func syncStatusTableExists(ctx context.Context, db *dbutil.Database, table string) (bool, error) {
 	var count int
 	var err error
 	switch db.Dialect {
@@ -191,7 +195,10 @@ func syncStatusTableExists(ctx context.Context, db *dbutil.Database, table strin
 		err = db.QueryRow(ctx,
 			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$1`, table).Scan(&count)
 	}
-	return err == nil && count > 0
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // portalBridgeableSQL is the "will this portal get a Matrix room at all" test,
@@ -259,14 +266,18 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, opts SyncStatusOpti
 	// joins on it, so inheriting an empty one would report 0% delivered on a
 	// perfectly healthy bridge.
 	if report.LoginID == "" || report.BridgeID == "" {
-		if !syncStatusTableExists(ctx, db, "user_login") {
+		hasUserLogin, err := syncStatusTableExists(ctx, db, "user_login")
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect the user_login table: %w", err)
+		}
+		if !hasUserLogin {
 			// Database exists but bridgev2 has never migrated it.
 			return report, nil
 		}
 		// One login per database: the two-account setup gives each account
 		// its own data dir, config and database.
 		var bridgeID, loginID string
-		err := db.QueryRow(ctx, `SELECT bridge_id, id FROM user_login ORDER BY id LIMIT 1`).
+		err = db.QueryRow(ctx, `SELECT bridge_id, id FROM user_login ORDER BY id LIMIT 1`).
 			Scan(&bridgeID, &loginID)
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -286,9 +297,27 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, opts SyncStatusOpti
 		return report, nil
 	}
 
-	report.CloudTablesPresent = syncStatusTableExists(ctx, db, "cloud_message") &&
-		syncStatusTableExists(ctx, db, "cloud_chat") &&
-		syncStatusTableExists(ctx, db, "cloud_sync_state")
+	cloudMessagePresent, err := syncStatusTableExists(ctx, db, "cloud_message")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect the cloud_message table: %w", err)
+	}
+	cloudChatPresent, err := syncStatusTableExists(ctx, db, "cloud_chat")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect the cloud_chat table: %w", err)
+	}
+	cloudSyncStatePresent, err := syncStatusTableExists(ctx, db, "cloud_sync_state")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect the cloud_sync_state table: %w", err)
+	}
+	report.CloudTablesPresent = cloudMessagePresent && cloudChatPresent && cloudSyncStatePresent
+	messagePresent, err := syncStatusTableExists(ctx, db, "message")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect the message table: %w", err)
+	}
+	backfillTaskPresent, err := syncStatusTableExists(ctx, db, "backfill_task")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect the backfill_task table: %w", err)
+	}
 
 	if report.CloudTablesPresent {
 		if err := report.readZones(ctx, db); err != nil {
@@ -297,18 +326,18 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, opts SyncStatusOpti
 		if err := report.readChatCounts(ctx, db); err != nil {
 			return nil, err
 		}
-		if syncStatusTableExists(ctx, db, "message") {
+		if messagePresent {
 			if err := report.readMessageCounts(ctx, db); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if syncStatusTableExists(ctx, db, "message") {
+	if messagePresent {
 		if err := report.readLastDelivered(ctx, db); err != nil {
 			return nil, err
 		}
 	}
-	if syncStatusTableExists(ctx, db, "backfill_task") {
+	if backfillTaskPresent {
 		if err := report.readBackfillTasks(ctx, db); err != nil {
 			return nil, err
 		}
@@ -339,10 +368,10 @@ func (r *SyncStatusReport) readZones(ctx context.Context, db *dbutil.Database) e
 			return fmt.Errorf("failed to read CloudKit sync state: %w", err)
 		}
 		z := ZoneSyncStatus{
-			Zone:      zone,
-			Present:   true,
-			HasToken:  token.Valid && token.String != "",
-			LastError: lastErr.String,
+			Zone:     zone,
+			Present:  true,
+			HasToken: token.Valid && token.String != "",
+			HasError: lastErr.Valid && lastErr.String != "",
 		}
 		if lastSuccess.Valid && lastSuccess.Int64 > 0 {
 			t := time.UnixMilli(lastSuccess.Int64)
@@ -615,8 +644,8 @@ func (r *SyncStatusReport) Format() string {
 			continue
 		}
 		line := fmt.Sprintf("  %-12s last success: %s", zoneLabel(z.Zone), syncStatusAgo(z.LastSuccess))
-		if z.LastError != "" {
-			line += fmt.Sprintf("  ⚠️ last error: %s", z.LastError)
+		if z.HasError {
+			line += "  ⚠️ last sync attempt failed (details redacted; inspect local logs)"
 		}
 		sb.WriteString(line + "\n")
 	}
@@ -712,7 +741,7 @@ func fnSyncStatus(ce *commands.Event) {
 
 	report, err := GetSyncStatus(ce.Ctx, ce.Bridge.DB.Database, opts)
 	if err != nil {
-		ce.Reply("Failed to read sync status: %v", err)
+		ce.Reply("Failed to read sync status.")
 		return
 	}
 	ce.Reply("%s", report.Format())

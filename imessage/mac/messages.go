@@ -137,6 +137,7 @@ JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
 JOIN chat              ON chat_message_join.chat_id = chat.ROWID
 LEFT JOIN handle sender_handle ON message.handle_id = sender_handle.ROWID
 WHERE message.date>$1
+  AND COALESCE(message.guid, '') <> ''
   AND message.item_type = 0
   AND COALESCE(message.associated_message_guid, '') = ''
   AND (message.is_from_me = 1 OR COALESCE(sender_handle.id, '') <> '')
@@ -161,6 +162,7 @@ SELECT EXISTS (
   LEFT JOIN handle sender_handle ON message.handle_id = sender_handle.ROWID
   WHERE (chat.guid=$1 OR $1='')
     AND message.date<$2
+    AND COALESCE(message.guid, '') <> ''
     AND message.item_type = 0
     AND COALESCE(message.associated_message_guid, '') = ''
     AND (message.is_from_me = 1 OR COALESCE(sender_handle.id, '') <> '')
@@ -180,7 +182,8 @@ SELECT EXISTS (
 const hasInitialBackfillableQuery = `
 SELECT EXISTS (
   SELECT 1 FROM (
-    SELECT message.ROWID, COALESCE(message.text, '') AS text,
+    SELECT message.ROWID, COALESCE(message.guid, '') AS guid,
+           COALESCE(message.text, '') AS text,
            COALESCE(message.subject, '') AS subject, message.attributedBody,
            message.item_type, COALESCE(message.associated_message_guid, '') AS associated_message_guid,
            message.is_from_me, COALESCE(sender_handle.id, '') AS sender_id
@@ -193,7 +196,8 @@ SELECT EXISTS (
     ORDER BY message.date DESC, message.ROWID DESC
     LIMIT $3
   ) candidate
-  WHERE candidate.item_type = 0
+  WHERE candidate.guid <> ''
+    AND candidate.item_type = 0
     AND candidate.associated_message_guid = ''
     AND (candidate.is_from_me = 1 OR candidate.sender_id <> '')
     AND (
@@ -663,7 +667,7 @@ func hasBackfillableMessage(messages []*imessage.Message) bool {
 }
 
 func macMessageCanBackfill(msg *imessage.Message) bool {
-	if msg == nil || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+	if msg == nil || msg.GUID == "" || msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
 		return false
 	}
 	if !msg.IsFromMe && msg.Sender.LocalID == "" {

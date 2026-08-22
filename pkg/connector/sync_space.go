@@ -222,7 +222,7 @@ func syncSpaceOneRoom(ce *commands.Event, login *bridgev2.UserLogin, dp bridgev2
 
 	log := ce.Log.With().
 		Str("action", "sync-space").
-		Str("portal_id", string(portal.ID)).
+		Str("portal_id", logSafeHandle(string(portal.ID))).
 		Stringer("room_id", portal.MXID).
 		Logger()
 

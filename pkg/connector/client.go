@@ -5227,12 +5227,13 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	logPortalID := logSafeHandle(portalID)
 	// Guard the CloudKit FFI calls below (upstream cloudkit.rs has
 	// reachable panic sites via type assertions). Missing one metadata
 	// refresh is strictly safer than crashing the bridge.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error().Interface("panic", r).Str("portal_id", portalID).
+			log.Error().Interface("panic", r).Str("portal_id", logPortalID).
 				Msg("refreshRecoveredChatMetadata panicked — skipped")
 		}
 	}()
@@ -5252,13 +5253,13 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 	// them, wasting hundreds of CloudKit API calls for nothing.
 	recoverableChats, err := c.client.ListRecoverableChats()
 	if err != nil {
-		log.Warn().Err(err).Str("portal_id", portalID).
+		log.Warn().Err(err).Str("portal_id", logPortalID).
 			Msg("Failed to list recoverable chats for metadata refresh")
 		return
 	}
 
 	log.Info().
-		Str("portal_id", portalID).
+		Str("portal_id", logPortalID).
 		Str("target_chat_id", targetChatID).
 		Str("target_group_id", targetGroupID).
 		Int("recycle_bin_count", len(recoverableChats)).
@@ -5317,7 +5318,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 			}
 		}
 		if len(matched) > 0 {
-			log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+			log.Info().Str("portal_id", logPortalID).Int("matched", len(matched)).
 				Msg("Matched recycle bin chat by participant overlap (per-participant UUID fallback)")
 			// Seed directly with our portal ID rather than going through
 			// ingestCloudChats, which would resolve to gid:<real-group-id>
@@ -5339,14 +5340,14 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 				}
 				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
 			}
-			log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+			log.Info().Str("portal_id", logPortalID).Int("matched", len(matched)).
 				Msg("Seeded chat metadata from recycle bin (participant fallback)")
 			return
 		}
 	}
 
 	if len(matched) == 0 {
-		log.Debug().Str("portal_id", portalID).
+		log.Debug().Str("portal_id", logPortalID).
 			Msg("No match in recycle bin — scanning main CloudKit chat zone for group metadata")
 		// Recycle bin is empty (Apple already recovered the chat back to the
 		// main zone). Scan CloudSyncChats to find the group record with the
@@ -5397,7 +5398,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 					}
 				}
 				if len(matched) > 0 {
-					log.Info().Str("portal_id", portalID).Int("page", page).Int("matched", len(matched)).
+					log.Info().Str("portal_id", logPortalID).Int("page", page).Int("matched", len(matched)).
 						Msg("Found group chat in main CloudKit zone (participant match)")
 					break
 				}
@@ -5408,7 +5409,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 			}
 		}
 		if len(matched) == 0 {
-			log.Debug().Str("portal_id", portalID).
+			log.Debug().Str("portal_id", logPortalID).
 				Msg("No matching chat metadata found in recycle bin or main zone")
 			return
 		}
@@ -5430,7 +5431,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 			}
 			c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
 		}
-		log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+		log.Info().Str("portal_id", logPortalID).Int("matched", len(matched)).
 			Msg("Seeded group chat metadata from main CloudKit zone")
 		return
 	}
@@ -5458,7 +5459,7 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 		c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
 	}
 
-	log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+	log.Info().Str("portal_id", logPortalID).Int("matched", len(matched)).
 		Msg("Seeded recovered chat metadata from recycle bin (UUID match)")
 }
 
@@ -5474,11 +5475,12 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	logPortalID := logSafeHandle(portalID)
 	// CloudKit FFI path — guard against upstream panics (cloudkit.rs type
 	// assertions). Dropping one restore pass is safer than crashing.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error().Interface("panic", r).Str("portal_id", portalID).
+			log.Error().Interface("panic", r).Str("portal_id", logPortalID).
 				Msg("recoverMessagesFromRecycleBin panicked — skipped")
 		}
 	}()
@@ -5488,13 +5490,13 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	// Get recoverable message GUIDs from the recycle bin zone.
 	entries, err := c.client.ListRecoverableMessageGuids()
 	if err != nil {
-		log.Warn().Err(err).Str("portal_id", portalID).
+		log.Warn().Err(err).Str("portal_id", logPortalID).
 			Msg("Failed to list recoverable message GUIDs for restore")
 		return
 	}
 
 	if len(entries) == 0 {
-		log.Debug().Str("portal_id", portalID).Msg("No recoverable messages found in recycle bin")
+		log.Debug().Str("portal_id", logPortalID).Msg("No recoverable messages found in recycle bin")
 		return
 	}
 
@@ -5544,7 +5546,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 		restored += int(n)
 	}
 
-	log.Info().Str("portal_id", portalID).Int("recycle_bin_guids", len(allGUIDs)).
+	log.Info().Str("portal_id", logPortalID).Int("recycle_bin_guids", len(allGUIDs)).
 		Int("restored", restored).Msg("Recovered messages from recycle bin")
 
 	// If no existing rows were undeleted (cloud_message is empty), seed
@@ -5601,13 +5603,13 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=FALSE, portal_id=$4
 			`, c.cloudStore.loginID, guid, metadata.CloudChatID, portalID, metadata.TimestampMS, metadata.Sender, metadata.IsFromMe, metadata.Service, nowMS, metadata.RecordName)
 			if insertErr != nil {
-				log.Debug().Err(insertErr).Str("guid", guid).Msg("Failed to seed cloud_message from recycle bin")
+				log.Debug().Err(insertErr).Str("guid", logSafeHandle(guid)).Msg("Failed to seed cloud_message from recycle bin")
 				continue
 			}
 			seeded++
 		}
 		if seeded > 0 {
-			log.Info().Str("portal_id", portalID).Int("seeded", seeded).
+			log.Info().Str("portal_id", logPortalID).Int("seeded", seeded).
 				Msg("Seeded cloud_message from recycle bin metadata (cloud_message was empty)")
 		}
 	}
@@ -5618,9 +5620,9 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 func (c *IMClient) fetchAndResyncRecoveredChat(log zerolog.Logger, portalKey networkid.PortalKey, portalID string) {
 	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID)
 	if err != nil {
-		log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to import CloudKit messages for recovered chat")
+		log.Warn().Err(err).Str("portal_id", logSafeHandle(portalID)).Msg("Failed to import CloudKit messages for recovered chat")
 	} else {
-		log.Info().Int("imported", imported).Str("portal_id", portalID).
+		log.Info().Int("imported", imported).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Imported CloudKit messages for recovered chat")
 	}
 	c.refreshRecoveredPortalAfterCloudSync(log, portalKey, "apns_chat_recover_fetched")
@@ -5665,6 +5667,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	if c.client == nil {
 		return 0, nil, fmt.Errorf("rustpush client not initialized")
 	}
+	logPortalID := logSafeHandle(portalID)
 
 	// Resolve the CloudKit chat_id for this portal.
 	cloudChatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID)
@@ -5685,7 +5688,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	}
 
 	log.Info().
-		Str("portal_id", portalID).
+		Str("portal_id", logPortalID).
 		Str("cloud_chat_id", cloudChatID).
 		Msg("Fetching messages from CloudKit for recovered chat with empty local cache")
 
@@ -5738,7 +5741,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 				Msg("CloudFetchRecentMessages failed for recovered chat")
 			return
 		}
-		log.Info().Int("count", len(targeted)).Str("portal_id", portalID).
+		log.Info().Int("count", len(targeted)).Str("portal_id", logPortalID).
 			Str("cloud_chat_id", chatID).
 			Msg("Targeted CloudKit fetch for recovered chat")
 		for _, msg := range targeted {
@@ -5786,7 +5789,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 		return 0, nil, ctx.Err()
 	}
 	if len(matched) == 0 {
-		log.Info().Str("portal_id", portalID).
+		log.Info().Str("portal_id", logPortalID).
 			Msg("All targeted fetches returned 0 — falling back to unfiltered CloudFetchRecentMessages")
 		// Use the same page/message limits as the targeted fetch (50 pages, 5000 msgs).
 		// Larger limits (e.g. 500 pages) caused CloudKit to return malformed responses
@@ -5828,7 +5831,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 		}
 		sort.Strings(sampleIDs)
 		log.Info().Int("total", len(unfiltered)).Int("matched", len(matched)).
-			Str("portal_id", portalID).
+			Str("portal_id", logPortalID).
 			Strs("sample_chat_ids", sampleIDs).
 			Msg("Unfiltered scan complete")
 		diag = &restoreFetchDiagnostic{
@@ -5923,10 +5926,11 @@ func cloudAttachmentGUIDPlaceholdersJSON(guids []string) string {
 
 func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, precheckedChatDBMessages, precheckedCloudMessages *bool, postCreate func(context.Context, *bridgev2.Portal)) {
 	portalID := string(portalKey.ID)
+	logPortalID := logSafeHandle(portalID)
 
 	existingPortal, err := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
 	if err != nil {
-		log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+		log.Warn().Err(err).Str("portal_id", logPortalID).Str("source", source).
 			Msg("Failed to check recovered chat portal before resync")
 		return
 	}
@@ -5945,13 +5949,13 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 			var err error
 			hasMessages, err = c.hasChatDBBackfillableMessages(portalID)
 			if err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+				log.Warn().Err(err).Str("portal_id", logPortalID).Str("source", source).
 					Msg("Failed to check chat.db messages before recovered chat resync")
 				return
 			}
 		}
 		if newPortalNeedsContent && !hasMessages {
-			log.Warn().Str("portal_id", portalID).Str("source", source).
+			log.Warn().Str("portal_id", logPortalID).Str("source", source).
 				Msg("Skipping recovered chat resync because no chat.db messages are available")
 			return
 		}
@@ -5967,13 +5971,13 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 				c.Main.Bridge.Config.Backfill.MaxInitialMessages,
 			)
 			if err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+				log.Warn().Err(err).Str("portal_id", logPortalID).Str("source", source).
 					Msg("Failed to check recovered chat messages before portal resync")
 				return
 			}
 		}
 		if newPortalNeedsContent && !hasMessages {
-			log.Warn().Str("portal_id", portalID).Str("source", source).
+			log.Warn().Str("portal_id", logPortalID).Str("source", source).
 				Msg("Skipping recovered chat resync because no contentful messages are available")
 			return
 		}
@@ -5981,14 +5985,14 @@ func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey netw
 		if newestTS, err := c.cloudStore.getNewestBackfillableMessageTimestamp(context.Background(), portalID, requireContentful); err == nil && newestTS > 0 {
 			latestMessageTS = time.UnixMilli(newestTS)
 		} else if err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Str("source", source).
+			log.Warn().Err(err).Str("portal_id", logPortalID).Str("source", source).
 				Msg("Failed to get newest recovered chat message timestamp")
 			return
 		}
 	}
 
 	log.Info().
-		Str("portal_id", portalID).
+		Str("portal_id", logPortalID).
 		Str("source", source).
 		Time("latest_message_ts", latestMessageTS).
 		Msg("Queueing ChatResync for recovered chat")
@@ -8331,6 +8335,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
+	logPortalID := logSafeHandle(portalID)
 
 	// Guard: if this portal was recently deleted, only backfill if there are
 	// live (non-deleted) messages. Prevents backfilling old messages into
@@ -8341,7 +8346,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	if isDeletedPortal && c.cloudStore != nil {
 		rows, err := c.cloudStore.listLatestMessages(context.Background(), portalID, 1)
 		if err == nil && len(rows) == 0 {
-			log.Info().Str("portal_id", portalID).Msg("FetchMessages: deleted portal with no live messages, returning empty")
+			log.Info().Str("portal_id", logPortalID).Msg("FetchMessages: deleted portal with no live messages, returning empty")
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 		}
 	}
@@ -8370,12 +8375,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		select {
 		case c.forwardBackfillSem <- struct{}{}:
 		case <-ctx.Done():
-			log.Warn().Str("portal_id", portalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
+			log.Warn().Str("portal_id", logPortalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
 		defer func() { <-c.forwardBackfillSem }()
 		log.Info().
-			Str("portal_id", portalID).
+			Str("portal_id", logPortalID).
 			Int("count", count).
 			Int("chunk_size", forwardChunkSize).
 			Str("trigger", "portal_creation").
@@ -8396,9 +8401,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			cursorGUID = string(params.AnchorMessage.ID)
 			hasCursor = true
 			log.Debug().
-				Str("portal_id", portalID).
+				Str("portal_id", logPortalID).
 				Int64("anchor_ts", cursorTS).
-				Str("anchor_guid", cursorGUID).
+				Str("anchor_guid", logSafeHandle(cursorGUID)).
 				Msg("Forward backfill: using anchor — fetching only newer messages")
 		}
 		if hasCatchupBundle {
@@ -8419,7 +8424,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			queryStart := time.Now()
 			rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 			if queryErr != nil {
-				log.Err(queryErr).Str("portal_id", portalID).Msg("Forward backfill: listLatestMessages FAILED")
+				log.Err(queryErr).Str("portal_id", logPortalID).Msg("Forward backfill: listLatestMessages FAILED")
 				return nil, queryErr
 			}
 			for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
@@ -8430,7 +8435,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			totalRows = len(rows)
 			chunk = 1
 			log.Debug().
-				Str("portal_id", portalID).
+				Str("portal_id", logPortalID).
 				Int("rows", totalRows).
 				Dur("query_ms", time.Since(queryStart)).
 				Msg("Forward backfill: fetched most recent messages")
@@ -8451,7 +8456,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
 				}
 				if queryErr != nil {
-					log.Err(queryErr).Str("portal_id", portalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
+					log.Err(queryErr).Str("portal_id", logPortalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
 					return nil, queryErr
 				}
 				if len(rows) == 0 {
@@ -8469,7 +8474,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				chunk++
 
 				log.Debug().
-					Str("portal_id", portalID).
+					Str("portal_id", logPortalID).
 					Int("chunk", chunk).
 					Int("chunk_rows", len(rows)).
 					Int("total_rows", totalRows).
@@ -8524,12 +8529,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// are looking at. The check is over rows already in memory — no
 			// extra query, per the one-writer SQLite pool.
 			if anyScrubbedDeliverable(allRows) {
-				log.Warn().Str("portal_id", portalID).Int("db_rows", totalRows).
+				log.Warn().Str("portal_id", logPortalID).Int("db_rows", totalRows).
 					Msg("Forward backfill: 0 deliverable messages from body-scrubbed rows — attempting one CloudKit rehydrate before marking done")
 				if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
 					rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 					if queryErr != nil {
-						log.Err(queryErr).Str("portal_id", portalID).
+						log.Err(queryErr).Str("portal_id", logPortalID).
 							Msg("Forward backfill: re-query after rehydrate FAILED")
 						return nil, queryErr
 					}
@@ -8552,13 +8557,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// re-runs this forever — but say so loudly. Accountable loss
 				// beats silent loss, and reconcileStrandedBackfills re-arms the
 				// portal at the next startup if content ever reappears.
-				log.Error().Str("portal_id", portalID).Int("db_rows", totalRows).
+				log.Error().Str("portal_id", logPortalID).Int("db_rows", totalRows).
 					Msg("Forward backfill: portal has CloudKit rows but none could be converted — marking done with nothing delivered (history NOT recoverable from CloudKit)")
 			}
 		}
 
 		if len(allMessages) == 0 {
-			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
+			log.Debug().Str("portal_id", logPortalID).Msg("Forward backfill: no rows to process")
 			// Use context.Background() — if the bridge is shutting down, ctx
 			// may be cancelled but we still need to persist the flag.
 			c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
@@ -8566,7 +8571,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 
 		log.Info().
-			Str("portal_id", portalID).
+			Str("portal_id", logPortalID).
 			Int("db_rows", totalRows).
 			Int("backfill_msgs", len(allMessages)).
 			Int("chunks", chunk).
@@ -8634,12 +8639,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						ReadUpTo:   lastMsgTS,
 					})
 					log.Info().
-						Str("portal_id", portalID).
-						Str("last_msg_id", string(lastMsgID)).
+						Str("portal_id", logPortalID).
+						Str("last_msg_id", logSafeHandle(string(lastMsgID))).
 						Str("last_msg_ts", lastMsgTS.UTC().Format(time.RFC3339)).
 						Msg("Queued double puppet read receipt (I read their message)")
 				} else if readErr != nil {
-					log.Warn().Err(readErr).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
+					log.Warn().Err(readErr).Str("portal_id", logPortalID).Msg("Failed to check if conversation is read by me")
 				}
 
 				c.onForwardBackfillDone()
@@ -8661,11 +8666,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 		beforeTS = cursor.TimestampMS
 		beforeGUID = cursor.GUID
-		cursorDesc = fmt.Sprintf("before ts=%d guid=%s", beforeTS, beforeGUID)
+		cursorDesc = fmt.Sprintf("before ts=%d guid=%s", beforeTS, logSafeHandle(beforeGUID))
 	} else if params.AnchorMessage != nil {
 		beforeTS = params.AnchorMessage.Timestamp.UnixMilli()
 		beforeGUID = string(params.AnchorMessage.ID)
-		cursorDesc = fmt.Sprintf("anchor ts=%d id=%s", beforeTS, beforeGUID)
+		cursorDesc = fmt.Sprintf("anchor ts=%d id=%s", beforeTS, logSafeHandle(beforeGUID))
 	}
 
 	if beforeTS == 0 && beforeGUID == "" {
@@ -8692,7 +8697,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// defer: the cost of being wrong that way is one more 30s wait.
 			hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID)
 			if msgErr != nil {
-				log.Warn().Err(msgErr).Str("portal_id", portalID).
+				log.Warn().Err(msgErr).Str("portal_id", logPortalID).
 					Msg("Backward backfill: hasPortalMessages failed — deferring rather than marking the task done")
 			}
 			if hasMessages || msgErr != nil {
@@ -8743,12 +8748,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// so this stops being invisible after the first pass.
 						deferEvt = log.Error()
 					}
-					deferEvt.Str("portal_id", portalID).Int("attempts", deferCount).
+					deferEvt.Str("portal_id", logPortalID).Int("attempts", deferCount).
 						Int("bound", maxBackwardDeferAttempts).
 						Msg("Backward backfill: no anchor after repeated deferrals — treating forward backfill as failed and recovering")
 					forwardLikelyFailed = true
 				} else {
-					log.Info().Str("portal_id", portalID).Int("attempt", deferCount).
+					log.Info().Str("portal_id", logPortalID).Int("attempt", deferCount).
 						Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
 						// Sleep before returning HasMore=true so the bridgev2 backfill
 						// queue doesn't tight-loop on this task and steal scheduler
@@ -8772,7 +8777,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				c.backwardDeferMu.Lock()
 				delete(c.backwardDeferCounts, portalID)
 				c.backwardDeferMu.Unlock()
-				log.Info().Str("portal_id", portalID).
+				log.Info().Str("portal_id", logPortalID).
 					Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
 				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 			}
@@ -8811,12 +8816,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					// the deferral bound: this portal is looping, not waiting.
 					recoveryEvt = log.Error()
 				}
-				recoveryEvt.Err(msgErr).Str("portal_id", portalID).Int("attempts", deferCount).
+				recoveryEvt.Err(msgErr).Str("portal_id", logPortalID).Int("attempts", deferCount).
 					Msg("Backward backfill: hasPortalMessages failed in the recovery path — retrying rather than marking the task done")
 				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
 			}
 			if hasMessages {
-				log.Info().Str("portal_id", portalID).
+				log.Info().Str("portal_id", logPortalID).
 					Msg("Backward backfill: no anchor but portal has messages — doing recovery backfill")
 				rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 				if queryErr != nil {
@@ -8841,7 +8846,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 							GUID:        oldest.GUID,
 						})
 						if cursorErr != nil {
-							log.Warn().Err(cursorErr).Str("portal_id", portalID).
+							log.Warn().Err(cursorErr).Str("portal_id", logPortalID).
 								Msg("Recovery backfill: failed to encode cursor, delivering this batch as the last one")
 							hasMore = false
 						} else {
@@ -8862,12 +8867,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// this portal — but the loss must not be silent.
 						// reconcileStrandedBackfills re-arms the task at the next
 						// startup if content ever comes back.
-						log.Error().Str("portal_id", portalID).Int("db_rows", len(rows)).
+						log.Error().Str("portal_id", logPortalID).Int("db_rows", len(rows)).
 							Bool("scrubbed_rows", anyScrubbedDeliverable(rows)).
 							Msg("Recovery backfill: portal has CloudKit rows but none could be converted — delivering nothing and marking forward-done")
 					}
 					log.Info().
-						Str("portal_id", portalID).
+						Str("portal_id", logPortalID).
 						Int("db_rows", len(rows)).
 						Int("backfill_msgs", len(allMessages)).
 						Bool("has_more", hasMore).
@@ -8898,13 +8903,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				}
 			}
 		}
-		log.Debug().Str("portal_id", portalID).
+		log.Debug().Str("portal_id", logPortalID).
 			Msg("Backward backfill: no anchor or cursor, nothing to paginate from")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 	}
 
 	log.Info().
-		Str("portal_id", portalID).
+		Str("portal_id", logPortalID).
 		Int("count", count).
 		Str("cursor", cursorDesc).
 		Str("trigger", "backfill_queue").
@@ -8913,7 +8918,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	queryStart := time.Now()
 	rows, err := c.cloudStore.listBackwardMessages(ctx, portalID, beforeTS, beforeGUID, fetchCount)
 	if err != nil {
-		log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Backward backfill: query FAILED")
+		log.Err(err).Str("portal_id", logPortalID).Dur("query_ms", time.Since(queryStart)).Msg("Backward backfill: query FAILED")
 		return nil, err
 	}
 	queryElapsed := time.Since(queryStart)
@@ -8942,7 +8947,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 
 	log.Info().
-		Str("portal_id", portalID).
+		Str("portal_id", logPortalID).
 		Int("db_rows", len(rows)).
 		Int("backfill_msgs", len(messages)).
 		Bool("has_more", hasMore).
@@ -9111,17 +9116,13 @@ func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logg
 	if c.cloudStore == nil || c.client == nil {
 		return false
 	}
-	// Captured before the clear so the failure path can re-arm exactly the rows
-	// this attempt touched: clearBodyScrubByPortalID stamps updated_ts=now on
-	// every row it clears, and any row CloudKit does repopulate gets content.
-	clearedFrom := time.Now().UnixMilli()
-	cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID)
+	clearedAttempt, err := c.cloudStore.clearBodyScrubForRehydrate(ctx, portalID)
 	if err != nil {
-		log.Warn().Err(err).Str("portal_id", portalID).
+		log.Warn().Err(err).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Rehydrate: failed to clear body_scrubbed, not attempting CloudKit re-fetch")
 		return false
 	}
-	log.Info().Int("cleared", cleared).Str("portal_id", portalID).
+	log.Info().Int("cleared", len(clearedAttempt.Rows)).Str("portal_id", logSafeHandle(portalID)).
 		Msg("Rehydrate: cleared body_scrubbed, re-fetching portal from CloudKit")
 
 	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -9139,23 +9140,23 @@ func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logg
 	// context.Background() on purpose — a cancelled ctx (shutdown, or the
 	// timeout above firing) is a likely reason to be here, and privacy state
 	// must not be left degraded because the recovery attempt was interrupted.
-	if rescrubbed, rescrubErr := c.cloudStore.rescrubEmptyRowsSince(context.Background(), portalID, clearedFrom); rescrubErr != nil {
-		log.Warn().Err(rescrubErr).Str("portal_id", portalID).
+	if rescrubbed, rescrubErr := c.cloudStore.rescrubClearedRows(context.Background(), portalID, clearedAttempt); rescrubErr != nil {
+		log.Warn().Err(rescrubErr).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Rehydrate: failed to restore body_scrubbed on rows CloudKit did not repopulate")
 	} else if rescrubbed > 0 {
-		log.Info().Int64("rescrubbed", rescrubbed).Str("portal_id", portalID).
+		log.Info().Int64("rescrubbed", rescrubbed).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Rehydrate: restored body_scrubbed on rows CloudKit did not repopulate")
 	}
 
 	if fetchErr != nil || imported == 0 {
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch failed")
+			log.Warn().Err(fetchErr).Str("portal_id", logSafeHandle(portalID)).Msg("Rehydrate: CloudKit re-fetch failed")
 		} else {
-			log.Warn().Str("portal_id", portalID).Msg("Rehydrate: CloudKit returned no messages for this portal")
+			log.Warn().Str("portal_id", logSafeHandle(portalID)).Msg("Rehydrate: CloudKit returned no messages for this portal")
 		}
 		return false
 	}
-	log.Info().Int("imported", imported).Str("portal_id", portalID).
+	log.Info().Int("imported", imported).Str("portal_id", logSafeHandle(portalID)).
 		Msg("Rehydrate: CloudKit re-fetch complete")
 	return true
 }
