@@ -114,6 +114,21 @@ func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDone = true
 	c.cloudSyncDoneLock.Unlock()
 
+	// Start the backward-backfill drain loop on homeservers that can't batch
+	// send. bridgev2's RunBackfillQueue returns immediately on those (Synapse
+	// and every other non-Beeper server), so the backfill_task rows queued by
+	// createPortalsFromCloudSync — and by bridgev2 itself on room creation —
+	// are never dispatched and deep history never arrives. See
+	// synapse_backfill.go; the call is bridge-scoped and idempotent, so every
+	// login may make it on every connect.
+	//
+	// Here rather than in Connect because this is the one point every backfill
+	// mode passes through (chat.db, CloudKit and backfill-disabled all reach
+	// it), and because in CloudKit mode it fires after the bootstrap sync
+	// instead of before it — deep history is the last thing that should be
+	// competing for the single SQLite writer.
+	c.startSynapseBackfillDrainIfNeeded()
+
 	// Flush the APNs reorder buffer once all forward backfills are complete.
 	// Messages accumulated during CloudKit sync to avoid interleaving APNs
 	// messages before older CloudKit messages in Matrix.
@@ -1572,6 +1587,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 }
 
+// ghostReconcilePacing is the gap left between ghost profile writes during the
+// contact reconcile. 80ms puts a 30-contact address book at ~2.4s — slow enough
+// that a Matrix client sees a stream of member events rather than a wall of
+// them, fast enough that nobody watching a first connect notices.
+const ghostReconcilePacing = 80 * time.Millisecond
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
@@ -1658,6 +1679,26 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
+		}
+		// Pace the writes. Each UpdateInfo that actually changes a name emits an
+		// m.room.member state event into every DM that ghost is in, and Matrix
+		// clients derive a DM's title and avatar from exactly that. Reconciling
+		// a whole address book unpaced fired 22 profile changes inside 9ms on a
+		// first connect, which is a burst no client is expecting; Beeper Desktop
+		// came out of it with a wedged icon cache that only a re-login cleared.
+		//
+		// This is the one connect where almost every ghost changes — afterwards
+		// the diff-gate above means near-zero updates — so spreading the first
+		// pass over a couple of seconds costs nothing anyone will notice and
+		// hands clients a rate they can absorb. Skipped after the last one so a
+		// small address book doesn't pay for a delay it doesn't need.
+		if reconciled > 0 {
+			select {
+			case <-c.stopChan:
+				log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
+				return
+			case <-time.After(ghostReconcilePacing):
+			}
 		}
 		ghost.UpdateInfo(ctx, info)
 		reconciled++

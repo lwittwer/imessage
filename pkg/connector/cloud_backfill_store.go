@@ -412,6 +412,18 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create cloud_attachment_dead table: %w", err)
 	}
 
+	// Records which portals the stranded-backfill reconciliation has already
+	// re-armed, so it is a one-shot per portal rather than something that
+	// re-fires every startup. See reconcileStrandedBackfills.
+	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_backfill_reconciled (
+		login_id      TEXT    NOT NULL,
+		portal_id     TEXT    NOT NULL,
+		reconciled_ts BIGINT  NOT NULL,
+		PRIMARY KEY (login_id, portal_id)
+	)`); err != nil {
+		return fmt.Errorf("failed to create cloud_backfill_reconciled table: %w", err)
+	}
+
 	// Create index that depends on record_name column (must be after migration)
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
 		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
@@ -3527,6 +3539,38 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	return int(n), nil
 }
 
+// rescrubEmptyRowsSince re-sets body_scrubbed on rows that a rehydrate attempt
+// cleared but CloudKit did not repopulate. It is the undo half of
+// clearBodyScrubByPortalID: clearing the flag drops the sticky-NULL protection
+// in upsertMessageBatch's ON CONFLICT clause, so leaving it cleared after a
+// failed re-fetch would let some later CloudKit sync quietly refill plaintext
+// for content that was already scrubbed once. Nothing would clear it again —
+// scrubBridgedBodies only touches rows with a bridgev2 `message` row, and these
+// rows have none — so the plaintext would simply stay.
+//
+// sinceMS is read before the clear, and the clear stamps updated_ts=now on every
+// row it touches, so `updated_ts >= sinceMS` scopes this to that attempt.
+// Rows CloudKit did repopulate have content and are excluded by the empty-body
+// test, so a successful restore is never re-scrubbed. Rows that were empty for
+// other reasons (system records, never-scrubbed rows) are older than sinceMS and
+// stay untouched — this must not invent scrub flags for rows the scrubber never
+// chose.
+func (s *cloudBackfillStore) rescrubEmptyRowsSince(ctx context.Context, portalID string, sinceMS int64) (int64, error) {
+	result, err := s.db.Exec(ctx, `
+		UPDATE cloud_message SET body_scrubbed=TRUE
+		WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=FALSE
+		  AND updated_ts >= $3
+		  AND COALESCE(text, '') = ''
+		  AND COALESCE(subject, '') = ''
+		  AND COALESCE(attachments_json, '') = ''
+	`, s.loginID, portalID, sinceMS)
+	if err != nil {
+		return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
 // clearAllBodyScrub drops the body_scrubbed flag from every non-deleted row
 // for this login so the next CloudKit upsert can repopulate plaintext from
 // Apple's source of truth. DEVELOPMENT-ONLY: used by the debug_disable_privacy
@@ -3624,6 +3668,91 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 // re-backfills a portal when a previously-undecryptable record becomes
 // readable on a version-upgrade re-sync — those land as freshly-written rows
 // with old message times, so message-time alone would wrongly skip them.
+// reconcileStrandedBackfills re-arms portals whose backfill was marked complete
+// but which never received any messages.
+//
+// How a portal gets into that state: bridgev2 runs a forward backfill's
+// CompleteCallback only after the Matrix batch send succeeds. If the send fails
+// — a "database is locked" during the crypto write, or a batch rejected for
+// duplicate event IDs — the callback never runs, fwd_backfill_done stays false,
+// and the backward task is left deciding what to do with no anchor. A failed
+// hasPortalMessages read at that moment used to answer "no messages", which
+// returns HasMore=false, which makes bridgev2 persist is_done=true. From then
+// on the portal matches portalsFullyBackfilledNoNewContent, stops receiving
+// ChatResync events, and never gets another forward backfill. The room stays
+// empty permanently and a restart does not help.
+//
+// The read is fixed at the source now, but that only protects portals from here
+// on. This repairs the ones already stranded: a task marked done, CloudKit rows
+// present, and not one bridged message to show for it. Clearing is_done drops
+// the portal back out of the skip set, so the next CloudKit sync queues a
+// ChatResync for it and forward backfill runs again.
+//
+// One shot per portal, tracked in cloud_backfill_reconciled. Without that,
+// a portal whose CloudKit rows are all system records — real content zero, so
+// still no bridged messages afterwards — would be re-armed on every single
+// startup.
+func (s *cloudBackfillStore) reconcileStrandedBackfills(ctx context.Context) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT bt.portal_id, bt.portal_receiver, bt.bridge_id
+		FROM backfill_task bt
+		WHERE bt.user_login_id=$1
+		  AND bt.is_done=1
+		  AND EXISTS (
+		    SELECT 1 FROM cloud_message cm
+		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message m
+		    WHERE m.bridge_id=bt.bridge_id AND m.room_id=bt.portal_id
+		      AND m.room_receiver=bt.portal_receiver
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cloud_backfill_reconciled r
+		    WHERE r.login_id=$1 AND r.portal_id=bt.portal_id
+		  )
+	`, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query stranded backfill tasks: %w", err)
+	}
+	type stranded struct{ portalID, portalReceiver, bridgeID string }
+	var found []stranded
+	for rows.Next() {
+		var st stranded
+		if err := rows.Scan(&st.portalID, &st.portalReceiver, &st.bridgeID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan stranded backfill task: %w", err)
+		}
+		found = append(found, st)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("failed to iterate stranded backfill tasks: %w", err)
+	}
+	rows.Close()
+
+	nowMS := time.Now().UnixMilli()
+	repaired := 0
+	for _, st := range found {
+		if _, err := s.db.Exec(ctx, `
+			UPDATE backfill_task
+			SET is_done=false, queue_done=false, next_dispatch_min_ts=0
+			WHERE bridge_id=$1 AND portal_id=$2 AND portal_receiver=$3
+		`, st.bridgeID, st.portalID, st.portalReceiver); err != nil {
+			return repaired, fmt.Errorf("failed to re-arm backfill task for %s: %w", st.portalID, err)
+		}
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO cloud_backfill_reconciled (login_id, portal_id, reconciled_ts)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (login_id, portal_id) DO UPDATE SET reconciled_ts=$3
+		`, s.loginID, st.portalID, nowMS); err != nil {
+			return repaired, fmt.Errorf("failed to record reconciliation for %s: %w", st.portalID, err)
+		}
+		repaired++
+	}
+	return repaired, nil
+}
+
 func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT bt.portal_id
@@ -3908,6 +4037,72 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	return n, nil
 }
 
+// pendingBackfillScrubHold is how long the scrubbers hold off on a portal that
+// is still waiting for its first forward backfill (see pendingBackfillGateSQL).
+//
+// It is a hold, not a permanent exemption, and that is the whole point. Forward
+// backfill for even a very large portal finishes in minutes; a day is generous
+// headroom. A portal that is still not delivered after that is broken in some
+// way we cannot see from the scrubber, and at that point privacy has to win over
+// the backfill race — otherwise a portal wedged forever would keep its plaintext
+// forever, which is the outcome the scrubber exists to prevent.
+const pendingBackfillScrubHold = 24 * time.Hour
+
+// pendingBackfillGateSQL builds the predicate that keeps the scrubbers off rows
+// belonging to a portal whose first forward backfill has not landed yet.
+// holdPlaceholder is the bind placeholder holding
+// now - pendingBackfillScrubHold in epoch ms.
+//
+// Why: the scrubber and the backfill pipeline read the same rows, and the
+// scrubber wins ties. cloudRowToBackfillMessages drops body_scrubbed rows, so a
+// scrub that lands between "row ingested" and "row delivered" removes that
+// message from the batch — and if it takes the portal's last deliverable row
+// with it, FetchMessages converts to zero messages and marks the portal
+// forward-done with an empty room. The 5-minute updated_ts grace window is not
+// enough for a portal that takes longer than that to backfill, which is exactly
+// why active restore pipelines are already passed in excludePortals. This is the
+// same protection, applied to the initial backfill instead of restores.
+//
+// The gate is deliberately "known pending", not "known done". Requiring
+// fwd_backfill_done=TRUE would have been simpler and much worse: the flag is
+// only ever set by a forward or recovery backfill, so a dormant portal that
+// finished backfilling before this flag existed — and gets no new messages to
+// trigger a resync catchup — would sit at FALSE forever and keep its delivered
+// plaintext forever. Blocking only portals we positively expect to deliver soon
+// avoids that.
+//
+// Three conditions, all required, so the hold stays narrow:
+//   - the portal has a live, non-filtered cloud_chat row that is not yet done.
+//     Filtered chats (Apple's junk bucket) never become portals when
+//     bridge_filtered_chats is off, so they would otherwise be held forever.
+//   - no cloud_chat row for the portal is done. One portal_id can carry several
+//     chat rows (an iMessage chat and an SMS chat for the same handle), and a
+//     newly-synced sibling row starts at FALSE; if any row is done, the portal
+//     has delivered and there is no race left to protect.
+//   - the pending row was first seen inside pendingBackfillScrubHold. This is
+//     what keeps a permanently wedged portal from becoming a permanent plaintext
+//     exemption.
+//
+// Correlates on cloud_message.portal_id, so it is only valid inside a query
+// whose innermost cloud_message scope is the candidate row. $1 is login_id.
+func pendingBackfillGateSQL(holdPlaceholder string) string {
+	return `NOT (
+		        EXISTS (
+		          SELECT 1 FROM cloud_chat pending
+		          WHERE pending.login_id=$1 AND pending.portal_id=cloud_message.portal_id
+		            AND pending.deleted=FALSE
+		            AND COALESCE(pending.is_filtered, 0) = 0
+		            AND pending.fwd_backfill_done=FALSE
+		            AND COALESCE(pending.created_ts, 0) >= ` + holdPlaceholder + `
+		        )
+		        AND NOT EXISTS (
+		          SELECT 1 FROM cloud_chat delivered
+		          WHERE delivered.login_id=$1 AND delivered.portal_id=cloud_message.portal_id
+		            AND delivered.fwd_backfill_done=TRUE
+		        )
+		      )`
+}
+
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
 // tapback_emoji) on cloud_message rows whose corresponding Matrix event has
 // been successfully delivered (an entry exists in bridgev2's `message` table)
@@ -3964,6 +4159,9 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// BodyScrubbed skip would silently drop the un-backfilled tail.
 	exclusionSQL := ""
 	args := []any{s.loginID, cutoff, bridgeID}
+	// $4: the pending-backfill hold cutoff. See pendingBackfillGateSQL.
+	args = append(args, time.Now().Add(-pendingBackfillScrubHold).UnixMilli())
+	pendingGate := pendingBackfillGateSQL(fmt.Sprintf("$%d", len(args)))
 	if len(excludePortals) > 0 {
 		placeholders := make([]string, 0, len(excludePortals))
 		for _, pid := range excludePortals {
@@ -4009,13 +4207,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND updated_ts < $2
 		      AND (
 		        deleted=TRUE
-		        OR UPPER(guid) IN (
-		          SELECT UPPER(id) FROM message
-		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
-		          UNION
-		          SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		          WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
-		            AND (room_receiver=$1 OR room_receiver='')
+		        OR (
+		          UPPER(guid) IN (
+		            SELECT UPPER(id) FROM message
+		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
+		            UNION
+		            SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		            WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
+		              AND (room_receiver=$1 OR room_receiver='')
+		          )
+		          AND `+pendingGate+`
 		        )
 		      )`+exclusionSQL+`
 		    LIMIT `+limitPlaceholder+`
@@ -4132,12 +4333,23 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 
 	// Only portals whose contentful row count exceeds the cap have an
 	// unreachable tail; the rest are entirely within the backfill window.
+	//
+	// Portals still waiting for their first forward backfill are skipped: the
+	// tail is only provably unreachable once the newest keepPerPortal rows have
+	// actually been delivered. Before that, the threshold this computes and the
+	// set listLatestMessages returns are not the same set — the threshold counts
+	// every non-deleted row, listLatestMessages only contentful ones — so a
+	// portal with system records among its newest rows can have deliverable rows
+	// below the threshold. Scrubbing them there would drop them from the batch.
+	// See pendingBackfillGateSQL for why the gate is "known pending" rather than
+	// "known done".
 	rows, err := s.db.Query(ctx, `
 		SELECT portal_id FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
+		  AND `+pendingBackfillGateSQL("$3")+`
 		GROUP BY portal_id
 		HAVING COUNT(*) > $2
-	`, s.loginID, keepPerPortal)
+	`, s.loginID, keepPerPortal, time.Now().Add(-pendingBackfillScrubHold).UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("list portals for tail scrub: %w", err)
 	}
