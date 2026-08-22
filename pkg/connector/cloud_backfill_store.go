@@ -3619,6 +3619,25 @@ type rehydrateScrubAttempt struct {
 	MarkerTS int64
 }
 
+// rawTxCloudMessageChatFilterWhere adapts the dbutil query predicate for a raw
+// transaction. dbutil rewrites $1 placeholders for regular queries, but the
+// transaction used by rehydrate is owned by database/sql. SQLite therefore
+// needs one positional argument for each repeated login predicate, while
+// PostgreSQL can reuse the numbered login placeholder.
+func (s *cloudBackfillStore) rawTxCloudMessageChatFilterWhere(alias, loginPlaceholder string) (string, []any) {
+	where := cloudMessageChatFilterWhere(alias, s.bridgeFiltered)
+	if s.db.Dialect == dbutil.Postgres {
+		return strings.ReplaceAll(where, "$1", loginPlaceholder), nil
+	}
+	loginCount := strings.Count(where, "$1")
+	where = strings.ReplaceAll(where, "$1", "?")
+	args := make([]any, loginCount)
+	for i := range args {
+		args[i] = s.loginID
+	}
+	return where, args
+}
+
 // clearBodyScrubForRehydrate atomically captures and clears the exact rows
 // changed by this automatic recovery attempt. MarkerTS distinguishes retained
 // attachment metadata from a later CloudKit upsert of the same GUID: every
@@ -3633,10 +3652,14 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	defer tx.Rollback()
 
 	selectParams := strings.Split(sqlPlaceholders(s.db, 2), ", ")
+	sourceFilter, sourceArgs := s.rawTxCloudMessageChatFilterWhere("cloud_message", selectParams[0])
+	selectArgs := []any{s.loginID, portalID}
+	selectArgs = append(selectArgs, sourceArgs...)
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT guid, updated_ts FROM cloud_message
 		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
-	`, selectParams[0], selectParams[1]), s.loginID, portalID)
+		`+sourceFilter+`
+	`, selectParams[0], selectParams[1]), selectArgs...)
 	if err != nil {
 		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
 	}
@@ -3659,17 +3682,21 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	const chunkSize = 500
 	for start := 0; start < len(attempt.Rows); start += chunkSize {
 		end := min(start+chunkSize, len(attempt.Rows))
-		params := strings.Split(sqlPlaceholders(s.db, 3+end-start), ", ")
+		params := strings.Split(sqlPlaceholders(s.db, 3+len(sourceArgs)+end-start), ", ")
+		updateSourceFilter, _ := s.rawTxCloudMessageChatFilterWhere("cloud_message", params[1])
 		args := make([]any, 0, 3+end-start)
 		args = append(args, attempt.MarkerTS, s.loginID, portalID)
+		args = append(args, sourceArgs...)
 		for _, row := range attempt.Rows[start:end] {
 			args = append(args, row.GUID)
 		}
+		guidStart := 3 + len(sourceArgs)
 		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
 			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+			  `+updateSourceFilter+`
 			  AND guid IN (%s)
-		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
+		`, params[0], params[1], params[2], strings.Join(params[guidStart:], ",")), args...); err != nil {
 			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
 		}
 	}
