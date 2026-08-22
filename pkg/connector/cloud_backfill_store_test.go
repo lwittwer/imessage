@@ -240,9 +240,9 @@ func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T
 	}
 	if _, err = db.Exec(ctx, `
 		INSERT INTO cloud_message (
-			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
 			has_body, body_scrubbed, created_ts, updated_ts
-		) VALUES ($1, 'filtered-message', $2, 2000, 'tel:+15551111111', FALSE, 'hello', 'record-filtered', TRUE, FALSE, $3, $3)
+		) VALUES ($1, 'filtered-message', 'filtered-chat', $2, 2000, 'tel:+15551111111', FALSE, 'hello', 'record-filtered', TRUE, FALSE, $3, $3)
 	`, defaultStore.loginID, portalID, now); err != nil {
 		t.Fatal(err)
 	}
@@ -260,6 +260,87 @@ func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T
 	}
 	if len(got) != 1 || got[0].PortalID != portalID || got[0].ContentfulCount != 1 {
 		t.Fatalf("opted-in filtered-chat candidates = %#v, want one contentful portal", got)
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampIncludesFilteredMetadataWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	defaultStore := newCloudBackfillStore(db, testSQLLoginID)
+	if err := defaultStore.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const (
+		portalID = "gid:filtered-metadata"
+		now      = int64(2000)
+	)
+	if err := defaultStore.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "filtered-metadata-chat", PortalID: portalID, Service: "iMessage",
+		DisplayName: "Updated Group", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+
+	if got, err := defaultStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatalf("default candidates: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("default filtered metadata candidates = %#v, want none", got)
+	}
+
+	optInStore := newCloudBackfillStore(db, testSQLLoginID, true)
+	got, err := optInStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("opted-in candidates: %v", err)
+	}
+	if len(got) != 1 || got[0].PortalID != portalID || got[0].MetadataTS != now || got[0].MessageCount != 0 || got[0].ContentfulCount != 0 {
+		t.Fatalf("opted-in filtered metadata candidates = %#v, want one metadata-only portal", got)
+	}
+}
+
+func TestOptedInFilteredMessageReadersExcludeDeletedChatSources(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID, true)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000097"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "deleted-filtered-chat", PortalID: portalID, Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: 1000, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE cloud_chat SET deleted=TRUE
+		WHERE login_id=$1 AND cloud_chat_id='deleted-filtered-chat'
+	`, testSQLLoginID); err != nil {
+		t.Fatalf("mark chat deleted: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "message-from-deleted-chat", RecordName: "record-from-deleted-chat",
+		CloudChatID: "deleted-filtered-chat", PortalID: portalID, TimestampMS: 2000,
+		Sender: "tel:+15551111111", Text: "must stay deleted", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	if got, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("deleted chat source produced opted-in candidates: %#v", got)
+	}
+	if got, err := store.listLatestMessages(ctx, portalID, 10); err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("deleted chat source produced opted-in backfill rows: %#v", got)
+	}
+	if count, err := store.countBackfillableMessages(ctx, portalID, true); err != nil {
+		t.Fatalf("countBackfillableMessages: %v", err)
+	} else if count != 0 {
+		t.Fatalf("countBackfillableMessages = %d, want 0 for deleted chat source", count)
 	}
 }
 

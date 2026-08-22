@@ -3123,12 +3123,15 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 // these rows, so metadata-only chats cannot create brand-new empty Matrix rooms.
 func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string {
 	col := func(name string) string { return alias + "." + name }
-	return fmt.Sprintf(`
+	where := fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
 		AND %s=FALSE
-		AND COALESCE(%s, 0) = 0
-	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("is_filtered"))
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"))
+	if len(bridgeFiltered) == 0 || !bridgeFiltered[0] {
+		where += fmt.Sprintf("\t\tAND COALESCE(%s, 0) = 0\n", col("is_filtered"))
+	}
+	return where
 }
 
 // cloudMessageChatFilterWhere keeps a message tied to the live cloud_chat row
@@ -3146,18 +3149,18 @@ func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) str
 // fail closed.
 func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
-	if includeFiltered {
-		return ""
-	}
 	col := func(name string) string { return alias + "." + name }
+	filteredClause := ""
+	if !includeFiltered {
+		filteredClause = "\n\t\t\t\t  AND COALESCE(matched.is_filtered, 0)=0"
+	}
 	return fmt.Sprintf(`
 		AND (
 			EXISTS (
 				SELECT 1 FROM cloud_chat matched
 				WHERE matched.login_id=$1
 				  AND LOWER(matched.cloud_chat_id)=LOWER(%s)
-				  AND matched.deleted=FALSE
-				  AND COALESCE(matched.is_filtered, 0)=0
+				  AND matched.deleted=FALSE%s
 			)
 			OR (
 				(
@@ -3175,7 +3178,7 @@ func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 				)
 			)
 		)
-	`, col("chat_id"), col("chat_id"), col("portal_id"))
+	`, col("chat_id"), filteredClause, col("chat_id"), col("portal_id"))
 }
 
 // cloudPortalSyncCandidateWhere matches rows that should make a portal eligible
