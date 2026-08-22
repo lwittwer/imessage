@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -49,7 +48,7 @@ func (e *emptyReader) Read(p []byte) (n int, err error) {
 	select {}
 }
 
-func (ba *bridgeAdapter) GetIPC() *ipc.Processor                      { return ba.ipcProc }
+func (ba *bridgeAdapter) GetIPC() *ipc.Processor                       { return ba.ipcProc }
 func (ba *bridgeAdapter) GetLog() log.Logger                           { return ba.maulog }
 func (ba *bridgeAdapter) GetZLog() *zerolog.Logger                     { return ba.zlog }
 func (ba *bridgeAdapter) GetConnectorConfig() *imessage.PlatformConfig { return ba.config }
@@ -59,7 +58,7 @@ func (ba *bridgeAdapter) PingServer() (start, serverTs, end time.Time) {
 	return now, now, now
 }
 
-func (ba *bridgeAdapter) SendBridgeStatus(state imessage.BridgeStatus)                        {}
-func (ba *bridgeAdapter) ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool          { return false }
-func (ba *bridgeAdapter) GetMessagesSince(chatGUID string, since time.Time) []string           { return nil }
-func (ba *bridgeAdapter) SetPushKey(req *imessage.PushKeyRequest)                              {}
+func (ba *bridgeAdapter) SendBridgeStatus(state imessage.BridgeStatus)                {}
+func (ba *bridgeAdapter) ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool { return false }
+func (ba *bridgeAdapter) GetMessagesSince(chatGUID string, since time.Time) []string  { return nil }
+func (ba *bridgeAdapter) SetPushKey(req *imessage.PushKeyRequest)                     {}

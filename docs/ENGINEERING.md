@@ -71,6 +71,72 @@ between sessions, an unchanged active backward cursor, union-only persistence,
 save rollback and retry, restore bundling, shared rows visible through multiple
 GUIDs, and legacy empty metadata.
 
+## CloudKit backfill, recovery, and diagnostics
+
+CloudKit history has a forward phase (the initial room batch) and a backward
+phase (older pages after room creation). bridgev2's queue requires the Beeper
+batch-send capability. On a homeserver without that capability, the connector's
+own bridge-wide drain loop is the only backward dispatcher: it waits two minutes
+after startup and up to 30 minutes for the initial forward pass, then sends
+individual timestamped events at a minimum five-second inter-task delay. It
+must never run alongside bridgev2's queue. A configured
+`backfill.max_initial_messages` cap intentionally disables backward requests;
+rows older than the newest capped messages are not pending and must not be
+reported as deliverable. The queue is one bridge-wide lane, so a large set of
+deferred portals can take hours to drain.
+
+Forward backfill and privacy scrubbing share the `cloud_message` rows. A portal
+waiting for its first forward delivery is protected from ordinary scrubbing for
+at most 24 hours, while active restore pipelines are excluded. The bound is a
+privacy invariant: a wedged portal cannot retain plaintext indefinitely. If a
+scrub race leaves a forward batch empty, the connector may rehydrate that
+portal once from CloudKit before completion. Startup reconciliation may re-arm a
+completed task that has CloudKit rows but no bridge message, but records a
+one-shot marker per portal so a permanently system-only portal does not loop on
+every restart. Deleted/unsent rows remain fail-closed and are scrubbed without
+waiting for the pending-backfill hold.
+
+`sync-status` is a read-only view over persisted rows and must remain useful
+when the daemon is stopped. It reports CloudKit zone state, chat/message
+classification, delivery matches, and backfill task state; it does not write
+progress counters. The in-bridge command may report live sync and batch-send
+capability, while the host CLI must render those as unknown because it has no
+process state. A complete delivery percentage means every currently cached
+bridgeable row has a matching bridgev2 message row; it is not a receipt for
+future Apple events, StatusKit state changes, or reactions.
+
+`sync-space` is an idempotent repair sweep for rooms created before Matrix
+double-puppeting was enabled. It may join rooms with the double puppet and add
+space-child state, but it is not a proof that homeserver membership and the
+database's `InSpace` marker agree. The sweep is paced, has a per-room timeout,
+allows one run per login, and reports individual failures for operator review.
+
+The connector clamps SQLite to one pooled connection because CloudKit sync,
+backfill delivery, and crypto writes otherwise contend on one database file.
+This prevents only in-process pool collisions; it serializes all bridge DB work
+and does not coordinate another bridge, a CLI, or an external SQLite writer.
+The configured 30-second busy-timeout request is currently overwritten by the
+database utility's five-second connection hook, so callers must not treat it as
+a guaranteed external-lock wait. Use PostgreSQL when concurrent writers are a
+requirement, and keep diagnostics read-only with no implicit migrations.
+
+`bridge_filtered_chats` is off by default. When enabled, chats that iCloud
+files under Unknown Senders become eligible for rooms, including delivery
+notifications and 2FA messages. The option changes room/message eligibility,
+so status reports and scrub/backfill gates must use the same predicate; do not
+enable it in a report alone or let a filtered sibling suppress an unfiltered
+chat sharing the same portal. When siblings share a portal, enforce filtering
+against each message's known `cloud_message.chat_id`: a known filtered or
+deleted source fails closed. Legacy rows with an empty or unrecognized chat ID
+retain the portal-level fallback so older persisted history remains restorable;
+that compatibility fallback cannot distinguish sibling filter state.
+
+FaceTime is notify-only: the bridge may remain registered for the FaceTime IDS
+service regardless of `disable_facetime`, and the option controls only incoming
+or missed call notices. Matrix cannot place, answer, or join a FaceTime call;
+the call is handled on an Apple device. Do not document or reintroduce
+`facetime-*` commands or web-join links without a separately validated feature.
+
 ## Current SMS/iMessage routing
 
 The ordering in `imessage/mac/messages.go` makes

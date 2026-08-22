@@ -14,10 +14,11 @@ log = "0.4"
 #
 # nac-validation is a standalone workspace member (libc + thiserror + cc only —
 # no rustpush, no open-absinthe), so this dep direction does NOT create a cycle.
-# The path reaches the repo-root `nac-validation/` from the built copy of this
-# crate at `third_party/rustpush-upstream/open-absinthe/`.
+# This manifest is tested in its repo-local overlay location, where the path is
+# `../../nac-validation`. The Makefile rewrites it to `../../../nac-validation`
+# after copying the overlay under `third_party/rustpush-upstream/open-absinthe/`.
 [target.'cfg(target_os = "macos")'.dependencies]
-nac-validation = { path = "../../../nac-validation", optional = true }
+nac-validation = { path = "../../nac-validation", optional = true }
 
 [features]
 serde = []

@@ -177,3 +177,22 @@ func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
 		})
 	}
 }
+
+func TestPendingInitialBackfillsExcludesSkippedReactionOnlyPortal(t *testing.T) {
+	reactionOnly := portalWithNewestMessage{
+		MessageActivityTS:      7000,
+		MessageWriteActivityTS: 7000,
+		MessageCount:           1,
+	}
+	if !shouldForceCloudBackfill(reactionOnly) {
+		t.Fatal("reaction-only candidate no longer requests a catch-up backfill")
+	}
+	ordered := []string{"reaction-only", "queued"}
+	needs := map[string]bool{"reaction-only": true, "queued": true}
+	if got := countInitialBackfillPortals(ordered, needs, map[string]bool{"reaction-only": true}); got != 1 {
+		t.Fatalf("pending initial backfill count = %d, want only the queued portal", got)
+	}
+	if got := countInitialBackfillPortals([]string{"reaction-only"}, needs, map[string]bool{"reaction-only": true}); got != 0 {
+		t.Fatalf("skipped unchanged reaction-only portal kept %d pending backfills, want 0", got)
+	}
+}

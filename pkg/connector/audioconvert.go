@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -528,12 +527,12 @@ func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	// -- Audio Description chunk ('desc') --
 	var desc bytes.Buffer
 	binary.Write(&desc, binary.BigEndian, math.Float64bits(48000.0)) // sample rate
-	desc.WriteString("opus")                                          // format ID
-	binary.Write(&desc, binary.BigEndian, uint32(0))                  // format flags
-	binary.Write(&desc, binary.BigEndian, uint32(0))                  // bytes per packet (VBR=0)
-	binary.Write(&desc, binary.BigEndian, uint32(framesPerPacket))    // frames per packet
-	binary.Write(&desc, binary.BigEndian, uint32(info.Channels))      // channels per frame
-	binary.Write(&desc, binary.BigEndian, uint32(0))                  // bits per channel (compressed=0)
+	desc.WriteString("opus")                                         // format ID
+	binary.Write(&desc, binary.BigEndian, uint32(0))                 // format flags
+	binary.Write(&desc, binary.BigEndian, uint32(0))                 // bytes per packet (VBR=0)
+	binary.Write(&desc, binary.BigEndian, uint32(framesPerPacket))   // frames per packet
+	binary.Write(&desc, binary.BigEndian, uint32(info.Channels))     // channels per frame
+	binary.Write(&desc, binary.BigEndian, uint32(0))                 // bits per channel (compressed=0)
 	cafWriteChunk(&buf, "desc", desc.Bytes())
 
 	// -- Magic Cookie chunk ('magc') = OpusHead packet --
@@ -542,9 +541,9 @@ func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	// -- Packet Table chunk ('pakt') --
 	var pakt bytes.Buffer
 	binary.Write(&pakt, binary.BigEndian, int64(len(info.Packets))) // number of packets
-	binary.Write(&pakt, binary.BigEndian, validFrames)               // valid frames
-	binary.Write(&pakt, binary.BigEndian, int32(info.PreSkip))       // priming frames
-	binary.Write(&pakt, binary.BigEndian, int32(0))                  // remainder frames
+	binary.Write(&pakt, binary.BigEndian, validFrames)              // valid frames
+	binary.Write(&pakt, binary.BigEndian, int32(info.PreSkip))      // priming frames
+	binary.Write(&pakt, binary.BigEndian, int32(0))                 // remainder frames
 	for _, pkt := range info.Packets {
 		pakt.Write(cafVLQ(int64(len(pkt))))
 	}

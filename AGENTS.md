@@ -182,10 +182,12 @@ config YAML is loaded. Keep existing overrides such as
   follows the upstream primary-account/default-SQLite flow; second-account and
   external-PostgreSQL resets are not coordinated by this command, and
   unsupported providers, database layouts, and options must fail before the
-  service is stopped. Manual reset
-  removes the service plus the relevant
-  `~/.local/share/corten-matrix*` data dir and therefore also destroys Apple
-  state, so do not use it for ordinary duplicate-room recovery.
+  service is stopped. There is no supported manual recursive-delete recipe:
+  do not bypass these checks with a recursive deletion command or by deleting a
+  data directory.
+  That destroys Apple state and can orphan a Beeper registration; resolve the
+  rejected configuration or obtain explicit approval for the exceptional full
+  wipe instead.
 
 ## Reset-Risk Changes
 

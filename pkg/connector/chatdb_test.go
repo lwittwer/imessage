@@ -117,6 +117,7 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 		{
 			name: "text",
 			msg: &imessage.Message{
+				GUID:     "guid-text",
 				ItemType: imessage.ItemTypeMessage,
 				Sender:   imessage.Identifier{LocalID: "+15551234567"},
 				Text:     "hello",
@@ -135,6 +136,7 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 		{
 			name: "subject only",
 			msg: &imessage.Message{
+				GUID:     "guid-subject",
 				ItemType: imessage.ItemTypeMessage,
 				Sender:   imessage.Identifier{LocalID: "+15551234567"},
 				Subject:  "Topic",
@@ -153,6 +155,7 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 		{
 			name: "attachment only",
 			msg: &imessage.Message{
+				GUID:     "guid-attachment",
 				ItemType: imessage.ItemTypeMessage,
 				Sender:   imessage.Identifier{LocalID: "+15551234567"},
 				Attachments: []*imessage.Attachment{{
@@ -164,6 +167,7 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 		{
 			name: "from me without sender",
 			msg: &imessage.Message{
+				GUID:     "guid-from-me",
 				ItemType: imessage.ItemTypeMessage,
 				IsFromMe: true,
 				Text:     "sent",
@@ -189,6 +193,15 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "contentful row without GUID",
+			msg: &imessage.Message{
+				ItemType: imessage.ItemTypeMessage,
+				Sender:   imessage.Identifier{LocalID: "+15551234567"},
+				Text:     "would collide",
+			},
+			want: false,
+		},
+		{
 			name: "system item",
 			msg: &imessage.Message{
 				ItemType: imessage.ItemTypeName,
@@ -205,6 +218,23 @@ func TestChatDBMessageCanBackfill(t *testing.T) {
 				t.Fatalf("chatDBMessageCanBackfill() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDeduplicateChatDBMessagesDropsNilButKeepsEmptyGUIDRows(t *testing.T) {
+	emptyGUID := &imessage.Message{GUID: "", Time: time.Unix(1, 0)}
+	duplicate := &imessage.Message{GUID: "same", Time: time.Unix(2, 0)}
+	got := deduplicateChatDBMessages([]*imessage.Message{
+		nil,
+		emptyGUID,
+		duplicate,
+		{GUID: "same", Time: time.Unix(3, 0)},
+	})
+	if len(got) != 2 {
+		t.Fatalf("deduplicateChatDBMessages returned %d rows, want 2", len(got))
+	}
+	if got[0] != emptyGUID || got[1] != duplicate {
+		t.Fatalf("deduplicateChatDBMessages = %#v, want empty-GUID and first duplicate rows", got)
 	}
 }
 

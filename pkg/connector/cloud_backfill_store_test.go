@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
@@ -10,6 +11,43 @@ import (
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
+
+func TestStrandedBackfillReconciliationQueryUsesPostgresBoolean(t *testing.T) {
+	if !strings.Contains(strandedBackfillReconciliationQuery, "bt.is_done=TRUE") {
+		t.Fatalf("reconciliation query does not use a portable boolean literal: %s", strandedBackfillReconciliationQuery)
+	}
+	if strings.Contains(strandedBackfillReconciliationQuery, "bt.is_done=1") {
+		t.Fatalf("reconciliation query still compares a boolean column to integer 1: %s", strandedBackfillReconciliationQuery)
+	}
+}
+
+func TestSetSyncStateErrorStoresSafeClassification(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const rawError = "CloudKit request https://example.invalid/records?token=secret failed for record-name"
+	if err = store.setSyncStateError(ctx, cloudZoneChats, rawError); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err = db.QueryRow(ctx, `SELECT last_error FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`, store.loginID, cloudZoneChats).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got == rawError || got != "cloudkit_sync_failed" {
+		t.Fatalf("setSyncStateError persisted %q, want safe classification", got)
+	}
+}
 
 func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	ctx := context.Background()
@@ -65,6 +103,24 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 			($1, 'unicode-whitespace-1', 'tel:+15550000007', 6750, 'tel:+15551111111', FALSE, char(160), 'record-5c', NULL, NULL, '', TRUE, FALSE, $2, $2),
 			($1, 'filtered-1', 'tel:+15550000006', 7000, 'tel:+15551111111', FALSE, 'filtered', 'record-6', NULL, NULL, '', TRUE, FALSE, $2, $2)
 	`, store.loginID, now); err != nil {
+		t.Fatal(err)
+	}
+	// Message filtering now fails closed when a portal has live cloud_chat
+	// metadata but the row has no source chat_id. Populate this legacy fixture's
+	// rows with their exact cloud_chat sibling so the test exercises content
+	// eligibility rather than the missing-source safety rule.
+	if _, err = db.Exec(ctx, `
+		UPDATE cloud_message
+		SET chat_id = (
+			SELECT cc.cloud_chat_id
+			FROM cloud_chat cc
+			WHERE cc.login_id=cloud_message.login_id
+			  AND cc.portal_id=cloud_message.portal_id
+			ORDER BY cc.cloud_chat_id
+			LIMIT 1
+		)
+		WHERE login_id=$1 AND COALESCE(chat_id, '') = ''
+	`, store.loginID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(ctx, `
@@ -153,6 +209,144 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 		if hasMessages {
 			t.Fatalf("hasContentfulMessages(%q) = true, want false", portalID)
 		}
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultStore := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = defaultStore.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		portalID = "tel:+15550000099"
+		now      = int64(1000)
+	)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, updated_ts, deleted, is_filtered)
+		VALUES ($1, 'filtered-chat', $2, $3, $3, FALSE, 1)
+	`, defaultStore.loginID, portalID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			has_body, body_scrubbed, created_ts, updated_ts
+		) VALUES ($1, 'filtered-message', $2, 2000, 'tel:+15551111111', FALSE, 'hello', 'record-filtered', TRUE, FALSE, $3, $3)
+	`, defaultStore.loginID, portalID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := defaultStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 0 {
+		t.Fatalf("default filtered-chat candidates = %#v, want none", got)
+	}
+
+	optInStore := newCloudBackfillStore(db, networkid.UserLoginID("login"), true)
+	got, err := optInStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PortalID != portalID || got[0].ContentfulCount != 1 {
+		t.Fatalf("opted-in filtered-chat candidates = %#v, want one contentful portal", got)
+	}
+}
+
+func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000098"
+	now := int64(1000)
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "chat-unfiltered", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 0},
+		{CloudChatID: "chat-filtered", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	attachments := cloudAttachmentGUIDPlaceholdersJSON([]string{"attachment-visible"})
+	filteredAttachments := cloudAttachmentGUIDPlaceholdersJSON([]string{"attachment-filtered"})
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "message-visible", RecordName: "record-visible", CloudChatID: "chat-unfiltered", PortalID: portalID, TimestampMS: 2000, Sender: "tel:+15551111111", Text: "visible", HasBody: true},
+		{GUID: "attachment-visible", RecordName: "record-attachment-visible", CloudChatID: "chat-unfiltered", PortalID: portalID, TimestampMS: 3000, Sender: "tel:+15551111111", AttachmentsJSON: attachments, HasBody: true},
+		{GUID: "message-filtered", RecordName: "record-filtered", CloudChatID: "chat-filtered", PortalID: portalID, TimestampMS: 4000, Sender: "tel:+15551111111", Text: "filtered", HasBody: true},
+		{GUID: "attachment-filtered", RecordName: "record-attachment-filtered", CloudChatID: "chat-filtered", PortalID: portalID, TimestampMS: 5000, Sender: "tel:+15551111111", AttachmentsJSON: filteredAttachments, HasBody: true},
+		{GUID: "message-empty-chat", RecordName: "record-empty-chat", CloudChatID: "", PortalID: portalID, TimestampMS: 6000, Sender: "tel:+15551111111", Text: "missing source", HasBody: true},
+		{GUID: "message-unknown-chat", RecordName: "record-unknown-chat", CloudChatID: "chat-unknown", PortalID: portalID, TimestampMS: 7000, Sender: "tel:+15551111111", Text: "unknown source", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	candidates, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].PortalID != portalID || candidates[0].MessageCount != 2 || candidates[0].ContentfulCount != 2 {
+		t.Fatalf("mixed sibling candidates = %#v, want one portal with two unfiltered rows", candidates)
+	}
+
+	readers := map[string]func() ([]cloudMessageRow, error){
+		"backward": func() ([]cloudMessageRow, error) {
+			return store.listBackwardMessages(ctx, portalID, 0, "", 20)
+		},
+		"forward": func() ([]cloudMessageRow, error) {
+			return store.listForwardMessages(ctx, portalID, 0, "", 20)
+		},
+		"write_activity": func() ([]cloudMessageRow, error) {
+			return store.listForwardMessagesByWriteActivity(ctx, portalID, 0, "", 20)
+		},
+		"latest": func() ([]cloudMessageRow, error) {
+			return store.listLatestMessages(ctx, portalID, 20)
+		},
+		"oldest": func() ([]cloudMessageRow, error) {
+			return store.listOldestMessages(ctx, portalID, 20)
+		},
+	}
+	for name, reader := range readers {
+		t.Run(name, func(t *testing.T) {
+			rows, err := reader()
+			if err != nil {
+				t.Fatalf("reader failed: %v", err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("reader returned %d rows (%#v), want only two unfiltered rows", len(rows), rows)
+			}
+			for _, row := range rows {
+				if row.GUID != "message-visible" && row.GUID != "attachment-visible" {
+					t.Fatalf("reader returned filtered sibling row %#v", row)
+				}
+			}
+		})
+	}
+
+	attachmentRows, err := store.listAllAttachmentMessages(ctx)
+	if err != nil {
+		t.Fatalf("listAllAttachmentMessages: %v", err)
+	}
+	if len(attachmentRows) != 1 || attachmentRows[0].GUID != "attachment-visible" {
+		t.Fatalf("attachment pre-upload rows = %#v, want only unfiltered attachment", attachmentRows)
+	}
+	count, err := store.countBackfillableMessages(ctx, portalID, false)
+	if err != nil {
+		t.Fatalf("countBackfillableMessages: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("countBackfillableMessages = %d, want 2 unfiltered rows", count)
 	}
 }
 

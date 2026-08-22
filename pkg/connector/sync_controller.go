@@ -114,6 +114,21 @@ func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDone = true
 	c.cloudSyncDoneLock.Unlock()
 
+	// Start the backward-backfill drain loop on homeservers that can't batch
+	// send. bridgev2's RunBackfillQueue returns immediately on those (Synapse
+	// and every other non-Beeper server), so the backfill_task rows queued by
+	// createPortalsFromCloudSync — and by bridgev2 itself on room creation —
+	// are never dispatched and deep history never arrives. See
+	// synapse_backfill.go; the call is bridge-scoped and idempotent, so every
+	// login may make it on every connect.
+	//
+	// Here rather than in Connect because this is the one point every backfill
+	// mode passes through (chat.db, CloudKit and backfill-disabled all reach
+	// it), and because in CloudKit mode it fires after the bootstrap sync
+	// instead of before it — deep history is the last thing that should be
+	// competing for the single SQLite writer.
+	c.startSynapseBackfillDrainIfNeeded()
+
 	// Flush the APNs reorder buffer once all forward backfills are complete.
 	// Messages accumulated during CloudKit sync to avoid interleaving APNs
 	// messages before older CloudKit messages in Matrix.
@@ -1572,6 +1587,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 }
 
+// ghostReconcilePacing is the gap left between ghost profile writes during the
+// contact reconcile. 80ms puts a 30-contact address book at ~2.4s — slow enough
+// that a Matrix client sees a stream of member events rather than a wall of
+// them, fast enough that nobody watching a first connect notices.
+const ghostReconcilePacing = 80 * time.Millisecond
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
@@ -1658,6 +1679,26 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
+		}
+		// Pace the writes. Each UpdateInfo that actually changes a name emits an
+		// m.room.member state event into every DM that ghost is in, and Matrix
+		// clients derive a DM's title and avatar from exactly that. Reconciling
+		// a whole address book unpaced fired 22 profile changes inside 9ms on a
+		// first connect, which is a burst no client is expecting; Beeper Desktop
+		// came out of it with a wedged icon cache that only a re-login cleared.
+		//
+		// This is the one connect where almost every ghost changes — afterwards
+		// the diff-gate above means near-zero updates — so spreading the first
+		// pass over a couple of seconds costs nothing anyone will notice and
+		// hands clients a rate they can absorb. Skipped after the last one so a
+		// small address book doesn't pay for a delay it doesn't need.
+		if reconciled > 0 {
+			select {
+			case <-c.stopChan:
+				log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
+				return
+			case <-time.After(ghostReconcilePacing):
+			}
 		}
 		ghost.UpdateInfo(ctx, info)
 		reconciled++
@@ -3970,6 +4011,16 @@ func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
 		(p.MessageActivityTS > p.NewestTS || p.MessageWriteActivityTS > p.ContentfulWriteActivity)
 }
 
+func countInitialBackfillPortals(ordered []string, needs map[string]bool, skipped map[string]bool) int {
+	count := 0
+	for _, portalID := range ordered {
+		if !skipped[portalID] && needs[portalID] {
+			count++
+		}
+	}
+	return count
+}
+
 type cloudCatchupBackfillBundle struct {
 	AfterWriteTS int64
 }
@@ -4019,6 +4070,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
 	lastQueuedByID := make(map[string]queuedPortalWatermark, len(portalInfos))
 	forwardBackfillPortals := 0
+	needsInitialBackfill := make(map[string]bool, len(portalInfos))
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	noContentSkipped := 0
@@ -4095,7 +4147,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			continue
 		}
 		if newPortalNeedsContent || shouldForceCloudBackfill(p) {
-			forwardBackfillPortals++
+			needsInitialBackfill[p.PortalID] = true
 		}
 		ordered = append(ordered, p.PortalID)
 	}
@@ -4137,6 +4189,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; processing all (noisier startup)")
 		skipUnchanged = nil
 	}
+	// Count only portals that will actually receive a ChatResync. A reaction- or
+	// metadata-only candidate can satisfy shouldForceCloudBackfill while also
+	// being provably unchanged since its completed backfill; skipping it below
+	// must not hold the APNs buffer waiting for a callback that will never run.
+	forwardBackfillPortals = countInitialBackfillPortals(ordered, needsInitialBackfill, skipUnchanged)
 	skippedChatResync := 0
 
 	// Set pendingInitialBackfills BEFORE queuing any portals.

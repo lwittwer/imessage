@@ -6,7 +6,7 @@ A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/Open
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
 
-**Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, **FaceTime calls** (web join links — works from non-Apple platforms), **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
+**Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, incoming **FaceTime call notices**, **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
 
 **Platforms**: macOS (full features) and Linux (via a hardware key extracted from a Mac once). On Linux, the Mac is needed **only** for the one-time key extraction — there is no relay or background process running on the Mac at runtime. Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
 
@@ -47,7 +47,7 @@ macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the b
    ./corten-matrix setup
    ```
 
-`setup` auto-installs Homebrew and dependencies if needed, walks you through homeserver URL / domain / Matrix ID / database choice and a few feature toggles (CloudKit backfill, FaceTime Bridge, StatusKit notifications, external CardDAV, HEIC conversion, video transcoding), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. For a self-hosted homeserver it will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge. You can re-run `corten-matrix setup` any time to flip these toggles without wiping your data — see [Reconfiguring without editing YAML](#reconfiguring-without-editing-yaml).
+`setup` auto-installs Homebrew and dependencies if needed, walks you through homeserver URL / domain / Matrix ID / database choice and a few feature toggles (CloudKit backfill, FaceTime call notices, StatusKit notifications, external CardDAV, HEIC conversion, video transcoding), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. For a self-hosted homeserver it will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge. You can re-run `corten-matrix setup` any time to flip these toggles without wiping your data — see [Reconfiguring without editing YAML](#reconfiguring-without-editing-yaml).
 
 `setup` also offers to symlink `corten-matrix` into `/usr/local/bin` so it's on your `PATH`; after that you can drop the `./` and run `corten-matrix <command>` from anywhere.
 
@@ -126,6 +126,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
+| `corten-matrix sync-status` / `sync-status 1` | Read a persisted backfill report for the first / second account without needing the daemon. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If a unit is already there it refuses and tells you to use `uninstall-service` first. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
 | `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
@@ -211,7 +212,6 @@ logout
 In **portal rooms** (any bridged DM or group), prefix commands with `!im`:
 
 ```
-!im facetime
 !im help
 ```
 
@@ -224,6 +224,8 @@ To abort an interactive command (a picker waiting for your reply), type `cancel`
 | `start-chat` | Open a new iMessage DM. With no arguments, the bot walks you through phone vs. email and explains the country-code format. With an argument (`start-chat +15551234567` or `start-chat someone@icloud.com`) it skips the picker. |
 | `contacts` | Search your synced contacts by name (iCloud, external CardDAV, or local macOS Contacts depending on `backfill_source` and `carddav` settings) and reply with a number to open a chat. Different from `start-chat` — use this when you don't remember the number/email. Alias: `find`. |
 | `restore-chat` | List iMessage chats in the recycle bin. Reply with a number to bring one back, including its history. |
+| `sync-status` | Show CloudKit zone state, ingested chats, bridgeable/delivered/pending messages, excluded rows, and backfill queue progress. The management-room version can also see live sync and homeserver batch capability. |
+| `sync-space` | Re-sweep every bridged room for double-puppet membership and personal-space filing. Use after enabling double puppeting on a bridge that already backfilled. |
 | `logout` | Sign out of iMessage. Lists active handles, you reply with a number (or `all`). The bot then walks you through the manual step at `appleid.apple.com → Devices` to fully revoke the bridge from Apple's servers. |
 | `help` | Full command list, grouped by section. |
 
@@ -255,49 +257,25 @@ Until you do step 4, Apple still considers the bridge a registered iMessage devi
 
 ## FaceTime
 
-> **Who this is for**: Matrix users on **Android, Windows, and Linux** who don't have an Apple device to take FaceTime calls on. The bridge places and receives FaceTime calls through Apple's web client (which runs in any modern browser on those platforms). If you already own a Mac or iPhone signed into the same Apple ID, the call rings on your Apple device natively and the bridge's web-join wrapper just clutters the chat — see [Opting out](#opting-out) below.
+The bridge stays registered for FaceTime, so Apple keeps telling it when someone
+calls you. When that happens it posts a notice in the portal:
 
-### In a 1:1 portal
+> 📞 **Incoming FaceTime call from Alice.**
 
-```
-!im facetime
-```
+You get two of these, and only these — someone is calling, or the call went
+unanswered ("Missed FaceTime call from Alice."). That is the whole feature. There are no FaceTime commands, no join links, and no
+way to place or answer a call from Matrix — answer on your iPhone, iPad, or Mac
+like you always have. Falling back to your Apple device is the point: it does
+video and audio properly, and the bridge just makes sure you know the call is
+happening if you're looking at Matrix rather than your phone.
 
-Rings the contact and posts a "🌐 Join FaceTime call" notice in the portal. Tap the link on your Android / Windows / Linux Matrix client to open Apple's FaceTime web client in a browser and join the call. The contact's iPhone or Mac shows it as a normal incoming FaceTime, and they can answer wherever they like.
+### Turning the notice off
 
-In a **group** portal, `!im facetime` doesn't ring anyone — the outgoing-call flow targets a single contact only, so the command falls back to posting a plain join link for participants to open themselves.
-
-When a contact rings **you**, the bridge posts "📞 **Incoming FaceTime call from {name}.**" in the DM portal with an **Answer FaceTime call** link that opens the FaceTime web client in your browser. Missed calls show up as a notice with a **Call back {name}** button (taps re-ring the contact through the bridge); "answered on another device" surfaces as a one-line passive notice. The bridge keeps a persistent ghost in the room used for FaceTime signalling — that's expected, leave it in place.
-
-### Other commands
-
-| Command | What it does |
-|---------|-------------|
-| `facetime-send` | Generate a link and deliver it as an iMessage to the contact (no Matrix message). |
-| `facetime-clear` | Revoke every bridge-created FaceTime link so the next `facetime` mints a fresh one. |
-| `facetime-invalidate-peer` | Force the peer's device to drop its cached bridge identity. Use when calls intermittently come through as audio-only. |
-| `facetime-rotate-identity` | Re-register the bridge's IDS identity (heavier than the per-peer invalidate). |
-| `facetime-letmein` / `facetime-letmein-approve` / `facetime-letmein-deny` | List, approve, or deny pending Let-Me-In delegated-access requests. |
-
-A full list lives under `!im help` in the **FaceTime** section.
-
-### Display name on join links
-
-The name pre-filled on the FaceTime web join page comes from your Apple Account. To override it, set `facetime_display_name` in `~/.local/share/corten-matrix/config.yaml`.
-
-### Caller identity on the recipient's screen (the `temp:` UUID)
-
-When you place a call, the person you're calling sees **your name** — but you may also notice a `temp:<uuid>` identity shown alongside it (most visibly in the call-detail card or call history). This is expected. Here's the reasoning:
-
-A bridge FaceTime call is carried by **Apple's FaceTime web client running in your browser**, not by the bridge process itself. When your browser opens the join link, Apple's web client generates a throwaway pseudonym for that session — a `temp:<uuid>` handle — and that pseudonym *is* the browser participant's identity on the call. The bridge never creates it and has no way to rename it.
-
-To make your name appear, the bridge stamps your display name (`facetime_display_name` → Apple Account name → your handle) onto that participant's **nickname** on the wire, so FaceTime renders your name on top. But FaceTime also shows a participant's underlying *identity* beneath the nickname, and for the web client that identity is the `temp:<uuid>`. So you'll typically see your name **twice** — once for your real IDS handle, once for the browser participant — plus that lingering pseudonym line under the latter.
-
-Removing the `temp:<uuid>` entirely would mean replacing or pruning the browser participant from the call — but that participant is the one actually carrying your audio and video, so removing it **drops the call**. (OpenBubbles' native Android app sidesteps this by injecting the name directly into its own embedded webview; a browser-based Matrix link can't reach into Apple's page to do that.) The bridge therefore leaves the pseudonym in place: showing your name is the safe, meaningful improvement, and suppressing the last identity line isn't possible without breaking calling.
-
-### Opting out
-
-If you have a Mac or iPhone signed into the same Apple ID, FaceTime rings there natively — the bridge's web-join wrapper adds nothing, so you should disable it. The setup flow asks "Disable FaceTime Bridge?" both on first install and on every subsequent re-run, so you can flip this at any time without editing YAML by hand. (You can also set `disable_facetime: true` in `~/.local/share/corten-matrix/config.yaml` directly.) Disabling skips every `facetime-*` command and suppresses all inbound FaceTime notices in your Matrix portals.
+Set `disable_facetime: true` in `~/.local/share/corten-matrix/config.yaml`, or
+answer "Post FaceTime call notices?" with `n` in `corten-matrix setup` — the
+setup flow asks on first install and on every re-run, so you can flip it without
+editing YAML. The bridge stays registered for FaceTime either way; only the
+notice goes away.
 
 ## Focus & Do Not Disturb
 
@@ -428,6 +406,60 @@ selection cannot merge their server-side history. Follow
 [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery) only
 after verifying the affected rooms and reading the destructive-action warning.
 
+### Deep history on self-hosted homeservers
+
+Backfill has two phases. The forward pass delivers the history available when a
+room is created and works on any supported homeserver. The backward pass pages
+older history after that first load. bridgev2 runs its normal queue when the
+homeserver supports Beeper's batch-send extension. On homeservers without that
+extension (including typical Synapse deployments), Corten-Matrix runs its own
+connector-owned queue and delivers older messages as individual events.
+
+The fallback queue waits two minutes after startup, then waits up to 30 minutes
+for the initial forward pass before proceeding. It enforces at least five
+seconds between tasks (even when setup wrote a one-second `batch_delay`) so
+one-writer SQLite databases and homeservers are not flooded. A large backlog
+therefore takes a long time and may appear quiet between batches; with many
+deferred portals, recovery can take hours. `sync-status` reports the queued and
+undispatched task counts.
+If `backfill.max_initial_messages` is capped, backward backfill is intentionally
+disabled and only the newest messages within that per-chat cap are deliverable.
+This is a throughput limitation of the no-batch path, not a claim that Synapse
+history stops at the first room load.
+
+### Inspecting backfill and room membership
+
+`sync-status` is a read-only diagnostic. In the management room, run
+`sync-status` (or `syncstatus`) to see live CloudKit sync state, per-zone
+successes and errors, ingested chats, bridgeable versus delivered messages,
+rows excluded as filtered/system/capped, and queued backfill tasks. From the
+host, `corten-matrix sync-status` (or `sync-status 1` for the second account)
+reads that account's `config.yaml` and database directly, so it remains useful
+when the daemon is stopped or wedged and does not need a Matrix connection.
+
+The host command reports persisted rows only. It cannot know whether a sync is
+currently in flight or whether the homeserver supports Beeper batch sending;
+those fields are shown only by the management-room command. A 100% delivery
+percentage means every currently cached, bridgeable CloudKit message has a
+matching Matrix bridge row. It is not a guarantee about future Apple events,
+StatusKit changes (which are not counted), or reactions (which bridge through
+a separate table). The report does not run migrations or write progress
+counters. A diagnostic run does not stop the service; if another process is
+writing the same SQLite file, use the normal service controls and expect the
+usual SQLite lock contention.
+
+After enabling Matrix double puppeting on a bridge that already created and
+backfilled rooms, run `sync-space` in the management room. It joins each room
+with the double-puppet user and files it into the user's personal filtering
+space, including the space itself when needed. The sweep runs in the
+background, is paced at roughly 25 rooms per second, and gives each room up to
+30 seconds for homeserver calls. It is idempotent and reports rooms already
+filed separately from newly filed rooms. The Matrix join API cannot distinguish
+an existing membership from a new join, so those are reported together. One
+sweep per login can run at a time. It requires a configured double puppet and
+personal filtering space, and it leaves individual failures for the bridge log
+rather than aborting the whole sweep.
+
 ## Privacy
 
 The bridge's design goal is the same as every other bridgev2 bridge: **message content lives in Matrix, and the bridge's own database holds only the routing metadata needed to correlate messages, edits, reactions, and deletes.** The bridgev2 `message` table never had a body column to begin with — it stores IDs, timestamps, and sender references, nothing else.
@@ -440,6 +472,16 @@ A periodic scrubber (every 5 minutes) NULLs the plaintext columns — `text`, `s
 
 - **Already delivered to Matrix.** A row is only scrubbed once its GUID has a corresponding row in bridgev2's `message` table (i.e. the message reached Matrix), *or* it was deleted/unsent. A message that hasn't bridged yet is never scrubbed — bridging always comes first, so the scrubber can never blank a message out from under the backfill pipeline.
 - **Past a 5-minute grace window.** Freshly-ingested rows get a buffer (keyed on last-ingest time) so the backfill pipeline has time to read the body before scrubbing clears it.
+
+There is an additional bounded race guard for CloudKit backfill. A portal that
+is still waiting for its first forward backfill is held out of ordinary
+scrubbing for up to 24 hours, and an active `restore-chat` pipeline is excluded
+until it finishes. This is deliberately not permanent: if a portal remains
+stuck beyond that window, privacy wins and its plaintext may be scrubbed. If a
+race still leaves a forward batch empty, the bridge makes one bounded CloudKit
+rehydration attempt before marking that batch complete. On startup it can
+re-arm a previously completed-but-empty portal once; repeated failures need
+diagnosis rather than an endless automatic retry.
 
 Scrubbing the local cache is not data loss: the canonical copy of every message stays in Messages in iCloud on Apple's servers. The `cloud_message` table is only a staging cache for backfill, never the source of truth.
 
@@ -519,7 +561,7 @@ The setup commands (`corten-matrix setup` and `corten-matrix setup-beeper`) are 
 - **Preferred handle** — pick a different `tel:` / `mailto:` from the registered list
 - **External CardDAV** — change email / server / app password
 - **CloudKit backfill** — enable or disable, switch between CloudKit and `chat.db` sources
-- **FaceTime Bridge** — enable or disable (`disable_facetime`)
+- **FaceTime call notices** — enable or disable (`disable_facetime`)
 - **StatusKit notifications** — enable or disable the iOS 18 Focus / DND 🌙 chat-title indicator (`statuskit_notifications`)
 - **HEIC conversion / video transcoding** — toggle on or off
 
@@ -530,7 +572,13 @@ corten-matrix setup-beeper       # Beeper
 
 The per-chat backfill cap (`backfill.max_initial_messages`) is asked only on the **first** install, before the bridge database exists. To change it later, edit `~/.local/share/corten-matrix/config.yaml` directly.
 
-Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`, `max_attachment_size_mb`) are also changed by editing `~/.local/share/corten-matrix/config.yaml` directly, then `corten-matrix restart` — see [Key options](#key-options).
+Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`,
+`bridge_filtered_chats`, and `max_attachment_size_mb`) are also changed by
+editing `~/.local/share/corten-matrix/config.yaml` directly, then
+`corten-matrix restart` — see [Key options](#key-options). Enabling
+`bridge_filtered_chats` can create rooms for iCloud's **Unknown Senders**
+bucket, including delivery notices and 2FA messages, so review the expected
+room count before turning it on.
 
 ### Reset and duplicate-room recovery
 
@@ -601,8 +649,8 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `preferred_handle` | *(from login)* | Outgoing iMessage identity in URI form (`tel:+15551234567` or `mailto:user@example.com`). |
 | `read_receipts` | `true` | Send read receipts to iMessage contacts when you read their messages in Matrix. Set `false` to stop contacts from seeing when you've read their messages. Incoming read receipts from contacts are unaffected. |
 | `typing_notifications` | `true` | Send typing indicators to iMessage contacts while you compose a reply in Matrix. Set `false` to hide your typing. Incoming typing indicators are unaffected. |
-| `disable_facetime` | `false` | Skip every `facetime-*` command and suppress inbound FaceTime notices. Set true if you have a Mac/iPhone that handles FT natively. |
-| `facetime_display_name` | *(from Apple Account SPD)* | Override the name pre-filled on FaceTime web join links. Falls back to the bare iMessage handle if the SPD lookup is also blank. |
+| `disable_facetime` | `false` | Don't post the incoming / missed FaceTime call notices. The bridge stays registered for FaceTime either way. |
+| `bridge_filtered_chats` | `false` | Bridge chats iCloud filed under "Unknown Senders" instead of skipping them. That filtering comes from your iCloud settings, not the bridge, and the bucket catches real conversation too — delivery notifications, 2FA codes, a business replying to you. |
 | `statuskit_share_on_startup` | `true` | Publish "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their Focus/DND state. |
 | `statuskit_notifications` | `true` | Append a 🌙 to a contact's chat title (+ ghost presence) when they toggle iOS 18 Focus / DND. The underlying StatusKit registration runs either way. |
 | `video_transcoding` | `false` | Auto-remux non-MP4 videos (e.g. QuickTime `.mov`) to MP4 for broad Matrix client compatibility. Requires `ffmpeg`. |
@@ -675,7 +723,6 @@ pkg/connector/                              # bridgev2 connector — the main Go
   ├── login.go                              #   Apple ID + external-key login flows
   ├── commands.go                           #   `start-chat`, `logout`, `restore-chat`, `msg-debug`, …
   ├── command_contacts.go                   #   `contacts` command — search + iMessage validation
-  ├── facetime.go                           #   FaceTime web-join + call control
   ├── statuskit_commands.go                 #   StatusKit (Focus / DND) commands
   ├── statuskit_cloudkit.go                 #   StatusKit CloudKit pull — fetches + injects peer presence records
   ├── statuskit_alias_resolver.go           #   StatusKit alias-cluster resolver
@@ -750,6 +797,8 @@ scripts/                                    # Setup scripts, embedded into the b
 - **Contact Key Verification must be off.** The bridge registers as a new iMessage device on your Apple ID and won't function while CKV is enabled. Turn it off before logging in: on iPhone, **Settings → [your name] → Contact Key Verification**; on a Mac, **System Settings → [your name] → Contact Key Verification**.
 - **chat.db backfill silently does nothing.** The bridge is missing Full Disk Access — grant it under **System Settings → Privacy & Security → Full Disk Access** (see [Receiving messages](#receiving-messages)).
 - **The extractor app won't open on the Mac.** Gatekeeper blocks the ad-hoc-signed app on first launch — see the Gatekeeper note under [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac) for the per-macOS-version override.
+- **"database is locked" in the log.** SQLite allows one writer, and the bridge writes hard during a first backfill — CloudKit sync, the backfill queue and the crypto store at once. The bridge serializes its own SQLite pool to a single connection at startup (you'll see a `[database]` line if it had to override a higher `max_open_conns`), which prevents its own writer collisions. The tradeoff is that all bridge database work queues behind that one connection, so a large backfill can be slower. The clamp does not coordinate a second process: a CLI command, another bridge instance, backup tool, or external `sqlite3` writer can still lock the file. The bridge asks SQLite for a 30-second busy timeout, but the current database utility resets each connection to 5 seconds, so do not treat 30 seconds as guaranteed. If contention persists, stop the service before maintenance or use PostgreSQL for concurrent database access.
+- **A conversation is stuck empty while the rest backfilled fine.** A failed batch send used to leave a portal marked complete with nothing in it, permanently. The bridge now re-arms those on startup — look for `Re-armed backfill for portals that were marked done with no bridged messages`. It repairs each affected portal once.
 - **Reading logs.** `corten-matrix logs` (or `logs 1` for the second account) pretty-prints the live log. On disk, `logs/bridge.log` is structured JSON (rotated), and raw process stdout / crash output lands in `logs/bridge.stdout.log` — per account under `~/.local/share/corten-matrix/` and `~/.local/share/corten-matrix-1/`.
 - **Is it running at all?** `corten-matrix status`, then `corten-matrix restart` if needed — raw `launchctl` / `systemctl` equivalents are under [Management](#management).
 
