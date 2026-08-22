@@ -594,13 +594,18 @@ func (s *cloudBackfillStore) hasAnySyncState(ctx context.Context) (bool, error) 
 
 func (s *cloudBackfillStore) setSyncStateError(ctx context.Context, zone, errMsg string) error {
 	nowMS := time.Now().UnixMilli()
+	// Do not persist FFI/CloudKit error text. Those errors can contain request
+	// URLs, record identifiers, or other account-specific data, and this value
+	// is surfaced by sync-status. Keep the persisted value to a stable,
+	// non-sensitive classification instead.
+	const safeErrorClass = "cloudkit_sync_failed"
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO cloud_sync_state (login_id, zone, continuation_token, last_error, updated_ts)
 		VALUES ($1, $2, NULL, $3, $4)
 		ON CONFLICT (login_id, zone) DO UPDATE SET
 			last_error=excluded.last_error,
 			updated_ts=excluded.updated_ts
-	`, s.loginID, zone, errMsg, nowMS)
+	`, s.loginID, zone, safeErrorClass, nowMS)
 	return err
 }
 
@@ -3539,36 +3544,138 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	return int(n), nil
 }
 
-// rescrubEmptyRowsSince re-sets body_scrubbed on rows that a rehydrate attempt
-// cleared but CloudKit did not repopulate. It is the undo half of
-// clearBodyScrubByPortalID: clearing the flag drops the sticky-NULL protection
-// in upsertMessageBatch's ON CONFLICT clause, so leaving it cleared after a
-// failed re-fetch would let some later CloudKit sync quietly refill plaintext
-// for content that was already scrubbed once. Nothing would clear it again —
-// scrubBridgedBodies only touches rows with a bridgev2 `message` row, and these
-// rows have none — so the plaintext would simply stay.
-//
-// sinceMS is read before the clear, and the clear stamps updated_ts=now on every
-// row it touches, so `updated_ts >= sinceMS` scopes this to that attempt.
-// Rows CloudKit did repopulate have content and are excluded by the empty-body
-// test, so a successful restore is never re-scrubbed. Rows that were empty for
-// other reasons (system records, never-scrubbed rows) are older than sinceMS and
-// stay untouched — this must not invent scrub flags for rows the scrubber never
-// chose.
-func (s *cloudBackfillStore) rescrubEmptyRowsSince(ctx context.Context, portalID string, sinceMS int64) (int64, error) {
-	result, err := s.db.Exec(ctx, `
-		UPDATE cloud_message SET body_scrubbed=TRUE
-		WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=FALSE
-		  AND updated_ts >= $3
-		  AND COALESCE(text, '') = ''
-		  AND COALESCE(subject, '') = ''
-		  AND COALESCE(attachments_json, '') = ''
-	`, s.loginID, portalID, sinceMS)
+type rehydrateScrubRow struct {
+	GUID      string
+	UpdatedTS int64
+}
+
+type rehydrateScrubAttempt struct {
+	Rows     []rehydrateScrubRow
+	MarkerTS int64
+}
+
+// clearBodyScrubForRehydrate atomically captures and clears the exact rows
+// changed by this automatic recovery attempt. MarkerTS distinguishes retained
+// attachment metadata from a later CloudKit upsert of the same GUID: every
+// upsert replaces updated_ts, while a missed row keeps the marker. The marker is
+// one second old so it cannot collide with a concurrent current-time upsert,
+// but remains inside the scrubber's five-minute grace period.
+func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, portalID string) (rehydrateScrubAttempt, error) {
+	tx, err := s.beginTx(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to begin body scrub clear for portal %s: %w", portalID, err)
 	}
-	n, _ := result.RowsAffected()
-	return n, nil
+	defer tx.Rollback()
+
+	selectParams := strings.Split(sqlPlaceholders(s.db, 2), ", ")
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT guid, updated_ts FROM cloud_message
+		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+	`, selectParams[0], selectParams[1]), s.loginID, portalID)
+	if err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+	}
+	attempt := rehydrateScrubAttempt{MarkerTS: time.Now().Add(-time.Second).UnixMilli()}
+	for rows.Next() {
+		var row rehydrateScrubRow
+		if err = rows.Scan(&row.GUID, &row.UpdatedTS); err != nil {
+			rows.Close()
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUID for portal %s: %w", portalID, err)
+		}
+		attempt.Rows = append(attempt.Rows, row)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUIDs for portal %s: %w", portalID, err)
+	}
+	if err = rows.Close(); err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to close cleared body GUIDs for portal %s: %w", portalID, err)
+	}
+	const chunkSize = 500
+	for start := 0; start < len(attempt.Rows); start += chunkSize {
+		end := min(start+chunkSize, len(attempt.Rows))
+		params := strings.Split(sqlPlaceholders(s.db, 3+end-start), ", ")
+		args := make([]any, 0, 3+end-start)
+		args = append(args, attempt.MarkerTS, s.loginID, portalID)
+		for _, row := range attempt.Rows[start:end] {
+			args = append(args, row.GUID)
+		}
+		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+			  AND guid IN (%s)
+		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to commit body scrub clear for portal %s: %w", portalID, err)
+	}
+	return attempt, nil
+}
+
+// rescrubClearedRows re-sets body_scrubbed only on exact rows this automatic
+// rehydrate attempt cleared and no CloudKit writer restored with deliverable
+// content. A row still carrying MarkerTS was not upserted, so retained old
+// attachment metadata does not exempt it. A concurrently upserted row is
+// re-armed only when text, subject, and attachment metadata are all empty.
+func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID string, attempt rehydrateScrubAttempt) (int64, error) {
+	if len(attempt.Rows) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin restoring body_scrubbed for portal %s: %w", portalID, err)
+	}
+	defer tx.Rollback()
+	const chunkSize = 200
+	var total int64
+	for start := 0; start < len(attempt.Rows); start += chunkSize {
+		end := min(start+chunkSize, len(attempt.Rows))
+		chunk := attempt.Rows[start:end]
+		paramCount := 3*len(chunk) + 4
+		params := strings.Split(sqlPlaceholders(s.db, paramCount), ", ")
+		args := make([]any, 0, paramCount)
+		caseSQL := make([]string, 0, len(chunk))
+		for i := range chunk {
+			caseSQL = append(caseSQL, fmt.Sprintf("WHEN %s THEN %s", params[2*i], params[2*i+1]))
+			args = append(args, chunk[i].GUID, chunk[i].UpdatedTS)
+		}
+		whereStart := 2 * len(chunk)
+		args = append(args, attempt.MarkerTS, s.loginID, portalID, attempt.MarkerTS)
+		guidParams := params[whereStart+4:]
+		for i := range chunk {
+			args = append(args, chunk[i].GUID)
+		}
+		result, execErr := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE cloud_message
+			SET body_scrubbed=TRUE,
+			    updated_ts=CASE
+			      WHEN updated_ts=%s THEN CASE guid %s ELSE updated_ts END
+			      ELSE updated_ts
+			    END
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=FALSE
+			  AND (
+			    updated_ts=%s
+			    OR (
+			      COALESCE(text, '') = ''
+			      AND COALESCE(subject, '') = ''
+			      AND COALESCE(attachments_json, '') = ''
+			    )
+			  )
+			  AND guid IN (%s)
+		`, params[whereStart], strings.Join(caseSQL, " "), params[whereStart+1], params[whereStart+2], params[whereStart+3], strings.Join(guidParams, ",")), args...)
+		if execErr != nil {
+			return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, execErr)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit restored body_scrubbed for portal %s: %w", portalID, err)
+	}
+	return total, nil
 }
 
 // clearAllBodyScrub drops the body_scrubbed flag from every non-deleted row
@@ -3693,25 +3800,9 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 // still no bridged messages afterwards — would be re-armed on every single
 // startup.
 func (s *cloudBackfillStore) reconcileStrandedBackfills(ctx context.Context) (int, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT bt.portal_id, bt.portal_receiver, bt.bridge_id
-		FROM backfill_task bt
-		WHERE bt.user_login_id=$1
-		  AND bt.is_done=1
-		  AND EXISTS (
-		    SELECT 1 FROM cloud_message cm
-		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
-		  )
-		  AND NOT EXISTS (
-		    SELECT 1 FROM message m
-		    WHERE m.bridge_id=bt.bridge_id AND m.room_id=bt.portal_id
-		      AND m.room_receiver=bt.portal_receiver
-		  )
-		  AND NOT EXISTS (
-		    SELECT 1 FROM cloud_backfill_reconciled r
-		    WHERE r.login_id=$1 AND r.portal_id=bt.portal_id
-		  )
-	`, s.loginID)
+	rows, err := s.db.Query(ctx, strandedBackfillReconciliationQuery,
+		s.loginID,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query stranded backfill tasks: %w", err)
 	}
@@ -3752,6 +3843,26 @@ func (s *cloudBackfillStore) reconcileStrandedBackfills(ctx context.Context) (in
 	}
 	return repaired, nil
 }
+
+const strandedBackfillReconciliationQuery = `
+		SELECT bt.portal_id, bt.portal_receiver, bt.bridge_id
+		FROM backfill_task bt
+		WHERE bt.user_login_id=$1
+		  AND bt.is_done=TRUE
+		  AND EXISTS (
+		    SELECT 1 FROM cloud_message cm
+		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message m
+		    WHERE m.bridge_id=bt.bridge_id AND m.room_id=bt.portal_id
+		      AND m.room_receiver=bt.portal_receiver
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cloud_backfill_reconciled r
+		    WHERE r.login_id=$1 AND r.portal_id=bt.portal_id
+		  )
+`
 
 func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.db.Query(ctx, `
@@ -4072,13 +4183,12 @@ const pendingBackfillScrubHold = 24 * time.Hour
 // avoids that.
 //
 // Three conditions, all required, so the hold stays narrow:
-//   - the portal has a live, non-filtered cloud_chat row that is not yet done.
-//     Filtered chats (Apple's junk bucket) never become portals when
-//     bridge_filtered_chats is off, so they would otherwise be held forever.
-//   - no cloud_chat row for the portal is done. One portal_id can carry several
-//     chat rows (an iMessage chat and an SMS chat for the same handle), and a
-//     newly-synced sibling row starts at FALSE; if any row is done, the portal
-//     has delivered and there is no race left to protect.
+//   - the message source has a live, non-filtered cloud_chat row that is not
+//     yet done. Filtered chats never become portals while the opt-in remains
+//     disabled, so they would otherwise be held forever.
+//   - no eligible completed row exists for that same source chat. A completed
+//     sibling is not proof that a newly synced sibling sharing the portal was
+//     delivered.
 //   - the pending row was first seen inside pendingBackfillScrubHold. This is
 //     what keeps a permanently wedged portal from becoming a permanent plaintext
 //     exemption.
@@ -4086,19 +4196,36 @@ const pendingBackfillScrubHold = 24 * time.Hour
 // Correlates on cloud_message.portal_id, so it is only valid inside a query
 // whose innermost cloud_message scope is the candidate row. $1 is login_id.
 func pendingBackfillGateSQL(holdPlaceholder string) string {
+	// Empty or unknown chat IDs use a fail-closed legacy fallback: any recent
+	// pending sibling protects the row, while no completed sibling can release
+	// it without an exact source match.
 	return `NOT (
 		        EXISTS (
 		          SELECT 1 FROM cloud_chat pending
 		          WHERE pending.login_id=$1 AND pending.portal_id=cloud_message.portal_id
 		            AND pending.deleted=FALSE
 		            AND COALESCE(pending.is_filtered, 0) = 0
+		            AND (
+		              COALESCE(cloud_message.chat_id, '') = ''
+		              OR LOWER(pending.cloud_chat_id)=LOWER(cloud_message.chat_id)
+		              OR NOT EXISTS (
+		                SELECT 1 FROM cloud_chat known
+		                WHERE known.login_id=$1
+		                  AND known.portal_id=cloud_message.portal_id
+		                  AND LOWER(known.cloud_chat_id)=LOWER(cloud_message.chat_id)
+		              )
+		            )
 		            AND pending.fwd_backfill_done=FALSE
 		            AND COALESCE(pending.created_ts, 0) >= ` + holdPlaceholder + `
 		        )
 		        AND NOT EXISTS (
 		          SELECT 1 FROM cloud_chat delivered
 		          WHERE delivered.login_id=$1 AND delivered.portal_id=cloud_message.portal_id
+		            AND delivered.deleted=FALSE
+		            AND COALESCE(delivered.is_filtered, 0) = 0
 		            AND delivered.fwd_backfill_done=TRUE
+		            AND COALESCE(cloud_message.chat_id, '') <> ''
+		            AND LOWER(delivered.cloud_chat_id)=LOWER(cloud_message.chat_id)
 		        )
 		      )`
 }

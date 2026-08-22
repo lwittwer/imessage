@@ -69,20 +69,12 @@ fn bridge_default_provider(
     path: PathBuf,
     device_id: String,
 ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    // The omnisette provider selected with `cleanroom-registration` takes a
-    // `device_id`; upstream OpenBubbles omnisette's `default_provider` is 2-arg.
-    // Gate on the feature so both signatures build: with cleanroom-registration
-    // the 3-arg call is used; without it (this from-source build) the 2-arg
-    // upstream signature is used.
-    #[cfg(feature = "cleanroom-registration")]
-    {
-        omnisette::default_provider(info, path, device_id)
-    }
-    #[cfg(not(feature = "cleanroom-registration"))]
-    {
-        let _ = device_id;
-        omnisette::default_provider(info, path)
-    }
+    // The pinned upstream omnisette exposes a two-argument `default_provider`
+    // for every provider selected here. Keep `device_id` in this wrapper's
+    // compatibility API, but let the provider derive/persist its identity from
+    // the login info and state path as upstream expects.
+    let _ = device_id;
+    omnisette::default_provider(info, path)
 }
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 fn bridge_default_provider(
@@ -1620,12 +1612,12 @@ async fn join_keychain_with_bottles(
                     // bare "Bad message" that reads like the login broke.
                     if matches!(e, rustpush::PushError::BadMsg) {
                         warn!(
-                            "Bottle {} (serial={}, build={}) has a stale signature — that device \
+                            "Bottle {} has a stale signature — that device \
                              re-keyed after this escrow record was written (OS upgrade, \
                              re-enrollment, or an earlier bridge install), so it can never be \
                              opened. Skipping to the next bottle; this is not a failure as long \
                              as a later one succeeds.",
-                            i, meta.serial, meta.build
+                            i
                         );
                     } else {
                         warn!("Bottle {} failed: {}", i, e);
@@ -13051,11 +13043,11 @@ async fn fetch_main_zone_page_newest_first(
         }));
         match item {
             Ok(item) => { results.insert(identifier, Some(item)); }
-            Err(e) => {
-                let panic_msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                else { "unknown panic".to_string() };
-                warn!("fetch_main_zone_page_newest_first: skipping record {}: deserialization panic: {}", identifier, panic_msg);
+            Err(_e) => {
+                warn!(
+                    "fetch_main_zone_page_newest_first: skipping record_id={} due to deserialization panic (details redacted)",
+                    log_safe_message_id(&identifier)
+                );
             }
         }
     }

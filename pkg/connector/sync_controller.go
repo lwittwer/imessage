@@ -4011,6 +4011,16 @@ func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
 		(p.MessageActivityTS > p.NewestTS || p.MessageWriteActivityTS > p.ContentfulWriteActivity)
 }
 
+func countInitialBackfillPortals(ordered []string, needs map[string]bool, skipped map[string]bool) int {
+	count := 0
+	for _, portalID := range ordered {
+		if !skipped[portalID] && needs[portalID] {
+			count++
+		}
+	}
+	return count
+}
+
 type cloudCatchupBackfillBundle struct {
 	AfterWriteTS int64
 }
@@ -4060,6 +4070,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
 	lastQueuedByID := make(map[string]queuedPortalWatermark, len(portalInfos))
 	forwardBackfillPortals := 0
+	needsInitialBackfill := make(map[string]bool, len(portalInfos))
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	noContentSkipped := 0
@@ -4136,7 +4147,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			continue
 		}
 		if newPortalNeedsContent || shouldForceCloudBackfill(p) {
-			forwardBackfillPortals++
+			needsInitialBackfill[p.PortalID] = true
 		}
 		ordered = append(ordered, p.PortalID)
 	}
@@ -4178,6 +4189,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; processing all (noisier startup)")
 		skipUnchanged = nil
 	}
+	// Count only portals that will actually receive a ChatResync. A reaction- or
+	// metadata-only candidate can satisfy shouldForceCloudBackfill while also
+	// being provably unchanged since its completed backfill; skipping it below
+	// must not hold the APNs buffer waiting for a callback that will never run.
+	forwardBackfillPortals = countInitialBackfillPortals(ordered, needsInitialBackfill, skipUnchanged)
 	skippedChatResync := 0
 
 	// Set pendingInitialBackfills BEFORE queuing any portals.

@@ -145,6 +145,142 @@ func TestScrubHoldsOffPendingBackfillPortals(t *testing.T) {
 	}
 }
 
+func TestScrubPendingGateIgnoresStaleDeletedOrFilteredDoneSiblings(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		staleChat   string
+		markStale   string
+		filterStale bool
+	}{
+		{name: "deleted sibling", staleChat: "C-DELETED-DONE", markStale: "deleted"},
+		{name: "filtered sibling", staleChat: "C-FILTERED-DONE", markStale: "filtered", filterStale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, db, store := scrubRaceFixture(t)
+			const bridgeID = "test-bridge"
+			now := time.Now().UnixMilli()
+			portalID := "tel:+15550006666"
+			staleFiltered := int64(0)
+			if tc.filterStale {
+				staleFiltered = 1
+			}
+			if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+				{CloudChatID: "C-LIVE-PENDING", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+				{CloudChatID: tc.staleChat, PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: staleFiltered},
+			}); err != nil {
+				t.Fatalf("upsertChatBatch: %v", err)
+			}
+			staleUpdate := `UPDATE cloud_chat SET fwd_backfill_done=TRUE`
+			if tc.markStale == "deleted" {
+				staleUpdate += `, deleted=TRUE`
+			}
+			staleUpdate += ` WHERE login_id=$1 AND cloud_chat_id=$2`
+			if _, err := db.Exec(ctx, staleUpdate, testSQLLoginID, tc.staleChat); err != nil {
+				t.Fatalf("mark stale sibling: %v", err)
+			}
+			if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+				GUID: "GUID-LIVE-PENDING", CloudChatID: "C-LIVE-PENDING", PortalID: portalID,
+				TimestampMS: now, Text: "must remain until the live sibling delivers", Service: "iMessage", HasBody: true,
+			}}); err != nil {
+				t.Fatalf("upsertMessageBatch: %v", err)
+			}
+			if _, err := db.Exec(ctx,
+				`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+				"GUID-LIVE-PENDING", bridgeID, string(testSQLLoginID),
+			); err != nil {
+				t.Fatalf("insert bridge message: %v", err)
+			}
+			if _, err := db.Exec(ctx,
+				`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`,
+				testSQLLoginID, now-int64(time.Hour/time.Millisecond),
+			); err != nil {
+				t.Fatalf("age message: %v", err)
+			}
+
+			scrubbed, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil)
+			if err != nil {
+				t.Fatalf("scrubBridgedBodies: %v", err)
+			}
+			if scrubbed != 0 {
+				t.Fatalf("scrubBridgedBodies scrubbed %d rows, want pending live sibling held", scrubbed)
+			}
+			var text sql.NullString
+			if err := db.QueryRow(ctx,
+				`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+				testSQLLoginID, "GUID-LIVE-PENDING").Scan(&text); err != nil {
+				t.Fatalf("read message text: %v", err)
+			}
+			if !text.Valid {
+				t.Fatalf("pending live sibling body was scrubbed despite stale %s sibling", tc.markStale)
+			}
+		})
+	}
+}
+
+func TestScrubPendingGateCorrelatesLiveSiblingCompletion(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const bridgeID = "test-bridge"
+	portalID := "tel:+15550008888"
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "C-LIVE-PENDING", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "C-LIVE-DONE", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_chat SET fwd_backfill_done=TRUE WHERE login_id=$1 AND cloud_chat_id=$2`,
+		testSQLLoginID, "C-LIVE-DONE",
+	); err != nil {
+		t.Fatalf("mark done sibling: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "GUID-LIVE-PENDING", CloudChatID: "C-LIVE-PENDING", PortalID: portalID, TimestampMS: now, Text: "pending sibling", Service: "iMessage", HasBody: true},
+		{GUID: "GUID-LIVE-DONE", CloudChatID: "C-LIVE-DONE", PortalID: portalID, TimestampMS: now + 1, Text: "done sibling", Service: "SMS", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+	for _, guid := range []string{"GUID-LIVE-PENDING", "GUID-LIVE-DONE"} {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			guid, bridgeID, string(testSQLLoginID),
+		); err != nil {
+			t.Fatalf("insert bridge message %s: %v", guid, err)
+		}
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`,
+		testSQLLoginID, now-int64(time.Hour/time.Millisecond),
+	); err != nil {
+		t.Fatalf("age messages: %v", err)
+	}
+
+	scrubbed, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
+	}
+	if scrubbed != 1 {
+		t.Fatalf("scrubBridgedBodies scrubbed %d rows, want only the completed sibling", scrubbed)
+	}
+	var pendingText, doneText sql.NullString
+	if err := db.QueryRow(ctx,
+		`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "GUID-LIVE-PENDING").Scan(&pendingText); err != nil {
+		t.Fatalf("read pending sibling: %v", err)
+	}
+	if err := db.QueryRow(ctx,
+		`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "GUID-LIVE-DONE").Scan(&doneText); err != nil {
+		t.Fatalf("read done sibling: %v", err)
+	}
+	if !pendingText.Valid {
+		t.Error("pending live sibling was scrubbed by another live done sibling")
+	}
+	if doneText.Valid {
+		t.Errorf("completed live sibling retained plaintext %q", doneText.String)
+	}
+}
+
 // TestScrubBridgedBodiesStillScrubsDeletedRowsWhilePending pins the one branch
 // the hold deliberately does not cover. A row the user deleted or unsent must
 // lose its plaintext immediately: there is no backfill left to protect (every
@@ -293,67 +429,116 @@ func TestAnyScrubbedDeliverable(t *testing.T) {
 	}
 }
 
-// TestRescrubEmptyRowsSince covers the undo half of a failed rehydrate. Clearing
-// body_scrubbed drops the sticky-NULL protection in upsertMessageBatch, so if
-// CloudKit cannot repopulate the rows the flag has to go back on — otherwise a
-// later sync could quietly refill plaintext that will never be delivered and
-// therefore never be scrubbed again.
-//
-// The two rows it must NOT touch are the point: a row CloudKit did restore
-// (content is back, it is deliverable again) and a row that was empty for
-// unrelated reasons and predates the attempt (inventing a scrub flag there would
-// block CloudKit from ever filling it in).
-func TestRescrubEmptyRowsSince(t *testing.T) {
+func TestRescrubClearedRowsDoesNotCaptureNewAPNSStub(t *testing.T) {
 	ctx, db, store := scrubRaceFixture(t)
 	now := time.Now().UnixMilli()
 
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
-		{GUID: "G-STILL-EMPTY", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, Service: "iMessage", HasBody: true},
-		{GUID: "G-RESTORED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, Text: "came back", Service: "iMessage", HasBody: true},
-		{GUID: "G-OLD-EMPTY", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, Service: "iMessage", HasBody: true},
-		{GUID: "G-OTHER-PORTAL", PortalID: "p2", CloudChatID: "C2", TimestampMS: now, Service: "iMessage", HasBody: true},
+		{GUID: "G-CLEARED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, Service: "iMessage", HasBody: true},
 	}); err != nil {
 		t.Fatalf("upsertMessageBatch: %v", err)
 	}
-
-	clearedFrom := now - 1000
-	// The old empty row predates the rehydrate attempt.
-	if _, err := db.Exec(ctx,
-		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1 AND guid='G-OLD-EMPTY'`,
-		testSQLLoginID, clearedFrom-1,
-	); err != nil {
-		t.Fatalf("age G-OLD-EMPTY: %v", err)
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET body_scrubbed=TRUE WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID); err != nil {
+		t.Fatalf("mark original row scrubbed: %v", err)
 	}
-
-	n, err := store.rescrubEmptyRowsSince(ctx, "p1", clearedFrom)
+	var beforeClear bool
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID).Scan(&beforeClear); err != nil {
+		t.Fatalf("read original scrub state before clear: %v", err)
+	} else if !beforeClear {
+		t.Fatal("original row was not marked scrubbed before clear")
+	}
+	clearedAttempt, err := store.clearBodyScrubForRehydrate(ctx, "p1")
 	if err != nil {
-		t.Fatalf("rescrubEmptyRowsSince: %v", err)
+		t.Fatalf("clearBodyScrubForRehydrate: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("rescrubEmptyRowsSince re-armed %d rows, want 1", n)
+	if len(clearedAttempt.Rows) != 1 || clearedAttempt.Rows[0].GUID != "G-CLEARED" {
+		t.Fatalf("cleared rows = %v, want G-CLEARED", clearedAttempt.Rows)
 	}
 
-	scrubbedOf := func(guid string) bool {
-		t.Helper()
-		var scrubbed bool
-		if err := db.QueryRow(ctx,
-			`SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
-			testSQLLoginID, guid,
-		).Scan(&scrubbed); err != nil {
-			t.Fatalf("read back %s: %v", guid, err)
+	// This is the APNs/CloudKit interleaving that the former updated_ts window
+	// captured: the placeholder did not exist when the scrub flags were cleared.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-NEW-APNS", PortalID: "p1", CloudChatID: "C1", TimestampMS: now + 1, Service: "iMessage", HasBody: true},
+	}); err != nil {
+		t.Fatalf("insert concurrent APNs stub: %v", err)
+	}
+	var clearedState bool
+	var clearedText, clearedSubject string
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed, COALESCE(text, ''), COALESCE(subject, '') FROM cloud_message WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID).Scan(&clearedState, &clearedText, &clearedSubject); err != nil {
+		t.Fatalf("read cleared row before re-arm: %v", err)
+	}
+	if clearedState || clearedText != "" || clearedSubject != "" {
+		t.Fatalf("cleared row before re-arm = scrubbed %v text %q subject %q", clearedState, clearedText, clearedSubject)
+	}
+	if n, err := store.rescrubClearedRows(ctx, "p1", clearedAttempt); err != nil {
+		t.Fatalf("rescrubClearedRows: %v", err)
+	} else if n != 1 {
+		t.Fatalf("rescrubbed rows = %d, want 1", n)
+	}
+
+	var originalScrubbed, stubScrubbed bool
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID).Scan(&originalScrubbed); err != nil {
+		t.Fatalf("read original scrub state: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='G-NEW-APNS'`, testSQLLoginID).Scan(&stubScrubbed); err != nil {
+		t.Fatalf("read stub scrub state: %v", err)
+	}
+	if !originalScrubbed || stubScrubbed {
+		t.Fatalf("scrub states original=%v stub=%v, want true false", originalScrubbed, stubScrubbed)
+	}
+
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-NEW-APNS", PortalID: "p1", CloudChatID: "C1", TimestampMS: now + 1, Text: "arrived later", Service: "iMessage", HasBody: true},
+	}); err != nil {
+		t.Fatalf("fill concurrent APNs stub: %v", err)
+	}
+	var text string
+	if err := db.QueryRow(ctx, `SELECT text FROM cloud_message WHERE login_id=$1 AND guid='G-NEW-APNS'`, testSQLLoginID).Scan(&text); err != nil {
+		t.Fatalf("read filled stub: %v", err)
+	}
+	if text != "arrived later" {
+		t.Fatalf("filled stub text = %q, want body accepted", text)
+	}
+}
+
+func TestRescrubClearedRowsRearmsMissedAttachmentOnlyRow(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	now := time.Now().UnixMilli()
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-FETCHED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, AttachmentsJSON: `[{"guid":"A1"}]`, Service: "iMessage", HasBody: true},
+		{GUID: "g-fetched", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, AttachmentsJSON: `[{"guid":"A1-case-variant"}]`, Service: "iMessage", HasBody: true},
+		{GUID: "G-MISSED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, AttachmentsJSON: `[{"guid":"A2"}]`, Service: "iMessage", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsert attachment rows: %v", err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET body_scrubbed=TRUE WHERE login_id=$1 AND portal_id='p1'`, testSQLLoginID); err != nil {
+		t.Fatalf("mark attachment rows scrubbed: %v", err)
+	}
+	clearedAttempt, err := store.clearBodyScrubForRehydrate(ctx, "p1")
+	if err != nil {
+		t.Fatalf("clearBodyScrubForRehydrate: %v", err)
+	}
+	// Simulate any CloudKit writer restoring one attachment-only row while the
+	// automatic targeted fetch is in flight. updated_ts must prove this exact
+	// row was refreshed even though its retained attachment metadata is unchanged.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-FETCHED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now, AttachmentsJSON: `[{"guid":"A1"}]`, Service: "iMessage", HasBody: true},
+	}); err != nil {
+		t.Fatalf("simulate concurrent attachment restore: %v", err)
+	}
+	if n, err := store.rescrubClearedRows(ctx, "p1", clearedAttempt); err != nil {
+		t.Fatalf("rescrubClearedRows: %v", err)
+	} else if n != 2 {
+		t.Fatalf("rescrubbed rows = %d, want 2", n)
+	}
+
+	for guid, want := range map[string]bool{"G-FETCHED": false, "g-fetched": true, "G-MISSED": true} {
+		var got bool
+		if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`, testSQLLoginID, guid).Scan(&got); err != nil {
+			t.Fatalf("read %s scrub state: %v", guid, err)
 		}
-		return scrubbed
-	}
-	if !scrubbedOf("G-STILL-EMPTY") {
-		t.Error("G-STILL-EMPTY kept body_scrubbed=FALSE with no content — a later CloudKit sync could refill plaintext nothing will scrub again")
-	}
-	if scrubbedOf("G-RESTORED") {
-		t.Error("G-RESTORED was re-scrubbed even though CloudKit gave its text back")
-	}
-	if scrubbedOf("G-OLD-EMPTY") {
-		t.Error("G-OLD-EMPTY was scrubbed, but it predates the rehydrate attempt — this must only undo what the attempt cleared")
-	}
-	if scrubbedOf("G-OTHER-PORTAL") {
-		t.Error("a row in another portal was re-scrubbed")
+		if got != want {
+			t.Errorf("%s body_scrubbed = %v, want %v", guid, got, want)
+		}
 	}
 }

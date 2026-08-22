@@ -160,6 +160,9 @@ RP_PATCH = rp_patch() { \
 
 # Prepare rustpush sources the same way upstream CI does: checkout with
 # submodules present and fake FairPlay certs available for build-time signing.
+# The overlay comparison ignores Cargo.toml's known relocated nac-validation
+# line and repo-local Cargo build output, so an already-prepared copy is not
+# recopied after running the documented direct overlay tests.
 ensure-rustpush-source:
 	@if [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
 		if [ -z "$(RUSTPUSH_PIN)" ]; then \
@@ -199,13 +202,22 @@ ensure-rustpush-source:
 			done; \
 		fi; \
 		if [ -d rustpush/open-absinthe ] && [ -f rustpush/open-absinthe/Cargo.toml ]; then \
-			if ! diff -rq rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe >/dev/null 2>&1; then \
+			if ! diff -rq -x Cargo.toml -x target rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe >/dev/null 2>&1 || \
+			   ! diff -q -I 'nac-validation = .*nac-validation.*' rustpush/open-absinthe/Cargo.toml third_party/rustpush-upstream/open-absinthe/Cargo.toml >/dev/null 2>&1; then \
 				echo "Overlaying our open-absinthe (native NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
 				rm -rf third_party/rustpush-upstream/open-absinthe; \
 				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
 			fi; \
 		fi; \
 	fi
+# The repo-owned open-absinthe overlay is one directory shallower than the
+# prepared copy under third_party/rustpush-upstream. Keep its manifest
+# directly testable in place, then make the copied manifest resolve the same
+# repo-root nac-validation crate after relocation. This is idempotent and
+# fails loudly if either layout or the overlay anchor changes.
+	@$(RP_PATCH) rp_patch "relocate open-absinthe nac-validation path" $(RUSTPUSH_DIR)/open-absinthe/Cargo.toml \
+	  's|path = "\.\./\.\./nac-validation"|path = "../../../nac-validation"|' \
+	  'path = "\.\./\.\./\.\./nac-validation"'
 # The rustpushgo anisette-aoskit / anisette-remote-v3 features reference
 # omnisette/prefer-* features that upstream omnisette doesn't define. cargo
 # validates the whole [features] table even though this build never selects
@@ -244,11 +256,6 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "keychain passcode_generation default" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^    pub passcode_generation: u32,$$/    #[serde(default)] pub passcode_generation: u32,/' \
 	  '#\[serde\(default\)\] pub passcode_generation: u32,'
-# Env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports
-# d77b1ac4). Off unless RUSTPUSH_LOG_REGISTER_BODY is set.
-	@$(RP_PATCH) rp_patch "REGISTER body XML dump" $(RUSTPUSH_DIR)/src/ids/user.rs \
-	  's/^    let mut request = SignedRequest::new\("id-register", Method::POST\)$$/    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)/' \
-	  'RUSTPUSH_LOG_REGISTER_BODY'
 # Soften statuskit.rs:119 panic to warn + default APSChannel (StatusKit reliability).
 	@$(RP_PATCH) rp_patch "statuskit no-saved-channel panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
 	  's/            panic!\("No saved channel for identifier!"\)$$/            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };/' \

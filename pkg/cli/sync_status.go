@@ -8,17 +8,21 @@
 // importing?" — is most interesting when the bridge is wedged, stopped, or has
 // not been added to a Matrix client yet.
 //
-// The queries themselves live in pkg/connector alongside the schema they read,
-// so the two entry points cannot drift apart.
+// The report currently lives in pkg/connector alongside the schema it reads;
+// a later, separately reviewed feature extracts it from the Rust/CGO package.
 
 package cli
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.mau.fi/util/dbutil"
 	"gopkg.in/yaml.v3"
@@ -74,8 +78,115 @@ func (c syncStatusConfig) effectiveMaxInitialMessages() int {
 	return c.Backfill.MaxInitialMessages
 }
 
+// validateSyncStatusArgs accepts only the optional account selector. Keeping
+// this separate from runSyncStatus makes the no-silent-fallback contract
+// testable without invoking die (which exits the process).
+func validateSyncStatusArgs(args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf("usage: corten-matrix sync-status [1]")
+	}
+	if len(args) == 1 && args[0] != "1" {
+		return fmt.Errorf("unknown sync-status argument %q (expected 1)", args[0])
+	}
+	return nil
+}
+
+func isSQLiteSyncStatusType(dbType string) bool {
+	dbType = strings.ToLower(strings.TrimSpace(dbType))
+	return strings.HasPrefix(dbType, "sqlite") || strings.HasPrefix(dbType, "litestream")
+}
+
+// readOnlySQLiteURI adds SQLite's VFS read-only mode without disturbing any
+// bridge-specific query parameters. mode=ro is important beyond the absence
+// of writes in our report: database/sql's SQLite driver otherwise creates a
+// missing file as soon as the first query runs, turning a diagnostic typo into
+// a new empty bridge database.
+func readOnlySQLiteURI(uri string) (string, error) {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return "", fmt.Errorf("empty SQLite database URI")
+	}
+	base, rawQuery, _ := strings.Cut(uri, "?")
+	if base == ":memory:" || strings.HasPrefix(strings.ToLower(base), "file::memory:") {
+		return "", fmt.Errorf("sync-status requires an existing file-backed SQLite database")
+	}
+	values := url.Values{}
+	if rawQuery != "" {
+		parsed, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return "", fmt.Errorf("invalid SQLite database URI: %w", err)
+		}
+		values = parsed
+	}
+	if strings.EqualFold(values.Get("mode"), "memory") {
+		return "", fmt.Errorf("sync-status requires an existing file-backed SQLite database")
+	}
+	values.Set("mode", "ro")
+	return base + "?" + values.Encode(), nil
+}
+
+// openSyncStatusDatabase deliberately does not use dbutil.NewWithDialect for
+// SQLite: that helper calls sql.Open with the caller's original DSN, whose
+// default mode is read-write/create. The daemon's sqlite3-fk-wal and litestream
+// drivers also run a ConnectHook that sets journal_mode=WAL, which is a write
+// and therefore fails against a read-only URI. The plain sqlite3 driver is the
+// same SQLite implementation without that write-oriented hook, so use it for
+// this read-only diagnostic while retaining the configured type for dialect
+// translation. PostgreSQL remains on the normal path so external deployments
+// keep working unchanged.
+func openSyncStatusDatabase(cfg syncStatusConfig) (*dbutil.Database, error) {
+	uri := cfg.Database.URI
+	driverName := cfg.Database.Type
+	if isSQLiteSyncStatusType(cfg.Database.Type) {
+		var err error
+		uri, err = readOnlySQLiteURI(uri)
+		if err != nil {
+			return nil, err
+		}
+		driverName = "sqlite3"
+	}
+	raw, err := sql.Open(driverName, uri)
+	if err != nil {
+		return nil, err
+	}
+	db, err := dbutil.NewWithDB(raw, cfg.Database.Type)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	// The daemon itself clamps SQLite to one connection. Match that here so a
+	// report never competes with the live bridge for a writer slot, while still
+	// retaining PostgreSQL's normal pool behavior.
+	if isSQLiteSyncStatusType(cfg.Database.Type) {
+		db.RawDB.SetMaxOpenConns(1)
+	}
+	return db, nil
+}
+
+// syncStatusDatabaseErrorClass deliberately discards driver text entirely.
+// Matching and returning a sanitized copy of a DSN is not sufficient: drivers
+// may decode credentials, normalize paths, or embed the secret in a nested
+// error. Only broad operational classes are safe to print from this CLI.
+func syncStatusDatabaseErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return "database operation failed"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "database query timed out"
+	case errors.Is(err, os.ErrNotExist):
+		return "database file not found"
+	case errors.Is(err, os.ErrPermission):
+		return "database permission denied"
+	default:
+		return "database operation failed"
+	}
+}
+
 // runSyncStatus implements `corten-matrix sync-status [1]`.
 func runSyncStatus(args []string) {
+	if err := validateSyncStatusArgs(args); err != nil {
+		die("%v", err)
+	}
 	dir := cortenDataDir()
 	who := ""
 	if len(args) > 0 && args[0] == "1" {
@@ -96,16 +207,11 @@ func runSyncStatus(args []string) {
 		die("No database configured in %s", configPath)
 	}
 
-	db, err := dbutil.NewWithDialect(cfg.Database.URI, cfg.Database.Type)
+	db, err := openSyncStatusDatabase(cfg)
 	if err != nil {
-		die("Could not open the database: %v", err)
+		die("Could not open the database: %s", syncStatusDatabaseErrorClass(err))
 	}
 	defer db.Close()
-	// One connection: the bridge may be running against this same file, and
-	// everything below is read-only, so there is no reason to open a pool that
-	// competes with it. No migrations are run — dbutil only upgrades when it
-	// is explicitly asked to.
-	db.RawDB.SetMaxOpenConns(1)
 
 	report, err := connector.GetSyncStatus(context.Background(), db, connector.SyncStatusOptions{
 		// BridgeID and LoginID are left empty: only the database knows them,
@@ -117,7 +223,8 @@ func runSyncStatus(args []string) {
 		// report then states as fact.
 	})
 	if err != nil {
-		die("Could not read sync status from %s: %v", cfg.Database.URI, err)
+		die("Could not read sync status from %s: %s", configPath,
+			syncStatusDatabaseErrorClass(err))
 	}
 
 	fmt.Printf("\n  %scorten-matrix sync-status%s%s\n  %s%s%s\n\n",

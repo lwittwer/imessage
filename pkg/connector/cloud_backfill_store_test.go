@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
@@ -10,6 +11,43 @@ import (
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
+
+func TestStrandedBackfillReconciliationQueryUsesPostgresBoolean(t *testing.T) {
+	if !strings.Contains(strandedBackfillReconciliationQuery, "bt.is_done=TRUE") {
+		t.Fatalf("reconciliation query does not use a portable boolean literal: %s", strandedBackfillReconciliationQuery)
+	}
+	if strings.Contains(strandedBackfillReconciliationQuery, "bt.is_done=1") {
+		t.Fatalf("reconciliation query still compares a boolean column to integer 1: %s", strandedBackfillReconciliationQuery)
+	}
+}
+
+func TestSetSyncStateErrorStoresSafeClassification(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const rawError = "CloudKit request https://example.invalid/records?token=secret failed for record-name"
+	if err = store.setSyncStateError(ctx, cloudZoneChats, rawError); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err = db.QueryRow(ctx, `SELECT last_error FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`, store.loginID, cloudZoneChats).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got == rawError || got != "cloudkit_sync_failed" {
+		t.Fatalf("setSyncStateError persisted %q, want safe classification", got)
+	}
+}
 
 func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	ctx := context.Background()

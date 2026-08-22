@@ -490,3 +490,34 @@ func assertInvariants(t *testing.T, r *SyncStatusReport) {
 		t.Errorf("DeliveredPercent = %v, want 0..100", pct)
 	}
 }
+
+func TestSyncStatusRedactsPersistedZoneErrors(t *testing.T) {
+	secret := "https://apple.invalid/account?token=secret-handle"
+	report := &SyncStatusReport{
+		HasLogin:           true,
+		CloudTablesPresent: true,
+		Zones: []ZoneSyncStatus{{
+			Zone:      cloudZoneMessages,
+			Present:   true,
+			HasError:  true,
+			LastError: secret,
+		}},
+	}
+	out := report.Format()
+	if strings.Contains(out, secret) || strings.Contains(out, "secret-handle") {
+		t.Fatalf("formatted sync status exposed persisted error details: %q", out)
+	}
+	if !strings.Contains(out, "details redacted") {
+		t.Fatalf("formatted sync status did not explain error redaction: %q", out)
+	}
+}
+
+func TestSyncStatusTableProbeErrorsAreReturned(t *testing.T) {
+	db := newTestSQLiteDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	if _, err := GetSyncStatus(context.Background(), db, SyncStatusOptions{}); err == nil {
+		t.Fatal("GetSyncStatus returned success after the table probe failed")
+	}
+}
