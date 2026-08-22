@@ -106,12 +106,14 @@ type SyncStatusReport struct {
 	// DeliveredMessages is a subset of DeliverableMessages by construction:
 	// same predicate, plus a matching row in bridgev2's `message` table.
 	DeliveredMessages int
-	// FilteredChatMessages / EmptySystemMessages / BeyondCapMessages are the
-	// rows that are NOT deliverable and never will be. Counting them as
-	// deliverable is what keeps a percentage from ever reaching 100%.
-	FilteredChatMessages int
-	EmptySystemMessages  int
-	BeyondCapMessages    int
+	// The buckets below are rows that are not currently deliverable. Portal
+	// mismatches are retained for re-ingest; the others have no local delivery
+	// path. Counting any of them as deliverable would keep the percentage from
+	// ever reaching 100%.
+	PortalMismatchMessages int
+	FilteredChatMessages   int
+	EmptySystemMessages    int
+	BeyondCapMessages      int
 	// UnavailableMessages are scrubbed rows with no matching bridgev2 message
 	// evidence. They cannot be delivered from the local persisted state and are
 	// excluded from the pending denominator rather than reported forever.
@@ -177,9 +179,9 @@ func (r *SyncStatusReport) PendingMessages() int {
 	return 0
 }
 
-// UnbridgeableMessages is the total of the three not-deliverable buckets.
+// UnbridgeableMessages is the total of the not-deliverable buckets.
 func (r *SyncStatusReport) UnbridgeableMessages() int {
-	return r.FilteredChatMessages + r.EmptySystemMessages + r.BeyondCapMessages + r.UnavailableMessages
+	return r.PortalMismatchMessages + r.FilteredChatMessages + r.EmptySystemMessages + r.BeyondCapMessages + r.UnavailableMessages
 }
 
 // DeliveredPercent is delivered/deliverable as a percentage, 100 when there is
@@ -279,6 +281,24 @@ func messageBridgeableSQL(messageCol, loginParam, bridgeFilteredParam string) st
 		        AND COALESCE(live.is_filtered, 0) <> 0
 		    )
 		  )
+		)`
+}
+
+// messageSourceMismatchSQL identifies a known CloudKit source chat whose
+// current portal differs from the portal persisted on the message. Readers
+// correctly fail closed for this shape, but it is recoverable when CloudKit
+// re-ingests the message and must not be described as Unknown Senders filtering.
+func messageSourceMismatchSQL(messageCol, loginParam string) string {
+	return `EXISTS (
+		  SELECT 1 FROM cloud_chat source
+		  WHERE source.login_id=` + loginParam + `
+		    AND LOWER(source.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		)
+		AND NOT EXISTS (
+		  SELECT 1 FROM cloud_chat exact_source
+		  WHERE exact_source.login_id=` + loginParam + `
+		    AND LOWER(exact_source.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		    AND exact_source.portal_id=` + messageCol + `.portal_id
 		)`
 }
 
@@ -580,14 +600,15 @@ func (r *SyncStatusReport) readMessageCounts(ctx context.Context, db *dbutil.Dat
 	query := `
 		SELECT
 			COUNT(*),
-			SUM(CASE WHEN c.portal_bridgeable = 0 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 1 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 0 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			SUM(CASE WHEN c.source_mismatch = 1 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 1 AND c.unavailable = 1 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
 			              AND $3 > 0 AND c.rn > $3 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
 			              AND ($3 = 0 OR c.rn <= $3) THEN 1 ELSE 0 END),
-			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			SUM(CASE WHEN c.source_mismatch = 0 AND c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
 			              AND ($3 = 0 OR c.rn <= $3) AND c.delivered = 1 THEN 1 ELSE 0 END)
 		FROM (
 			SELECT
@@ -618,6 +639,8 @@ func (r *SyncStatusReport) readMessageCounts(ctx context.Context, db *dbutil.Dat
 						cm.has_body,
 						CASE WHEN cm.tapback_type IS NOT NULL AND cm.tapback_type >= 2000
 							THEN 1 ELSE 0 END AS is_reaction,
+						CASE WHEN ` + messageSourceMismatchSQL("cm", "$1") + `
+							THEN 1 ELSE 0 END AS source_mismatch,
 						CASE WHEN ` + messageBridgeableSQL("cm", "$1", "$4") + `
 							THEN 1 ELSE 0 END AS portal_bridgeable,
 						CASE WHEN UPPER(cm.guid) IN (` + deliveredGUIDSetSQL(db) + `
@@ -631,13 +654,14 @@ func (r *SyncStatusReport) readMessageCounts(ctx context.Context, db *dbutil.Dat
 		WHERE c.is_reaction = 0
 	`
 	var candidates int
-	var filtered, unavailableCount, empty, beyondCap, deliverable, delivered sql.NullInt64
+	var mismatch, filtered, unavailableCount, empty, beyondCap, deliverable, delivered sql.NullInt64
 	err := db.QueryRow(ctx, query, r.LoginID, r.BridgeID, r.MessageCap, r.BridgeFilteredChats).
-		Scan(&candidates, &filtered, &unavailableCount, &empty, &beyondCap, &deliverable, &delivered)
+		Scan(&candidates, &mismatch, &filtered, &unavailableCount, &empty, &beyondCap, &deliverable, &delivered)
 	if err != nil {
 		return fmt.Errorf("failed to count messages: %w", err)
 	}
 	r.CandidateMessages = candidates
+	r.PortalMismatchMessages = int(mismatch.Int64)
 	r.FilteredChatMessages = int(filtered.Int64)
 	r.UnavailableMessages = int(unavailableCount.Int64)
 	r.EmptySystemMessages = int(empty.Int64)
@@ -788,6 +812,9 @@ func (r *SyncStatusReport) Format() string {
 
 	if unbridgeable := r.UnbridgeableMessages(); unbridgeable > 0 {
 		sb.WriteString(fmt.Sprintf("Not bridgeable (%d, excluded from the total above):\n", unbridgeable))
+		if r.PortalMismatchMessages > 0 {
+			sb.WriteString(fmt.Sprintf("  %d whose CloudKit source is now mapped to a different portal — retained locally and awaiting re-ingest under the current portal\n", r.PortalMismatchMessages))
+		}
 		if r.FilteredChatMessages > 0 {
 			sb.WriteString(fmt.Sprintf("  %d in chats iCloud filed under Unknown Senders — set `bridge_filtered_chats: true` to bridge them\n", r.FilteredChatMessages))
 		}

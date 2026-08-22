@@ -85,7 +85,9 @@ retain the portal-level fallback only when every live sibling is unfiltered, so
 older persisted history remains restorable without leaking across a mixed
 sibling set; synthetic/recycle metadata rows must not disable that compatibility
 fallback. A source row remapped to another portal is authoritative and must not
-authorize stale history through the old portal.
+authorize stale history through the old portal. That mismatch is recoverable:
+keep the row unreadable, but retain its plaintext for authoritative CloudKit
+re-ingest instead of treating it as permanently filtered and scrubbing it.
 
 ## Sync-status diagnostic contract
 
@@ -100,6 +102,8 @@ The report's source-chat eligibility, content predicate, ordering, and cap
 window must match the connector readers. In particular, filtered or deleted
 siblings are excluded before the per-portal cap is ranked, while readable
 reaction/system rows still consume the same slots as `listLatestMessages`.
+Rows whose known source moved to another portal must have a distinct mismatch
+bucket and remediation; never describe them as Unknown Senders filtering.
 Persisted CloudKit errors, database URIs, Apple handles, record identifiers,
 and driver error details must never be rendered. The in-bridge command may
 report live sync and batch-send capability; the host CLI must show those as

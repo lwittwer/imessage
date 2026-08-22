@@ -9,12 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
-	// Registers the "sqlite3" driver the test config names. The bridge binary
-	// links it too (via litestream's sqlite3-fk-wal), but pkg/cli itself has
-	// no reason to import a database driver outside a test.
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	_ "go.mau.fi/util/dbutil/litestream"
 )
 
@@ -176,6 +174,8 @@ func TestOpenSyncStatusDatabaseDoesNotCreateSQLiteFile(t *testing.T) {
 			defer db.Close()
 			if err := db.RawDB.Ping(); err == nil {
 				t.Fatal("Ping succeeded for a missing read-only database")
+			} else if got := syncStatusDatabaseErrorClass(err); got != "database file not found" {
+				t.Fatalf("missing database error class = %q, want database file not found", got)
 			}
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Fatalf("read-only diagnostic created %s (stat error: %v)", path, err)
@@ -204,6 +204,9 @@ func TestSyncStatusDatabaseErrorClassNeverExposesDriverDetails(t *testing.T) {
 		},
 		{name: "permission class is static", err: errors.Join(errors.New(secretPath), os.ErrPermission), want: "database permission denied"},
 		{name: "not found class is static", err: errors.Join(errors.New(secretPath), os.ErrNotExist), want: "database file not found"},
+		{name: "sqlite missing file", err: sqlite3.Error{Code: sqlite3.ErrCantOpen, SystemErrno: syscall.ENOENT}, want: "database file not found"},
+		{name: "sqlite permission", err: sqlite3.Error{Code: sqlite3.ErrCantOpen, SystemErrno: syscall.EACCES}, want: "database permission denied"},
+		{name: "sqlite generic cant open", err: sqlite3.Error{Code: sqlite3.ErrCantOpen}, want: "SQLite database could not be opened"},
 		{name: "timeout class is static", err: errors.Join(errors.New(secretURL), context.DeadlineExceeded), want: "database query timed out"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

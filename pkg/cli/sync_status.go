@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mattn/go-sqlite3"
 	"go.mau.fi/util/dbutil"
 	"gopkg.in/yaml.v3"
 
@@ -97,10 +98,9 @@ func isSQLiteSyncStatusType(dbType string) bool {
 }
 
 // readOnlySQLiteURI adds SQLite's VFS read-only mode without disturbing any
-// bridge-specific query parameters. mode=ro is important beyond the absence
-// of writes in our report: database/sql's SQLite driver otherwise creates a
-// missing file as soon as the first query runs, turning a diagnostic typo into
-// a new empty bridge database.
+// bridge-specific query parameters. For the supported Beeper-generated file:
+// URI, mode=ro also prevents a diagnostic typo from creating an empty bridge
+// database. Custom bare-path DSNs do not provide that guarantee.
 func readOnlySQLiteURI(uri string) (string, error) {
 	uri = strings.TrimSpace(uri)
 	if uri == "" {
@@ -168,6 +168,17 @@ func openSyncStatusDatabase(cfg syncStatusConfig) (*dbutil.Database, error) {
 // may decode credentials, normalize paths, or embed the secret in a nested
 // error. Only broad operational classes are safe to print from this CLI.
 func syncStatusDatabaseErrorClass(err error) string {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrCantOpen {
+		switch {
+		case errors.Is(sqliteErr.SystemErrno, os.ErrNotExist):
+			return "database file not found"
+		case errors.Is(sqliteErr.SystemErrno, os.ErrPermission):
+			return "database permission denied"
+		default:
+			return "SQLite database could not be opened"
+		}
+	}
 	switch {
 	case err == nil:
 		return "database operation failed"

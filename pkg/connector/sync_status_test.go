@@ -340,12 +340,16 @@ func TestGetSyncStatus(t *testing.T) {
 				h.msg(msg{guid: "legacy", portal: "tel:+15550500", chatID: "legacy-source", ts: 1000, text: "legacy"})
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
-				assertCounts(t, r, counts{candidates: 7, deliverable: 2, filtered: 4, beyondCap: 1})
+				assertCounts(t, r, counts{candidates: 7, deliverable: 2, mismatch: 1, filtered: 3, beyondCap: 1})
 				if r.ChatsIngested != 3 || r.ChatsFiltered != 0 {
 					t.Errorf("chat counts = ingested %d filtered %d, want 3 and 0", r.ChatsIngested, r.ChatsFiltered)
 				}
 				if got := r.PendingMessages(); got != 2 {
 					t.Errorf("PendingMessages = %d, want 2", got)
+				}
+				out := r.Format()
+				if !strings.Contains(out, "mapped to a different portal") {
+					t.Errorf("Format missing portal-mismatch remediation:\n%s", out)
 				}
 			},
 		},
@@ -443,6 +447,26 @@ func TestGetSyncStatus(t *testing.T) {
 			},
 		},
 		{
+			name: "bridge_filtered_chats does not disguise portal mismatch",
+			opts: SyncStatusOptions{BridgeFilteredChats: true},
+			setup: func(t *testing.T, h *syncStatusHarness) {
+				zonesSynced(h)
+				h.chat("tel:+15550300", "remapped-source", false, false)
+				h.chat("tel:+15550400", "old-live", false, false)
+				h.msg(msg{guid: "remapped", portal: "tel:+15550400", chatID: "remapped-source", ts: 2000, text: "recoverable"})
+			},
+			check: func(t *testing.T, r *SyncStatusReport) {
+				assertCounts(t, r, counts{candidates: 1, mismatch: 1})
+				out := r.Format()
+				if !strings.Contains(out, "mapped to a different portal") {
+					t.Errorf("Format missing portal mismatch:\n%s", out)
+				}
+				if strings.Contains(out, "set `bridge_filtered_chats: true`") {
+					t.Errorf("Format prescribed filtered-chat opt-in for a portal mismatch:\n%s", out)
+				}
+			},
+		},
+		{
 			name: "scrubbed rows still count as content",
 			setup: func(t *testing.T, h *syncStatusHarness) {
 				zonesSynced(h)
@@ -533,6 +557,7 @@ type counts struct {
 	candidates  int
 	deliverable int
 	delivered   int
+	mismatch    int
 	filtered    int
 	empty       int
 	beyondCap   int
@@ -548,6 +573,7 @@ func assertCounts(t *testing.T, r *SyncStatusReport, want counts) {
 		{"CandidateMessages", r.CandidateMessages, want.candidates},
 		{"DeliverableMessages", r.DeliverableMessages, want.deliverable},
 		{"DeliveredMessages", r.DeliveredMessages, want.delivered},
+		{"PortalMismatchMessages", r.PortalMismatchMessages, want.mismatch},
 		{"FilteredChatMessages", r.FilteredChatMessages, want.filtered},
 		{"EmptySystemMessages", r.EmptySystemMessages, want.empty},
 		{"BeyondCapMessages", r.BeyondCapMessages, want.beyondCap},

@@ -3761,13 +3761,19 @@ func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID st
 		params := strings.Split(sqlPlaceholders(s.db, paramCount), ", ")
 		args := make([]any, 0, paramCount)
 		caseSQL := make([]string, 0, len(chunk))
+		// Keep argument order identical to textual placeholder order. Postgres
+		// binds numbered placeholders regardless of where they appear, but SQLite
+		// emits bare ? placeholders and binds strictly left-to-right. The marker
+		// comparison is the first placeholder in the UPDATE, followed by the CASE
+		// pairs, then the WHERE arguments.
+		args = append(args, attempt.MarkerTS)
 		for i := range chunk {
-			caseSQL = append(caseSQL, fmt.Sprintf("WHEN %s THEN %s", params[2*i], params[2*i+1]))
+			caseSQL = append(caseSQL, fmt.Sprintf("WHEN %s THEN %s", params[2*i+1], params[2*i+2]))
 			args = append(args, chunk[i].GUID, chunk[i].UpdatedTS)
 		}
-		whereStart := 2 * len(chunk)
-		args = append(args, attempt.MarkerTS, s.loginID, portalID, attempt.MarkerTS)
-		guidParams := params[whereStart+4:]
+		whereStart := 2*len(chunk) + 1
+		args = append(args, s.loginID, portalID, attempt.MarkerTS)
+		guidParams := params[whereStart+3:]
 		for i := range chunk {
 			args = append(args, chunk[i].GUID)
 		}
@@ -3788,7 +3794,7 @@ func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID st
 			    )
 			  )
 			  AND guid IN (%s)
-		`, params[whereStart], strings.Join(caseSQL, " "), params[whereStart+1], params[whereStart+2], params[whereStart+3], strings.Join(guidParams, ",")), args...)
+		`, params[0], strings.Join(caseSQL, " "), params[whereStart], params[whereStart+1], params[whereStart+2], strings.Join(guidParams, ",")), args...)
 		if execErr != nil {
 			return 0, fmt.Errorf("failed to restore body_scrubbed: %w", execErr)
 		}
@@ -4514,11 +4520,13 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 }
 
 // permanentlyFilteredMessageWhere identifies rows that this bridge can never
-// deliver. Known sources must still be live and eligible on the message's exact
-// portal; this catches deleted and remapped sources as well as filtered ones.
-// When filtered chats are disabled, legacy rows on a mixed portal also fail
-// closed. These rows bypass the delivered-message and pending-backfill gates in
-// scrubBridgedBodies because no Matrix message row can ever exist for them.
+// deliver because their source on this exact portal is deleted or filtered.
+// A source mapped to another portal remains unreadable through the normal
+// message predicate, but is not permanently scrubbed: CloudKit re-ingest can
+// still realign that recoverable routing mismatch. When filtered chats are
+// disabled, legacy rows on a mixed portal also fail closed. These permanent
+// rows bypass the delivered-message and pending-backfill gates because no
+// Matrix message row can ever exist for them.
 func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 	eligibleFilter := ""
 	legacyMixedPortal := ""
@@ -4548,6 +4556,7 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 				SELECT 1 FROM cloud_chat source
 				WHERE source.login_id=$1
 				  AND LOWER(source.cloud_chat_id)=LOWER(%s.chat_id)
+				  AND source.portal_id=%s.portal_id
 			)
 			AND NOT EXISTS (
 				SELECT 1 FROM cloud_chat eligible
@@ -4558,7 +4567,7 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 			)
 		)
 		%s
-	)`, alias, alias, alias, eligibleFilter, legacyMixedPortal)
+	)`, alias, alias, alias, alias, eligibleFilter, legacyMixedPortal)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),

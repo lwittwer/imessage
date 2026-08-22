@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -169,13 +170,18 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
 		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+		{CloudChatID: "C-DELETED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "C-ALL-UNFILTERED", PortalID: "p-all-unfiltered", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 	}); err != nil {
 		t.Fatalf("upsert chats: %v", err)
 	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_chat SET deleted=TRUE WHERE login_id=$1 AND cloud_chat_id='C-DELETED'`, testSQLLoginID); err != nil {
+		t.Fatalf("mark source chat deleted: %v", err)
+	}
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
 		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "still needed", Service: "iMessage", HasBody: true},
 		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 2000, Text: "must not remain on disk", Service: "SMS", HasBody: true},
+		{GUID: "G-DELETED-SOURCE", CloudChatID: "C-DELETED", PortalID: portalID, TimestampMS: 2500, Text: "deleted source body", Service: "iMessage", HasBody: true},
 		{GUID: "G-MIXED-EMPTY", CloudChatID: "", PortalID: portalID, TimestampMS: 3000, Text: "ambiguous mixed history", Service: "iMessage", HasBody: true},
 		{GUID: "G-MIXED-UNKNOWN", CloudChatID: "unknown-source", PortalID: portalID, TimestampMS: 4000, Text: "unknown mixed history", Service: "iMessage", HasBody: true},
 		{GUID: "G-ALL-UNFILTERED-LEGACY", CloudChatID: "legacy-source", PortalID: "p-all-unfiltered", TimestampMS: 5000, Text: "restorable legacy history", Service: "iMessage", HasBody: true},
@@ -190,8 +196,8 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)
 	}
-	if scrubbed != 3 {
-		t.Fatalf("scrubbed rows = %d, want exact filtered plus two ambiguous mixed-sibling rows", scrubbed)
+	if scrubbed != 4 {
+		t.Fatalf("scrubbed rows = %d, want filtered/deleted sources plus two ambiguous mixed-sibling rows", scrubbed)
 	}
 	for _, tc := range []struct {
 		guid      string
@@ -200,6 +206,7 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	}{
 		{guid: "G-UNFILTERED", wantText: true, wantScrub: false},
 		{guid: "G-FILTERED", wantText: false, wantScrub: true},
+		{guid: "G-DELETED-SOURCE", wantText: false, wantScrub: true},
 		{guid: "G-MIXED-EMPTY", wantText: false, wantScrub: true},
 		{guid: "G-MIXED-UNKNOWN", wantText: false, wantScrub: true},
 		{guid: "G-ALL-UNFILTERED-LEGACY", wantText: true, wantScrub: false},
@@ -215,48 +222,58 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	}
 }
 
-func TestScrubBridgedBodiesClearsRemappedSourcePlaintext(t *testing.T) {
-	ctx, db, store := scrubRaceFixture(t)
-	const oldPortal = "tel:+15550007770"
-	const newPortal = "tel:+15550007771"
-	const guid = "G-REMAPPED-SOURCE"
-	now := time.Now().UnixMilli()
-	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
-		{CloudChatID: "C-REMAPPED", PortalID: newPortal, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
-		{CloudChatID: "C-OLD-LIVE", PortalID: oldPortal, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now},
-	}); err != nil {
-		t.Fatalf("upsert chats: %v", err)
-	}
-	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
-		GUID: guid, CloudChatID: "C-REMAPPED", PortalID: oldPortal,
-		TimestampMS: 1000, Text: "stale duplicate-room history", Service: "iMessage", HasBody: true,
-	}}); err != nil {
-		t.Fatalf("upsert message: %v", err)
-	}
-	if _, err := db.Exec(ctx,
-		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1 AND guid=$3`,
-		testSQLLoginID, now-int64(time.Hour/time.Millisecond), guid,
-	); err != nil {
-		t.Fatalf("age message: %v", err)
-	}
+func TestScrubBridgedBodiesPreservesRemappedSourceForHealing(t *testing.T) {
+	for _, bridgeFiltered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bridge_filtered=%v", bridgeFiltered), func(t *testing.T) {
+			ctx, db, store := scrubRaceFixture(t)
+			store.bridgeFiltered = bridgeFiltered
+			const oldPortal = "tel:+15550007770"
+			const newPortal = "tel:+15550007771"
+			const guid = "G-REMAPPED-SOURCE"
+			now := time.Now().UnixMilli()
+			if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+				{CloudChatID: "C-REMAPPED", PortalID: newPortal, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+				{CloudChatID: "C-OLD-LIVE", PortalID: oldPortal, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now},
+			}); err != nil {
+				t.Fatalf("upsert chats: %v", err)
+			}
+			if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+				GUID: guid, CloudChatID: "C-REMAPPED", PortalID: oldPortal,
+				TimestampMS: 1000, Text: "recoverable portal mismatch", Service: "iMessage", HasBody: true,
+			}}); err != nil {
+				t.Fatalf("upsert message: %v", err)
+			}
+			if _, err := db.Exec(ctx,
+				`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1 AND guid=$3`,
+				testSQLLoginID, now-int64(time.Hour/time.Millisecond), guid,
+			); err != nil {
+				t.Fatalf("age message: %v", err)
+			}
 
-	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
-	if err != nil {
-		t.Fatalf("scrubBridgedBodies: %v", err)
-	}
-	if scrubbed != 1 {
-		t.Fatalf("scrubbed rows = %d, want remapped source scrubbed", scrubbed)
-	}
-	var text sql.NullString
-	var bodyScrubbed bool
-	if err := db.QueryRow(ctx,
-		`SELECT text, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
-		testSQLLoginID, guid,
-	).Scan(&text, &bodyScrubbed); err != nil {
-		t.Fatalf("read remapped row: %v", err)
-	}
-	if text.Valid || !bodyScrubbed {
-		t.Fatalf("remapped row text valid=%v scrubbed=%v, want false/true", text.Valid, bodyScrubbed)
+			if rows, err := store.listLatestMessages(ctx, oldPortal, 10); err != nil {
+				t.Fatalf("listLatestMessages: %v", err)
+			} else if len(rows) != 0 {
+				t.Fatalf("remapped source became readable through old portal: %#v", rows)
+			}
+			scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+			if err != nil {
+				t.Fatalf("scrubBridgedBodies: %v", err)
+			}
+			if scrubbed != 0 {
+				t.Fatalf("scrubbed rows = %d, want recoverable remap retained", scrubbed)
+			}
+			var text sql.NullString
+			var bodyScrubbed bool
+			if err := db.QueryRow(ctx,
+				`SELECT text, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+				testSQLLoginID, guid,
+			).Scan(&text, &bodyScrubbed); err != nil {
+				t.Fatalf("read remapped row: %v", err)
+			}
+			if !text.Valid || text.String != "recoverable portal mismatch" || bodyScrubbed {
+				t.Fatalf("remapped row text=%#v scrubbed=%v, want retained plaintext", text, bodyScrubbed)
+			}
+		})
 	}
 }
 
@@ -696,7 +713,8 @@ func TestRescrubClearedRowsDoesNotCaptureNewAPNSStub(t *testing.T) {
 	}
 
 	var originalScrubbed, stubScrubbed bool
-	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID).Scan(&originalScrubbed); err != nil {
+	var restoredUpdatedTS int64
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed, updated_ts FROM cloud_message WHERE login_id=$1 AND guid='G-CLEARED'`, testSQLLoginID).Scan(&originalScrubbed, &restoredUpdatedTS); err != nil {
 		t.Fatalf("read original scrub state: %v", err)
 	}
 	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='G-NEW-APNS'`, testSQLLoginID).Scan(&stubScrubbed); err != nil {
@@ -704,6 +722,9 @@ func TestRescrubClearedRowsDoesNotCaptureNewAPNSStub(t *testing.T) {
 	}
 	if !originalScrubbed || stubScrubbed {
 		t.Fatalf("scrub states original=%v stub=%v, want true false", originalScrubbed, stubScrubbed)
+	}
+	if restoredUpdatedTS != clearedAttempt.Rows[0].UpdatedTS {
+		t.Fatalf("restored updated_ts = %d, want original %d", restoredUpdatedTS, clearedAttempt.Rows[0].UpdatedTS)
 	}
 
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
