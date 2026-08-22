@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +40,22 @@ func scrubRaceFixture(t *testing.T) (context.Context, *dbutil.Database, *cloudBa
 		t.Fatalf("create message table: %v", err)
 	}
 	return ctx, db, store
+}
+
+func TestRehydrateErrorsDoNotExposePortalID(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const portalID = "tel:+15550009999"
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	_, err := store.clearBodyScrubForRehydrate(ctx, portalID)
+	if err == nil {
+		t.Fatal("clearBodyScrubForRehydrate unexpectedly succeeded on a closed database")
+	}
+	if strings.Contains(err.Error(), portalID) {
+		t.Fatalf("rehydrate error exposed portal ID: %q", err)
+	}
 }
 
 // TestScrubHoldsOffPendingBackfillPortals is the ordering rule: a delivered body

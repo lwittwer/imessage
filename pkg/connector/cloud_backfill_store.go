@@ -3563,7 +3563,7 @@ type rehydrateScrubAttempt struct {
 func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, portalID string) (rehydrateScrubAttempt, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
-		return rehydrateScrubAttempt{}, fmt.Errorf("failed to begin body scrub clear for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to begin body scrub clear: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -3573,23 +3573,23 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
 	`, selectParams[0], selectParams[1]), s.loginID, portalID)
 	if err != nil {
-		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
 	}
 	attempt := rehydrateScrubAttempt{MarkerTS: time.Now().Add(-time.Second).UnixMilli()}
 	for rows.Next() {
 		var row rehydrateScrubRow
 		if err = rows.Scan(&row.GUID, &row.UpdatedTS); err != nil {
 			rows.Close()
-			return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUID for portal %s: %w", portalID, err)
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUID: %w", err)
 		}
 		attempt.Rows = append(attempt.Rows, row)
 	}
 	if err = rows.Err(); err != nil {
 		rows.Close()
-		return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUIDs for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUIDs: %w", err)
 	}
 	if err = rows.Close(); err != nil {
-		return rehydrateScrubAttempt{}, fmt.Errorf("failed to close cleared body GUIDs for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to close cleared body GUIDs: %w", err)
 	}
 	const chunkSize = 500
 	for start := 0; start < len(attempt.Rows); start += chunkSize {
@@ -3605,11 +3605,11 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
 			  AND guid IN (%s)
 		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
-			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
 		}
 	}
 	if err = tx.Commit(); err != nil {
-		return rehydrateScrubAttempt{}, fmt.Errorf("failed to commit body scrub clear for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to commit body scrub clear: %w", err)
 	}
 	return attempt, nil
 }
@@ -3626,7 +3626,7 @@ func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID st
 
 	tx, err := s.beginTx(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin restoring body_scrubbed for portal %s: %w", portalID, err)
+		return 0, fmt.Errorf("failed to begin restoring body_scrubbed: %w", err)
 	}
 	defer tx.Rollback()
 	const chunkSize = 200
@@ -3667,13 +3667,13 @@ func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID st
 			  AND guid IN (%s)
 		`, params[whereStart], strings.Join(caseSQL, " "), params[whereStart+1], params[whereStart+2], params[whereStart+3], strings.Join(guidParams, ",")), args...)
 		if execErr != nil {
-			return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, execErr)
+			return 0, fmt.Errorf("failed to restore body_scrubbed: %w", execErr)
 		}
 		n, _ := result.RowsAffected()
 		total += n
 	}
 	if err = tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit restored body_scrubbed for portal %s: %w", portalID, err)
+		return 0, fmt.Errorf("failed to commit restored body_scrubbed: %w", err)
 	}
 	return total, nil
 }
