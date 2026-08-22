@@ -605,6 +605,66 @@ func TestRescrubClearedRowsDoesNotCaptureNewAPNSStub(t *testing.T) {
 	}
 }
 
+func TestRehydrateClearExcludesFilteredSibling(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const portalID = "p1"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 1000},
+		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: 1000, IsFiltered: 1},
+	}); err != nil {
+		t.Fatalf("upsert chats: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "visible", Service: "iMessage", HasBody: true},
+		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 1000, Text: "hidden", Service: "SMS", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsert messages: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE cloud_message
+		SET body_scrubbed=TRUE, text=NULL, subject=NULL, sender=''
+		WHERE login_id=$1 AND portal_id=$2
+	`, testSQLLoginID, portalID); err != nil {
+		t.Fatalf("scrub messages: %v", err)
+	}
+
+	attempt, err := store.clearBodyScrubForRehydrate(ctx, portalID)
+	if err != nil {
+		t.Fatalf("clearBodyScrubForRehydrate: %v", err)
+	}
+	if len(attempt.Rows) != 1 || attempt.Rows[0].GUID != "G-UNFILTERED" {
+		t.Fatalf("rehydrate cleared rows = %#v, want only G-UNFILTERED", attempt.Rows)
+	}
+
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "visible restored", Service: "iMessage", HasBody: true},
+		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 1000, Text: "hidden restored", Service: "SMS", HasBody: true},
+	}); err != nil {
+		t.Fatalf("rehydrate upsert: %v", err)
+	}
+
+	var unfilteredScrubbed, filteredScrubbed bool
+	var unfilteredText, filteredText sql.NullString
+	if err := db.QueryRow(ctx, `
+		SELECT body_scrubbed, text FROM cloud_message
+		WHERE login_id=$1 AND guid='G-UNFILTERED'
+	`, testSQLLoginID).Scan(&unfilteredScrubbed, &unfilteredText); err != nil {
+		t.Fatalf("read unfiltered row: %v", err)
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT body_scrubbed, text FROM cloud_message
+		WHERE login_id=$1 AND guid='G-FILTERED'
+	`, testSQLLoginID).Scan(&filteredScrubbed, &filteredText); err != nil {
+		t.Fatalf("read filtered row: %v", err)
+	}
+	if unfilteredScrubbed || !unfilteredText.Valid || unfilteredText.String != "visible restored" {
+		t.Fatalf("unfiltered row = scrubbed %v text %#v, want restored plaintext", unfilteredScrubbed, unfilteredText)
+	}
+	if !filteredScrubbed || filteredText.Valid {
+		t.Fatalf("filtered row = scrubbed %v text %#v, want scrubbed and NULL", filteredScrubbed, filteredText)
+	}
+}
+
 func TestRescrubClearedRowsRearmsMissedAttachmentOnlyRow(t *testing.T) {
 	ctx, db, store := scrubRaceFixture(t)
 	now := time.Now().UnixMilli()
