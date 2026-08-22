@@ -169,12 +169,16 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
 		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+		{CloudChatID: "C-ALL-UNFILTERED", PortalID: "p-all-unfiltered", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 	}); err != nil {
 		t.Fatalf("upsert chats: %v", err)
 	}
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
 		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "still needed", Service: "iMessage", HasBody: true},
 		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 2000, Text: "must not remain on disk", Service: "SMS", HasBody: true},
+		{GUID: "G-MIXED-EMPTY", CloudChatID: "", PortalID: portalID, TimestampMS: 3000, Text: "ambiguous mixed history", Service: "iMessage", HasBody: true},
+		{GUID: "G-MIXED-UNKNOWN", CloudChatID: "unknown-source", PortalID: portalID, TimestampMS: 4000, Text: "unknown mixed history", Service: "iMessage", HasBody: true},
+		{GUID: "G-ALL-UNFILTERED-LEGACY", CloudChatID: "legacy-source", PortalID: "p-all-unfiltered", TimestampMS: 5000, Text: "restorable legacy history", Service: "iMessage", HasBody: true},
 	}); err != nil {
 		t.Fatalf("upsert messages: %v", err)
 	}
@@ -186,8 +190,8 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)
 	}
-	if scrubbed != 1 {
-		t.Fatalf("scrubbed rows = %d, want the one permanently filtered row", scrubbed)
+	if scrubbed != 3 {
+		t.Fatalf("scrubbed rows = %d, want exact filtered plus two ambiguous mixed-sibling rows", scrubbed)
 	}
 	for _, tc := range []struct {
 		guid      string
@@ -196,6 +200,9 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	}{
 		{guid: "G-UNFILTERED", wantText: true, wantScrub: false},
 		{guid: "G-FILTERED", wantText: false, wantScrub: true},
+		{guid: "G-MIXED-EMPTY", wantText: false, wantScrub: true},
+		{guid: "G-MIXED-UNKNOWN", wantText: false, wantScrub: true},
+		{guid: "G-ALL-UNFILTERED-LEGACY", wantText: true, wantScrub: false},
 	} {
 		var text sql.NullString
 		var bodyScrubbed bool
@@ -755,6 +762,54 @@ func TestRehydrateClearExcludesFilteredSibling(t *testing.T) {
 	}
 	if !filteredScrubbed || filteredText.Valid {
 		t.Fatalf("filtered row = scrubbed %v text %#v, want scrubbed and NULL", filteredScrubbed, filteredText)
+	}
+}
+
+func TestRehydrateClearNeverReopensDeletedBodies(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	now := time.Now().UnixMilli()
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-DELETED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now,
+		Text: "deleted body", Service: "iMessage", HasBody: true, Deleted: true,
+	}}); err != nil {
+		t.Fatalf("upsert deleted message: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE cloud_message SET body_scrubbed=TRUE, text=NULL, subject=NULL, sender=''
+		WHERE login_id=$1 AND guid='G-DELETED'
+	`, testSQLLoginID); err != nil {
+		t.Fatalf("scrub deleted message: %v", err)
+	}
+
+	attempt, err := store.clearBodyScrubForRehydrate(ctx, "p1")
+	if err != nil {
+		t.Fatalf("clearBodyScrubForRehydrate: %v", err)
+	}
+	if len(attempt.Rows) != 0 {
+		t.Fatalf("rehydrate captured deleted rows: %#v", attempt.Rows)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-DELETED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now,
+		Text: "must stay deleted", Service: "iMessage", HasBody: true, Deleted: true,
+	}}); err != nil {
+		t.Fatalf("simulate CloudKit rehydrate upsert: %v", err)
+	}
+	if n, err := store.rescrubClearedRows(ctx, "p1", attempt); err != nil {
+		t.Fatalf("rescrubClearedRows: %v", err)
+	} else if n != 0 {
+		t.Fatalf("rescrubbed deleted rows = %d, want 0 because none were reopened", n)
+	}
+
+	var bodyScrubbed bool
+	var text sql.NullString
+	if err := db.QueryRow(ctx, `
+		SELECT body_scrubbed, text FROM cloud_message
+		WHERE login_id=$1 AND guid='G-DELETED'
+	`, testSQLLoginID).Scan(&bodyScrubbed, &text); err != nil {
+		t.Fatalf("read deleted row: %v", err)
+	}
+	if !bodyScrubbed || text.Valid {
+		t.Fatalf("deleted row = scrubbed %v text %#v, want true and NULL", bodyScrubbed, text)
 	}
 }
 

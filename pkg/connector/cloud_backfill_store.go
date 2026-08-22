@@ -3688,7 +3688,7 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	selectArgs = append(selectArgs, sourceArgs...)
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT guid, updated_ts FROM cloud_message
-		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
 		`+sourceFilter+`
 	`, selectParams[0], selectParams[1]), selectArgs...)
 	if err != nil {
@@ -3724,7 +3724,7 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 		guidStart := 3 + len(sourceArgs)
 		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
-			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
 			  `+updateSourceFilter+`
 			  AND guid IN (%s)
 		`, params[0], params[1], params[2], strings.Join(params[guidStart:], ",")), args...); err != nil {
@@ -4521,13 +4521,31 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 	if bridgeFiltered {
 		return "FALSE"
 	}
-	return fmt.Sprintf(`EXISTS (
-		SELECT 1 FROM cloud_chat filtered
-		WHERE filtered.login_id=$1
-		  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
-		  AND filtered.portal_id=%s.portal_id
-		  AND COALESCE(filtered.is_filtered, 0) <> 0
-	)`, alias, alias)
+	return fmt.Sprintf(`(
+		EXISTS (
+			SELECT 1 FROM cloud_chat filtered
+			WHERE filtered.login_id=$1
+			  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
+			  AND filtered.portal_id=%s.portal_id
+			  AND COALESCE(filtered.is_filtered, 0) <> 0
+		)
+		OR (
+			NOT EXISTS (
+				SELECT 1 FROM cloud_chat source
+				WHERE source.login_id=$1
+				  AND LOWER(source.cloud_chat_id)=LOWER(%s.chat_id)
+			)
+			AND EXISTS (
+				SELECT 1 FROM cloud_chat live
+				WHERE live.login_id=$1
+				  AND live.portal_id=%s.portal_id
+				  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+				  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+				  AND live.deleted=FALSE
+				  AND COALESCE(live.is_filtered, 0) <> 0
+			)
+		)
+	)`, alias, alias, alias, alias)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),
