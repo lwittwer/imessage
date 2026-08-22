@@ -765,6 +765,54 @@ func TestRehydrateClearExcludesFilteredSibling(t *testing.T) {
 	}
 }
 
+func TestRehydrateClearNeverReopensDeletedBodies(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	now := time.Now().UnixMilli()
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-DELETED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now,
+		Text: "deleted body", Service: "iMessage", HasBody: true, Deleted: true,
+	}}); err != nil {
+		t.Fatalf("upsert deleted message: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE cloud_message SET body_scrubbed=TRUE, text=NULL, subject=NULL, sender=''
+		WHERE login_id=$1 AND guid='G-DELETED'
+	`, testSQLLoginID); err != nil {
+		t.Fatalf("scrub deleted message: %v", err)
+	}
+
+	attempt, err := store.clearBodyScrubForRehydrate(ctx, "p1")
+	if err != nil {
+		t.Fatalf("clearBodyScrubForRehydrate: %v", err)
+	}
+	if len(attempt.Rows) != 0 {
+		t.Fatalf("rehydrate captured deleted rows: %#v", attempt.Rows)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-DELETED", PortalID: "p1", CloudChatID: "C1", TimestampMS: now,
+		Text: "must stay deleted", Service: "iMessage", HasBody: true, Deleted: true,
+	}}); err != nil {
+		t.Fatalf("simulate CloudKit rehydrate upsert: %v", err)
+	}
+	if n, err := store.rescrubClearedRows(ctx, "p1", attempt); err != nil {
+		t.Fatalf("rescrubClearedRows: %v", err)
+	} else if n != 0 {
+		t.Fatalf("rescrubbed deleted rows = %d, want 0 because none were reopened", n)
+	}
+
+	var bodyScrubbed bool
+	var text sql.NullString
+	if err := db.QueryRow(ctx, `
+		SELECT body_scrubbed, text FROM cloud_message
+		WHERE login_id=$1 AND guid='G-DELETED'
+	`, testSQLLoginID).Scan(&bodyScrubbed, &text); err != nil {
+		t.Fatalf("read deleted row: %v", err)
+	}
+	if !bodyScrubbed || text.Valid {
+		t.Fatalf("deleted row = scrubbed %v text %#v, want true and NULL", bodyScrubbed, text)
+	}
+}
+
 func TestRescrubClearedRowsRearmsMissedAttachmentOnlyRow(t *testing.T) {
 	ctx, db, store := scrubRaceFixture(t)
 	now := time.Now().UnixMilli()
