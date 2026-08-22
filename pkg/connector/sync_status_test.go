@@ -9,6 +9,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -27,6 +28,17 @@ import (
 // true.
 
 const syncStatusTestBridgeID = "corten"
+
+func TestSyncStatusReadErrorReplyRedactsUnderlyingError(t *testing.T) {
+	const secret = "postgres://user:password@example.invalid/bridge?token=secret"
+	got := syncStatusReadErrorReply(errors.New(secret))
+	if got != syncStatusReadFailureMessage {
+		t.Fatalf("syncStatusReadErrorReply() = %q, want static privacy-safe message", got)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("syncStatusReadErrorReply() leaked the underlying error: %q", got)
+	}
+}
 
 // bridgev2 tables the report reads. Only the columns it touches are declared —
 // enough for the SQL to run, not a copy of the framework's schema.
@@ -99,6 +111,7 @@ func (h *syncStatusHarness) chat(portalID, chatID string, filtered bool, deleted
 type msg struct {
 	guid     string
 	portal   string
+	chatID   string // exact cloud_chat.cloud_chat_id; empty preserves an intentional legacy-unknown row
 	ts       int64
 	text     string
 	sender   string
@@ -114,6 +127,13 @@ type msg struct {
 
 func (h *syncStatusHarness) msg(m msg) {
 	h.t.Helper()
+	chatID := m.chatID
+	if chatID == "" {
+		// Keep the old synthetic value for rows that intentionally exercise the
+		// no-metadata fallback (for example an orphan/deleted fixture). Ordinary
+		// rows must set chatID to the exact live cloud_chat source above.
+		chatID = "chat-" + m.portal
+	}
 	sender := m.sender
 	if sender == "" && !m.fromMe && !m.scrubbed && !m.noSender {
 		sender = "tel:+15550001"
@@ -131,7 +151,7 @@ func (h *syncStatusHarness) msg(m msg) {
 			is_from_me, text, subject, service, deleted, tapback_type, attachments_json,
 			created_ts, updated_ts, record_name, has_body, body_scrubbed)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', 'iMessage', $9, $10, $11, 1000, 1000, $12, $13, $14)
-	`, testSQLLoginID, m.guid, "chat-"+m.portal, m.portal, m.ts, sender, m.fromMe,
+	`, testSQLLoginID, m.guid, chatID, m.portal, m.ts, sender, m.fromMe,
 		m.text, m.deleted, tapback, m.attach, record, !m.noBody, m.scrubbed)
 }
 
@@ -169,7 +189,7 @@ func TestGetSyncStatus(t *testing.T) {
 				h.chat("tel:+15550100", "c1", false, false)
 				for i := 1; i <= 3; i++ {
 					guid := fmt.Sprintf("guid-%d", i)
-					h.msg(msg{guid: guid, portal: "tel:+15550100", ts: int64(i) * 1000, text: "hello"})
+					h.msg(msg{guid: guid, portal: "tel:+15550100", chatID: "c1", ts: int64(i) * 1000, text: "hello"})
 					h.delivered(guid, loginID, int64(i)*1000)
 				}
 			},
@@ -200,7 +220,7 @@ func TestGetSyncStatus(t *testing.T) {
 				zonesSynced(h)
 				h.chat("tel:+15550100", "c1", false, false)
 				for i := 1; i <= 4; i++ {
-					h.msg(msg{guid: fmt.Sprintf("guid-%d", i), portal: "tel:+15550100", ts: int64(i) * 1000, text: "hello"})
+					h.msg(msg{guid: fmt.Sprintf("guid-%d", i), portal: "tel:+15550100", chatID: "c1", ts: int64(i) * 1000, text: "hello"})
 				}
 				// Delivered in the two spellings bridgev2 really writes: an
 				// uppercase APNs guid, and a part-suffixed id from a message
@@ -264,18 +284,22 @@ func TestGetSyncStatus(t *testing.T) {
 				h.chat("tel:+15550200", "c3-sms", true, false)
 				h.chat("tel:+15550200", "c3-im", false, false)
 
-				h.msg(msg{guid: "ok-1", portal: "tel:+15550100", ts: 5000, text: "hello"})
-				h.msg(msg{guid: "ok-2", portal: "tel:+15550200", ts: 5000, text: "hello"})
-				h.msg(msg{guid: "filtered-1", portal: "tel:+15559999", ts: 5000, text: "spam"})
+				h.msg(msg{guid: "ok-1", portal: "tel:+15550100", chatID: "c1", ts: 5000, text: "hello"})
+				h.msg(msg{guid: "ok-2", portal: "tel:+15550200", chatID: "c3-im", ts: 5000, text: "hello"})
+				h.msg(msg{guid: "filtered-1", portal: "tel:+15559999", chatID: "c2", ts: 5000, text: "spam"})
 				// Empty/system shapes: no body at all, and a not-from-me row
-				// with no sender (cloudRowToBackfillMessages drops both).
-				h.msg(msg{guid: "system-1", portal: "tel:+15550100", ts: 4000, noBody: true})
-				h.msg(msg{guid: "system-2", portal: "tel:+15550100", ts: 3000, text: "hi", noSender: true})
+				// with no sender. The direct-message sender fallback makes the
+				// latter deliverable; only the no-body row is unbridgeable.
+				h.msg(msg{guid: "system-1", portal: "tel:+15550100", chatID: "c1", ts: 4000, noBody: true})
+				h.msg(msg{guid: "system-2", portal: "tel:+15550100", chatID: "c1", ts: 3000, text: "hi", noSender: true})
 				// A reaction: bridges into the `reaction` table, so it must not
 				// be counted as a message anywhere.
-				h.msg(msg{guid: "react-1", portal: "tel:+15550100", ts: 6000, text: "Loved x", tapback: 2000})
+				h.msg(msg{guid: "react-1", portal: "tel:+15550100", chatID: "c1", ts: 6000, text: "Loved x", tapback: 2000})
 				// Soft-deleted, and an echo-dedup stub with no record_name:
 				// backfill cannot read either.
+				// These rows are intentionally left with the synthetic unknown
+				// chat_id: deletion/no-record filtering excludes them before the
+				// source-chat eligibility check runs.
 				h.msg(msg{guid: "gone-1", portal: "tel:+15550100", ts: 2000, text: "bye", deleted: true})
 				h.msg(msg{guid: "stub-1", portal: "tel:+15550100", ts: 1000, noRecord: true})
 
@@ -283,7 +307,7 @@ func TestGetSyncStatus(t *testing.T) {
 				h.delivered("ok-2", loginID, 5000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
-				assertCounts(t, r, counts{candidates: 5, deliverable: 2, delivered: 2, filtered: 1, empty: 2})
+				assertCounts(t, r, counts{candidates: 5, deliverable: 3, delivered: 2, filtered: 1, empty: 1})
 				// Three conversations across four cloud_chat rows, and only
 				// the genuinely-skipped one counts as skipped: tel:+15550200
 				// keeps its room despite the filtered SMS sibling.
@@ -293,8 +317,8 @@ func TestGetSyncStatus(t *testing.T) {
 				if r.ChatsFiltered != 1 {
 					t.Errorf("ChatsFiltered = %d, want 1 — the portal with a bridgeable sibling is not skipped", r.ChatsFiltered)
 				}
-				if got := r.DeliveredPercent(); got != 100 {
-					t.Errorf("DeliveredPercent = %v, want 100 once the unbridgeable rows are excluded", got)
+				if got := r.DeliveredPercent(); got != 66.66666666666667 {
+					t.Errorf("DeliveredPercent = %v, want 66.66666666666667 with one senderless direct message pending", got)
 				}
 				out := r.Format()
 				for _, want := range []string{"Unknown Senders", "empty or system rows"} {
@@ -313,11 +337,11 @@ func TestGetSyncStatus(t *testing.T) {
 				// Newest first: a reaction, then four messages. The reaction
 				// takes a slot, because listLatestMessages — which IS the
 				// forward backfill at room creation — does not filter it out.
-				h.msg(msg{guid: "react-1", portal: "tel:+15550100", ts: 5000, text: "Loved", tapback: 2000})
-				h.msg(msg{guid: "m-4", portal: "tel:+15550100", ts: 4000, text: "newest"})
-				h.msg(msg{guid: "m-3", portal: "tel:+15550100", ts: 3000, text: "older"})
-				h.msg(msg{guid: "m-2", portal: "tel:+15550100", ts: 2000, text: "older still"})
-				h.msg(msg{guid: "m-1", portal: "tel:+15550100", ts: 1000, text: "oldest"})
+				h.msg(msg{guid: "react-1", portal: "tel:+15550100", chatID: "c1", ts: 5000, text: "Loved", tapback: 2000})
+				h.msg(msg{guid: "m-4", portal: "tel:+15550100", chatID: "c1", ts: 4000, text: "newest"})
+				h.msg(msg{guid: "m-3", portal: "tel:+15550100", chatID: "c1", ts: 3000, text: "older"})
+				h.msg(msg{guid: "m-2", portal: "tel:+15550100", chatID: "c1", ts: 2000, text: "older still"})
+				h.msg(msg{guid: "m-1", portal: "tel:+15550100", chatID: "c1", ts: 1000, text: "oldest"})
 				h.delivered("m-4", loginID, 4000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
@@ -341,7 +365,7 @@ func TestGetSyncStatus(t *testing.T) {
 				zonesSynced(h)
 				h.chat("tel:+15550100", "c1", false, false)
 				for i := 1; i <= 3; i++ {
-					h.msg(msg{guid: fmt.Sprintf("guid-%d", i), portal: "tel:+15550100", ts: int64(i) * 1000, text: "hello"})
+					h.msg(msg{guid: fmt.Sprintf("guid-%d", i), portal: "tel:+15550100", chatID: "c1", ts: int64(i) * 1000, text: "hello"})
 				}
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
@@ -360,7 +384,7 @@ func TestGetSyncStatus(t *testing.T) {
 			setup: func(t *testing.T, h *syncStatusHarness) {
 				zonesSynced(h)
 				h.chat("tel:+15559999", "c2", true, false)
-				h.msg(msg{guid: "filtered-1", portal: "tel:+15559999", ts: 5000, text: "spam"})
+				h.msg(msg{guid: "filtered-1", portal: "tel:+15559999", chatID: "c2", ts: 5000, text: "spam"})
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
 				assertCounts(t, r, counts{candidates: 1, deliverable: 1})
@@ -374,7 +398,7 @@ func TestGetSyncStatus(t *testing.T) {
 				// The privacy scrubber nulls text and sender once a row is
 				// bridged. Read as "empty", these would file a healthy
 				// long-running bridge under "not bridgeable".
-				h.msg(msg{guid: "scrubbed-1", portal: "tel:+15550100", ts: 1000, scrubbed: true})
+				h.msg(msg{guid: "scrubbed-1", portal: "tel:+15550100", chatID: "c1", ts: 1000, scrubbed: true})
 				h.delivered("scrubbed-1", loginID, 1000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
@@ -488,36 +512,5 @@ func assertInvariants(t *testing.T, r *SyncStatusReport) {
 	}
 	if pct := r.DeliveredPercent(); pct > 100 || pct < 0 {
 		t.Errorf("DeliveredPercent = %v, want 0..100", pct)
-	}
-}
-
-func TestSyncStatusRedactsPersistedZoneErrors(t *testing.T) {
-	secret := "https://apple.invalid/account?token=secret-handle"
-	report := &SyncStatusReport{
-		HasLogin:           true,
-		CloudTablesPresent: true,
-		Zones: []ZoneSyncStatus{{
-			Zone:      cloudZoneMessages,
-			Present:   true,
-			HasError:  true,
-			LastError: secret,
-		}},
-	}
-	out := report.Format()
-	if strings.Contains(out, secret) || strings.Contains(out, "secret-handle") {
-		t.Fatalf("formatted sync status exposed persisted error details: %q", out)
-	}
-	if !strings.Contains(out, "details redacted") {
-		t.Fatalf("formatted sync status did not explain error redaction: %q", out)
-	}
-}
-
-func TestSyncStatusTableProbeErrorsAreReturned(t *testing.T) {
-	db := newTestSQLiteDB(t)
-	if err := db.Close(); err != nil {
-		t.Fatalf("close database: %v", err)
-	}
-	if _, err := GetSyncStatus(context.Background(), db, SyncStatusOptions{}); err == nil {
-		t.Fatal("GetSyncStatus returned success after the table probe failed")
 	}
 }

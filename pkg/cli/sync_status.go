@@ -8,8 +8,9 @@
 // importing?" — is most interesting when the bridge is wedged, stopped, or has
 // not been added to a Matrix client yet.
 //
-// The report currently lives in pkg/connector alongside the schema it reads;
-// a later, separately reviewed feature extracts it from the Rust/CGO package.
+// The query/report implementation lives in pkg/syncstatus, a small package
+// shared by the CGO-free CLI and the running connector command, so the two
+// entry points cannot drift apart.
 
 package cli
 
@@ -27,7 +28,7 @@ import (
 	"go.mau.fi/util/dbutil"
 	"gopkg.in/yaml.v3"
 
-	"github.com/lrhodin/corten-matrix/pkg/connector"
+	"github.com/lrhodin/corten-matrix/pkg/syncstatus"
 )
 
 // syncStatusConfig is the slice of config.yaml this report needs. It is a
@@ -213,7 +214,7 @@ func runSyncStatus(args []string) {
 	}
 	defer db.Close()
 
-	report, err := connector.GetSyncStatus(context.Background(), db, connector.SyncStatusOptions{
+	report, err := syncstatus.GetSyncStatus(context.Background(), db, syncstatus.SyncStatusOptions{
 		// BridgeID and LoginID are left empty: only the database knows them,
 		// and GetSyncStatus reads them from the single user_login row.
 		MaxInitialMessages:  cfg.effectiveMaxInitialMessages(),
