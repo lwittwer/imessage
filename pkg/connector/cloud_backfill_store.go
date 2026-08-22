@@ -4521,13 +4521,31 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 	if bridgeFiltered {
 		return "FALSE"
 	}
-	return fmt.Sprintf(`EXISTS (
-		SELECT 1 FROM cloud_chat filtered
-		WHERE filtered.login_id=$1
-		  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
-		  AND filtered.portal_id=%s.portal_id
-		  AND COALESCE(filtered.is_filtered, 0) <> 0
-	)`, alias, alias)
+	return fmt.Sprintf(`(
+		EXISTS (
+			SELECT 1 FROM cloud_chat filtered
+			WHERE filtered.login_id=$1
+			  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
+			  AND filtered.portal_id=%s.portal_id
+			  AND COALESCE(filtered.is_filtered, 0) <> 0
+		)
+		OR (
+			NOT EXISTS (
+				SELECT 1 FROM cloud_chat source
+				WHERE source.login_id=$1
+				  AND LOWER(source.cloud_chat_id)=LOWER(%s.chat_id)
+			)
+			AND EXISTS (
+				SELECT 1 FROM cloud_chat live
+				WHERE live.login_id=$1
+				  AND live.portal_id=%s.portal_id
+				  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+				  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+				  AND live.deleted=FALSE
+				  AND COALESCE(live.is_filtered, 0) <> 0
+			)
+		)
+	)`, alias, alias, alias, alias)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),

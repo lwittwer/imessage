@@ -169,12 +169,16 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
 		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+		{CloudChatID: "C-ALL-UNFILTERED", PortalID: "p-all-unfiltered", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 	}); err != nil {
 		t.Fatalf("upsert chats: %v", err)
 	}
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
 		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "still needed", Service: "iMessage", HasBody: true},
 		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 2000, Text: "must not remain on disk", Service: "SMS", HasBody: true},
+		{GUID: "G-MIXED-EMPTY", CloudChatID: "", PortalID: portalID, TimestampMS: 3000, Text: "ambiguous mixed history", Service: "iMessage", HasBody: true},
+		{GUID: "G-MIXED-UNKNOWN", CloudChatID: "unknown-source", PortalID: portalID, TimestampMS: 4000, Text: "unknown mixed history", Service: "iMessage", HasBody: true},
+		{GUID: "G-ALL-UNFILTERED-LEGACY", CloudChatID: "legacy-source", PortalID: "p-all-unfiltered", TimestampMS: 5000, Text: "restorable legacy history", Service: "iMessage", HasBody: true},
 	}); err != nil {
 		t.Fatalf("upsert messages: %v", err)
 	}
@@ -186,8 +190,8 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)
 	}
-	if scrubbed != 1 {
-		t.Fatalf("scrubbed rows = %d, want the one permanently filtered row", scrubbed)
+	if scrubbed != 3 {
+		t.Fatalf("scrubbed rows = %d, want exact filtered plus two ambiguous mixed-sibling rows", scrubbed)
 	}
 	for _, tc := range []struct {
 		guid      string
@@ -196,6 +200,9 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 	}{
 		{guid: "G-UNFILTERED", wantText: true, wantScrub: false},
 		{guid: "G-FILTERED", wantText: false, wantScrub: true},
+		{guid: "G-MIXED-EMPTY", wantText: false, wantScrub: true},
+		{guid: "G-MIXED-UNKNOWN", wantText: false, wantScrub: true},
+		{guid: "G-ALL-UNFILTERED-LEGACY", wantText: true, wantScrub: false},
 	} {
 		var text sql.NullString
 		var bodyScrubbed bool
