@@ -293,7 +293,9 @@ func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 		VALUES ($1, 'group-rename-guid', 'chat-group-rename', 'group-rename',
 		 5000, 'tel:+15550001', 0, 'Renamed ' || char(65532), '', 0, NULL, '', 'record-2', 0, 1)`, loginID)
 
-	// has_body=false is the persisted shape used for participant/system rows.
+	// A has_body=false row with no content is the persisted shape used for
+	// participant/system records. Contentful has_body=false rows are covered by
+	// TestGetSyncStatusKeepsContentfulHasBodyFalseMessageEligible.
 	exec(`INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, is_filtered, deleted, display_name)
 		VALUES ($1, 'chat-no-body', 'no-body', 0, 0, '')`, loginID)
 	exec(`INSERT INTO cloud_message
@@ -301,7 +303,7 @@ func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 		 text, subject, deleted, tapback_type, attachments_json, record_name,
 		 body_scrubbed, has_body)
 		VALUES ($1, 'no-body-guid', 'chat-no-body', 'no-body',
-		 4000, 'tel:+15550001', 0, 'participants changed', '', 0, NULL, '', 'record-3', 0, 0)`, loginID)
+		 4000, 'tel:+15550001', 0, '', '', 0, NULL, '', 'record-3', 0, 0)`, loginID)
 
 	// A legacy row with neither a live chat row nor a CloudKit chat_id still uses
 	// the connector's no-metadata fallback and therefore remains pending.
@@ -490,5 +492,47 @@ func TestGetSyncStatusCapIgnoresNewerFilteredSibling(t *testing.T) {
 		t.Fatalf("cap counts = candidates %d, filtered %d, beyond %d, deliverable %d, pending %d; want 2, 1, 0, 1, 1",
 			r.CandidateMessages, r.FilteredChatMessages, r.BeyondCapMessages,
 			r.DeliverableMessages, r.PendingMessages())
+	}
+}
+
+func TestGetSyncStatusKeepsContentfulHasBodyFalseMessageEligible(t *testing.T) {
+	const (
+		bridgeID = "corten"
+		loginID  = "login-has-body-false"
+		portalID = "tel:+15550000097"
+	)
+	ctx := context.Background()
+	db := newSyncStatusParityDB(t)
+	if _, err := db.Exec(ctx, `INSERT INTO user_login (bridge_id, id) VALUES ($1, $2)`, bridgeID, loginID); err != nil {
+		t.Fatalf("insert login: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat
+			(login_id, cloud_chat_id, portal_id, is_filtered, deleted, display_name)
+		VALUES ($1, 'chat-restored', $2, 0, 0, '')
+	`, loginID, portalID); err != nil {
+		t.Fatalf("insert chat: %v", err)
+	}
+	// Restored Apple messages can carry real content while has_body remains
+	// false. cloudRowToBackfillMessages delivers these; diagnostics must agree.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message
+			(login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+			 text, subject, deleted, tapback_type, attachments_json, record_name,
+			 body_scrubbed, has_body)
+		VALUES ($1, 'restored-guid', 'chat-restored', $2, 1000, 'tel:+15550001', 0,
+		        'restored text', '', 0, NULL, '', 'restored-record', 0, 0)
+	`, loginID, portalID); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+
+	r, err := GetSyncStatus(ctx, db, SyncStatusOptions{BridgeID: bridgeID, LoginID: loginID})
+	if err != nil {
+		t.Fatalf("GetSyncStatus: %v", err)
+	}
+	if r.CandidateMessages != 1 || r.EmptySystemMessages != 0 ||
+		r.DeliverableMessages != 1 || r.PendingMessages() != 1 {
+		t.Fatalf("has_body=false counts = candidates %d, empty %d, deliverable %d, pending %d; want 1, 0, 1, 1",
+			r.CandidateMessages, r.EmptySystemMessages, r.DeliverableMessages, r.PendingMessages())
 	}
 }

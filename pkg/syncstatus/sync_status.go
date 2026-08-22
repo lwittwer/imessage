@@ -517,11 +517,9 @@ func statusMessageContentfulSQL(alias string, db *dbutil.Database) string {
 	instr := sqlInstrFunc(db)
 	return `CASE WHEN (
 			(COALESCE(` + alias + `.body_scrubbed, FALSE)=TRUE
-			 AND ` + alias + `.delivered=1
-			 AND COALESCE(` + alias + `.has_body, TRUE)=TRUE)
+			 AND ` + alias + `.delivered=1)
 			OR
 			(COALESCE(` + alias + `.body_scrubbed, FALSE)=FALSE
-			 AND COALESCE(` + alias + `.has_body, TRUE)=TRUE
 			 AND (` + alias + `.is_from_me=TRUE
 			      OR COALESCE(` + alias + `.sender, '') <> ''
 			      OR (` + alias + `.portal_id NOT LIKE 'gid:%'
