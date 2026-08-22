@@ -3570,7 +3570,7 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	selectParams := strings.Split(sqlPlaceholders(s.db, 2), ", ")
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT guid, updated_ts FROM cloud_message
-		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
 	`, selectParams[0], selectParams[1]), s.loginID, portalID)
 	if err != nil {
 		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
@@ -3602,7 +3602,7 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 		}
 		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
-			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
 			  AND guid IN (%s)
 		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
 			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
