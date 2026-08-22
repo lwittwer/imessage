@@ -125,6 +125,19 @@ func TestPendingInitialBackfillsExcludesSkippedReactionOnlyPortal(t *testing.T) 
 	}
 }
 
+func TestGroupDedupSwapCarriesInitialBackfillNeed(t *testing.T) {
+	needs := map[string]bool{"gid:old": true}
+
+	moveInitialBackfillNeed(needs, "gid:old", "gid:room")
+
+	if got := countInitialBackfillPortals([]string{"gid:room"}, needs, nil); got != 1 {
+		t.Fatalf("swapped group portal pending count = %d, want 1", got)
+	}
+	if needs["gid:old"] {
+		t.Fatal("old deduplicated portal retained an initial-backfill need")
+	}
+}
+
 func TestShouldForceCloudBackfillOnlyForMessageTableActivity(t *testing.T) {
 	tests := []struct {
 		name string
