@@ -105,6 +105,24 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	`, store.loginID, now); err != nil {
 		t.Fatal(err)
 	}
+	// Message filtering now fails closed when a portal has live cloud_chat
+	// metadata but the row has no source chat_id. Populate this legacy fixture's
+	// rows with their exact cloud_chat sibling so the test exercises content
+	// eligibility rather than the missing-source safety rule.
+	if _, err = db.Exec(ctx, `
+		UPDATE cloud_message
+		SET chat_id = (
+			SELECT cc.cloud_chat_id
+			FROM cloud_chat cc
+			WHERE cc.login_id=cloud_message.login_id
+			  AND cc.portal_id=cloud_message.portal_id
+			ORDER BY cc.cloud_chat_id
+			LIMIT 1
+		)
+		WHERE login_id=$1 AND COALESCE(chat_id, '') = ''
+	`, store.loginID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = db.Exec(ctx, `
 		UPDATE cloud_message
 		SET subject = ' ' || char(10)
@@ -191,6 +209,364 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 		if hasMessages {
 			t.Fatalf("hasContentfulMessages(%q) = true, want false", portalID)
 		}
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+
+	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultStore := newCloudBackfillStore(db, networkid.UserLoginID("login"))
+	if err = defaultStore.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		portalID = "tel:+15550000099"
+		now      = int64(1000)
+	)
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, updated_ts, deleted, is_filtered)
+		VALUES ($1, 'filtered-chat', $2, $3, $3, FALSE, 1)
+	`, defaultStore.loginID, portalID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, text, record_name,
+			has_body, body_scrubbed, created_ts, updated_ts
+		) VALUES ($1, 'filtered-message', 'filtered-chat', $2, 2000, 'tel:+15551111111', FALSE, 'hello', 'record-filtered', TRUE, FALSE, $3, $3)
+	`, defaultStore.loginID, portalID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := defaultStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 0 {
+		t.Fatalf("default filtered-chat candidates = %#v, want none", got)
+	}
+
+	optInStore := newCloudBackfillStore(db, networkid.UserLoginID("login"), true)
+	got, err := optInStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PortalID != portalID || got[0].ContentfulCount != 1 {
+		t.Fatalf("opted-in filtered-chat candidates = %#v, want one contentful portal", got)
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampIncludesFilteredMetadataWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	defaultStore := newCloudBackfillStore(db, testSQLLoginID)
+	if err := defaultStore.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const (
+		portalID = "gid:filtered-metadata"
+		now      = int64(2000)
+	)
+	if err := defaultStore.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "filtered-metadata-chat", PortalID: portalID, Service: "iMessage",
+		DisplayName: "Updated Group", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+
+	if got, err := defaultStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatalf("default candidates: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("default filtered metadata candidates = %#v, want none", got)
+	}
+
+	optInStore := newCloudBackfillStore(db, testSQLLoginID, true)
+	got, err := optInStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("opted-in candidates: %v", err)
+	}
+	if len(got) != 1 || got[0].PortalID != portalID || got[0].MetadataTS != now || got[0].MessageCount != 0 || got[0].ContentfulCount != 0 {
+		t.Fatalf("opted-in filtered metadata candidates = %#v, want one metadata-only portal", got)
+	}
+}
+
+func TestOptedInFilteredMessageReadersExcludeDeletedChatSources(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID, true)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000097"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "deleted-filtered-chat", PortalID: portalID, Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: 1000, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE cloud_chat SET deleted=TRUE
+		WHERE login_id=$1 AND cloud_chat_id='deleted-filtered-chat'
+	`, testSQLLoginID); err != nil {
+		t.Fatalf("mark chat deleted: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "message-from-deleted-chat", RecordName: "record-from-deleted-chat",
+		CloudChatID: "deleted-filtered-chat", PortalID: portalID, TimestampMS: 2000,
+		Sender: "tel:+15551111111", Text: "must stay deleted", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	if got, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("deleted chat source produced opted-in candidates: %#v", got)
+	}
+	if got, err := store.listLatestMessages(ctx, portalID, 10); err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("deleted chat source produced opted-in backfill rows: %#v", got)
+	}
+	if count, err := store.countBackfillableMessages(ctx, portalID, true); err != nil {
+		t.Fatalf("countBackfillableMessages: %v", err)
+	} else if count != 0 {
+		t.Fatalf("countBackfillableMessages = %d, want 0 for deleted chat source", count)
+	}
+}
+
+func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000098"
+	now := int64(1000)
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "chat-unfiltered", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 0},
+		{CloudChatID: "chat-filtered", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	attachments := cloudAttachmentGUIDPlaceholdersJSON([]string{"attachment-visible"})
+	filteredAttachments := cloudAttachmentGUIDPlaceholdersJSON([]string{"attachment-filtered"})
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "message-visible", RecordName: "record-visible", CloudChatID: "chat-unfiltered", PortalID: portalID, TimestampMS: 2000, Sender: "tel:+15551111111", Text: "visible", HasBody: true},
+		{GUID: "attachment-visible", RecordName: "record-attachment-visible", CloudChatID: "chat-unfiltered", PortalID: portalID, TimestampMS: 3000, Sender: "tel:+15551111111", AttachmentsJSON: attachments, HasBody: true},
+		{GUID: "message-filtered", RecordName: "record-filtered", CloudChatID: "chat-filtered", PortalID: portalID, TimestampMS: 4000, Sender: "tel:+15551111111", Text: "filtered", HasBody: true},
+		{GUID: "attachment-filtered", RecordName: "record-attachment-filtered", CloudChatID: "chat-filtered", PortalID: portalID, TimestampMS: 5000, Sender: "tel:+15551111111", AttachmentsJSON: filteredAttachments, HasBody: true},
+		{GUID: "message-empty-chat", RecordName: "record-empty-chat", CloudChatID: "", PortalID: portalID, TimestampMS: 6000, Sender: "tel:+15551111111", Text: "missing source", HasBody: true},
+		{GUID: "message-unknown-chat", RecordName: "record-unknown-chat", CloudChatID: "chat-unknown", PortalID: portalID, TimestampMS: 7000, Sender: "tel:+15551111111", Text: "unknown source", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	candidates, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].PortalID != portalID || candidates[0].MessageCount != 2 || candidates[0].ContentfulCount != 2 {
+		t.Fatalf("mixed sibling candidates = %#v, want one portal with two unfiltered rows", candidates)
+	}
+
+	readers := map[string]func() ([]cloudMessageRow, error){
+		"backward": func() ([]cloudMessageRow, error) {
+			return store.listBackwardMessages(ctx, portalID, 0, "", 20)
+		},
+		"forward": func() ([]cloudMessageRow, error) {
+			return store.listForwardMessages(ctx, portalID, 0, "", 20)
+		},
+		"write_activity": func() ([]cloudMessageRow, error) {
+			return store.listForwardMessagesByWriteActivity(ctx, portalID, 0, "", 20)
+		},
+		"latest": func() ([]cloudMessageRow, error) {
+			return store.listLatestMessages(ctx, portalID, 20)
+		},
+		"oldest": func() ([]cloudMessageRow, error) {
+			return store.listOldestMessages(ctx, portalID, 20)
+		},
+	}
+	for name, reader := range readers {
+		t.Run(name, func(t *testing.T) {
+			rows, err := reader()
+			if err != nil {
+				t.Fatalf("reader failed: %v", err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("reader returned %d rows (%#v), want only two unfiltered rows", len(rows), rows)
+			}
+			for _, row := range rows {
+				if row.GUID != "message-visible" && row.GUID != "attachment-visible" {
+					t.Fatalf("reader returned filtered sibling row %#v", row)
+				}
+			}
+		})
+	}
+
+	attachmentRows, err := store.listAllAttachmentMessages(ctx)
+	if err != nil {
+		t.Fatalf("listAllAttachmentMessages: %v", err)
+	}
+	if len(attachmentRows) != 1 || attachmentRows[0].GUID != "attachment-visible" {
+		t.Fatalf("attachment pre-upload rows = %#v, want only unfiltered attachment", attachmentRows)
+	}
+	count, err := store.countBackfillableMessages(ctx, portalID, false)
+	if err != nil {
+		t.Fatalf("countBackfillableMessages: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("countBackfillableMessages = %d, want 2 unfiltered rows", count)
+	}
+}
+
+func TestLegacyUnknownSourcesRemainReadableWithOnlyUnfilteredSiblings(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000097"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "known-unfiltered", PortalID: portalID, Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: 1000,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "legacy-empty", RecordName: "record-empty", CloudChatID: "", PortalID: portalID, TimestampMS: 1000, Text: "empty source", HasBody: true},
+		{GUID: "legacy-unknown", RecordName: "record-unknown", CloudChatID: "unknown-source", PortalID: portalID, TimestampMS: 2000, Text: "unknown source", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	rows, err := store.listLatestMessages(ctx, portalID, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("legacy all-unfiltered rows = %#v, want both empty and unknown sources", rows)
+	}
+}
+
+func TestMessageSourceRemappedToAnotherPortalFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const oldPortal = "tel:+15550000094"
+	const newPortal = "tel:+15550000095"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "remapped-source", PortalID: newPortal, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 2000},
+		{CloudChatID: "old-live-source", PortalID: oldPortal, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: 1000},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "stale-old-portal", RecordName: "stale-record", CloudChatID: "remapped-source",
+		PortalID: oldPortal, TimestampMS: 1000, Text: "stale duplicate-room history", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	rows, err := store.listLatestMessages(ctx, oldPortal, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("remapped source authorized stale portal rows: %#v", rows)
+	}
+}
+
+func TestRehydrateChatIdentifierUsesNewestEligibleSibling(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "gid:rehydrate-selector"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "eligible-older", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 1000},
+		{CloudChatID: "filtered-newer", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: 4000, IsFiltered: 1},
+		{CloudChatID: "deleted-newest", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 5000},
+		{CloudChatID: "eligible-newer", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 3000},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_chat SET deleted=TRUE WHERE login_id=$1 AND cloud_chat_id='deleted-newest'`, testSQLLoginID); err != nil {
+		t.Fatalf("delete newest sibling: %v", err)
+	}
+	if got := store.getRehydrateChatIdentifierByPortalID(ctx, portalID); got != "eligible-newer" {
+		t.Fatalf("rehydrate chat identifier = %q, want newest live unfiltered sibling", got)
+	}
+}
+
+func TestSyntheticChatRowsPreserveLegacyMessageFallback(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000096"
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "legacy-message", RecordName: "legacy-record", CloudChatID: "legacy-chat-without-metadata",
+		PortalID: portalID, TimestampMS: 1000, Sender: "tel:+15551111111", Text: "legacy history", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+	store.markForwardBackfillDone(ctx, portalID)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, display_name, deleted, created_ts)
+		VALUES ($1, 'recycle:' || $2, $2, '', FALSE, $3)
+	`, testSQLLoginID, portalID, int64(1)); err != nil {
+		t.Fatalf("insert recycle row: %v", err)
+	}
+
+	var pseudoRows int
+	if err := db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2
+		  AND (cloud_chat_id LIKE 'synthetic:%' OR cloud_chat_id LIKE 'recycle:%')
+	`, testSQLLoginID, portalID).Scan(&pseudoRows); err != nil {
+		t.Fatalf("count pseudo rows: %v", err)
+	}
+	if pseudoRows != 2 {
+		t.Fatalf("pseudo cloud_chat rows = %d, want 2", pseudoRows)
+	}
+
+	rows, err := store.listLatestMessages(ctx, portalID, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "legacy-message" {
+		t.Fatalf("legacy rows after synthetic marker = %#v, want message preserved", rows)
+	}
+	candidates, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].PortalID != portalID || candidates[0].ContentfulCount != 1 {
+		t.Fatalf("legacy candidates after synthetic marker = %#v, want one contentful portal", candidates)
 	}
 }
 

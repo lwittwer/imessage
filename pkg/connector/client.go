@@ -5670,7 +5670,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	logPortalID := logSafeHandle(portalID)
 
 	// Resolve the CloudKit chat_id for this portal.
-	cloudChatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID)
+	cloudChatID := c.cloudStore.getRehydrateChatIdentifierByPortalID(ctx, portalID)
 	// Also try the stored group_id as a fallback chatId — it may differ from
 	// the per-participant UUID in the portal_id (see per-participant UUID lore).
 	groupIDForFetch := ""
@@ -5719,7 +5719,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 		portalUUID := strings.TrimPrefix(portalID, "gid:")
 		acceptableChatIDSuffixes[normalizeUUID(portalUUID)] = true
 		acceptableChatIDSuffixes[strings.ToLower(portalUUID)] = true
-		if chatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID); chatID != "" {
+		if chatID := c.cloudStore.getRehydrateChatIdentifierByPortalID(ctx, portalID); chatID != "" {
 			acceptableChatIDSuffixes[normalizeUUID(chatID)] = true
 			acceptableChatIDSuffixes[strings.ToLower(chatID)] = true
 		}

@@ -363,7 +363,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		connection:              rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
 		contactsReady:           false,
 		contactsReadyCh:         make(chan struct{}),
-		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
+		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID, c.Config.BridgeFilteredChats),
 		sharedProfileStore:      newSharedProfileStore(c.Bridge.DB.Database, login.ID),
 		pendingAttachments:      newPendingAttachmentStore(c.Bridge.DB.Database, login.ID),
 		fordCache:               NewFordKeyCache(),

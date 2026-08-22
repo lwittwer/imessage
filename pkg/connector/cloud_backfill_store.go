@@ -16,8 +16,9 @@ import (
 )
 
 type cloudBackfillStore struct {
-	db      *dbutil.Database
-	loginID networkid.UserLoginID
+	db             *dbutil.Database
+	loginID        networkid.UserLoginID
+	bridgeFiltered bool
 }
 
 type cloudMessageRow struct {
@@ -84,8 +85,12 @@ const (
 	cloudZoneAttachments = "attachmentManateeZone"
 )
 
-func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *cloudBackfillStore {
-	return &cloudBackfillStore{db: db, loginID: loginID}
+func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID, bridgeFiltered ...bool) *cloudBackfillStore {
+	return &cloudBackfillStore{
+		db:             db,
+		loginID:        loginID,
+		bridgeFiltered: len(bridgeFiltered) > 0 && bridgeFiltered[0],
+	}
 }
 
 // columnExists reports whether tableName has a column named columnName.
@@ -1806,6 +1811,33 @@ func (s *cloudBackfillStore) getChatIdentifierByPortalID(ctx context.Context, po
 	return chatID
 }
 
+// getRehydrateChatIdentifierByPortalID returns the newest live CloudKit chat
+// source that is eligible for this bridge configuration. Rehydrate must not
+// use getChatIdentifierByPortalID: a portal can have filtered or deleted Apple
+// siblings, and fetching one of those can leave the eligible sibling scrubbed
+// while making the recovery attempt look successful.
+func (s *cloudBackfillStore) getRehydrateChatIdentifierByPortalID(ctx context.Context, portalID string) string {
+	filteredClause := ""
+	if !s.bridgeFiltered {
+		filteredClause = " AND COALESCE(is_filtered, 0)=0"
+	}
+	var chatID string
+	err := s.db.QueryRow(ctx, `
+		SELECT cloud_chat_id FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2
+		  AND cloud_chat_id <> ''
+		  AND cloud_chat_id NOT LIKE 'synthetic:%'
+		  AND cloud_chat_id NOT LIKE 'recycle:%'
+		  AND deleted=FALSE`+filteredClause+`
+		ORDER BY updated_ts DESC, cloud_chat_id ASC
+		LIMIT 1
+	`, s.loginID, portalID).Scan(&chatID)
+	if err != nil {
+		return ""
+	}
+	return chatID
+}
+
 // getCloudRecordNamesByPortalID returns all non-empty chat record_names for a portal.
 func (s *cloudBackfillStore) getCloudRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
@@ -2614,11 +2646,12 @@ func (s *cloudBackfillStore) deleteLocalChatByGroupID(ctx context.Context, group
 // for a portal, or 0 if no messages exist.
 func (s *cloudBackfillStore) getOldestMessageTimestamp(ctx context.Context, portalID string) (int64, error) {
 	var ts sql.NullInt64
-	err := s.db.QueryRow(ctx, `
+	query := `
 		SELECT MIN(timestamp_ms)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-	`, s.loginID, portalID).Scan(&ts)
+	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
+	err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&ts)
 	if err != nil || !ts.Valid {
 		return 0, err
 	}
@@ -2629,11 +2662,12 @@ func (s *cloudBackfillStore) getOldestMessageTimestamp(ctx context.Context, port
 // for a portal, or 0 if no messages exist.
 func (s *cloudBackfillStore) getNewestMessageTimestamp(ctx context.Context, portalID string) (int64, error) {
 	var ts sql.NullInt64
-	err := s.db.QueryRow(ctx, `
+	query := `
 		SELECT MAX(timestamp_ms)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-	`, s.loginID, portalID).Scan(&ts)
+	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
+	err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&ts)
 	if err != nil || !ts.Valid {
 		return 0, err
 	}
@@ -2650,7 +2684,9 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		baseQuery += " AND " + cloudBackfillableEventWhere("cloud_message")
+		baseQuery += " AND " + cloudBackfillableEventWhere("cloud_message", s.bridgeFiltered)
+	} else {
+		baseQuery += cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
 	}
 	var ts sql.NullInt64
 	err := s.db.QueryRow(ctx, baseQuery, s.loginID, portalID).Scan(&ts)
@@ -2733,11 +2769,12 @@ func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (in
 
 func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID string) (bool, error) {
 	var count int
-	err := s.db.QueryRow(ctx, `
+	query := `
 		SELECT COUNT(*)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-	`, s.loginID, portalID).Scan(&count)
+	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
+	err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -2752,7 +2789,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM cloud_message cm
-		WHERE `+cloudBackfillableEventWhere("cm")+`
+		WHERE `+cloudBackfillableEventWhere("cm", s.bridgeFiltered)+`
 		  AND cm.portal_id=$2
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
@@ -2779,11 +2816,12 @@ func (s *cloudBackfillStore) hasContentfulMessagesInLatestWindow(ctx context.Con
 			  AND cm.portal_id=$2
 			  AND cm.deleted=FALSE
 			  AND cm.record_name <> ''
+			  `+cloudMessageChatFilterWhere("cm", s.bridgeFiltered)+`
 		)
 		SELECT COUNT(*)
 		FROM ranked cm
 		WHERE cm.rn <= $3
-		  AND `+cloudBackfillableEventWhere("cm")+`
+		  AND `+cloudBackfillableEventWhere("cm", s.bridgeFiltered)+`
 	`, s.loginID, portalID, maxInitialMessages).Scan(&count)
 	if err != nil {
 		return false, err
@@ -2801,7 +2839,9 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		query += " AND " + cloudBackfillableEventWhere("cloud_message")
+		query += " AND " + cloudBackfillableEventWhere("cloud_message", s.bridgeFiltered)
+	} else {
+		query += cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count); err != nil {
@@ -2828,7 +2868,7 @@ func (s *cloudBackfillStore) listBackwardMessages(
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-	`
+	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
 	args := []any{s.loginID, portalID}
 	if beforeTS > 0 || beforeGUID != "" {
 		query += ` AND (timestamp_ms < $3 OR (timestamp_ms = $3 AND guid < $4))`
@@ -2853,6 +2893,7 @@ func (s *cloudBackfillStore) listForwardMessages(
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
 			AND (timestamp_ms > $3 OR (timestamp_ms = $3 AND guid > $4))
 		ORDER BY timestamp_ms ASC, guid ASC
 		LIMIT $5
@@ -2870,6 +2911,7 @@ func (s *cloudBackfillStore) listForwardMessagesByWriteActivity(
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
 			AND (
 				MAX(created_ts, updated_ts) > $3
 				OR ($4 <> '' AND MAX(created_ts, updated_ts) = $3 AND guid > $4)
@@ -2902,6 +2944,7 @@ func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID st
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
 		ORDER BY timestamp_ms DESC, guid DESC
 		LIMIT $3
 	`
@@ -2916,6 +2959,7 @@ func (s *cloudBackfillStore) listOldestMessages(ctx context.Context, portalID st
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
 		ORDER BY timestamp_ms ASC, guid ASC
 		LIMIT $3
 	`
@@ -2932,6 +2976,7 @@ func (s *cloudBackfillStore) listAllAttachmentMessages(ctx context.Context) ([]c
 		  AND deleted=FALSE
 		  AND attachments_json IS NOT NULL
 		  AND attachments_json <> ''
+		  ` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
 		ORDER BY timestamp_ms ASC, guid ASC
 	`
 	return s.queryMessages(ctx, query, s.loginID)
@@ -3000,11 +3045,14 @@ type portalWithNewestMessage struct {
 // ContentfulCount is stricter and only counts rows that can create a message
 // event by themselves; callers use it to prevent creating new empty rooms while
 // still allowing existing rooms to catch up metadata-only or reaction-only rows.
+// When bridge_filtered_chats is enabled, filtered cloud_chat rows participate
+// in the candidate set. Otherwise a portal is excluded only when every live
+// cloud_chat row behind it is filtered; a mixed portal remains eligible.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, maxInitialMessages int) ([]portalWithNewestMessage, error) {
 	args := []any{s.loginID}
 	rankedCTE := ""
 	contentSource := "cloud_message cm"
-	contentStatsWhere := cloudPortalSyncCandidateWhere("cm")
+	contentStatsWhere := cloudPortalSyncCandidateWhere("cm", s.bridgeFiltered)
 	const uncappedInitialBackfill = 1<<31 - 1
 	if maxInitialMessages > 0 && maxInitialMessages < uncappedInitialBackfill {
 		rankedCTE = `
@@ -3019,9 +3067,10 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
 			  AND cm.deleted=FALSE
 			  AND cm.record_name <> ''
+			  ` + cloudMessageChatFilterWhere("cm", s.bridgeFiltered) + `
 		),`
 		contentSource = "ranked cm"
-		contentStatsWhere = "cm.rn <= $2 AND " + cloudPortalSyncCandidateWhere("cm")
+		contentStatsWhere = "cm.rn <= $2 AND " + cloudPortalSyncCandidateWhere("cm", s.bridgeFiltered)
 		args = append(args, maxInitialMessages)
 	}
 	query := `
@@ -3037,19 +3086,19 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			       COUNT(*) AS msg_count,
 			       0 AS contentful_count
 			FROM cloud_message cm
-			WHERE ` + cloudPortalSyncCandidateWhere("cm") + `
+			WHERE ` + cloudPortalSyncCandidateWhere("cm", s.bridgeFiltered) + `
 			GROUP BY cm.portal_id
 		),
 		content_stats AS (
 			SELECT cm.portal_id,
-			       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
+			       MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm", s.bridgeFiltered) + ` THEN cm.timestamp_ms ELSE 0 END) AS newest_ts,
 			       0 AS message_activity_ts,
 			       0 AS message_write_activity_ts,
-			       COALESCE(MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN CASE WHEN cm.created_ts > cm.updated_ts THEN cm.created_ts ELSE cm.updated_ts END ELSE 0 END), 0) AS contentful_write_activity_ts,
+			       COALESCE(MAX(CASE WHEN ` + cloudBackfillableEventWhere("cm", s.bridgeFiltered) + ` THEN CASE WHEN cm.created_ts > cm.updated_ts THEN cm.created_ts ELSE cm.updated_ts END ELSE 0 END), 0) AS contentful_write_activity_ts,
 			       0 AS metadata_ts,
 			       0 AS activity_ts,
 			       0 AS msg_count,
-			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm") + ` THEN 1 ELSE 0 END) AS contentful_count
+			       SUM(CASE WHEN ` + cloudBackfillableEventWhere("cm", s.bridgeFiltered) + ` THEN 1 ELSE 0 END) AS contentful_count
 			FROM ` + contentSource + `
 			WHERE ` + contentStatsWhere + `
 			GROUP BY cm.portal_id
@@ -3060,7 +3109,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			       COALESCE(MAX(cc.updated_ts), 0) AS metadata_ts,
 			       COALESCE(MAX(cc.updated_ts), 0) AS activity_ts, 0 AS msg_count, 0 AS contentful_count
 			FROM cloud_chat cc
-			WHERE ` + cloudChatPortalSyncCandidateWhere("cc") + `
+			WHERE ` + cloudChatPortalSyncCandidateWhere("cc", s.bridgeFiltered) + `
 			GROUP BY cc.portal_id
 		)
 		SELECT portal_id, MAX(newest_ts) AS newest_ts, MAX(activity_ts) AS activity_ts,
@@ -3099,50 +3148,101 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 // cloudChatPortalSyncCandidateWhere matches chat metadata rows that should make
 // an existing portal eligible for a ChatResync. ContentfulCount remains zero for
 // these rows, so metadata-only chats cannot create brand-new empty Matrix rooms.
-func cloudChatPortalSyncCandidateWhere(alias string) string {
+func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string {
 	col := func(name string) string { return alias + "." + name }
-	return fmt.Sprintf(`
+	where := fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
 		AND %s=FALSE
-		AND COALESCE(%s, 0) = 0
-		AND NOT EXISTS (
-			SELECT 1 FROM cloud_chat fc
-			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"))
+	if len(bridgeFiltered) == 0 || !bridgeFiltered[0] {
+		where += fmt.Sprintf("\t\tAND COALESCE(%s, 0) = 0\n", col("is_filtered"))
+	}
+	return where
+}
+
+// cloudMessageChatFilterWhere keeps a message tied to the live cloud_chat row
+// that produced it. A portal may contain multiple Apple chat siblings (for
+// example iMessage and SMS) with different filtered state, so a portal-level
+// "any unfiltered sibling" check is not enough for message readers: it would
+// allow a filtered sibling's content and attachments through shared queries.
+//
+// Rows with a known chat_id must have a matching live, eligible cloud_chat row
+// on the same portal. If no source row exists anywhere for that chat_id, retain
+// the legacy fallback unless this portal has a live filtered sibling. This
+// keeps old rows readable for all-unfiltered portals while preventing an empty
+// or unknown source from leaking across a mixed filtered/unfiltered sibling
+// set. A matching filtered, deleted, or remapped source never falls back: once
+// Apple has supplied an authoritative mapping, fail closed.
+func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
+	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+	col := func(name string) string { return alias + "." + name }
+	filteredClause := ""
+	legacyFilteredClause := ""
+	if !includeFiltered {
+		filteredClause = "\n\t\t\t\t  AND COALESCE(matched.is_filtered, 0)=0"
+		legacyFilteredClause = fmt.Sprintf(`
+				AND NOT EXISTS (
+					SELECT 1 FROM cloud_chat live
+					WHERE live.login_id=$1
+					  AND live.portal_id=%s
+					  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+					  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+					  AND live.deleted=FALSE
+					  AND COALESCE(live.is_filtered, 0) <> 0
+				)
+			`, col("portal_id"))
+	}
+	return fmt.Sprintf(`
+		AND (
+			EXISTS (
+				SELECT 1 FROM cloud_chat matched
+				WHERE matched.login_id=$1
+				  AND LOWER(matched.cloud_chat_id)=LOWER(%s)
+				  AND matched.portal_id=%s
+				  AND matched.deleted=FALSE%s
+			)
+			OR (
+				NOT EXISTS (
+					SELECT 1 FROM cloud_chat source
+					WHERE source.login_id=$1
+					  AND LOWER(source.cloud_chat_id)=LOWER(%s)
+				)
+				%s
+			)
 		)
-	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("is_filtered"), col("portal_id"))
+	`, col("chat_id"), col("portal_id"), filteredClause, col("chat_id"), legacyFilteredClause)
 }
 
 // cloudPortalSyncCandidateWhere matches rows that should make a portal eligible
 // for a ChatResync. It intentionally includes reaction rows so existing rooms
 // can catch up offline tapbacks; callers must still use ContentfulCount before
 // creating a brand-new room.
-func cloudPortalSyncCandidateWhere(alias string) string {
+func cloudPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string {
 	col := func(name string) string { return alias + "." + name }
+	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
 	base := fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
 		AND %s=FALSE
 		AND %s <> ''
-		AND NOT EXISTS (
-			SELECT 1 FROM cloud_chat fc
-			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
-		)
-	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"), col("portal_id"))
+	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"))
+	base += cloudMessageChatFilterWhere(alias, includeFiltered)
 	return base + fmt.Sprintf(`
 		AND (
 			%s >= 2000
 			OR (%s)
 		)
-	`, col("tapback_type"), cloudBackfillableEventWhere(alias))
+	`, col("tapback_type"), cloudBackfillableEventWhere(alias, includeFiltered))
 }
 
 // cloudBackfillableEventWhere matches rows that can create at least one
 // BackfillMessage through cloudRowToBackfillMessages. This is stricter than the
 // FetchMessages read filter: readable reaction-only, system, scrubbed, or empty
 // rows should not create portals by themselves.
-func cloudBackfillableEventWhere(alias string) string {
+func cloudBackfillableEventWhere(alias string, bridgeFiltered ...bool) string {
 	col := func(name string) string { return alias + "." + name }
+	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
 	trimChars := "' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288)"
 	normalizedText := fmt.Sprintf("TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), %s)", col("text"), trimChars)
 	normalizedSubject := fmt.Sprintf("TRIM(COALESCE(%s, ''), %s)", col("subject"), trimChars)
@@ -3160,11 +3260,7 @@ func cloudBackfillableEventWhere(alias string) string {
 			OR %s <> ''
 			OR COALESCE(%s, '') <> ''
 		)
-		AND NOT EXISTS (
-			SELECT 1 FROM cloud_chat fc
-			WHERE fc.login_id=$1 AND fc.portal_id=%s AND COALESCE(fc.is_filtered, 0) != 0
-		)
-		AND NOT EXISTS (
+	`+cloudMessageChatFilterWhere(alias, includeFiltered)+` AND NOT EXISTS (
 			SELECT 1 FROM cloud_chat sc
 			WHERE sc.login_id=$1
 			  AND sc.portal_id=%s
@@ -3175,7 +3271,7 @@ func cloudBackfillableEventWhere(alias string) string {
 		)
 	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"), col("record_name"),
 		col("body_scrubbed"), col("tapback_type"), col("tapback_type"), col("is_from_me"), col("sender"), col("portal_id"), col("portal_id"),
-		normalizedText, normalizedSubject, col("attachments_json"), col("portal_id"), col("portal_id"),
+		normalizedText, normalizedSubject, col("attachments_json"), col("portal_id"),
 		normalizedText, normalizedDisplayName, col("attachments_json"), col("tapback_type"))
 }
 
@@ -3554,6 +3650,25 @@ type rehydrateScrubAttempt struct {
 	MarkerTS int64
 }
 
+// rawTxCloudMessageChatFilterWhere adapts the dbutil query predicate for a raw
+// transaction. dbutil rewrites $1 placeholders for regular queries, but the
+// transaction used by rehydrate is owned by database/sql. SQLite therefore
+// needs one positional argument for each repeated login predicate, while
+// PostgreSQL can reuse the numbered login placeholder.
+func (s *cloudBackfillStore) rawTxCloudMessageChatFilterWhere(alias, loginPlaceholder string) (string, []any) {
+	where := cloudMessageChatFilterWhere(alias, s.bridgeFiltered)
+	if s.db.Dialect == dbutil.Postgres {
+		return strings.ReplaceAll(where, "$1", loginPlaceholder), nil
+	}
+	loginCount := strings.Count(where, "$1")
+	where = strings.ReplaceAll(where, "$1", "?")
+	args := make([]any, loginCount)
+	for i := range args {
+		args[i] = s.loginID
+	}
+	return where, args
+}
+
 // clearBodyScrubForRehydrate atomically captures and clears the exact rows
 // changed by this automatic recovery attempt. MarkerTS distinguishes retained
 // attachment metadata from a later CloudKit upsert of the same GUID: every
@@ -3568,10 +3683,14 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	defer tx.Rollback()
 
 	selectParams := strings.Split(sqlPlaceholders(s.db, 2), ", ")
+	sourceFilter, sourceArgs := s.rawTxCloudMessageChatFilterWhere("cloud_message", selectParams[0])
+	selectArgs := []any{s.loginID, portalID}
+	selectArgs = append(selectArgs, sourceArgs...)
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT guid, updated_ts FROM cloud_message
 		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
-	`, selectParams[0], selectParams[1]), s.loginID, portalID)
+		`+sourceFilter+`
+	`, selectParams[0], selectParams[1]), selectArgs...)
 	if err != nil {
 		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
 	}
@@ -3594,17 +3713,21 @@ func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, por
 	const chunkSize = 500
 	for start := 0; start < len(attempt.Rows); start += chunkSize {
 		end := min(start+chunkSize, len(attempt.Rows))
-		params := strings.Split(sqlPlaceholders(s.db, 3+end-start), ", ")
+		params := strings.Split(sqlPlaceholders(s.db, 3+len(sourceArgs)+end-start), ", ")
+		updateSourceFilter, _ := s.rawTxCloudMessageChatFilterWhere("cloud_message", params[1])
 		args := make([]any, 0, 3+end-start)
 		args = append(args, attempt.MarkerTS, s.loginID, portalID)
+		args = append(args, sourceArgs...)
 		for _, row := range attempt.Rows[start:end] {
 			args = append(args, row.GUID)
 		}
+		guidStart := 3 + len(sourceArgs)
 		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
 			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE AND deleted=FALSE
+			  `+updateSourceFilter+`
 			  AND guid IN (%s)
-		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
+		`, params[0], params[1], params[2], strings.Join(params[guidStart:], ",")), args...); err != nil {
 			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed: %w", err)
 		}
 	}
@@ -4183,51 +4306,70 @@ const pendingBackfillScrubHold = 24 * time.Hour
 // avoids that.
 //
 // Three conditions, all required, so the hold stays narrow:
-//   - the message source has a live, non-filtered cloud_chat row that is not
-//     yet done. Filtered chats never become portals while the opt-in remains
-//     disabled, so they would otherwise be held forever.
-//   - no eligible completed row exists for that same source chat. A completed
-//     sibling is not proof that a newly synced sibling sharing the portal was
-//     delivered.
+//   - the portal has a live cloud_chat row that is not yet done. When
+//     bridge_filtered_chats is off, only non-filtered rows qualify; filtered
+//     chats (Apple's junk bucket) never become portals and would otherwise be
+//     held forever. Opting in deliberately includes filtered rows in the hold.
+//   - no live, eligible cloud_chat row for the portal is done. Deleted and
+//     filtered historical siblings are not proof that the pending live row was
+//     delivered; one portal_id can carry several chat rows (an iMessage chat
+//     and an SMS chat for the same handle).
 //   - the pending row was first seen inside pendingBackfillScrubHold. This is
 //     what keeps a permanently wedged portal from becoming a permanent plaintext
 //     exemption.
 //
-// Correlates on cloud_message.portal_id, so it is only valid inside a query
-// whose innermost cloud_message scope is the candidate row. $1 is login_id.
-func pendingBackfillGateSQL(holdPlaceholder string) string {
-	// Empty or unknown chat IDs use a fail-closed legacy fallback: any recent
-	// pending sibling protects the row, while no completed sibling can release
-	// it without an exact source match.
+// Correlates on cloud_message.portal_id and, when available, its chat_id, so
+// it is only valid inside a query whose innermost cloud_message scope is the
+// candidate row. $1 is login_id.
+
+func pendingBackfillGateSQL(holdPlaceholder string, bridgeFiltered ...bool) string {
+	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+	filtered := ""
+	if !includeFiltered {
+		filtered = "AND COALESCE(pending.is_filtered, 0) = 0"
+	}
+	// A portal can contain several live cloud_chat siblings. A completed
+	// sibling is proof only for the message rows belonging to that same chat;
+	// otherwise a newly pending sibling can be scrubbed before its own forward
+	// batch lands. Empty or unknown chat IDs have no safe delivered proof, but a
+	// pending sibling still keeps them held (the fail-closed legacy path).
+	pendingChatScope := `
+				    AND (
+				      COALESCE(cloud_message.chat_id, '') = ''
+				      OR LOWER(pending.cloud_chat_id)=LOWER(cloud_message.chat_id)
+				      OR NOT EXISTS (
+				        SELECT 1 FROM cloud_chat known
+				        WHERE known.login_id=$1
+				          AND known.portal_id=cloud_message.portal_id
+				          AND LOWER(known.cloud_chat_id)=LOWER(cloud_message.chat_id)
+				      )
+				    )`
+	deliveredChatScope := `
+				    AND COALESCE(cloud_message.chat_id, '') <> ''
+				    AND LOWER(delivered.cloud_chat_id)=LOWER(cloud_message.chat_id)`
+	deliveredFiltered := ""
+	if !includeFiltered {
+		deliveredFiltered = "AND COALESCE(delivered.is_filtered, 0) = 0"
+	}
 	return `NOT (
 		        EXISTS (
 		          SELECT 1 FROM cloud_chat pending
-		          WHERE pending.login_id=$1 AND pending.portal_id=cloud_message.portal_id
-		            AND pending.deleted=FALSE
-		            AND COALESCE(pending.is_filtered, 0) = 0
-		            AND (
-		              COALESCE(cloud_message.chat_id, '') = ''
-		              OR LOWER(pending.cloud_chat_id)=LOWER(cloud_message.chat_id)
-		              OR NOT EXISTS (
-		                SELECT 1 FROM cloud_chat known
-		                WHERE known.login_id=$1
-		                  AND known.portal_id=cloud_message.portal_id
-		                  AND LOWER(known.cloud_chat_id)=LOWER(cloud_message.chat_id)
-		              )
-		            )
-		            AND pending.fwd_backfill_done=FALSE
+				  WHERE pending.login_id=$1 AND pending.portal_id=cloud_message.portal_id
+				    AND pending.deleted=FALSE
+				    ` + filtered + `
+				    ` + pendingChatScope + `
+				    AND pending.fwd_backfill_done=FALSE
 		            AND COALESCE(pending.created_ts, 0) >= ` + holdPlaceholder + `
 		        )
-		        AND NOT EXISTS (
-		          SELECT 1 FROM cloud_chat delivered
-		          WHERE delivered.login_id=$1 AND delivered.portal_id=cloud_message.portal_id
-		            AND delivered.deleted=FALSE
-		            AND COALESCE(delivered.is_filtered, 0) = 0
-		            AND delivered.fwd_backfill_done=TRUE
-		            AND COALESCE(cloud_message.chat_id, '') <> ''
-		            AND LOWER(delivered.cloud_chat_id)=LOWER(cloud_message.chat_id)
-		        )
-		      )`
+				AND NOT EXISTS (
+				  SELECT 1 FROM cloud_chat delivered
+				  WHERE delivered.login_id=$1 AND delivered.portal_id=cloud_message.portal_id
+				    AND delivered.deleted=FALSE
+				    AND delivered.fwd_backfill_done=TRUE
+				    ` + deliveredFiltered + `
+				    ` + deliveredChatScope + `
+				  )
+			      )`
 }
 
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
@@ -4288,7 +4430,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	args := []any{s.loginID, cutoff, bridgeID}
 	// $4: the pending-backfill hold cutoff. See pendingBackfillGateSQL.
 	args = append(args, time.Now().Add(-pendingBackfillScrubHold).UnixMilli())
-	pendingGate := pendingBackfillGateSQL(fmt.Sprintf("$%d", len(args)))
+	pendingGate := pendingBackfillGateSQL(fmt.Sprintf("$%d", len(args)), s.bridgeFiltered)
 	if len(excludePortals) > 0 {
 		placeholders := make([]string, 0, len(excludePortals))
 		for _, pid := range excludePortals {
@@ -4335,6 +4477,9 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND (
 		        deleted=TRUE
 		        OR (
+		          `+permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered)+`
+		        )
+		        OR (
 		          UPPER(guid) IN (
 		            SELECT UPPER(id) FROM message
 		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
@@ -4366,6 +4511,41 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		}
 	}
 	return total, nil
+}
+
+// permanentlyFilteredMessageWhere identifies rows that this bridge can never
+// deliver while bridge_filtered_chats is disabled. They bypass the delivered
+// message and pending-backfill gates in scrubBridgedBodies; otherwise their
+// plaintext remains on disk forever because no Matrix message row can exist.
+func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
+	if bridgeFiltered {
+		return "FALSE"
+	}
+	return fmt.Sprintf(`(
+		EXISTS (
+			SELECT 1 FROM cloud_chat filtered
+			WHERE filtered.login_id=$1
+			  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
+			  AND filtered.portal_id=%s.portal_id
+			  AND COALESCE(filtered.is_filtered, 0) <> 0
+		)
+		OR (
+			NOT EXISTS (
+				SELECT 1 FROM cloud_chat source
+				WHERE source.login_id=$1
+				  AND LOWER(source.cloud_chat_id)=LOWER(%s.chat_id)
+			)
+			AND EXISTS (
+				SELECT 1 FROM cloud_chat live
+				WHERE live.login_id=$1
+				  AND live.portal_id=%s.portal_id
+				  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+				  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+				  AND live.deleted=FALSE
+				  AND COALESCE(live.is_filtered, 0) <> 0
+			)
+		)
+	)`, alias, alias, alias, alias)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),
@@ -4465,15 +4645,18 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 	// tail is only provably unreachable once the newest keepPerPortal rows have
 	// actually been delivered. Before that, the threshold this computes and the
 	// set listLatestMessages returns are not the same set — the threshold counts
-	// every non-deleted row, listLatestMessages only contentful ones — so a
-	// portal with system records among its newest rows can have deliverable rows
-	// below the threshold. Scrubbing them there would drop them from the batch.
+	// every eligible non-deleted row, listLatestMessages only contentful ones —
+	// so a portal with system records among its newest rows can have deliverable
+	// rows below the threshold. Scrubbing them there would drop them from the
+	// batch. Filtered siblings are excluded from the count and threshold too;
+	// otherwise junk rows could consume the cap for an unfiltered sibling.
 	// See pendingBackfillGateSQL for why the gate is "known pending" rather than
 	// "known done".
 	rows, err := s.db.Query(ctx, `
 		SELECT portal_id FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
-		  AND `+pendingBackfillGateSQL("$3")+`
+		  `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`
+		  AND `+pendingBackfillGateSQL("$3", s.bridgeFiltered)+`
 		GROUP BY portal_id
 		HAVING COUNT(*) > $2
 	`, s.loginID, keepPerPortal, time.Now().Add(-pendingBackfillScrubHold).UnixMilli())
@@ -4506,6 +4689,7 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 		err := s.db.QueryRow(ctx, `
 			SELECT timestamp_ms FROM cloud_message
 			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+			  `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`
 			ORDER BY timestamp_ms DESC, guid DESC
 			LIMIT 1 OFFSET $3
 		`, s.loginID, pid, keepPerPortal-1).Scan(&threshold)
@@ -4519,11 +4703,13 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 				UPDATE cloud_message
 				SET text=NULL, subject=NULL, sender='', tapback_emoji=NULL, body_scrubbed=TRUE
 				WHERE login_id=$1 AND portal_id=$2
+				  `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`
 				  AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
 				  AND updated_ts < $3 AND timestamp_ms < $4
 				  AND guid IN (
 				    SELECT guid FROM cloud_message
 				    WHERE login_id=$1 AND portal_id=$2
+				      `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`
 				      AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
 				      AND updated_ts < $3 AND timestamp_ms < $4
 				    LIMIT $5
