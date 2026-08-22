@@ -431,6 +431,94 @@ func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 	}
 }
 
+func TestLegacyUnknownSourcesRemainReadableWithOnlyUnfilteredSiblings(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000097"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "known-unfiltered", PortalID: portalID, Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: 1000,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "legacy-empty", RecordName: "record-empty", CloudChatID: "", PortalID: portalID, TimestampMS: 1000, Text: "empty source", HasBody: true},
+		{GUID: "legacy-unknown", RecordName: "record-unknown", CloudChatID: "unknown-source", PortalID: portalID, TimestampMS: 2000, Text: "unknown source", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	rows, err := store.listLatestMessages(ctx, portalID, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("legacy all-unfiltered rows = %#v, want both empty and unknown sources", rows)
+	}
+}
+
+func TestMessageSourceRemappedToAnotherPortalFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const oldPortal = "tel:+15550000094"
+	const newPortal = "tel:+15550000095"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "remapped-source", PortalID: newPortal, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 2000},
+		{CloudChatID: "old-live-source", PortalID: oldPortal, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: 1000},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "stale-old-portal", RecordName: "stale-record", CloudChatID: "remapped-source",
+		PortalID: oldPortal, TimestampMS: 1000, Text: "stale duplicate-room history", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	rows, err := store.listLatestMessages(ctx, oldPortal, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("remapped source authorized stale portal rows: %#v", rows)
+	}
+}
+
+func TestRehydrateChatIdentifierUsesNewestEligibleSibling(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "gid:rehydrate-selector"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "eligible-older", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 1000},
+		{CloudChatID: "filtered-newer", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: 4000, IsFiltered: 1},
+		{CloudChatID: "deleted-newest", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 5000},
+		{CloudChatID: "eligible-newer", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: 3000},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_chat SET deleted=TRUE WHERE login_id=$1 AND cloud_chat_id='deleted-newest'`, testSQLLoginID); err != nil {
+		t.Fatalf("delete newest sibling: %v", err)
+	}
+	if got := store.getRehydrateChatIdentifierByPortalID(ctx, portalID); got != "eligible-newer" {
+		t.Fatalf("rehydrate chat identifier = %q, want newest live unfiltered sibling", got)
+	}
+}
+
 func TestSyntheticChatRowsPreserveLegacyMessageFallback(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)

@@ -81,8 +81,11 @@ enable it in a report alone or let a filtered sibling suppress an unfiltered
 chat sharing the same portal. When siblings share a portal, enforce filtering
 against each message's known `cloud_message.chat_id`: a known filtered or
 deleted source fails closed. Legacy rows with an empty or unrecognized chat ID
-retain the portal-level fallback so older persisted history remains restorable;
-synthetic/recycle metadata rows must not disable that compatibility fallback.
+retain the portal-level fallback only when every live sibling is unfiltered, so
+older persisted history remains restorable without leaking across a mixed
+sibling set; synthetic/recycle metadata rows must not disable that compatibility
+fallback. A source row remapped to another portal is authoritative and must not
+authorize stale history through the old portal.
 
 ## Current SMS/iMessage routing
 

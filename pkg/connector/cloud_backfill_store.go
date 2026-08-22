@@ -1811,6 +1811,33 @@ func (s *cloudBackfillStore) getChatIdentifierByPortalID(ctx context.Context, po
 	return chatID
 }
 
+// getRehydrateChatIdentifierByPortalID returns the newest live CloudKit chat
+// source that is eligible for this bridge configuration. Rehydrate must not
+// use getChatIdentifierByPortalID: a portal can have filtered or deleted Apple
+// siblings, and fetching one of those can leave the eligible sibling scrubbed
+// while making the recovery attempt look successful.
+func (s *cloudBackfillStore) getRehydrateChatIdentifierByPortalID(ctx context.Context, portalID string) string {
+	filteredClause := ""
+	if !s.bridgeFiltered {
+		filteredClause = " AND COALESCE(is_filtered, 0)=0"
+	}
+	var chatID string
+	err := s.db.QueryRow(ctx, `
+		SELECT cloud_chat_id FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2
+		  AND cloud_chat_id <> ''
+		  AND cloud_chat_id NOT LIKE 'synthetic:%'
+		  AND cloud_chat_id NOT LIKE 'recycle:%'
+		  AND deleted=FALSE`+filteredClause+`
+		ORDER BY updated_ts DESC, cloud_chat_id ASC
+		LIMIT 1
+	`, s.loginID, portalID).Scan(&chatID)
+	if err != nil {
+		return ""
+	}
+	return chatID
+}
+
 // getCloudRecordNamesByPortalID returns all non-empty chat record_names for a portal.
 func (s *cloudBackfillStore) getCloudRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
@@ -3140,19 +3167,31 @@ func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) str
 // "any unfiltered sibling" check is not enough for message readers: it would
 // allow a filtered sibling's content and attachments through shared queries.
 //
-// Rows with a known chat_id must have a matching live, unfiltered cloud_chat
-// row when filtered chats are disabled. If no matching chat row exists, retain
-// the legacy fallback only when the portal has no live cloud_chat metadata at
-// all. This keeps old/synthetic no-metadata rows readable while making empty or
-// unknown chat IDs fail closed once a portal's live sibling set is known. A
-// matching filtered or deleted row never falls back: once the source is known,
-// fail closed.
+// Rows with a known chat_id must have a matching live, eligible cloud_chat row
+// on the same portal. If no source row exists anywhere for that chat_id, retain
+// the legacy fallback unless this portal has a live filtered sibling. This
+// keeps old rows readable for all-unfiltered portals while preventing an empty
+// or unknown source from leaking across a mixed filtered/unfiltered sibling
+// set. A matching filtered, deleted, or remapped source never falls back: once
+// Apple has supplied an authoritative mapping, fail closed.
 func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
 	col := func(name string) string { return alias + "." + name }
 	filteredClause := ""
+	legacyFilteredClause := ""
 	if !includeFiltered {
 		filteredClause = "\n\t\t\t\t  AND COALESCE(matched.is_filtered, 0)=0"
+		legacyFilteredClause = fmt.Sprintf(`
+				AND NOT EXISTS (
+					SELECT 1 FROM cloud_chat live
+					WHERE live.login_id=$1
+					  AND live.portal_id=%s
+					  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+					  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+					  AND live.deleted=FALSE
+					  AND COALESCE(live.is_filtered, 0) <> 0
+				)
+			`, col("portal_id"))
 	}
 	return fmt.Sprintf(`
 		AND (
@@ -3160,27 +3199,19 @@ func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 				SELECT 1 FROM cloud_chat matched
 				WHERE matched.login_id=$1
 				  AND LOWER(matched.cloud_chat_id)=LOWER(%s)
+				  AND matched.portal_id=%s
 				  AND matched.deleted=FALSE%s
 			)
 			OR (
-				(
-					NOT EXISTS (
-						SELECT 1 FROM cloud_chat matched
-						WHERE matched.login_id=$1
-						  AND LOWER(matched.cloud_chat_id)=LOWER(%s)
-					)
-					AND NOT EXISTS (
-						SELECT 1 FROM cloud_chat live
-						WHERE live.login_id=$1
-						  AND live.portal_id=%s
-						  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
-						  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
-						  AND live.deleted=FALSE
-					)
+				NOT EXISTS (
+					SELECT 1 FROM cloud_chat source
+					WHERE source.login_id=$1
+					  AND LOWER(source.cloud_chat_id)=LOWER(%s)
 				)
+				%s
 			)
 		)
-	`, col("chat_id"), filteredClause, col("chat_id"), col("portal_id"))
+	`, col("chat_id"), col("portal_id"), filteredClause, col("chat_id"), legacyFilteredClause)
 }
 
 // cloudPortalSyncCandidateWhere matches rows that should make a portal eligible
@@ -4446,6 +4477,9 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND (
 		        deleted=TRUE
 		        OR (
+		          `+permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered)+`
+		        )
+		        OR (
 		          UPPER(guid) IN (
 		            SELECT UPPER(id) FROM message
 		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
@@ -4477,6 +4511,23 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		}
 	}
 	return total, nil
+}
+
+// permanentlyFilteredMessageWhere identifies rows that this bridge can never
+// deliver while bridge_filtered_chats is disabled. They bypass the delivered
+// message and pending-backfill gates in scrubBridgedBodies; otherwise their
+// plaintext remains on disk forever because no Matrix message row can exist.
+func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
+	if bridgeFiltered {
+		return "FALSE"
+	}
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1 FROM cloud_chat filtered
+		WHERE filtered.login_id=$1
+		  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
+		  AND filtered.portal_id=%s.portal_id
+		  AND COALESCE(filtered.is_filtered, 0) <> 0
+	)`, alias, alias)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),

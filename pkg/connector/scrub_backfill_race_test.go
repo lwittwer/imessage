@@ -162,6 +162,82 @@ func TestScrubHoldsOffPendingBackfillPortals(t *testing.T) {
 	}
 }
 
+func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const portalID = "tel:+15550008888"
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+	}); err != nil {
+		t.Fatalf("upsert chats: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "G-UNFILTERED", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "still needed", Service: "iMessage", HasBody: true},
+		{GUID: "G-FILTERED", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 2000, Text: "must not remain on disk", Service: "SMS", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsert messages: %v", err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`, testSQLLoginID, now-int64(time.Hour/time.Millisecond)); err != nil {
+		t.Fatalf("age messages: %v", err)
+	}
+
+	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
+	}
+	if scrubbed != 1 {
+		t.Fatalf("scrubbed rows = %d, want the one permanently filtered row", scrubbed)
+	}
+	for _, tc := range []struct {
+		guid      string
+		wantText  bool
+		wantScrub bool
+	}{
+		{guid: "G-UNFILTERED", wantText: true, wantScrub: false},
+		{guid: "G-FILTERED", wantText: false, wantScrub: true},
+	} {
+		var text sql.NullString
+		var bodyScrubbed bool
+		if err := db.QueryRow(ctx, `SELECT text, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`, testSQLLoginID, tc.guid).Scan(&text, &bodyScrubbed); err != nil {
+			t.Fatalf("read %s: %v", tc.guid, err)
+		}
+		if text.Valid != tc.wantText || bodyScrubbed != tc.wantScrub {
+			t.Errorf("%s text valid=%v scrubbed=%v, want %v/%v", tc.guid, text.Valid, bodyScrubbed, tc.wantText, tc.wantScrub)
+		}
+	}
+
+	ctxOptIn, dbOptIn, storeOptIn := scrubRaceFixture(t)
+	storeOptIn.bridgeFiltered = true
+	if err := storeOptIn.upsertChatBatch(ctxOptIn, []cloudChatUpsertRow{{
+		CloudChatID: "C-OPTED-IN", PortalID: "p-opted-in", Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsert opted-in chat: %v", err)
+	}
+	if err := storeOptIn.upsertMessageBatch(ctxOptIn, []cloudMessageRow{{
+		GUID: "G-OPTED-IN", CloudChatID: "C-OPTED-IN", PortalID: "p-opted-in",
+		TimestampMS: 1000, Text: "eligible by configuration", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert opted-in message: %v", err)
+	}
+	if _, err := dbOptIn.Exec(ctxOptIn, `UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`, testSQLLoginID, now-int64(time.Hour/time.Millisecond)); err != nil {
+		t.Fatalf("age opted-in message: %v", err)
+	}
+	if scrubbed, err := storeOptIn.scrubBridgedBodies(ctxOptIn, "test-bridge", time.Minute, nil); err != nil {
+		t.Fatalf("scrub opted-in filtered row: %v", err)
+	} else if scrubbed != 0 {
+		t.Fatalf("scrubbed %d opted-in filtered rows, want 0 before delivery", scrubbed)
+	}
+	var optedInText sql.NullString
+	if err := dbOptIn.QueryRow(ctxOptIn, `SELECT text FROM cloud_message WHERE login_id=$1 AND guid='G-OPTED-IN'`, testSQLLoginID).Scan(&optedInText); err != nil {
+		t.Fatalf("read opted-in row: %v", err)
+	}
+	if !optedInText.Valid {
+		t.Fatal("opted-in filtered row was scrubbed before it could be delivered")
+	}
+}
+
 func TestScrubPendingGateIgnoresStaleDeletedOrFilteredDoneSiblings(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
