@@ -207,6 +207,43 @@ func TestGetSyncStatusOptInStillExcludesDeletedChatMessages(t *testing.T) {
 	}
 }
 
+func TestGetSyncStatusSyntheticRowsPreserveLegacyFallback(t *testing.T) {
+	const (
+		bridgeID = "corten"
+		loginID  = "login-synthetic-legacy"
+		portalID = "tel:+15550000096"
+	)
+	ctx := context.Background()
+	db := newSyncStatusParityDB(t)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat
+			(login_id, cloud_chat_id, portal_id, is_filtered, deleted, display_name)
+		VALUES ($1, 'synthetic:' || $2, $2, 0, 0, ''),
+		       ($1, 'recycle:' || $2, $2, 0, 0, '')
+	`, loginID, portalID); err != nil {
+		t.Fatalf("insert pseudo chats: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message
+			(login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+			 text, subject, deleted, tapback_type, attachments_json, record_name,
+			 body_scrubbed, has_body)
+		VALUES ($1, 'legacy-guid', 'legacy-chat-without-metadata', $2, 1000,
+			'tel:+15550001', 0, 'legacy history', '', 0, NULL, '', 'legacy-record', 0, 1)
+	`, loginID, portalID); err != nil {
+		t.Fatalf("insert legacy message: %v", err)
+	}
+
+	report, err := GetSyncStatus(ctx, db, SyncStatusOptions{BridgeID: bridgeID, LoginID: loginID})
+	if err != nil {
+		t.Fatalf("GetSyncStatus: %v", err)
+	}
+	if report.CandidateMessages != 1 || report.FilteredChatMessages != 0 || report.UnavailableMessages != 0 || report.DeliverableMessages != 1 || report.PendingMessages() != 1 {
+		t.Fatalf("synthetic legacy counts = candidates %d, filtered %d, unavailable %d, deliverable %d, pending %d; want 1, 0, 0, 1, 1",
+			report.CandidateMessages, report.FilteredChatMessages, report.UnavailableMessages, report.DeliverableMessages, report.PendingMessages())
+	}
+}
+
 func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 	const (
 		bridgeID = "corten"
@@ -266,8 +303,8 @@ func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 		VALUES ($1, 'no-body-guid', 'chat-no-body', 'no-body',
 		 4000, 'tel:+15550001', 0, 'participants changed', '', 0, NULL, '', 'record-3', 0, 0)`, loginID)
 
-	// A restore orphan has neither a live chat row nor the CloudKit chat_id the
-	// bridge would need to rehydrate one. It must not remain pending forever.
+	// A legacy row with neither a live chat row nor a CloudKit chat_id still uses
+	// the connector's no-metadata fallback and therefore remains pending.
 	exec(`INSERT INTO cloud_message
 		(login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
 		 text, subject, deleted, tapback_type, attachments_json, record_name,
@@ -310,17 +347,17 @@ func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 	}{
 		{"candidates", r.CandidateMessages, 6},
 		{"filtered", r.FilteredChatMessages, 1},
-		{"unavailable", r.UnavailableMessages, 2},
+		{"unavailable", r.UnavailableMessages, 1},
 		{"empty/system", r.EmptySystemMessages, 2},
-		{"deliverable", r.DeliverableMessages, 1},
+		{"deliverable", r.DeliverableMessages, 2},
 		{"delivered", r.DeliveredMessages, 1},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
 		}
 	}
-	if r.PendingMessages() != 0 {
-		t.Errorf("PendingMessages = %d, want 0", r.PendingMessages())
+	if r.PendingMessages() != 1 {
+		t.Errorf("PendingMessages = %d, want 1 for the legacy no-metadata row", r.PendingMessages())
 	}
 	if r.ChatsFiltered != 0 {
 		t.Errorf("ChatsFiltered = %d, want 0 for a deleted filtered sibling", r.ChatsFiltered)

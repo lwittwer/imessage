@@ -271,6 +271,8 @@ func messageBridgeableSQL(messageCol, loginParam, bridgeFilteredParam string) st
 		    SELECT 1 FROM cloud_chat live
 		    WHERE live.login_id=` + loginParam + `
 		      AND live.portal_id=` + messageCol + `.portal_id
+		      AND live.cloud_chat_id NOT LIKE 'synthetic:%'
+		      AND live.cloud_chat_id NOT LIKE 'recycle:%'
 		      AND live.deleted=FALSE
 		  )
 		)`
@@ -537,21 +539,13 @@ func statusMessageContentfulSQL(alias string, db *dbutil.Database) string {
 				 ))) THEN 1 ELSE 0 END`
 }
 
-// statusMessageUnavailableSQL identifies rows that cannot be recovered by a
-// future local delivery attempt. A CloudKit chat_id is enough to keep a
-// recycle-bin-only message temporarily eligible; a row with neither that
-// identifier nor a live cloud_chat record is a permanent orphan.
+// statusMessageUnavailableSQL identifies scrubbed rows that have no bridgev2
+// delivery evidence. Unscrubbed legacy rows without chat metadata remain
+// deliverable: that is the same compatibility fallback the connector readers
+// use, so classifying them as unavailable would hide active pending work.
 func statusMessageUnavailableSQL(alias string) string {
-	return `CASE WHEN (
-			(COALESCE(` + alias + `.body_scrubbed, FALSE)=TRUE AND ` + alias + `.delivered=0)
-			OR
-			(COALESCE(` + alias + `.chat_id, '') = '' AND NOT EXISTS (
-				SELECT 1 FROM cloud_chat orphan_chat
-				WHERE orphan_chat.login_id=$1
-				  AND orphan_chat.portal_id=` + alias + `.portal_id
-				  AND orphan_chat.deleted=FALSE
-			))
-		) THEN 1 ELSE 0 END`
+	return `CASE WHEN COALESCE(` + alias + `.body_scrubbed, FALSE)=TRUE
+			AND ` + alias + `.delivered=0 THEN 1 ELSE 0 END`
 }
 
 // readMessageCounts is the heart of the report: one pass over cloud_message

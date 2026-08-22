@@ -9116,17 +9116,13 @@ func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logg
 	if c.cloudStore == nil || c.client == nil {
 		return false
 	}
-	// Captured before the clear so the failure path can re-arm exactly the rows
-	// this attempt touched: clearBodyScrubByPortalID stamps updated_ts=now on
-	// every row it clears, and any row CloudKit does repopulate gets content.
-	clearedFrom := time.Now().UnixMilli()
-	cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID)
+	clearedAttempt, err := c.cloudStore.clearBodyScrubForRehydrate(ctx, portalID)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Rehydrate: failed to clear body_scrubbed, not attempting CloudKit re-fetch")
 		return false
 	}
-	log.Info().Int("cleared", cleared).Str("portal_id", logSafeHandle(portalID)).
+	log.Info().Int("cleared", len(clearedAttempt.Rows)).Str("portal_id", logSafeHandle(portalID)).
 		Msg("Rehydrate: cleared body_scrubbed, re-fetching portal from CloudKit")
 
 	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -9144,7 +9140,7 @@ func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logg
 	// context.Background() on purpose — a cancelled ctx (shutdown, or the
 	// timeout above firing) is a likely reason to be here, and privacy state
 	// must not be left degraded because the recovery attempt was interrupted.
-	if rescrubbed, rescrubErr := c.cloudStore.rescrubEmptyRowsSince(context.Background(), portalID, clearedFrom); rescrubErr != nil {
+	if rescrubbed, rescrubErr := c.cloudStore.rescrubClearedRows(context.Background(), portalID, clearedAttempt); rescrubErr != nil {
 		log.Warn().Err(rescrubErr).Str("portal_id", logSafeHandle(portalID)).
 			Msg("Rehydrate: failed to restore body_scrubbed on rows CloudKit did not repopulate")
 	} else if rescrubbed > 0 {

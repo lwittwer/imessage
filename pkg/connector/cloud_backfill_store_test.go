@@ -431,6 +431,57 @@ func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 	}
 }
 
+func TestSyntheticChatRowsPreserveLegacyMessageFallback(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const portalID = "tel:+15550000096"
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "legacy-message", RecordName: "legacy-record", CloudChatID: "legacy-chat-without-metadata",
+		PortalID: portalID, TimestampMS: 1000, Sender: "tel:+15551111111", Text: "legacy history", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+	store.markForwardBackfillDone(ctx, portalID)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, display_name, deleted, created_ts)
+		VALUES ($1, 'recycle:' || $2, $2, '', FALSE, $3)
+	`, testSQLLoginID, portalID, int64(1)); err != nil {
+		t.Fatalf("insert recycle row: %v", err)
+	}
+
+	var pseudoRows int
+	if err := db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_chat
+		WHERE login_id=$1 AND portal_id=$2
+		  AND (cloud_chat_id LIKE 'synthetic:%' OR cloud_chat_id LIKE 'recycle:%')
+	`, testSQLLoginID, portalID).Scan(&pseudoRows); err != nil {
+		t.Fatalf("count pseudo rows: %v", err)
+	}
+	if pseudoRows != 2 {
+		t.Fatalf("pseudo cloud_chat rows = %d, want 2", pseudoRows)
+	}
+
+	rows, err := store.listLatestMessages(ctx, portalID, 10)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "legacy-message" {
+		t.Fatalf("legacy rows after synthetic marker = %#v, want message preserved", rows)
+	}
+	candidates, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].PortalID != portalID || candidates[0].ContentfulCount != 1 {
+		t.Fatalf("legacy candidates after synthetic marker = %#v, want one contentful portal", candidates)
+	}
+}
+
 func TestAttachmentGUIDPlaceholdersCountAsContentfulMessages(t *testing.T) {
 	ctx := context.Background()
 	rawDB, err := sql.Open("sqlite3", ":memory:")

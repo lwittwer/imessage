@@ -3173,6 +3173,8 @@ func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 						SELECT 1 FROM cloud_chat live
 						WHERE live.login_id=$1
 						  AND live.portal_id=%s
+						  AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+						  AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
 						  AND live.deleted=FALSE
 					)
 				)
@@ -3607,36 +3609,138 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	return int(n), nil
 }
 
-// rescrubEmptyRowsSince re-sets body_scrubbed on rows that a rehydrate attempt
-// cleared but CloudKit did not repopulate. It is the undo half of
-// clearBodyScrubByPortalID: clearing the flag drops the sticky-NULL protection
-// in upsertMessageBatch's ON CONFLICT clause, so leaving it cleared after a
-// failed re-fetch would let some later CloudKit sync quietly refill plaintext
-// for content that was already scrubbed once. Nothing would clear it again —
-// scrubBridgedBodies only touches rows with a bridgev2 `message` row, and these
-// rows have none — so the plaintext would simply stay.
-//
-// sinceMS is read before the clear, and the clear stamps updated_ts=now on every
-// row it touches, so `updated_ts >= sinceMS` scopes this to that attempt.
-// Rows CloudKit did repopulate have content and are excluded by the empty-body
-// test, so a successful restore is never re-scrubbed. Rows that were empty for
-// other reasons (system records, never-scrubbed rows) are older than sinceMS and
-// stay untouched — this must not invent scrub flags for rows the scrubber never
-// chose.
-func (s *cloudBackfillStore) rescrubEmptyRowsSince(ctx context.Context, portalID string, sinceMS int64) (int64, error) {
-	result, err := s.db.Exec(ctx, `
-		UPDATE cloud_message SET body_scrubbed=TRUE
-		WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=FALSE
-		  AND updated_ts >= $3
-		  AND COALESCE(text, '') = ''
-		  AND COALESCE(subject, '') = ''
-		  AND COALESCE(attachments_json, '') = ''
-	`, s.loginID, portalID, sinceMS)
+type rehydrateScrubRow struct {
+	GUID      string
+	UpdatedTS int64
+}
+
+type rehydrateScrubAttempt struct {
+	Rows     []rehydrateScrubRow
+	MarkerTS int64
+}
+
+// clearBodyScrubForRehydrate atomically captures and clears the exact rows
+// changed by this automatic recovery attempt. MarkerTS distinguishes retained
+// attachment metadata from a later CloudKit upsert of the same GUID: every
+// upsert replaces updated_ts, while a missed row keeps the marker. The marker is
+// one second old so it cannot collide with a concurrent current-time upsert,
+// but remains inside the scrubber's five-minute grace period.
+func (s *cloudBackfillStore) clearBodyScrubForRehydrate(ctx context.Context, portalID string) (rehydrateScrubAttempt, error) {
+	tx, err := s.beginTx(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, err)
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to begin body scrub clear for portal %s: %w", portalID, err)
 	}
-	n, _ := result.RowsAffected()
-	return n, nil
+	defer tx.Rollback()
+
+	selectParams := strings.Split(sqlPlaceholders(s.db, 2), ", ")
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT guid, updated_ts FROM cloud_message
+		WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+	`, selectParams[0], selectParams[1]), s.loginID, portalID)
+	if err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+	}
+	attempt := rehydrateScrubAttempt{MarkerTS: time.Now().Add(-time.Second).UnixMilli()}
+	for rows.Next() {
+		var row rehydrateScrubRow
+		if err = rows.Scan(&row.GUID, &row.UpdatedTS); err != nil {
+			rows.Close()
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUID for portal %s: %w", portalID, err)
+		}
+		attempt.Rows = append(attempt.Rows, row)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to read cleared body GUIDs for portal %s: %w", portalID, err)
+	}
+	if err = rows.Close(); err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to close cleared body GUIDs for portal %s: %w", portalID, err)
+	}
+	const chunkSize = 500
+	for start := 0; start < len(attempt.Rows); start += chunkSize {
+		end := min(start+chunkSize, len(attempt.Rows))
+		params := strings.Split(sqlPlaceholders(s.db, 3+end-start), ", ")
+		args := make([]any, 0, 3+end-start)
+		args = append(args, attempt.MarkerTS, s.loginID, portalID)
+		for _, row := range attempt.Rows[start:end] {
+			args = append(args, row.GUID)
+		}
+		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=%s
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=TRUE
+			  AND guid IN (%s)
+		`, params[0], params[1], params[2], strings.Join(params[3:], ",")), args...); err != nil {
+			return rehydrateScrubAttempt{}, fmt.Errorf("failed to clear body_scrubbed for portal %s: %w", portalID, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return rehydrateScrubAttempt{}, fmt.Errorf("failed to commit body scrub clear for portal %s: %w", portalID, err)
+	}
+	return attempt, nil
+}
+
+// rescrubClearedRows re-sets body_scrubbed only on exact rows this automatic
+// rehydrate attempt cleared and no CloudKit writer restored with deliverable
+// content. A row still carrying MarkerTS was not upserted, so retained old
+// attachment metadata does not exempt it. A concurrently upserted row is
+// re-armed only when text, subject, and attachment metadata are all empty.
+func (s *cloudBackfillStore) rescrubClearedRows(ctx context.Context, portalID string, attempt rehydrateScrubAttempt) (int64, error) {
+	if len(attempt.Rows) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin restoring body_scrubbed for portal %s: %w", portalID, err)
+	}
+	defer tx.Rollback()
+	const chunkSize = 200
+	var total int64
+	for start := 0; start < len(attempt.Rows); start += chunkSize {
+		end := min(start+chunkSize, len(attempt.Rows))
+		chunk := attempt.Rows[start:end]
+		paramCount := 3*len(chunk) + 4
+		params := strings.Split(sqlPlaceholders(s.db, paramCount), ", ")
+		args := make([]any, 0, paramCount)
+		caseSQL := make([]string, 0, len(chunk))
+		for i := range chunk {
+			caseSQL = append(caseSQL, fmt.Sprintf("WHEN %s THEN %s", params[2*i], params[2*i+1]))
+			args = append(args, chunk[i].GUID, chunk[i].UpdatedTS)
+		}
+		whereStart := 2 * len(chunk)
+		args = append(args, attempt.MarkerTS, s.loginID, portalID, attempt.MarkerTS)
+		guidParams := params[whereStart+4:]
+		for i := range chunk {
+			args = append(args, chunk[i].GUID)
+		}
+		result, execErr := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE cloud_message
+			SET body_scrubbed=TRUE,
+			    updated_ts=CASE
+			      WHEN updated_ts=%s THEN CASE guid %s ELSE updated_ts END
+			      ELSE updated_ts
+			    END
+			WHERE login_id=%s AND portal_id=%s AND body_scrubbed=FALSE
+			  AND (
+			    updated_ts=%s
+			    OR (
+			      COALESCE(text, '') = ''
+			      AND COALESCE(subject, '') = ''
+			      AND COALESCE(attachments_json, '') = ''
+			    )
+			  )
+			  AND guid IN (%s)
+		`, params[whereStart], strings.Join(caseSQL, " "), params[whereStart+1], params[whereStart+2], params[whereStart+3], strings.Join(guidParams, ",")), args...)
+		if execErr != nil {
+			return 0, fmt.Errorf("failed to restore body_scrubbed for portal %s: %w", portalID, execErr)
+		}
+		n, _ := result.RowsAffected()
+		total += n
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit restored body_scrubbed for portal %s: %w", portalID, err)
+	}
+	return total, nil
 }
 
 // clearAllBodyScrub drops the body_scrubbed flag from every non-deleted row
