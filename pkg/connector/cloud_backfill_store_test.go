@@ -2,15 +2,22 @@ package connector
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"testing"
 
 	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
-	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/util/dbutil"
-	"maunium.net/go/mautrix/bridgev2/networkid"
 )
+
+func newTestCloudBackfillStore(t *testing.T, bridgeFiltered ...bool) (*dbutil.Database, *cloudBackfillStore) {
+	t.Helper()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID, bridgeFiltered...)
+	if err := store.ensureSchema(context.Background()); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	return db, store
+}
 
 func TestStrandedBackfillReconciliationQueryUsesPostgresBoolean(t *testing.T) {
 	if !strings.Contains(strandedBackfillReconciliationQuery, "bt.is_done=TRUE") {
@@ -23,25 +30,13 @@ func TestStrandedBackfillReconciliationQueryUsesPostgresBoolean(t *testing.T) {
 
 func TestSetSyncStateErrorStoresSafeClassification(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
 	const rawError = "CloudKit request https://example.invalid/records?token=secret failed for record-name"
-	if err = store.setSyncStateError(ctx, cloudZoneChats, rawError); err != nil {
+	if err := store.setSyncStateError(ctx, cloudZoneChats, rawError); err != nil {
 		t.Fatal(err)
 	}
 	var got string
-	if err = db.QueryRow(ctx, `SELECT last_error FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`, store.loginID, cloudZoneChats).Scan(&got); err != nil {
+	if err := db.QueryRow(ctx, `SELECT last_error FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`, store.loginID, cloudZoneChats).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got == rawError || got != "cloudkit_sync_failed" {
@@ -51,20 +46,8 @@ func TestSetSyncStateErrorStoresSafeClassification(t *testing.T) {
 
 func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
+	var err error
 
 	now := int64(1000)
 	if _, err = db.Exec(ctx, `
@@ -214,20 +197,8 @@ func TestListPortalIDsWithNewestTimestampIncludesChatOnlyPortals(t *testing.T) {
 
 func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defaultStore := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = defaultStore.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, defaultStore := newTestCloudBackfillStore(t)
+	var err error
 	const (
 		portalID = "tel:+15550000099"
 		now      = int64(1000)
@@ -253,7 +224,7 @@ func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T
 		t.Fatalf("default filtered-chat candidates = %#v, want none", got)
 	}
 
-	optInStore := newCloudBackfillStore(db, networkid.UserLoginID("login"), true)
+	optInStore := newCloudBackfillStore(db, testSQLLoginID, true)
 	got, err := optInStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
 	if err != nil {
 		t.Fatal(err)
@@ -265,11 +236,7 @@ func TestListPortalIDsWithNewestTimestampBridgesFilteredWhenOptedIn(t *testing.T
 
 func TestListPortalIDsWithNewestTimestampIncludesFilteredMetadataWhenOptedIn(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	defaultStore := newCloudBackfillStore(db, testSQLLoginID)
-	if err := defaultStore.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	db, defaultStore := newTestCloudBackfillStore(t)
 
 	const (
 		portalID = "gid:filtered-metadata"
@@ -300,11 +267,7 @@ func TestListPortalIDsWithNewestTimestampIncludesFilteredMetadataWhenOptedIn(t *
 
 func TestOptedInFilteredMessageReadersExcludeDeletedChatSources(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID, true)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	db, store := newTestCloudBackfillStore(t, true)
 
 	const portalID = "tel:+15550000097"
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
@@ -346,11 +309,7 @@ func TestOptedInFilteredMessageReadersExcludeDeletedChatSources(t *testing.T) {
 
 func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	_, store := newTestCloudBackfillStore(t)
 
 	const portalID = "tel:+15550000098"
 	now := int64(1000)
@@ -433,11 +392,7 @@ func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 
 func TestLegacyUnknownSourcesRemainReadableWithOnlyUnfilteredSiblings(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	_, store := newTestCloudBackfillStore(t)
 
 	const portalID = "tel:+15550000097"
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
@@ -464,11 +419,7 @@ func TestLegacyUnknownSourcesRemainReadableWithOnlyUnfilteredSiblings(t *testing
 
 func TestMessageSourceRemappedToAnotherPortalFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	_, store := newTestCloudBackfillStore(t)
 
 	const oldPortal = "tel:+15550000094"
 	const newPortal = "tel:+15550000095"
@@ -496,11 +447,7 @@ func TestMessageSourceRemappedToAnotherPortalFailsClosed(t *testing.T) {
 
 func TestRehydrateChatIdentifierUsesNewestEligibleSibling(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	db, store := newTestCloudBackfillStore(t)
 
 	const portalID = "gid:rehydrate-selector"
 	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
@@ -521,11 +468,7 @@ func TestRehydrateChatIdentifierUsesNewestEligibleSibling(t *testing.T) {
 
 func TestSyntheticChatRowsPreserveLegacyMessageFallback(t *testing.T) {
 	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
+	db, store := newTestCloudBackfillStore(t)
 
 	const portalID = "tel:+15550000096"
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
@@ -572,20 +515,8 @@ func TestSyntheticChatRowsPreserveLegacyMessageFallback(t *testing.T) {
 
 func TestAttachmentGUIDPlaceholdersCountAsContentfulMessages(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
+	var err error
 
 	attachmentsJSON := cloudAttachmentGUIDPlaceholdersJSON([]string{"att-guid-1"})
 	if attachmentsJSON == "" {
@@ -654,20 +585,8 @@ func TestCloudRowToBackfillMessagesSkipsPaddedRenameNotice(t *testing.T) {
 
 func TestPortalsFullyBackfilledNoNewContentChecksChatMetadata(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
+	var err error
 	if _, err = db.Exec(ctx, `
 		CREATE TABLE backfill_task (
 			user_login_id TEXT NOT NULL,
@@ -711,20 +630,8 @@ func TestPortalsFullyBackfilledNoNewContentChecksChatMetadata(t *testing.T) {
 
 func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
+	var err error
 
 	now := int64(1000)
 	if _, err = db.Exec(ctx, `
@@ -803,20 +710,8 @@ func TestListPortalIDsWithNewestTimestampRespectsInitialBackfillCap(t *testing.T
 
 func TestListForwardMessagesByWriteActivityFindsLateArrivalsBeforeAnchor(t *testing.T) {
 	ctx := context.Background()
-	rawDB, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rawDB.Close() })
-
-	db, err := dbutil.NewWithDB(rawDB, "sqlite3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newCloudBackfillStore(db, networkid.UserLoginID("login"))
-	if err = store.ensureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	db, store := newTestCloudBackfillStore(t)
+	var err error
 	if _, err = db.Exec(ctx, `
 		CREATE TABLE backfill_task (
 			user_login_id TEXT NOT NULL,

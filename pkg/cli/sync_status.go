@@ -8,8 +8,8 @@
 // importing?" — is most interesting when the bridge is wedged, stopped, or has
 // not been added to a Matrix client yet.
 //
-// The report currently lives in pkg/connector alongside the schema it reads;
-// a later, separately reviewed feature extracts it from the Rust/CGO package.
+// The report lives in pkg/connector alongside the schema it reads. Both entry
+// points call that implementation directly so classification cannot drift.
 
 package cli
 

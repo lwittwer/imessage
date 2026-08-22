@@ -126,6 +126,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
+| `corten-matrix sync-status` / `sync-status 1` | Read a persisted backfill report for the first / second account without needing the daemon. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If a unit is already there it refuses and tells you to use `uninstall-service` first. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
 | `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
@@ -223,6 +224,7 @@ To abort an interactive command (a picker waiting for your reply), type `cancel`
 | `start-chat` | Open a new iMessage DM. With no arguments, the bot walks you through phone vs. email and explains the country-code format. With an argument (`start-chat +15551234567` or `start-chat someone@icloud.com`) it skips the picker. |
 | `contacts` | Search your synced contacts by name (iCloud, external CardDAV, or local macOS Contacts depending on `backfill_source` and `carddav` settings) and reply with a number to open a chat. Different from `start-chat` — use this when you don't remember the number/email. Alias: `find`. |
 | `restore-chat` | List iMessage chats in the recycle bin. Reply with a number to bring one back, including its history. |
+| `sync-status` | Show CloudKit zone state, ingested chats, bridgeable/delivered/pending messages, excluded rows, and backfill queue progress. |
 | `logout` | Sign out of iMessage. Lists active handles, you reply with a number (or `all`). The bot then walks you through the manual step at `appleid.apple.com → Devices` to fully revoke the bridge from Apple's servers. |
 | `help` | Full command list, grouped by section. |
 
@@ -402,6 +404,24 @@ If an older install already created duplicate Matrix rooms, fixing identity
 selection cannot merge their server-side history. Follow
 [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery) only
 after verifying the affected rooms and reading the destructive-action warning.
+
+### Inspecting backfill status
+
+`sync-status` is a read-only diagnostic. In the management room, run
+`sync-status` (or `syncstatus`) to see persisted CloudKit zone state, ingested
+chats, bridgeable versus delivered messages, rows excluded as
+filtered/system/capped, and queued backfill tasks. From the host,
+`corten-matrix sync-status` (or `sync-status 1` for the second account) reads
+that account's `config.yaml` and database directly, so it remains useful when
+the daemon is stopped or wedged and does not need a Matrix connection.
+
+The host command reports persisted rows only. It cannot know whether a sync is
+currently in flight or whether the homeserver supports Beeper batch sending;
+those fields are available only to the management-room command. A 100%
+delivery percentage means every currently cached, bridgeable CloudKit message
+has a matching Matrix bridge row. It is not a guarantee about future Apple
+events, StatusKit changes, or reactions, and the report does not run migrations
+or write progress counters.
 
 ## Privacy
 

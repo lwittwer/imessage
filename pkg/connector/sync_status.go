@@ -19,6 +19,17 @@ import (
 	"maunium.net/go/mautrix/bridgev2/commands"
 )
 
+const (
+	// Keep persisted CloudKit error details out of both terminal and
+	// management-room output. The value may contain Apple handles, URLs, or
+	// transport credentials.
+	safeZoneErrorMessage = "last sync attempt failed (details redacted)"
+	// This is the same set of whitespace characters stripped by
+	// cloudBackfillableEventWhere. Keeping the report's content predicate in
+	// lockstep prevents group rename/system rows from becoming pending work.
+	sqliteTrimChars = "' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288)"
+)
+
 // sync-status answers the one question users keep filing issues about: "is my
 // backfill actually finished, and if not, what is stuck?"
 //
@@ -47,7 +58,9 @@ type ZoneSyncStatus struct {
 	// HasError records only whether the last attempt failed. Persisted driver
 	// and CloudKit error text may contain account identifiers or URLs, so it is
 	// never retained in this report.
-	HasError  bool
+	HasError bool
+	// LastError is retained as a deprecated compatibility field for callers
+	// that construct reports themselves. Format never renders its contents.
 	LastError string
 	UpdatedAt *time.Time
 }
@@ -99,6 +112,10 @@ type SyncStatusReport struct {
 	FilteredChatMessages int
 	EmptySystemMessages  int
 	BeyondCapMessages    int
+	// UnavailableMessages are scrubbed rows with no matching bridgev2 message
+	// evidence. They cannot be delivered from the local persisted state and are
+	// excluded from the pending denominator rather than reported forever.
+	UnavailableMessages int
 
 	// MessageCap is the effective Backfill.MaxInitialMessages, or 0 when
 	// backfill is uncapped.
@@ -162,7 +179,7 @@ func (r *SyncStatusReport) PendingMessages() int {
 
 // UnbridgeableMessages is the total of the three not-deliverable buckets.
 func (r *SyncStatusReport) UnbridgeableMessages() int {
-	return r.FilteredChatMessages + r.EmptySystemMessages + r.BeyondCapMessages
+	return r.FilteredChatMessages + r.EmptySystemMessages + r.BeyondCapMessages + r.UnavailableMessages
 }
 
 // DeliveredPercent is delivered/deliverable as a percentage, 100 when there is
@@ -215,12 +232,53 @@ func portalBridgeableSQL(portalCol, loginParam, bridgeFilteredParam string) stri
 		OR NOT EXISTS (
 		  SELECT 1 FROM cloud_chat fc
 		  WHERE fc.login_id=` + loginParam + ` AND fc.portal_id=` + portalCol + `
+		    AND fc.deleted=FALSE
 		    AND COALESCE(fc.is_filtered, 0) <> 0
 		)
 		OR EXISTS (
 		  SELECT 1 FROM cloud_chat fc
 		  WHERE fc.login_id=` + loginParam + ` AND fc.portal_id=` + portalCol + `
 		    AND COALESCE(fc.is_filtered, 0) = 0 AND fc.deleted = FALSE
+		)`
+}
+
+// messageBridgeableSQL applies the filtered-chat decision to the source chat
+// of one cloud_message row. A portal can contain multiple Apple chat siblings
+// (for example iMessage and SMS) with different filtered state, so the
+// portal-level predicate above is not enough for message counts: it would let
+// a filtered sibling's message through whenever another sibling is unfiltered.
+//
+// A known filtered, deleted, or remapped source fails closed. Empty or unknown
+// chat IDs retain the legacy fallback only when the portal has no live
+// filtered sibling. Synthetic/recycle metadata rows are excluded from that
+// sibling check so they cannot disable the compatibility fallback.
+func messageBridgeableSQL(messageCol, loginParam, bridgeFilteredParam string) string {
+	return `EXISTS (
+		  SELECT 1 FROM cloud_chat matched
+		  WHERE matched.login_id=` + loginParam + `
+		    AND LOWER(matched.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		    AND matched.portal_id=` + messageCol + `.portal_id
+		    AND matched.deleted=FALSE
+		    AND (` + bridgeFilteredParam + ` OR COALESCE(matched.is_filtered, 0)=0)
+		)
+		OR (
+		  NOT EXISTS (
+		    SELECT 1 FROM cloud_chat source
+		    WHERE source.login_id=` + loginParam + `
+		      AND LOWER(source.cloud_chat_id)=LOWER(` + messageCol + `.chat_id)
+		  )
+		  AND (
+		    ` + bridgeFilteredParam + `
+		    OR NOT EXISTS (
+		      SELECT 1 FROM cloud_chat live
+		      WHERE live.login_id=` + loginParam + `
+		        AND live.portal_id=` + messageCol + `.portal_id
+		        AND SUBSTR(live.cloud_chat_id, 1, 10) <> 'synthetic:'
+		        AND SUBSTR(live.cloud_chat_id, 1, 8) <> 'recycle:'
+		        AND live.deleted=FALSE
+		        AND COALESCE(live.is_filtered, 0) <> 0
+		    )
+		  )
 		)`
 }
 
@@ -433,14 +491,61 @@ func (r *SyncStatusReport) readChatCounts(ctx context.Context, db *dbutil.Databa
 	return nil
 }
 
+func normalizedStatusTextSQL(column string, db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return "TRIM(COALESCE(" + column + ", ''))"
+	}
+	return "TRIM(REPLACE(COALESCE(" + column + ", ''), char(65532), ''), " + sqliteTrimChars + ")"
+}
+
+// statusMessageContentfulSQL mirrors cloudBackfillableEventWhere's durable
+// delivery predicate while accounting for already-scrubbed delivered rows. A
+// scrubbed row is contentful only when its matching bridgev2 message row is
+// present; otherwise it is an orphaned privacy tombstone and must not remain
+// pending forever. has_body is intentionally not checked: restored Apple
+// messages can carry real content while that legacy flag remains false.
+func statusMessageContentfulSQL(alias string, db *dbutil.Database) string {
+	text := normalizedStatusTextSQL(alias+".text", db)
+	subject := normalizedStatusTextSQL(alias+".subject", db)
+	instr := sqlInstrFunc(db)
+	return `CASE WHEN (
+			(COALESCE(` + alias + `.body_scrubbed, FALSE)=TRUE
+			 AND ` + alias + `.delivered=1)
+			OR
+			(COALESCE(` + alias + `.body_scrubbed, FALSE)=FALSE
+			 AND (` + alias + `.is_from_me=TRUE
+			      OR COALESCE(` + alias + `.sender, '') <> ''
+			      OR (` + alias + `.portal_id NOT LIKE 'gid:%'
+			          AND ` + instr + `(` + alias + `.portal_id, ',') = 0))
+			 AND (` + text + ` <> '' OR ` + subject + ` <> ''
+			      OR COALESCE(` + alias + `.attachments_json, '') <> '')
+			 AND NOT EXISTS (
+				SELECT 1 FROM cloud_chat sc
+				WHERE sc.login_id=$1 AND sc.portal_id=` + alias + `.portal_id
+				  AND sc.deleted=FALSE
+				  AND COALESCE(sc.display_name, '') <> ''
+				  AND ` + text + ` = ` + normalizedStatusTextSQL("sc.display_name", db) + `
+				  AND COALESCE(` + alias + `.attachments_json, '') = ''
+				  AND ` + alias + `.tapback_type IS NULL
+				 ))) THEN 1 ELSE 0 END`
+}
+
+// statusMessageUnavailableSQL identifies scrubbed rows that have no bridgev2
+// delivery evidence. Unscrubbed legacy rows without chat metadata retain the
+// connector's compatibility fallback and remain deliverable.
+func statusMessageUnavailableSQL(alias string) string {
+	return `CASE WHEN COALESCE(` + alias + `.body_scrubbed, FALSE)=TRUE
+			AND ` + alias + `.delivered=0 THEN 1 ELSE 0 END`
+}
+
 // readMessageCounts is the heart of the report: one pass over cloud_message
 // that sorts every row into exactly one bucket.
 //
-// The buckets are evaluated in priority order — filtered chat, then empty /
-// system row, then beyond the cap, then deliverable — so they are disjoint and
-// sum to CandidateMessages. That ordering is what stops the same row being
-// both "not bridgeable" and "pending", which is how a percentage ends up
-// unable to reach 100%.
+// The buckets are evaluated in priority order — filtered chat, scrubbed or
+// unavailable row, empty/system row, beyond the cap, then deliverable — so
+// they are disjoint and sum to CandidateMessages. That ordering is what stops
+// the same row being both "not bridgeable" and "pending", which is how a
+// percentage ends up unable to reach 100%.
 //
 // Why each predicate is what it is:
 //
@@ -455,67 +560,86 @@ func (r *SyncStatusReport) readChatCounts(ctx context.Context, db *dbutil.Databa
 //     forever. They still take part in the ROW_NUMBER ranking below, because
 //     listLatestMessages does not filter them and they really do consume slots
 //     under a cap.
-//   - "Contentful" reuses the predicate from countBackfillableMessages, and
-//     body_scrubbed=TRUE counts as content: on a long-running bridge most
-//     successfully delivered rows have had their text nulled by the privacy
-//     scrubber, and treating those as empty would file the bulk of a healthy
-//     database under "not bridgeable". The second half of the clause is
-//     cloudRowToBackfillMessages' empty-sender drop (a not-from-me row with no
-//     sender is a system record and never becomes a Matrix event).
-//   - The filtered-chat test is portalBridgeableSQL, shared with the chat
-//     count so the two can never disagree about which conversations are
-//     skipped.
-//   - The cap window is the newest N rows per portal by (timestamp_ms DESC,
-//     guid DESC), which is listLatestMessages' exact ordering — that call, with
-//     count = MaxInitialMessages, IS the forward backfill at room creation.
-//     Ranking happens before the contentful filter because that is the order
-//     the store applies it in.
+//   - "Contentful" reuses cloudBackfillableEventWhere's durable predicate:
+//     body_scrubbed=TRUE counts as content only with bridgev2 delivery proof;
+//     otherwise it is unavailable rather than pending forever. Whitespace and
+//     object-replacement-only text is empty, group renames are metadata rows,
+//     and senderless direct-message rows retain the portal-ID fallback.
+//   - Chat counts use portalBridgeableSQL, while message counts use
+//     messageBridgeableSQL to correlate each row with its source chat. A
+//     mixed portal therefore remains ingested without leaking a filtered
+//     sibling's messages into the deliverable bucket.
+//   - The cap window is the newest N eligible source rows per portal by
+//     (timestamp_ms DESC, guid DESC), which is listLatestMessages' exact
+//     filtering and ordering. Filtered or deleted siblings do not consume a
+//     slot; readable reaction/system rows still do consume slots before the
+//     contentful filter is applied.
 func (r *SyncStatusReport) readMessageCounts(ctx context.Context, db *dbutil.Database) error {
+	contentful := statusMessageContentfulSQL("w", db)
+	unavailable := statusMessageUnavailableSQL("w")
 	query := `
 		SELECT
 			COUNT(*),
-			SUM(CASE WHEN w.portal_bridgeable = 0 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN w.portal_bridgeable = 1 AND w.contentful = 0 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN w.portal_bridgeable = 1 AND w.contentful = 1
-			              AND $3 > 0 AND w.rn > $3 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN w.portal_bridgeable = 1 AND w.contentful = 1
-			              AND ($3 = 0 OR w.rn <= $3) THEN 1 ELSE 0 END),
-			SUM(CASE WHEN w.portal_bridgeable = 1 AND w.contentful = 1
-			              AND ($3 = 0 OR w.rn <= $3) AND w.delivered = 1 THEN 1 ELSE 0 END)
+			SUM(CASE WHEN c.portal_bridgeable = 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 1 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			              AND $3 > 0 AND c.rn > $3 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			              AND ($3 = 0 OR c.rn <= $3) THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.portal_bridgeable = 1 AND c.unavailable = 0 AND c.contentful = 1
+			              AND ($3 = 0 OR c.rn <= $3) AND c.delivered = 1 THEN 1 ELSE 0 END)
 		FROM (
 			SELECT
-				CASE WHEN cm.tapback_type IS NOT NULL AND cm.tapback_type >= 2000
-					THEN 1 ELSE 0 END AS is_reaction,
-				CASE WHEN (COALESCE(cm.text, '') <> ''
-				           OR COALESCE(cm.attachments_json, '') <> ''
-				           OR cm.body_scrubbed = TRUE)
-				          AND (cm.body_scrubbed = TRUE
-				               OR cm.is_from_me = TRUE
-				               OR COALESCE(cm.sender, '') <> '')
-					THEN 1 ELSE 0 END AS contentful,
-				CASE WHEN ` + portalBridgeableSQL("cm.portal_id", "$1", "$4") + `
-					THEN 1 ELSE 0 END AS portal_bridgeable,
-				CASE WHEN UPPER(cm.guid) IN (` + deliveredGUIDSetSQL(db) + `
-				          ) THEN 1 ELSE 0 END AS delivered,
-				ROW_NUMBER() OVER (
-					PARTITION BY cm.portal_id
-					ORDER BY cm.timestamp_ms DESC, cm.guid DESC
-				) AS rn
-			FROM cloud_message cm
-			WHERE cm.login_id=$1 AND cm.deleted=FALSE AND cm.record_name <> ''
-			  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
-		) w
-		WHERE w.is_reaction = 0
+				w.*,
+				` + contentful + ` AS contentful,
+				` + unavailable + ` AS unavailable
+			FROM (
+				SELECT
+					s.*,
+					SUM(s.portal_bridgeable) OVER (
+						PARTITION BY s.portal_id
+						ORDER BY s.timestamp_ms DESC, s.guid DESC
+						ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+					) AS rn
+				FROM (
+					SELECT
+						cm.portal_id,
+						cm.timestamp_ms,
+						cm.guid,
+						cm.chat_id,
+						cm.is_from_me,
+						cm.sender,
+						cm.text,
+						cm.subject,
+						cm.attachments_json,
+						cm.tapback_type,
+						cm.body_scrubbed,
+						cm.has_body,
+						CASE WHEN cm.tapback_type IS NOT NULL AND cm.tapback_type >= 2000
+							THEN 1 ELSE 0 END AS is_reaction,
+						CASE WHEN ` + messageBridgeableSQL("cm", "$1", "$4") + `
+							THEN 1 ELSE 0 END AS portal_bridgeable,
+						CASE WHEN UPPER(cm.guid) IN (` + deliveredGUIDSetSQL(db) + `
+						          ) THEN 1 ELSE 0 END AS delivered
+					FROM cloud_message cm
+					WHERE cm.login_id=$1 AND cm.deleted=FALSE AND cm.record_name <> ''
+					  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
+				) s
+			) w
+		) c
+		WHERE c.is_reaction = 0
 	`
 	var candidates int
-	var filtered, empty, beyondCap, deliverable, delivered sql.NullInt64
+	var filtered, unavailableCount, empty, beyondCap, deliverable, delivered sql.NullInt64
 	err := db.QueryRow(ctx, query, r.LoginID, r.BridgeID, r.MessageCap, r.BridgeFilteredChats).
-		Scan(&candidates, &filtered, &empty, &beyondCap, &deliverable, &delivered)
+		Scan(&candidates, &filtered, &unavailableCount, &empty, &beyondCap, &deliverable, &delivered)
 	if err != nil {
 		return fmt.Errorf("failed to count messages: %w", err)
 	}
 	r.CandidateMessages = candidates
 	r.FilteredChatMessages = int(filtered.Int64)
+	r.UnavailableMessages = int(unavailableCount.Int64)
 	r.EmptySystemMessages = int(empty.Int64)
 	r.BeyondCapMessages = int(beyondCap.Int64)
 	r.DeliverableMessages = int(deliverable.Int64)
@@ -644,8 +768,8 @@ func (r *SyncStatusReport) Format() string {
 			continue
 		}
 		line := fmt.Sprintf("  %-12s last success: %s", zoneLabel(z.Zone), syncStatusAgo(z.LastSuccess))
-		if z.HasError {
-			line += "  ⚠️ last sync attempt failed (details redacted; inspect local logs)"
+		if z.HasError || z.LastError != "" {
+			line += "  ⚠️ " + safeZoneErrorMessage
 		}
 		sb.WriteString(line + "\n")
 	}
@@ -672,6 +796,9 @@ func (r *SyncStatusReport) Format() string {
 		}
 		if r.BeyondCapMessages > 0 {
 			sb.WriteString(fmt.Sprintf("  %d older than the newest %d per chat, which `max_initial_messages` caps delivery at\n", r.BeyondCapMessages, r.MessageCap))
+		}
+		if r.UnavailableMessages > 0 {
+			sb.WriteString(fmt.Sprintf("  %d scrubbed or orphaned rows with no safe local delivery path (details omitted)\n", r.UnavailableMessages))
 		}
 	}
 

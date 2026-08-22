@@ -3148,14 +3148,14 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 // cloudChatPortalSyncCandidateWhere matches chat metadata rows that should make
 // an existing portal eligible for a ChatResync. ContentfulCount remains zero for
 // these rows, so metadata-only chats cannot create brand-new empty Matrix rooms.
-func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string {
+func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered bool) string {
 	col := func(name string) string { return alias + "." + name }
 	where := fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
 		AND %s=FALSE
 	`, col("login_id"), col("portal_id"), col("portal_id"), col("deleted"))
-	if len(bridgeFiltered) == 0 || !bridgeFiltered[0] {
+	if !bridgeFiltered {
 		where += fmt.Sprintf("\t\tAND COALESCE(%s, 0) = 0\n", col("is_filtered"))
 	}
 	return where
@@ -3174,8 +3174,8 @@ func cloudChatPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) str
 // or unknown source from leaking across a mixed filtered/unfiltered sibling
 // set. A matching filtered, deleted, or remapped source never falls back: once
 // Apple has supplied an authoritative mapping, fail closed.
-func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
-	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+func cloudMessageChatFilterWhere(alias string, bridgeFiltered bool) string {
+	includeFiltered := bridgeFiltered
 	col := func(name string) string { return alias + "." + name }
 	filteredClause := ""
 	legacyFilteredClause := ""
@@ -3218,9 +3218,9 @@ func cloudMessageChatFilterWhere(alias string, bridgeFiltered ...bool) string {
 // for a ChatResync. It intentionally includes reaction rows so existing rooms
 // can catch up offline tapbacks; callers must still use ContentfulCount before
 // creating a brand-new room.
-func cloudPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string {
+func cloudPortalSyncCandidateWhere(alias string, bridgeFiltered bool) string {
 	col := func(name string) string { return alias + "." + name }
-	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+	includeFiltered := bridgeFiltered
 	base := fmt.Sprintf(`
 		%s=$1
 		AND %s IS NOT NULL AND %s <> ''
@@ -3240,9 +3240,9 @@ func cloudPortalSyncCandidateWhere(alias string, bridgeFiltered ...bool) string 
 // BackfillMessage through cloudRowToBackfillMessages. This is stricter than the
 // FetchMessages read filter: readable reaction-only, system, scrubbed, or empty
 // rows should not create portals by themselves.
-func cloudBackfillableEventWhere(alias string, bridgeFiltered ...bool) string {
+func cloudBackfillableEventWhere(alias string, bridgeFiltered bool) string {
 	col := func(name string) string { return alias + "." + name }
-	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+	includeFiltered := bridgeFiltered
 	trimChars := "' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288)"
 	normalizedText := fmt.Sprintf("TRIM(REPLACE(COALESCE(%s, ''), char(65532), ''), %s)", col("text"), trimChars)
 	normalizedSubject := fmt.Sprintf("TRIM(COALESCE(%s, ''), %s)", col("subject"), trimChars)
@@ -4322,8 +4322,8 @@ const pendingBackfillScrubHold = 24 * time.Hour
 // it is only valid inside a query whose innermost cloud_message scope is the
 // candidate row. $1 is login_id.
 
-func pendingBackfillGateSQL(holdPlaceholder string, bridgeFiltered ...bool) string {
-	includeFiltered := len(bridgeFiltered) > 0 && bridgeFiltered[0]
+func pendingBackfillGateSQL(holdPlaceholder string, bridgeFiltered bool) string {
+	includeFiltered := bridgeFiltered
 	filtered := ""
 	if !includeFiltered {
 		filtered = "AND COALESCE(pending.is_filtered, 0) = 0"
@@ -4514,21 +4514,17 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 }
 
 // permanentlyFilteredMessageWhere identifies rows that this bridge can never
-// deliver while bridge_filtered_chats is disabled. They bypass the delivered
-// message and pending-backfill gates in scrubBridgedBodies; otherwise their
-// plaintext remains on disk forever because no Matrix message row can exist.
+// deliver. Known sources must still be live and eligible on the message's exact
+// portal; this catches deleted and remapped sources as well as filtered ones.
+// When filtered chats are disabled, legacy rows on a mixed portal also fail
+// closed. These rows bypass the delivered-message and pending-backfill gates in
+// scrubBridgedBodies because no Matrix message row can ever exist for them.
 func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
-	if bridgeFiltered {
-		return "FALSE"
-	}
-	return fmt.Sprintf(`(
-		EXISTS (
-			SELECT 1 FROM cloud_chat filtered
-			WHERE filtered.login_id=$1
-			  AND LOWER(filtered.cloud_chat_id)=LOWER(%s.chat_id)
-			  AND filtered.portal_id=%s.portal_id
-			  AND COALESCE(filtered.is_filtered, 0) <> 0
-		)
+	eligibleFilter := ""
+	legacyMixedPortal := ""
+	if !bridgeFiltered {
+		eligibleFilter = "\n\t\t\t\t  AND COALESCE(eligible.is_filtered, 0) = 0"
+		legacyMixedPortal = fmt.Sprintf(`
 		OR (
 			NOT EXISTS (
 				SELECT 1 FROM cloud_chat source
@@ -4544,8 +4540,25 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 				  AND live.deleted=FALSE
 				  AND COALESCE(live.is_filtered, 0) <> 0
 			)
+		)`, alias, alias)
+	}
+	return fmt.Sprintf(`(
+		(
+			EXISTS (
+				SELECT 1 FROM cloud_chat source
+				WHERE source.login_id=$1
+				  AND LOWER(source.cloud_chat_id)=LOWER(%s.chat_id)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM cloud_chat eligible
+				WHERE eligible.login_id=$1
+				  AND LOWER(eligible.cloud_chat_id)=LOWER(%s.chat_id)
+				  AND eligible.portal_id=%s.portal_id
+				  AND eligible.deleted=FALSE%s
+			)
 		)
-	)`, alias, alias, alias, alias)
+		%s
+	)`, alias, alias, alias, eligibleFilter, legacyMixedPortal)
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),

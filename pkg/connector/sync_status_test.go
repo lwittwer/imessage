@@ -99,6 +99,7 @@ func (h *syncStatusHarness) chat(portalID, chatID string, filtered bool, deleted
 type msg struct {
 	guid     string
 	portal   string
+	chatID   string // exact cloud_chat source; empty keeps the legacy unknown-source shape
 	ts       int64
 	text     string
 	sender   string
@@ -114,6 +115,13 @@ type msg struct {
 
 func (h *syncStatusHarness) msg(m msg) {
 	h.t.Helper()
+	chatID := m.chatID
+	if chatID == "" {
+		// Most fixtures intentionally exercise the legacy no-source fallback.
+		// Source-parity cases set chatID explicitly to distinguish mixed
+		// filtered/unfiltered siblings.
+		chatID = "chat-" + m.portal
+	}
 	sender := m.sender
 	if sender == "" && !m.fromMe && !m.scrubbed && !m.noSender {
 		sender = "tel:+15550001"
@@ -131,7 +139,7 @@ func (h *syncStatusHarness) msg(m msg) {
 			is_from_me, text, subject, service, deleted, tapback_type, attachments_json,
 			created_ts, updated_ts, record_name, has_body, body_scrubbed)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', 'iMessage', $9, $10, $11, 1000, 1000, $12, $13, $14)
-	`, testSQLLoginID, m.guid, "chat-"+m.portal, m.portal, m.ts, sender, m.fromMe,
+	`, testSQLLoginID, m.guid, chatID, m.portal, m.ts, sender, m.fromMe,
 		m.text, m.deleted, tapback, m.attach, record, !m.noBody, m.scrubbed)
 }
 
@@ -265,10 +273,11 @@ func TestGetSyncStatus(t *testing.T) {
 				h.chat("tel:+15550200", "c3-im", false, false)
 
 				h.msg(msg{guid: "ok-1", portal: "tel:+15550100", ts: 5000, text: "hello"})
-				h.msg(msg{guid: "ok-2", portal: "tel:+15550200", ts: 5000, text: "hello"})
+				h.msg(msg{guid: "ok-2", portal: "tel:+15550200", chatID: "c3-im", ts: 5000, text: "hello"})
 				h.msg(msg{guid: "filtered-1", portal: "tel:+15559999", ts: 5000, text: "spam"})
-				// Empty/system shapes: no body at all, and a not-from-me row
-				// with no sender (cloudRowToBackfillMessages drops both).
+				// Empty/system shapes: no body at all, and a restored direct
+				// message with has_body=false but real text. The latter remains
+				// eligible through the portal-ID sender fallback.
 				h.msg(msg{guid: "system-1", portal: "tel:+15550100", ts: 4000, noBody: true})
 				h.msg(msg{guid: "system-2", portal: "tel:+15550100", ts: 3000, text: "hi", noSender: true})
 				// A reaction: bridges into the `reaction` table, so it must not
@@ -283,7 +292,7 @@ func TestGetSyncStatus(t *testing.T) {
 				h.delivered("ok-2", loginID, 5000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
-				assertCounts(t, r, counts{candidates: 5, deliverable: 2, delivered: 2, filtered: 1, empty: 2})
+				assertCounts(t, r, counts{candidates: 5, deliverable: 3, delivered: 2, filtered: 1, empty: 1})
 				// Three conversations across four cloud_chat rows, and only
 				// the genuinely-skipped one counts as skipped: tel:+15550200
 				// keeps its room despite the filtered SMS sibling.
@@ -293,14 +302,81 @@ func TestGetSyncStatus(t *testing.T) {
 				if r.ChatsFiltered != 1 {
 					t.Errorf("ChatsFiltered = %d, want 1 — the portal with a bridgeable sibling is not skipped", r.ChatsFiltered)
 				}
-				if got := r.DeliveredPercent(); got != 100 {
-					t.Errorf("DeliveredPercent = %v, want 100 once the unbridgeable rows are excluded", got)
+				if got := r.DeliveredPercent(); got != 66.66666666666667 {
+					t.Errorf("DeliveredPercent = %v, want 66.66666666666667 with one restored direct message pending", got)
 				}
 				out := r.Format()
 				for _, want := range []string{"Unknown Senders", "empty or system rows"} {
 					if !strings.Contains(out, want) {
 						t.Errorf("Format missing %q:\n%s", want, out)
 					}
+				}
+			},
+		},
+		{
+			name: "message source eligibility matches mixed sibling filtering",
+			opts: SyncStatusOptions{MaxInitialMessages: 1},
+			setup: func(t *testing.T, h *syncStatusHarness) {
+				zonesSynced(h)
+				// The mixed portal remains a valid room because it has an
+				// unfiltered live sibling, but each message must still be
+				// classified against its own source chat.
+				h.chat("tel:+15550200", "mixed-live", false, false)
+				h.chat("tel:+15550200", "mixed-filtered", true, false)
+				h.chat("tel:+15550200", "mixed-deleted-filtered", true, true)
+				// The source exists, but Apple remapped it to another portal;
+				// that authoritative mapping must not authorize stale history.
+				h.chat("tel:+15550300", "remapped-source", false, false)
+				h.chat("tel:+15550400", "old-live", false, false)
+
+				h.msg(msg{guid: "mixed-visible-new", portal: "tel:+15550200", chatID: "mixed-live", ts: 4000, text: "visible"})
+				h.msg(msg{guid: "mixed-visible-old", portal: "tel:+15550200", chatID: "mixed-live", ts: 3000, text: "visible older"})
+				h.msg(msg{guid: "mixed-filtered", portal: "tel:+15550200", chatID: "mixed-filtered", ts: 7000, text: "hidden"})
+				h.msg(msg{guid: "mixed-deleted", portal: "tel:+15550200", chatID: "mixed-deleted-filtered", ts: 6000, text: "deleted source"})
+				h.msg(msg{guid: "mixed-unknown", portal: "tel:+15550200", chatID: "legacy-mixed-source", ts: 5000, text: "unknown source"})
+				h.msg(msg{guid: "remapped", portal: "tel:+15550400", chatID: "remapped-source", ts: 2000, text: "stale"})
+				// No source row at all: an old all-unfiltered history retains
+				// the connector's compatibility fallback.
+				h.msg(msg{guid: "legacy", portal: "tel:+15550500", chatID: "legacy-source", ts: 1000, text: "legacy"})
+			},
+			check: func(t *testing.T, r *SyncStatusReport) {
+				assertCounts(t, r, counts{candidates: 7, deliverable: 2, filtered: 4, beyondCap: 1})
+				if r.ChatsIngested != 3 || r.ChatsFiltered != 0 {
+					t.Errorf("chat counts = ingested %d filtered %d, want 3 and 0", r.ChatsIngested, r.ChatsFiltered)
+				}
+				if got := r.PendingMessages(); got != 2 {
+					t.Errorf("PendingMessages = %d, want 2", got)
+				}
+			},
+		},
+		{
+			name: "message content classification matches backfill",
+			setup: func(t *testing.T, h *syncStatusHarness) {
+				zonesSynced(h)
+
+				h.chat("gid:group-rename", "group-rename", false, false)
+				h.exec(`UPDATE cloud_chat SET display_name=$1 WHERE login_id=$2 AND cloud_chat_id=$3`,
+					"Renamed\u00a0", testSQLLoginID, "group-rename")
+				h.msg(msg{guid: "group-rename-guid", portal: "gid:group-rename", chatID: "group-rename", ts: 5000, text: "Renamed \ufffc"})
+
+				h.chat("gid:no-body", "no-body", false, false)
+				h.msg(msg{guid: "no-body-guid", portal: "gid:no-body", chatID: "no-body", ts: 4000, noBody: true})
+
+				// Legacy content with no source metadata retains the same direct-
+				// message fallback used by the connector readers.
+				h.msg(msg{guid: "legacy-guid", portal: "tel:+15550500", chatID: "legacy-source", ts: 3000, text: "restored"})
+
+				h.chat("tel:+15550600", "scrubbed-undelivered", false, false)
+				h.msg(msg{guid: "scrubbed-undelivered-guid", portal: "tel:+15550600", chatID: "scrubbed-undelivered", ts: 2000, scrubbed: true})
+
+				h.chat("tel:+15550700", "scrubbed-delivered", false, false)
+				h.msg(msg{guid: "scrubbed-delivered-guid", portal: "tel:+15550700", chatID: "scrubbed-delivered", ts: 1000, scrubbed: true})
+				h.delivered("scrubbed-delivered-guid", loginID, 1000)
+			},
+			check: func(t *testing.T, r *SyncStatusReport) {
+				assertCounts(t, r, counts{candidates: 5, deliverable: 2, delivered: 1, empty: 2, unavailable: 1})
+				if got := r.PendingMessages(); got != 1 {
+					t.Errorf("PendingMessages = %d, want 1 for the legacy row", got)
 				}
 			},
 		},
@@ -376,9 +452,15 @@ func TestGetSyncStatus(t *testing.T) {
 				// long-running bridge under "not bridgeable".
 				h.msg(msg{guid: "scrubbed-1", portal: "tel:+15550100", ts: 1000, scrubbed: true})
 				h.delivered("scrubbed-1", loginID, 1000)
+				// A scrubbed row without bridgev2 evidence cannot be called
+				// pending: its body is gone and there is no safe local event path.
+				h.msg(msg{guid: "scrubbed-undelivered", portal: "tel:+15550100", ts: 2000, scrubbed: true})
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
-				assertCounts(t, r, counts{candidates: 1, deliverable: 1, delivered: 1})
+				assertCounts(t, r, counts{candidates: 2, deliverable: 1, delivered: 1, unavailable: 1})
+				if !strings.Contains(r.Format(), "scrubbed or orphaned rows") {
+					t.Errorf("Format did not explain unavailable scrubbed rows:\n%s", r.Format())
+				}
 			},
 		},
 		{
@@ -454,6 +536,7 @@ type counts struct {
 	filtered    int
 	empty       int
 	beyondCap   int
+	unavailable int
 }
 
 func assertCounts(t *testing.T, r *SyncStatusReport, want counts) {
@@ -468,6 +551,7 @@ func assertCounts(t *testing.T, r *SyncStatusReport, want counts) {
 		{"FilteredChatMessages", r.FilteredChatMessages, want.filtered},
 		{"EmptySystemMessages", r.EmptySystemMessages, want.empty},
 		{"BeyondCapMessages", r.BeyondCapMessages, want.beyondCap},
+		{"UnavailableMessages", r.UnavailableMessages, want.unavailable},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
@@ -492,7 +576,7 @@ func assertInvariants(t *testing.T, r *SyncStatusReport) {
 }
 
 func TestSyncStatusRedactsPersistedZoneErrors(t *testing.T) {
-	secret := "https://apple.invalid/account?token=secret-handle"
+	secret := "apple-handle:+15551234567 https://apple.invalid/account?token=secret-handle"
 	report := &SyncStatusReport{
 		HasLogin:           true,
 		CloudTablesPresent: true,
@@ -507,8 +591,15 @@ func TestSyncStatusRedactsPersistedZoneErrors(t *testing.T) {
 	if strings.Contains(out, secret) || strings.Contains(out, "secret-handle") {
 		t.Fatalf("formatted sync status exposed persisted error details: %q", out)
 	}
-	if !strings.Contains(out, "details redacted") {
+	if !strings.Contains(out, safeZoneErrorMessage) {
 		t.Fatalf("formatted sync status did not explain error redaction: %q", out)
+	}
+	// LastError remains source-compatible for callers constructing reports, but
+	// its contents must never become output even when HasError is not set.
+	report.Zones[0].HasError = false
+	out = report.Format()
+	if strings.Contains(out, "secret-handle") || strings.Contains(out, "apple-handle:+15551234567") {
+		t.Fatalf("formatted compatibility error exposed persisted details: %q", out)
 	}
 }
 

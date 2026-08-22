@@ -87,6 +87,24 @@ sibling set; synthetic/recycle metadata rows must not disable that compatibility
 fallback. A source row remapped to another portal is authoritative and must not
 authorize stale history through the old portal.
 
+## Sync-status diagnostic contract
+
+`pkg/connector/sync_status.go` is the shared implementation for both the
+management-room command and host CLI. It is a read-only view over persisted
+rows and must remain usable when the daemon is stopped. It reports CloudKit
+zone state, chat/message classification, delivery matches, and backfill task
+state; it must not run migrations, create a missing database for the supported
+Beeper `file:` SQLite URI, or write progress counters.
+
+The report's source-chat eligibility, content predicate, ordering, and cap
+window must match the connector readers. In particular, filtered or deleted
+siblings are excluded before the per-portal cap is ranked, while readable
+reaction/system rows still consume the same slots as `listLatestMessages`.
+Persisted CloudKit errors, database URIs, Apple handles, record identifiers,
+and driver error details must never be rendered. The in-bridge command may
+report live sync and batch-send capability; the host CLI must show those as
+unknown because it has no process state.
+
 ## Current SMS/iMessage routing
 
 The ordering in `imessage/mac/messages.go` makes

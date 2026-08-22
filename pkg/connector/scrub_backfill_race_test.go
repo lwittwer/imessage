@@ -213,35 +213,50 @@ func TestScrubBridgedBodiesClearsUndeliverableFilteredPlaintext(t *testing.T) {
 			t.Errorf("%s text valid=%v scrubbed=%v, want %v/%v", tc.guid, text.Valid, bodyScrubbed, tc.wantText, tc.wantScrub)
 		}
 	}
+}
 
-	ctxOptIn, dbOptIn, storeOptIn := scrubRaceFixture(t)
-	storeOptIn.bridgeFiltered = true
-	if err := storeOptIn.upsertChatBatch(ctxOptIn, []cloudChatUpsertRow{{
-		CloudChatID: "C-OPTED-IN", PortalID: "p-opted-in", Service: "iMessage",
-		ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1,
+func TestScrubBridgedBodiesClearsRemappedSourcePlaintext(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const oldPortal = "tel:+15550007770"
+	const newPortal = "tel:+15550007771"
+	const guid = "G-REMAPPED-SOURCE"
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "C-REMAPPED", PortalID: newPortal, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "C-OLD-LIVE", PortalID: oldPortal, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now},
+	}); err != nil {
+		t.Fatalf("upsert chats: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: guid, CloudChatID: "C-REMAPPED", PortalID: oldPortal,
+		TimestampMS: 1000, Text: "stale duplicate-room history", Service: "iMessage", HasBody: true,
 	}}); err != nil {
-		t.Fatalf("upsert opted-in chat: %v", err)
+		t.Fatalf("upsert message: %v", err)
 	}
-	if err := storeOptIn.upsertMessageBatch(ctxOptIn, []cloudMessageRow{{
-		GUID: "G-OPTED-IN", CloudChatID: "C-OPTED-IN", PortalID: "p-opted-in",
-		TimestampMS: 1000, Text: "eligible by configuration", Service: "iMessage", HasBody: true,
-	}}); err != nil {
-		t.Fatalf("upsert opted-in message: %v", err)
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1 AND guid=$3`,
+		testSQLLoginID, now-int64(time.Hour/time.Millisecond), guid,
+	); err != nil {
+		t.Fatalf("age message: %v", err)
 	}
-	if _, err := dbOptIn.Exec(ctxOptIn, `UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`, testSQLLoginID, now-int64(time.Hour/time.Millisecond)); err != nil {
-		t.Fatalf("age opted-in message: %v", err)
+
+	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
 	}
-	if scrubbed, err := storeOptIn.scrubBridgedBodies(ctxOptIn, "test-bridge", time.Minute, nil); err != nil {
-		t.Fatalf("scrub opted-in filtered row: %v", err)
-	} else if scrubbed != 0 {
-		t.Fatalf("scrubbed %d opted-in filtered rows, want 0 before delivery", scrubbed)
+	if scrubbed != 1 {
+		t.Fatalf("scrubbed rows = %d, want remapped source scrubbed", scrubbed)
 	}
-	var optedInText sql.NullString
-	if err := dbOptIn.QueryRow(ctxOptIn, `SELECT text FROM cloud_message WHERE login_id=$1 AND guid='G-OPTED-IN'`, testSQLLoginID).Scan(&optedInText); err != nil {
-		t.Fatalf("read opted-in row: %v", err)
+	var text sql.NullString
+	var bodyScrubbed bool
+	if err := db.QueryRow(ctx,
+		`SELECT text, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, guid,
+	).Scan(&text, &bodyScrubbed); err != nil {
+		t.Fatalf("read remapped row: %v", err)
 	}
-	if !optedInText.Valid {
-		t.Fatal("opted-in filtered row was scrubbed before it could be delivered")
+	if text.Valid || !bodyScrubbed {
+		t.Fatalf("remapped row text valid=%v scrubbed=%v, want false/true", text.Valid, bodyScrubbed)
 	}
 }
 

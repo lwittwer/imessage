@@ -1929,6 +1929,24 @@ const (
 	bodyScrubGracePeriod = 5 * time.Minute
 )
 
+// runPrivacyScrub performs the shared body, reaction-text, and unreachable
+// tail scrubs. The callers provide their existing body/reaction error text so
+// startup and periodic passes retain their distinct logging behavior.
+func (c *IMClient) runPrivacyScrub(ctx context.Context, log zerolog.Logger, bodyErrMsg, reactionErrMsg string) {
+	scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
+	if err != nil {
+		log.Warn().Err(err).Msg(bodyErrMsg)
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+	}
+	if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
+		log.Warn().Err(rerr).Msg(reactionErrMsg)
+	} else if rscrubbed > 0 {
+		log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
+	}
+	c.runUnbridgedTailScrub(ctx, log)
+}
+
 // runBodyScrubLoop runs the privacy scrubber on a fixed interval for the
 // lifetime of the IMClient. Bootstrap-time scrubbing is handled by
 // runPostSyncHousekeeping; this loop covers steady-state ongoing operation
@@ -1945,21 +1963,10 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
-			if err != nil {
-				log.Warn().Err(err).Msg("Body scrub failed")
-			} else if scrubbed > 0 {
-				log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
-			}
-			if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
-				log.Warn().Err(rerr).Msg("Reaction-text scrub failed")
-			} else if rscrubbed > 0 {
-				log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
-			}
 			// Tail scrub must run here too, not just post-sync: rows synced just
 			// before a post-sync pass are still inside the grace window and get
 			// skipped, so without a later periodic pass they'd never be scrubbed.
-			c.runUnbridgedTailScrub(ctx, log)
+			c.runPrivacyScrub(ctx, log, "Body scrub failed", "Reaction-text scrub failed")
 			cancel()
 		}
 	}
@@ -2253,30 +2260,10 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Info().Int64("pruned", pruned).Msg("Pruned orphaned attachment cache entries")
 	}
 
-	// Privacy: scrub plaintext from cloud_message rows that have been
-	// successfully bridged to Matrix. Runs both here (post-bootstrap, so
-	// existing rows migrate on first boot of this version) and on a
-	// dedicated ticker (see runBodyScrubLoop).
-	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs()); err != nil {
-		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
-	} else if scrubbed > 0 {
-		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
-	}
-
-	// Privacy: reaction rows store the quoted-body descriptor but nothing reads
-	// it (reactions render from tapback metadata), so clear it unconditionally.
-	if scrubbed, err := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); err != nil {
-		log.Warn().Err(err).Msg("Failed to scrub reaction text")
-	} else if scrubbed > 0 {
-		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
-	}
-
-	// Privacy: scrub plaintext from the un-backfillable tail (rows older than
-	// the newest MaxInitialMessages per portal, which backward backfill can
-	// never reach when a cap is set). No-op when backfill is uncapped. Also
-	// runs on the periodic ticker (runBodyScrubLoop) to catch rows that were
-	// inside the grace window during this pass.
-	c.runUnbridgedTailScrub(ctx, log)
+	// Privacy: run the body, reaction, and un-backfillable-tail scrubs. The
+	// post-bootstrap pass migrates existing rows, while the periodic ticker
+	// (runBodyScrubLoop) catches rows that were inside the grace window here.
+	c.runPrivacyScrub(ctx, log, "Failed to scrub bridged message bodies", "Failed to scrub reaction text")
 
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.
 	if deleted, err := c.cloudStore.deleteOrphanedMessages(ctx); err != nil {

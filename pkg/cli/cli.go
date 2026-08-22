@@ -13,9 +13,11 @@
 //     Docker Compose + the `imessage` host wrapper drive the lifecycle there;
 //     the bridge daemon itself still runs via the container entrypoint.
 
-// Package cli is the shared, CGO-free management/install CLI used by both the
-// pure-Go installer bundle (cmd/corten-installer) and the post-install bridge
-// binary (cmd/corten-matrix).
+// Package cli is the shared management/install CLI used by both the installer
+// bundle (cmd/corten-installer) and the post-install bridge binary
+// (cmd/corten-matrix). Most commands remain CGO-free; sync-status deliberately
+// reuses the connector-owned report so diagnostics cannot drift from the
+// bridge's classification rules.
 package cli
 
 import (

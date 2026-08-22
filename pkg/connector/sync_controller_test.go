@@ -107,14 +107,6 @@ func TestBackfillTriggerTimestampIncludesReactionOnlyActivity(t *testing.T) {
 }
 
 func TestPendingInitialBackfillsExcludesSkippedReactionOnlyPortal(t *testing.T) {
-	reactionOnly := portalWithNewestMessage{
-		MessageActivityTS:      7000,
-		MessageWriteActivityTS: 7000,
-		MessageCount:           1,
-	}
-	if !shouldForceCloudBackfill(reactionOnly) {
-		t.Fatal("reaction-only candidate no longer requests a catch-up backfill")
-	}
 	ordered := []string{"reaction-only", "queued"}
 	needs := map[string]bool{"reaction-only": true, "queued": true}
 	if got := countInitialBackfillPortals(ordered, needs, map[string]bool{"reaction-only": true}); got != 1 {

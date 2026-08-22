@@ -5669,8 +5669,11 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	}
 	logPortalID := logSafeHandle(portalID)
 
-	// Resolve the CloudKit chat_id for this portal.
-	cloudChatID := c.cloudStore.getRehydrateChatIdentifierByPortalID(ctx, portalID)
+	// Resolve the CloudKit chat_id for this portal. Keep the exact stored value
+	// separate from the fallback used for targeted fetches so the suffix
+	// allowlist sees the same rehydrate identifier without querying again.
+	rehydrateChatID := c.cloudStore.getRehydrateChatIdentifierByPortalID(ctx, portalID)
+	cloudChatID := rehydrateChatID
 	// Also try the stored group_id as a fallback chatId — it may differ from
 	// the per-participant UUID in the portal_id (see per-participant UUID lore).
 	groupIDForFetch := ""
@@ -5719,9 +5722,9 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 		portalUUID := strings.TrimPrefix(portalID, "gid:")
 		acceptableChatIDSuffixes[normalizeUUID(portalUUID)] = true
 		acceptableChatIDSuffixes[strings.ToLower(portalUUID)] = true
-		if chatID := c.cloudStore.getRehydrateChatIdentifierByPortalID(ctx, portalID); chatID != "" {
-			acceptableChatIDSuffixes[normalizeUUID(chatID)] = true
-			acceptableChatIDSuffixes[strings.ToLower(chatID)] = true
+		if rehydrateChatID != "" {
+			acceptableChatIDSuffixes[normalizeUUID(rehydrateChatID)] = true
+			acceptableChatIDSuffixes[strings.ToLower(rehydrateChatID)] = true
 		}
 		if gid := c.cloudStore.getGroupIDForPortalID(ctx, portalID); gid != "" {
 			acceptableChatIDSuffixes[normalizeUUID(gid)] = true
