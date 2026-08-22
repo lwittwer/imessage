@@ -4021,6 +4021,13 @@ func countInitialBackfillPortals(ordered []string, needs map[string]bool, skippe
 	return count
 }
 
+func moveInitialBackfillNeed(needs map[string]bool, fromPortalID, toPortalID string) {
+	if needs[fromPortalID] {
+		needs[toPortalID] = true
+	}
+	delete(needs, fromPortalID)
+}
+
 type cloudCatchupBackfillBundle struct {
 	AfterWriteTS int64
 }
@@ -4128,6 +4135,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 							break
 						}
 					}
+					moveInitialBackfillNeed(needsInitialBackfill, existingPortalID, p.PortalID)
 				} else {
 					log.Info().
 						Str("kept_portal_id", existingPortalID).
