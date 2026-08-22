@@ -144,6 +144,69 @@ func newSyncStatusParityDB(t *testing.T) *dbutil.Database {
 	return db
 }
 
+func TestGetSyncStatusPropagatesTableProbeFailures(t *testing.T) {
+	raw, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open SQLite: %v", err)
+	}
+	db, err := dbutil.NewWithDB(raw, "sqlite3")
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("wrap SQLite: %v", err)
+	}
+	if err = raw.Close(); err != nil {
+		t.Fatalf("close SQLite: %v", err)
+	}
+
+	report, err := GetSyncStatus(context.Background(), db, SyncStatusOptions{})
+	if err == nil {
+		t.Fatalf("GetSyncStatus returned report %#v, want table-probe error", report)
+	}
+	if !strings.Contains(err.Error(), "failed to inspect the user_login table") {
+		t.Fatalf("GetSyncStatus error = %q, want user_login probe classification", err)
+	}
+}
+
+func TestGetSyncStatusOptInStillExcludesDeletedChatMessages(t *testing.T) {
+	const (
+		bridgeID = "corten"
+		loginID  = "login-deleted-filtered"
+	)
+	ctx := context.Background()
+	db := newSyncStatusParityDB(t)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat
+			(login_id, cloud_chat_id, portal_id, is_filtered, deleted, display_name)
+		VALUES ($1, 'deleted-filtered-chat', 'deleted-filtered-portal', 1, 1, '')
+	`, loginID); err != nil {
+		t.Fatalf("insert deleted chat: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message
+			(login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+			 text, subject, deleted, tapback_type, attachments_json, record_name,
+			 body_scrubbed, has_body)
+		VALUES ($1, 'deleted-filtered-guid', 'deleted-filtered-chat',
+			'deleted-filtered-portal', 1000, 'tel:+15550001', 0,
+			'must stay deleted', '', 0, NULL, '', 'deleted-filtered-record', 0, 1)
+	`, loginID); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+
+	report, err := GetSyncStatus(ctx, db, SyncStatusOptions{
+		BridgeID:            bridgeID,
+		LoginID:             loginID,
+		BridgeFilteredChats: true,
+	})
+	if err != nil {
+		t.Fatalf("GetSyncStatus: %v", err)
+	}
+	if report.CandidateMessages != 1 || report.FilteredChatMessages != 1 || report.DeliverableMessages != 0 || report.PendingMessages() != 0 {
+		t.Fatalf("deleted filtered counts = candidates %d, filtered %d, deliverable %d, pending %d; want 1, 1, 0, 0",
+			report.CandidateMessages, report.FilteredChatMessages, report.DeliverableMessages, report.PendingMessages())
+	}
+}
+
 func TestGetSyncStatusSQLitePredicateParity(t *testing.T) {
 	const (
 		bridgeID = "corten"
