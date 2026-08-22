@@ -505,7 +505,13 @@ corten-matrix setup-beeper       # Beeper
 
 The per-chat backfill cap (`backfill.max_initial_messages`) is asked only on the **first** install, before the bridge database exists. To change it later, edit `~/.local/share/corten-matrix/config.yaml` directly.
 
-Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`, `max_attachment_size_mb`) are also changed by editing `~/.local/share/corten-matrix/config.yaml` directly, then `corten-matrix restart` — see [Key options](#key-options).
+Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`,
+`bridge_filtered_chats`, and `max_attachment_size_mb`) are also changed by
+editing `~/.local/share/corten-matrix/config.yaml` directly, then
+`corten-matrix restart` — see [Key options](#key-options). Enabling
+`bridge_filtered_chats` can create rooms for iCloud's **Unknown Senders**
+bucket, including delivery notices and 2FA messages, so review the expected
+room count before turning it on.
 
 ### Reset and duplicate-room recovery
 

@@ -71,6 +71,19 @@ between sessions, an unchanged active backward cursor, union-only persistence,
 save rollback and retry, restore bundling, shared rows visible through multiple
 GUIDs, and legacy empty metadata.
 
+## Filtered CloudKit chats
+
+`bridge_filtered_chats` is off by default. When enabled, chats that iCloud
+files under Unknown Senders become eligible for rooms, including delivery
+notifications and 2FA messages. The option changes room/message eligibility,
+so status reports and scrub/backfill gates must use the same predicate; do not
+enable it in a report alone or let a filtered sibling suppress an unfiltered
+chat sharing the same portal. When siblings share a portal, enforce filtering
+against each message's known `cloud_message.chat_id`: a known filtered or
+deleted source fails closed. Legacy rows with an empty or unrecognized chat ID
+retain the portal-level fallback so older persisted history remains restorable;
+synthetic/recycle metadata rows must not disable that compatibility fallback.
+
 ## Current SMS/iMessage routing
 
 The ordering in `imessage/mac/messages.go` makes

@@ -19,7 +19,7 @@ import (
 // Two mechanisms are under test: the hold that keeps the scrubbers off a portal
 // that has not delivered yet (pendingBackfillGateSQL), and the pieces
 // FetchMessages uses to notice and recover when it happens anyway
-// (anyScrubbedDeliverable, rescrubEmptyRowsSince).
+// (anyScrubbedDeliverable, rescrubClearedRows).
 
 // scrubRaceFixture builds a store with bridgev2's message table alongside it,
 // since scrubBridgedBodies only scrubs rows that have a delivered message row.
@@ -319,6 +319,51 @@ func TestScrubBridgedBodiesStillScrubsDeletedRowsWhilePending(t *testing.T) {
 	}
 }
 
+func TestScrubHoldsOffOptedInFilteredBackfillPortals(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	store.bridgeFiltered = true
+	const bridgeID = "test-bridge"
+	now := time.Now().UnixMilli()
+	portalID := "tel:+15550005555"
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+		CloudChatID: "C-FILTERED-OPTED-IN", PortalID: portalID, Service: "iMessage",
+		ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1,
+	}}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "GUID-FILTERED-OPTED-IN", CloudChatID: "C-FILTERED-OPTED-IN", PortalID: portalID,
+		TimestampMS: now, Text: "plaintext", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"GUID-FILTERED-OPTED-IN", bridgeID, string(testSQLLoginID),
+	); err != nil {
+		t.Fatalf("insert bridgev2 message row: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`,
+		testSQLLoginID, now-int64(time.Hour/time.Millisecond),
+	); err != nil {
+		t.Fatalf("age message: %v", err)
+	}
+
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
+	}
+	var text sql.NullString
+	if err := db.QueryRow(ctx,
+		`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "GUID-FILTERED-OPTED-IN").Scan(&text); err != nil {
+		t.Fatalf("read message text: %v", err)
+	}
+	if !text.Valid {
+		t.Error("body of opted-in filtered portal was scrubbed while its forward backfill was pending")
+	}
+}
+
 // TestScrubUnbridgedTailHoldsOffPendingBackfillPortals covers the same hold on
 // the tail scrubber, which is the more dangerous of the two: it clears rows that
 // were never delivered, choosing them by position rather than by delivery. Its
@@ -379,6 +424,65 @@ func TestScrubUnbridgedTailHoldsOffPendingBackfillPortals(t *testing.T) {
 	}
 	if pendingPlaintext != 4 {
 		t.Errorf("portal awaiting forward backfill kept %d/4 rows with text — its tail was scrubbed before delivery", pendingPlaintext)
+	}
+}
+
+func TestScrubUnbridgedTailCountsOnlyEligibleMixedSiblingRows(t *testing.T) {
+	ctx, db, store := scrubRaceFixture(t)
+	const portalID = "tel:+15550007777"
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "C-UNFILTERED", PortalID: portalID, Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "C-FILTERED", PortalID: portalID, Service: "SMS", ParticipantsJSON: "[]", UpdatedTS: now, IsFiltered: 1},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	store.markForwardBackfillDone(ctx, portalID)
+	rows := []cloudMessageRow{
+		{GUID: "U-1", RecordName: "rec-U-1", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 1000, Text: "unfiltered one", Service: "iMessage", HasBody: true},
+		{GUID: "U-2", RecordName: "rec-U-2", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 2000, Text: "unfiltered two", Service: "iMessage", HasBody: true},
+		{GUID: "U-3", RecordName: "rec-U-3", CloudChatID: "C-UNFILTERED", PortalID: portalID, TimestampMS: 3000, Text: "unfiltered three", Service: "iMessage", HasBody: true},
+		{GUID: "F-1", RecordName: "rec-F-1", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 4000, Text: "filtered one", Service: "SMS", HasBody: true},
+		{GUID: "F-2", RecordName: "rec-F-2", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 5000, Text: "filtered two", Service: "SMS", HasBody: true},
+		{GUID: "F-3", RecordName: "rec-F-3", CloudChatID: "C-FILTERED", PortalID: portalID, TimestampMS: 6000, Text: "filtered three", Service: "SMS", HasBody: true},
+	}
+	if err := store.upsertMessageBatch(ctx, rows); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$2 WHERE login_id=$1`,
+		testSQLLoginID, now-int64(time.Hour/time.Millisecond),
+	); err != nil {
+		t.Fatalf("age messages: %v", err)
+	}
+
+	scrubbed, err := store.scrubUnbridgedTail(ctx, 2, time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubUnbridgedTail: %v", err)
+	}
+	if scrubbed != 1 {
+		t.Fatalf("scrubUnbridgedTail scrubbed %d rows, want only the oldest eligible unfiltered row", scrubbed)
+	}
+	for _, tc := range []struct {
+		guid string
+		want bool
+	}{
+		{guid: "U-1", want: false},
+		{guid: "U-2", want: true},
+		{guid: "U-3", want: true},
+		{guid: "F-1", want: true},
+		{guid: "F-2", want: true},
+		{guid: "F-3", want: true},
+	} {
+		var text sql.NullString
+		if err := db.QueryRow(ctx,
+			`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, tc.guid).Scan(&text); err != nil {
+			t.Fatalf("read %s: %v", tc.guid, err)
+		}
+		if text.Valid != tc.want {
+			t.Errorf("%s text validity = %v, want %v", tc.guid, text.Valid, tc.want)
+		}
 	}
 }
 
