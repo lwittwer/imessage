@@ -18,6 +18,29 @@ func TestNetworkExampleIsValidYAML(t *testing.T) {
 	}
 }
 
+// TestNetworkExampleNotifyOnlyDefaults pins the safety-sensitive defaults that
+// changed when interactive FaceTime support was removed. Unknown-Senders chats
+// and FaceTime notices must remain opt-in/opt-out respectively on upgrades;
+// otherwise regenerating a config could create rooms or notices unexpectedly.
+func TestNetworkExampleNotifyOnlyDefaults(t *testing.T) {
+	var cfg struct {
+		BridgeFilteredChats bool `yaml:"bridge_filtered_chats"`
+		DisableFaceTime     bool `yaml:"disable_facetime"`
+	}
+	if err := yaml.Unmarshal([]byte(NetworkExampleConfig), &cfg); err != nil {
+		t.Fatalf("NetworkExampleConfig is not valid YAML: %v", err)
+	}
+	if cfg.BridgeFilteredChats {
+		t.Error("bridge_filtered_chats defaulted true; it must remain opt-in")
+	}
+	// DisableFaceTime=false means notices remain enabled by default. The bridge
+	// stays notify-only either way; this field must not be mistaken for an
+	// interactive call capability toggle.
+	if cfg.DisableFaceTime {
+		t.Error("disable_facetime defaulted true; notices should remain enabled")
+	}
+}
+
 // TestWrapNetworkParsesAndPreservesKeys is the anti-drift guard: whatever the
 // bbctl path emits must (a) parse as valid YAML and (b) expose exactly the
 // same key set the bridge sees, nested under `network:`. This is what stops

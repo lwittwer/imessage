@@ -71,6 +71,44 @@ between sessions, an unchanged active backward cursor, union-only persistence,
 save rollback and retry, restore bundling, shared rows visible through multiple
 GUIDs, and legacy empty metadata.
 
+## Filtered CloudKit chats
+
+`bridge_filtered_chats` is off by default. When enabled, chats that iCloud
+files under Unknown Senders become eligible for rooms, including delivery
+notifications and 2FA messages. The option changes room/message eligibility,
+so status reports and scrub/backfill gates must use the same predicate; do not
+enable it in a report alone or let a filtered sibling suppress an unfiltered
+chat sharing the same portal. When siblings share a portal, enforce filtering
+against each message's known `cloud_message.chat_id`: a known filtered or
+deleted source fails closed. Legacy rows with an empty or unrecognized chat ID
+retain the portal-level fallback only when every live sibling is unfiltered, so
+older persisted history remains restorable without leaking across a mixed
+sibling set; synthetic/recycle metadata rows must not disable that compatibility
+fallback. A source row remapped to another portal is authoritative and must not
+authorize stale history through the old portal. That mismatch is recoverable:
+keep the row unreadable, but retain its plaintext for authoritative CloudKit
+re-ingest instead of treating it as permanently filtered and scrubbing it.
+
+## Sync-status diagnostic contract
+
+`pkg/connector/sync_status.go` is the shared implementation for both the
+management-room command and host CLI. It is a read-only view over persisted
+rows and must remain usable when the daemon is stopped. It reports CloudKit
+zone state, chat/message classification, delivery matches, and backfill task
+state; it must not run migrations, create a missing database for the supported
+Beeper `file:` SQLite URI, or write progress counters.
+
+The report's source-chat eligibility, content predicate, ordering, and cap
+window must match the connector readers. In particular, filtered or deleted
+siblings are excluded before the per-portal cap is ranked, while readable
+reaction/system rows still consume the same slots as `listLatestMessages`.
+Rows whose known source moved to another portal must have a distinct mismatch
+bucket and remediation; never describe them as Unknown Senders filtering.
+Persisted CloudKit errors, database URIs, Apple handles, record identifiers,
+and driver error details must never be rendered. The in-bridge command may
+report live sync and batch-send capability; the host CLI must show those as
+unknown because it has no process state.
+
 ## Current SMS/iMessage routing
 
 The ordering in `imessage/mac/messages.go` makes

@@ -114,6 +114,21 @@ func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDone = true
 	c.cloudSyncDoneLock.Unlock()
 
+	// Start the backward-backfill drain loop on homeservers that can't batch
+	// send. bridgev2's RunBackfillQueue returns immediately on those (Synapse
+	// and every other non-Beeper server), so the backfill_task rows queued by
+	// createPortalsFromCloudSync — and by bridgev2 itself on room creation —
+	// are never dispatched and deep history never arrives. See
+	// synapse_backfill.go; the call is bridge-scoped and idempotent, so every
+	// login may make it on every connect.
+	//
+	// Here rather than in Connect because this is the one point every backfill
+	// mode passes through (chat.db, CloudKit and backfill-disabled all reach
+	// it), and because in CloudKit mode it fires after the bootstrap sync
+	// instead of before it — deep history is the last thing that should be
+	// competing for the single SQLite writer.
+	c.startSynapseBackfillDrainIfNeeded()
+
 	// Flush the APNs reorder buffer once all forward backfills are complete.
 	// Messages accumulated during CloudKit sync to avoid interleaving APNs
 	// messages before older CloudKit messages in Matrix.
@@ -1572,6 +1587,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 }
 
+// ghostReconcilePacing is the gap left between ghost profile writes during the
+// contact reconcile. 80ms puts a 30-contact address book at ~2.4s — slow enough
+// that a Matrix client sees a stream of member events rather than a wall of
+// them, fast enough that nobody watching a first connect notices.
+const ghostReconcilePacing = 80 * time.Millisecond
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
@@ -1658,6 +1679,26 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
+		}
+		// Pace the writes. Each UpdateInfo that actually changes a name emits an
+		// m.room.member state event into every DM that ghost is in, and Matrix
+		// clients derive a DM's title and avatar from exactly that. Reconciling
+		// a whole address book unpaced fired 22 profile changes inside 9ms on a
+		// first connect, which is a burst no client is expecting; Beeper Desktop
+		// came out of it with a wedged icon cache that only a re-login cleared.
+		//
+		// This is the one connect where almost every ghost changes — afterwards
+		// the diff-gate above means near-zero updates — so spreading the first
+		// pass over a couple of seconds costs nothing anyone will notice and
+		// hands clients a rate they can absorb. Skipped after the last one so a
+		// small address book doesn't pay for a delay it doesn't need.
+		if reconciled > 0 {
+			select {
+			case <-c.stopChan:
+				log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
+				return
+			case <-time.After(ghostReconcilePacing):
+			}
 		}
 		ghost.UpdateInfo(ctx, info)
 		reconciled++
@@ -1888,6 +1929,24 @@ const (
 	bodyScrubGracePeriod = 5 * time.Minute
 )
 
+// runPrivacyScrub performs the shared body, reaction-text, and unreachable
+// tail scrubs. The callers provide their existing body/reaction error text so
+// startup and periodic passes retain their distinct logging behavior.
+func (c *IMClient) runPrivacyScrub(ctx context.Context, log zerolog.Logger, bodyErrMsg, reactionErrMsg string) {
+	scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
+	if err != nil {
+		log.Warn().Err(err).Msg(bodyErrMsg)
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
+	}
+	if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
+		log.Warn().Err(rerr).Msg(reactionErrMsg)
+	} else if rscrubbed > 0 {
+		log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
+	}
+	c.runUnbridgedTailScrub(ctx, log)
+}
+
 // runBodyScrubLoop runs the privacy scrubber on a fixed interval for the
 // lifetime of the IMClient. Bootstrap-time scrubbing is handled by
 // runPostSyncHousekeeping; this loop covers steady-state ongoing operation
@@ -1904,21 +1963,10 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
-			if err != nil {
-				log.Warn().Err(err).Msg("Body scrub failed")
-			} else if scrubbed > 0 {
-				log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
-			}
-			if rscrubbed, rerr := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); rerr != nil {
-				log.Warn().Err(rerr).Msg("Reaction-text scrub failed")
-			} else if rscrubbed > 0 {
-				log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
-			}
 			// Tail scrub must run here too, not just post-sync: rows synced just
 			// before a post-sync pass are still inside the grace window and get
 			// skipped, so without a later periodic pass they'd never be scrubbed.
-			c.runUnbridgedTailScrub(ctx, log)
+			c.runPrivacyScrub(ctx, log, "Body scrub failed", "Reaction-text scrub failed")
 			cancel()
 		}
 	}
@@ -2212,30 +2260,10 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Info().Int64("pruned", pruned).Msg("Pruned orphaned attachment cache entries")
 	}
 
-	// Privacy: scrub plaintext from cloud_message rows that have been
-	// successfully bridged to Matrix. Runs both here (post-bootstrap, so
-	// existing rows migrate on first boot of this version) and on a
-	// dedicated ticker (see runBodyScrubLoop).
-	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs()); err != nil {
-		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
-	} else if scrubbed > 0 {
-		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
-	}
-
-	// Privacy: reaction rows store the quoted-body descriptor but nothing reads
-	// it (reactions render from tapback metadata), so clear it unconditionally.
-	if scrubbed, err := c.cloudStore.scrubReactionText(ctx, bodyScrubGracePeriod); err != nil {
-		log.Warn().Err(err).Msg("Failed to scrub reaction text")
-	} else if scrubbed > 0 {
-		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
-	}
-
-	// Privacy: scrub plaintext from the un-backfillable tail (rows older than
-	// the newest MaxInitialMessages per portal, which backward backfill can
-	// never reach when a cap is set). No-op when backfill is uncapped. Also
-	// runs on the periodic ticker (runBodyScrubLoop) to catch rows that were
-	// inside the grace window during this pass.
-	c.runUnbridgedTailScrub(ctx, log)
+	// Privacy: run the body, reaction, and un-backfillable-tail scrubs. The
+	// post-bootstrap pass migrates existing rows, while the periodic ticker
+	// (runBodyScrubLoop) catches rows that were inside the grace window here.
+	c.runPrivacyScrub(ctx, log, "Failed to scrub bridged message bodies", "Failed to scrub reaction text")
 
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.
 	if deleted, err := c.cloudStore.deleteOrphanedMessages(ctx); err != nil {
@@ -3970,6 +3998,23 @@ func shouldForceCloudBackfill(p portalWithNewestMessage) bool {
 		(p.MessageActivityTS > p.NewestTS || p.MessageWriteActivityTS > p.ContentfulWriteActivity)
 }
 
+func countInitialBackfillPortals(ordered []string, needs map[string]bool, skipped map[string]bool) int {
+	count := 0
+	for _, portalID := range ordered {
+		if !skipped[portalID] && needs[portalID] {
+			count++
+		}
+	}
+	return count
+}
+
+func moveInitialBackfillNeed(needs map[string]bool, fromPortalID, toPortalID string) {
+	if needs[fromPortalID] {
+		needs[toPortalID] = true
+	}
+	delete(needs, fromPortalID)
+}
+
 type cloudCatchupBackfillBundle struct {
 	AfterWriteTS int64
 }
@@ -4019,6 +4064,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	portalInfoByID := make(map[string]portalWithNewestMessage, len(portalInfos))
 	lastQueuedByID := make(map[string]queuedPortalWatermark, len(portalInfos))
 	forwardBackfillPortals := 0
+	needsInitialBackfill := make(map[string]bool, len(portalInfos))
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	noContentSkipped := 0
@@ -4076,6 +4122,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 							break
 						}
 					}
+					moveInitialBackfillNeed(needsInitialBackfill, existingPortalID, p.PortalID)
 				} else {
 					log.Info().
 						Str("kept_portal_id", existingPortalID).
@@ -4095,7 +4142,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			continue
 		}
 		if newPortalNeedsContent || shouldForceCloudBackfill(p) {
-			forwardBackfillPortals++
+			needsInitialBackfill[p.PortalID] = true
 		}
 		ordered = append(ordered, p.PortalID)
 	}
@@ -4137,6 +4184,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; processing all (noisier startup)")
 		skipUnchanged = nil
 	}
+	// Count only portals that will actually receive a ChatResync. A reaction- or
+	// metadata-only candidate can satisfy shouldForceCloudBackfill while also
+	// being provably unchanged since its completed backfill; skipping it below
+	// must not hold the APNs buffer waiting for a callback that will never run.
+	forwardBackfillPortals = countInitialBackfillPortals(ordered, needsInitialBackfill, skipUnchanged)
 	skippedChatResync := 0
 
 	// Set pendingInitialBackfills BEFORE queuing any portals.
