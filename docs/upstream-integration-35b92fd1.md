@@ -92,14 +92,16 @@ The final workflow additionally:
 
 - requires one exact 40-character OpenCider commit for every private checkout;
 - serializes runs targeting the same release tag;
-- refuses to reuse a pre-existing tag;
+- checks immediately before release creation that the tag does not exist;
 - verifies that the created tag resolves to the dispatched public commit; and
 - records the private builder commit in the job summary.
 
 Together these enforce one reproducibility rule: the tag identifies the public
 source commit, while the workflow run records the requested immutable private
 builder SHA. No broader attestation, checksum, publishing, or release-management
-subsystem was added.
+subsystem was added. The absence check and later verification are not an atomic
+lock against another privileged writer creating or moving the tag; publishing
+the draft remains the manual approval boundary.
 
 ## Reset and deployment impact
 
@@ -121,8 +123,8 @@ The merged tree passed:
 - `go vet` across those packages;
 - workflow YAML and trigger/permission inspection;
 - `git diff --check` and clean-worktree checks; and
-- a macOS `make build`, confirmation that `.build-commit` matched the source
-  merge `35b92fd1`, and `codesign --verify`.
+- an incremental macOS `make build` at source merge `35b92fd1`, confirmation
+  that `.build-commit` matched that merge, and `codesign --verify`.
 
 A final simplification review also confirmed that the management-room sections
 are byte-identical to upstream and that every functional deviation protects a
@@ -136,6 +138,7 @@ The following still require their real environments:
 - management-room creation and migration on a live Matrix homeserver;
 - live Apple IDS/APNs/CloudKit traffic and real-account restore behavior;
 - live PostgreSQL execution;
+- a forced clean Rust rebuild and execution on an Intel Homebrew host;
 - the private OpenCider and cross-architecture GitHub Actions builds; and
 - draft-release creation and tag verification on GitHub.
 
