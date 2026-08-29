@@ -56,11 +56,27 @@ ifneq ($(UNAME_S),Darwin)
   $(error This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework. Build and run it on a Mac.)
 endif
 
-# Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
-export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
+# Homebrew prefix differs by architecture: /opt/homebrew on Apple Silicon,
+# /usr/local on Intel. Detect an installed brew first; if this is a fresh
+# install, select the architecture's normal target so check-deps installs and
+# later CGO compilation use the same location. Override with
+# `make BREW_PREFIX=...` (or an exported BREW_PREFIX) for non-standard installs.
+#
+# Keep the detected value simply-expanded so this shell probe runs once per make
+# invocation, while still preserving both environment and command-line overrides.
+ifeq ($(origin BREW_PREFIX),undefined)
+BREW_PREFIX := $(shell \
+	if [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew; \
+	elif [ -x /usr/local/bin/brew ]; then echo /usr/local; \
+	elif command -v brew >/dev/null 2>&1; then brew --prefix; \
+	elif [ "$$(uname -m)" = x86_64 ]; then echo /usr/local; \
+	else echo /opt/homebrew; fi)
+endif
+
+export PATH := $(BREW_PREFIX)/bin:$(BREW_PREFIX)/sbin:$(PATH)
 BINARY      := $(APP_NAME)
-CGO_CFLAGS  := -I/opt/homebrew/include
-CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
+CGO_CFLAGS  := -I$(BREW_PREFIX)/include
+CGO_LDFLAGS := -L$(BREW_PREFIX)/lib -L$(CURDIR)
 CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
 
 # ===========================================================================
@@ -72,14 +88,14 @@ check-deps:
 	@if ! command -v brew >/dev/null 2>&1; then \
 		echo "Installing Homebrew..."; \
 		NONINTERACTIVE=1 /bin/bash -c "$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; \
-		eval "$$(/opt/homebrew/bin/brew shellenv)"; \
+		eval "$$("$(BREW_PREFIX)/bin/brew" shellenv)"; \
 	fi; \
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	command -v tmux >/dev/null 2>&1  || missing="$$missing tmux"; \
-	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
+	[ -f "$(BREW_PREFIX)/include/olm/olm.h" ] || missing="$$missing libolm"; \
 	pkg-config --exists libheif 2>/dev/null || missing="$$missing libheif"; \
 	if [ -n "$$missing" ]; then \
 		echo "Installing dependencies:$$missing"; \
@@ -118,11 +134,12 @@ FAIRPLAY_CERTS := 4056631661436364584235346952193 \
                   4056631661436364584235346952208
 
 # ---------------------------------------------------------------------------
-# rustpush source patches — every one of them PROVEN to have landed.
+# source-build patches — every one of them PROVEN to have landed.
 # ---------------------------------------------------------------------------
-# Each patch below goes through rp_patch, which mirrors build.sh's helper of the
-# same name (same labels, same perl expressions, same verify regexes — the two
-# patch sets are kept identical on purpose; diff them when you touch either).
+# Each patch below goes through RP_PATCH, whose fail-closed semantics mirror the
+# build.sh helper. Shared vendored-tree patches should remain aligned where both
+# build lanes use them; public source-build compatibility patches may be present
+# only here and must be verified against this repository's exact pinned tree.
 #
 #   rp_patch <label> <file> <perl-expr> <verify-ere>
 #

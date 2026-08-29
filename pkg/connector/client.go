@@ -1526,7 +1526,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Run in a goroutine to avoid blocking Connect on the homeserver round-trip.
 	go c.ensureBotPushRuleSilenced(ctx)
 
-	go c.maybeSendManagementRoomWelcome(context.Background(), log)
+	go c.ensureManagementRoom(context.Background(), log)
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
@@ -1618,33 +1618,160 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 }
 
-// maybeSendManagementRoomWelcome posts a one-time welcome notice to the user's
-// management room on first successful connect, then sets WelcomeSent in
-// UserLoginMetadata so subsequent connects don't repost. The room itself is
-// auto-created by bridgev2's GetManagementRoom on first call.
-func (c *IMClient) maybeSendManagementRoomWelcome(ctx context.Context, log zerolog.Logger) {
+// mgmtRoomEnsureMu serializes ensureManagementRoom across logins so two
+// concurrent connects can't both decide the user needs a room and build two.
+var mgmtRoomEnsureMu sync.Mutex
+
+// ensureManagementRoom makes sure the user's management room is the kind that
+// actually works: a room the USER created with the bridge bot invited — the
+// exact shape a user gets by DMing the bot themselves, which is the shape
+// clients handle correctly (bot on the participant list, normal chat controls,
+// leave/archive/delete all available).
+//
+// bridgev2's own GetManagementRoom builds the room backwards: the BOT creates
+// it and pulls the user in via BeeperInitialMembers/auto-join. That room is the
+// bug as reported — the client treats it as bridge infrastructure the user is
+// stuck inside rather than a chat the user owns, while a management room made
+// by DMing the bot behaves normally. Same members, opposite creator.
+//
+// Runs on every connect. Three cases:
+//
+//  1. Fresh install (no room, welcome never sent): create the room as the user
+//     via their double puppet and post the welcome into it.
+//  2. Existing BOT-created room: self-heal — create a correct room, welcome,
+//     repoint, then delete the old room. Detected by the m.room.create sender,
+//     so it runs exactly once per install and never touches a healthy room.
+//  3. Healthy room, or no room because the user left theirs on purpose
+//     (welcome already sent): do nothing.
+func (c *IMClient) ensureManagementRoom(ctx context.Context, log zerolog.Logger) {
+	mgmtRoomEnsureMu.Lock()
+	defer mgmtRoomEnsureMu.Unlock()
 	meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata)
-	if !ok || meta.WelcomeSent {
+	if !ok {
 		return
 	}
-	mgmtRoom, err := c.UserLogin.User.GetManagementRoom(ctx)
+	user := c.UserLogin.User
+	roomID := user.ManagementRoom
+	if roomID == "" {
+		if meta.WelcomeSent {
+			// The user left their management room deliberately; don't rebuild.
+			return
+		}
+		c.createManagementRoom(ctx, log, meta, "")
+		return
+	}
+	// A room exists — check who created it. GetPowerLevels populates
+	// CreateEvent, and the m.room.create sender is the creator.
+	pl, err := c.Main.Bridge.Matrix.GetPowerLevels(ctx, roomID)
+	if err != nil || pl.CreateEvent == nil {
+		log.Warn().Err(err).Str("management_room", string(roomID)).
+			Msg("Management room: can't read create event, leaving room as is")
+		return
+	}
+	if pl.CreateEvent.Sender != c.Main.Bridge.Bot.GetMXID() {
+		// User-created: the good shape. Nothing to do.
+		return
+	}
+	log.Info().Str("management_room", string(roomID)).
+		Msg("Management room: bot-created room detected, replacing it with a user-created one")
+	c.createManagementRoom(ctx, log, meta, roomID)
+}
+
+// createManagementRoom creates the management room as the USER (double puppet),
+// with the bridge bot invited — a plain trusted private DM, no name, topic, or
+// avatar of its own, so clients render it off the bot's profile exactly like a
+// DM the user opened by hand. Posts the welcome, and when oldRoom is set
+// (migration), deletes the bot-created room it replaces.
+func (c *IMClient) createManagementRoom(ctx context.Context, log zerolog.Logger, meta *UserLoginMetadata, oldRoom id.RoomID) {
+	user := c.UserLogin.User
+	dp := user.DoublePuppet(ctx)
+	if dp == nil {
+		log.Warn().Msg("Management room: no double puppet, can't create the room as the user")
+		if oldRoom != "" {
+			// Can't migrate without the user's own token; keep the old room.
+			return
+		}
+		// Fresh install fallback: a bot-created room is better than none.
+		roomID, err := user.GetManagementRoom(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Management room: fallback creation failed")
+			return
+		}
+		c.postManagementRoomWelcome(ctx, log, meta, roomID)
+		return
+	}
+	bot := c.Main.Bridge.Bot.GetMXID()
+	req := &mautrix.ReqCreateRoom{
+		Visibility: "private",
+		Preset:     "trusted_private_chat",
+		IsDirect:   true,
+		Invite:     []id.UserID{bot},
+	}
+	if c.Main.Bridge.Matrix.GetCapabilities().AutoJoinInvites {
+		// Hungryserv accepts the invite server-side at creation, so the bot
+		// arrives as a silent join and handleBotInvite never posts its own
+		// hello on top of our welcome.
+		req.BeeperAutoJoinInvites = true
+		req.BeeperInitialMembers = []id.UserID{bot}
+	}
+	roomID, err := dp.CreateRoom(ctx, req)
 	if err != nil {
-		log.Warn().Err(err).Msg("Welcome: failed to get management room")
+		log.Err(err).Msg("Management room: failed to create room as the user")
 		return
 	}
-	prefix := c.Main.Bridge.Config.CommandPrefix
-	markdown := fmt.Sprintf(managementRoomWelcomeMarkdown, prefix)
+	// Point the bridge at the new room before anything else so notices and
+	// GetManagementRoom resolve to it and nothing builds a competitor.
+	user.ManagementRoom = roomID
+	if err = user.Save(ctx); err != nil {
+		log.Err(err).Str("management_room", string(roomID)).
+			Msg("Management room: failed to save new room ID")
+		return
+	}
+	// Belt for homeservers without auto-join: accept the pending invite as the
+	// bot. No-op where the server already joined it.
+	if err = c.Main.Bridge.Bot.EnsureJoined(ctx, roomID); err != nil {
+		log.Warn().Err(err).Str("management_room", string(roomID)).
+			Msg("Management room: bot failed to join new room")
+	}
+	// A client creating a DM also files it under m.direct; match that.
+	if marker, ok := dp.(bridgev2.MarkAsDMMatrixAPI); ok {
+		if err = marker.MarkAsDM(ctx, roomID, bot); err != nil {
+			log.Warn().Err(err).Msg("Management room: failed to mark as DM with the bot")
+		}
+	}
+	log.Info().Str("management_room", string(roomID)).
+		Msg("Management room: created as the user with the bot invited")
+	c.postManagementRoomWelcome(ctx, log, meta, roomID)
+	if oldRoom != "" {
+		if err = c.Main.Bridge.Bot.DeleteRoom(ctx, oldRoom, false); err != nil {
+			log.Warn().Err(err).Str("old_room", string(oldRoom)).
+				Msg("Management room: failed to remove old bot-created room")
+		} else {
+			log.Info().Str("old_room", string(oldRoom)).
+				Msg("Management room: removed old bot-created room")
+		}
+	}
+}
+
+// postManagementRoomWelcome posts the welcome notice and stamps WelcomeSent on
+// first send. Unconditional on migration — a replacement room needs its intro
+// even though the flag is already set.
+func (c *IMClient) postManagementRoomWelcome(ctx context.Context, log zerolog.Logger, meta *UserLoginMetadata, roomID id.RoomID) {
+	markdown := fmt.Sprintf(managementRoomWelcomeMarkdown, c.Main.Bridge.Config.CommandPrefix)
 	content := format.RenderMarkdown(markdown, true, false)
-	if _, err := c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
-		log.Warn().Err(err).Str("management_room", string(mgmtRoom)).Msg("Welcome: failed to send welcome message")
+	if _, err := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
+		log.Warn().Err(err).Str("management_room", string(roomID)).
+			Msg("Management room: failed to send welcome message")
 		return
 	}
-	meta.WelcomeSent = true
-	if err := c.UserLogin.Save(ctx); err != nil {
-		log.Warn().Err(err).Msg("Welcome: failed to persist welcome_sent flag")
-		return
+	if !meta.WelcomeSent {
+		meta.WelcomeSent = true
+		if err := c.UserLogin.Save(ctx); err != nil {
+			log.Warn().Err(err).Msg("Management room: failed to persist welcome_sent flag")
+		}
 	}
-	log.Info().Str("management_room", string(mgmtRoom)).Msg("Welcome: posted management-room welcome notice")
+	log.Info().Str("management_room", string(roomID)).
+		Msg("Management room: posted welcome notice")
 }
 
 // managementRoomWelcomeMarkdown is the body posted on first connect. The
@@ -1679,6 +1806,24 @@ You're signed in. This is your **management room** — the bot uses it to delive
 
 Run ` + "`help`" + ` any time for the full command list.
 `
+
+// existingManagementRoom returns the management room the user already has, or
+// "" if they don't have one. Unlike User.GetManagementRoom it never creates one.
+//
+// Bot notices must use this. GetManagementRoom creates a room whenever the
+// pointer is empty, and bridgev2 clears that pointer the moment the user leaves
+// (bridgev2/queue.go:128). So a user who leaves their management room gets a
+// brand-new one built and — on Beeper, where the create carries
+// BeeperInitialMembers/BeeperAutoJoinInvites — is silently re-joined to it by
+// the next notice that fires. Same name, same avatar, same topic, new room ID.
+// From the user's side the room they just left is simply still there and cannot
+// be escaped.
+//
+// Leaving is never power-gated in Matrix; the leave was always working. What
+// was broken is that the bridge immediately rebuilt what the user left.
+func (c *IMClient) existingManagementRoom() id.RoomID {
+	return c.UserLogin.User.ManagementRoom
+}
 
 func (c *IMClient) Disconnect() {
 	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
@@ -4280,9 +4425,9 @@ func (c *IMClient) postFaceTimeNotice(log zerolog.Logger, msg rustpushgo.Wrapped
 		}
 	}
 
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg(logLabel + ": failed to get management room for fallback notice")
+	mgmtRoom := c.existingManagementRoom()
+	if mgmtRoom == "" {
+		log.Debug().Msg(logLabel + ": no management room, skipping fallback notice")
 		return
 	}
 	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
@@ -4865,22 +5010,20 @@ func (c *IMClient) finishRestoreBackfillPipeline(portalID string) {
 	c.restorePipelinesMu.Unlock()
 }
 
-// activeRestorePortalIDs returns a snapshot of portal IDs with an active
-// restore pipeline. The privacy scrubber excludes these so a long backfill
-// (large portal, many thousands of messages) can't be re-scrubbed mid-flight,
-// which would interact with cloudRowToBackfillMessages' BodyScrubbed skip to
-// silently drop the un-backfilled tail.
-func (c *IMClient) activeRestorePortalIDs() []string {
+// withActiveRestorePortals runs a scrub while holding the restore-pipeline
+// lifecycle lock. Existing restores are excluded, and a new restore cannot
+// start between candidate enumeration and the scrub UPDATE.
+func (c *IMClient) withActiveRestorePortals(scrub func([]string) (int64, error)) (int64, error) {
 	c.restorePipelinesMu.Lock()
 	defer c.restorePipelinesMu.Unlock()
 	if len(c.restorePipelines) == 0 {
-		return nil
+		return scrub(nil)
 	}
 	out := make([]string, 0, len(c.restorePipelines))
 	for pid := range c.restorePipelines {
 		out = append(out, pid)
 	}
-	return out
+	return scrub(out)
 }
 
 // runUnbridgedTailScrub clears plaintext from cloud_message rows older than the
@@ -4904,7 +5047,9 @@ func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger
 	if keepN <= 0 || keepN >= math.MaxInt32 {
 		return
 	}
-	scrubbed, err := c.cloudStore.scrubUnbridgedTail(ctx, keepN, bodyScrubGracePeriod, c.activeRestorePortalIDs())
+	scrubbed, err := c.withActiveRestorePortals(func(excludePortals []string) (int64, error) {
+		return c.cloudStore.scrubUnbridgedTail(ctx, keepN, bodyScrubGracePeriod, excludePortals)
+	})
 	if err != nil {
 		log.Warn().Err(err).Msg("Unbridged-tail scrub failed")
 	} else if scrubbed > 0 {
@@ -8287,19 +8432,63 @@ type cloudBackfillCursor struct {
 // line; wall time says almost nothing.
 const maxBackwardDeferAttempts = 20
 
+const forwardBackfillRetryDelay = time.Second
+
+// scheduleForwardBackfillRetry queues a forced resync after the cancelled
+// FetchMessages call has returned and bridgev2 has released the portal's
+// forward-backfill lock. The delayed event must not reuse the cancelled
+// request context.
+func (c *IMClient) scheduleForwardBackfillRetry(portalKey networkid.PortalKey) {
+	login := c.UserLogin
+	time.AfterFunc(forwardBackfillRetryDelay, func() {
+		runForwardBackfillRetry(func() bool {
+			if login == nil {
+				log.Warn().
+					Str("portal_id", logSafeHandle(string(portalKey.ID))).
+					Str("receiver", logSafeHandle(string(portalKey.Receiver))).
+					Msg("Forward backfill retry rejected: user login is unavailable")
+				return false
+			}
+			result := login.QueueRemoteEvent(&simplevent.ChatResync{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatResync,
+					PortalKey: portalKey,
+					LogContext: func(logContext zerolog.Context) zerolog.Context {
+						return logContext.Str("source", "forward_backfill_retry")
+					},
+				},
+				CheckNeedsBackfillFunc: func(context.Context, *database.Message) (bool, error) {
+					return true, nil
+				},
+			})
+			accepted := result.Success && !result.Ignored
+			if !accepted {
+				login.Log.Warn().Err(result.Error).
+					Str("portal_id", logSafeHandle(string(portalKey.ID))).
+					Str("receiver", logSafeHandle(string(portalKey.Receiver))).
+					Bool("ignored", result.Ignored).
+					Msg("Forward backfill retry was not accepted; releasing bootstrap accounting")
+			}
+			return accepted
+		}, c.onForwardBackfillDone)
+	})
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
 
 	// For forward backfill calls: ensure the bootstrap pending counter is
-	// decremented on every return path. The normal path (with messages) sets
-	// forwardDone=true and uses CompleteCallback to decrement AFTER bridgev2
-	// delivers the batch to Matrix. All other paths (early return, empty
-	// result, error) decrement here via defer — there is nothing to wait for.
+	// decremented on every terminal return path. The normal path (with messages)
+	// sets forwardDone=true and uses CompleteCallback to decrement AFTER bridgev2
+	// delivers the batch to Matrix. A semaphore cancellation schedules another
+	// forward attempt, so that path deliberately leaves the original pending
+	// count in place for the retry to complete (or the watchdog to force-flush).
 	var forwardDone bool
+	var forwardRetryScheduled bool
 	if params.Forward {
 		defer func() {
-			if !forwardDone {
+			if !forwardDone && !forwardRetryScheduled {
 				c.onForwardBackfillDone()
 			}
 		}()
@@ -8372,14 +8561,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Acquire semaphore to limit concurrent forward backfills.
 		// This prevents overwhelming CloudKit/Matrix with simultaneous
 		// attachment downloads and uploads across many portals.
-		// Use a select with ctx.Done() so we don't block the portal event
-		// loop indefinitely when all slots are taken — that causes "Portal
-		// event channel is still full" errors and dropped events.
-		select {
-		case c.forwardBackfillSem <- struct{}{}:
-		case <-ctx.Done():
-			log.Warn().Str("portal_id", logPortalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+		// If the request is cancelled while waiting, schedule a new forward
+		// attempt after bridgev2 releases the portal lock. Returning the
+		// cancellation error prevents this attempt from being marked done.
+		if err := waitForForwardBackfillSlot(ctx, c.forwardBackfillSem, func() {
+			c.scheduleForwardBackfillRetry(params.Portal.PortalKey)
+		}); err != nil {
+			forwardRetryScheduled = true
+			log.Warn().Err(err).Str("portal_id", logPortalID).
+				Msg("Forward backfill: context cancelled while waiting for semaphore; retry scheduled")
+			return nil, err
 		}
 		defer func() { <-c.forwardBackfillSem }()
 		log.Info().
