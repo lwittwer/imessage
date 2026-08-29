@@ -1,0 +1,141 @@
+# Upstream integration record: `35b92fd1`
+
+This record explains the 2026-08-29 merge of upstream `main` into
+`beta-latest`, including the small places where the final tree intentionally
+differs from upstream. It is an integration and validation record, not a live
+deployment approval.
+
+## Scope and provenance
+
+- Merge commit: `35b92fd1268fe45438af7c18d241eac9a31efbed`
+- Previous `beta-latest`: `e2f2ea1186b797af97f7251338ae365fc508ed90`
+- Integrated upstream `main`: `5758f5970062a0add9ffb93b65c985247fe0397a`
+- Common base: `755e2d212c78bf76933e84d2b912c173291ccb91`
+
+Upstream contributed management-room lifecycle changes, portable Homebrew
+dependency discovery, privacy-scrubber and forward-backfill contention work,
+and a manual release-binary workflow.
+
+The management-room history contains two reverted experiments. `729991df` and
+`018da71a` were reverted by `3e54ab55`; the standalone DM-marking change in
+`4427c680` was reverted by `dab265df`. The effective management-room changes
+are `d41878e9` and `7b3af506`.
+
+## Integrated behavior
+
+### Management rooms
+
+The final management-room implementation is unchanged from upstream. New rooms
+are created as the Matrix user when double-puppet access is available. Existing
+bot-created rooms can be replaced, the replacement is marked as a DM, and the
+welcome message is posted there. Without double-puppet access, the existing
+bridgev2 fallback remains in use.
+
+An intentionally cleared management-room pointer is respected by the FaceTime,
+Shared Streams, and recycle-bin notice paths, so those paths do not immediately
+recreate a room the user left.
+
+This state is deliberately treated as disposable. The integration does not add
+a migration state machine, notice replay queue, welcome retry subsystem, or
+room-history preservation contract. Bridgev2's own status-notice path may still
+recreate a missing room, and transient notices may be skipped while no room is
+configured. Those consequences do not justify fork-specific lifecycle
+machinery for a replaceable management room.
+
+### Source builds
+
+The architecture-aware `BREW_PREFIX` work was retained, including support for
+both Apple Silicon and Intel Homebrew layouts.
+
+Upstream's build-time patches for the omnisette provider and
+`disable_icloud_contacts` were not retained. The provider adaptation already
+exists in tracked beta source, while the contacts patches would rewrite tracked
+Go and YAML files during the build. A source build should compile the reviewed
+tree rather than create an untracked source variant through anchor-sensitive
+Perl substitutions.
+
+### Privacy scrubber and forward backfill
+
+Upstream's core contention improvements were retained: an index-backed finite
+candidate pass, one delivered-message materialization per scrub pass, chunked
+updates, and delayed forward-backfill retry when semaphore acquisition is
+cancelled.
+
+The implementation was adapted to preserve beta's existing data contracts:
+
+- Candidate and write-time predicates remain scoped by login and receiver.
+- Filtered and deleted sibling chats cannot authorize or suppress the wrong
+  portal's history.
+- A CloudKit source remapped to another portal stays unreadable but retains its
+  plaintext for authoritative re-ingest.
+- Permanently filtered/deleted candidates remain distinct from candidates that
+  require proof of Matrix delivery.
+- Pending initial backfills and active restore pipelines remain excluded.
+- Restore lifecycle changes are serialized across candidate selection and the
+  scrub update, preventing a restore from starting inside that window.
+- Cancellation that races a successful semaphore send returns the slot and
+  schedules the replacement attempt.
+- Retry diagnostics use sanitized portal and receiver identifiers.
+
+These are not speculative recovery layers. Removing them could permanently
+scrub recoverable message content or leave forward-backfill bootstrap accounting
+stuck. The implementation uses the existing restore mutex and existing SQL
+eligibility predicates rather than introducing new persisted state.
+
+### Release workflow
+
+Upstream's manual-only workflow, pinned public actions, read-only default
+permissions, private build-log containment, and exact three-artifact release
+allowlist were retained.
+
+The final workflow additionally:
+
+- requires one exact 40-character OpenCider commit for every private checkout;
+- serializes runs targeting the same release tag;
+- refuses to reuse a pre-existing tag;
+- verifies that the created tag resolves to the dispatched public commit; and
+- records the private builder commit in the job summary.
+
+Together these enforce one provenance rule: the release must identify one
+public source commit and one immutable private builder commit. No broader
+attestation, checksum, publishing, or release-management subsystem was added.
+
+## Reset and deployment impact
+
+No portal IDs, Apple identity, login/session representation, or reset boundary
+changed. No reset or re-login is required by this integration. The scrubber
+schema addition is an index and is created through the existing schema setup.
+
+Management-room replacement may delete the old bot-created room as upstream
+intends. This does not affect Apple state, message portals, backfill history, or
+credentials.
+
+## Validation performed
+
+The merged tree passed:
+
+- focused and full `pkg/connector` tests;
+- focused race-detector tests and the full connector race suite;
+- broader Go tests for the connector, CLI, bbctl, command, and macOS packages;
+- `go vet` across those packages;
+- workflow YAML and trigger/permission inspection;
+- `git diff --check` and clean-worktree checks; and
+- a macOS `make build`, `.build-commit` verification, and `codesign --verify`.
+
+A final simplification review also confirmed that the management-room sections
+are byte-identical to upstream and that every functional deviation protects a
+specific data-integrity, privacy, build-reproducibility, or release-provenance
+contract.
+
+## Validation not performed
+
+The following still require their real environments:
+
+- management-room creation and migration on a live Matrix homeserver;
+- live Apple IDS/APNs/CloudKit traffic and real-account restore behavior;
+- live PostgreSQL execution;
+- the private OpenCider and cross-architecture GitHub Actions builds; and
+- draft-release creation and tag verification on GitHub.
+
+No live bridge, Matrix room, Apple state, launchd service, or local runtime
+database was changed while preparing this integration.
