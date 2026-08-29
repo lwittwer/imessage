@@ -22,4 +22,4 @@ jobs:
           gh api \
             --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --field body='@codex review'
+            --raw-field body='@codex review'
