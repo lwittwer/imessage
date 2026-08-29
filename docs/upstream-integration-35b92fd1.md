@@ -51,7 +51,7 @@ Upstream's build-time patches for the omnisette provider and
 `disable_icloud_contacts` were not retained. The provider adaptation already
 exists in tracked beta source, while the contacts patches would rewrite tracked
 Go and YAML files during the build. A source build should compile the reviewed
-tree rather than create an untracked source variant through anchor-sensitive
+tree rather than leave a dirty tracked-source variant through anchor-sensitive
 Perl substitutions.
 
 ### Privacy scrubber and forward backfill
@@ -96,9 +96,10 @@ The final workflow additionally:
 - verifies that the created tag resolves to the dispatched public commit; and
 - records the private builder commit in the job summary.
 
-Together these enforce one provenance rule: the release must identify one
-public source commit and one immutable private builder commit. No broader
-attestation, checksum, publishing, or release-management subsystem was added.
+Together these enforce one reproducibility rule: the tag identifies the public
+source commit, while the workflow run records the requested immutable private
+builder SHA. No broader attestation, checksum, publishing, or release-management
+subsystem was added.
 
 ## Reset and deployment impact
 
@@ -120,7 +121,8 @@ The merged tree passed:
 - `go vet` across those packages;
 - workflow YAML and trigger/permission inspection;
 - `git diff --check` and clean-worktree checks; and
-- a macOS `make build`, `.build-commit` verification, and `codesign --verify`.
+- a macOS `make build`, confirmation that `.build-commit` matched the source
+  merge `35b92fd1`, and `codesign --verify`.
 
 A final simplification review also confirmed that the management-room sections
 are byte-identical to upstream and that every functional deviation protects a
