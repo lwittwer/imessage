@@ -17,17 +17,22 @@ func createScrubberBridgeMessageTable(t *testing.T, db *dbutil.Database, ctx con
 	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
 		id TEXT NOT NULL,
 		bridge_id TEXT NOT NULL,
+		room_id TEXT NOT NULL,
 		room_receiver TEXT NOT NULL DEFAULT ''
 	)`); err != nil {
 		t.Fatalf("create message table: %v", err)
 	}
+	if _, err := db.Exec(ctx, `CREATE INDEX IF NOT EXISTS message_delivery_test_idx
+		ON message (bridge_id, room_receiver, id)`); err != nil {
+		t.Fatalf("create message index: %v", err)
+	}
 }
 
-func insertScrubberBridgeMessage(t *testing.T, db *dbutil.Database, ctx context.Context, id, bridgeID, receiver string) {
+func insertScrubberBridgeMessage(t *testing.T, db *dbutil.Database, ctx context.Context, id, bridgeID, portalID, receiver string) {
 	t.Helper()
 	if _, err := db.Exec(ctx,
-		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-		id, bridgeID, receiver,
+		`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+		id, bridgeID, portalID, receiver,
 	); err != nil {
 		t.Fatalf("insert bridgev2 message row %q: %v", id, err)
 	}
@@ -90,33 +95,34 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 	}
 }
 
-func TestLoadBridgedGUIDSetNormalizesAndScopesIDs(t *testing.T) {
+func TestLoadBridgedMessageIDsNormalizesAndScopesIDs(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
 	store := newCloudBackfillStore(db, testSQLLoginID)
 	createScrubberBridgeMessageTable(t, db, ctx)
 
 	otherLogin := networkid.UserLoginID("other-login")
-	insertScrubberBridgeMessage(t, db, ctx, "ABC-1", "bridge", string(testSQLLoginID))
-	insertScrubberBridgeMessage(t, db, ctx, "guid-2_att0", "bridge", "")
-	insertScrubberBridgeMessage(t, db, ctx, strings.ToUpper("guid-3"), "bridge", string(testSQLLoginID))
-	insertScrubberBridgeMessage(t, db, ctx, "wrong-bridge", "other-bridge", string(testSQLLoginID))
-	insertScrubberBridgeMessage(t, db, ctx, "wrong-login", "bridge", string(otherLogin))
+	const portalID = "gid:test"
+	insertScrubberBridgeMessage(t, db, ctx, "ABC-1", "bridge", portalID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "guid-2_att0", "bridge", portalID, "")
+	insertScrubberBridgeMessage(t, db, ctx, strings.ToUpper("guid-3"), "bridge", portalID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "wrong-bridge", "other-bridge", portalID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "wrong-login", "bridge", portalID, string(otherLogin))
 
-	set, err := store.loadBridgedGUIDSet(ctx, "bridge")
+	witnesses, err := store.loadBridgedMessageIDs(ctx, "bridge")
 	if err != nil {
-		t.Fatalf("loadBridgedGUIDSet: %v", err)
+		t.Fatalf("loadBridgedMessageIDs: %v", err)
 	}
-	for guid, want := range map[string]bool{
-		"abc-1":        true,
-		"guid-2":       true,
-		"guid-3":       true,
-		"wrong-bridge": false,
-		"wrong-login":  false,
+	for guid, want := range map[string]string{
+		"abc-1":        "ABC-1",
+		"guid-2":       "guid-2_att0",
+		"guid-3":       strings.ToUpper("guid-3"),
+		"wrong-bridge": "",
+		"wrong-login":  "",
 	} {
-		_, got := set[guid]
+		got := witnesses[bridgedDeliveryKey{guid: guid, portalID: portalID}]
 		if got != want {
-			t.Errorf("set contains %q = %v, want %v", guid, got, want)
+			t.Errorf("witness for %q = %q, want %q", guid, got, want)
 		}
 	}
 }
@@ -141,7 +147,7 @@ func TestScrubBridgedBodiesMultiChunkPreservesEligibility(t *testing.T) {
 			GUID: guid, PortalID: "gid:bulk", TimestampMS: old,
 			Text: "secret " + guid, Sender: "tel:+1555", Service: "iMessage", HasBody: true,
 		})
-		insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, string(testSQLLoginID))
+		insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, "gid:bulk", string(testSQLLoginID))
 	}
 	if err := store.upsertMessageBatch(ctx, bulk); err != nil {
 		t.Fatalf("upsert bulk messages: %v", err)
@@ -160,8 +166,8 @@ func TestScrubBridgedBodiesMultiChunkPreservesEligibility(t *testing.T) {
 		{GUID: "restore-portal-row", PortalID: "gid:restore", TimestampMS: old,
 			Text: "restoring secret", Service: "iMessage", HasBody: true},
 	}
-	insertScrubberBridgeMessage(t, db, ctx, "fresh-delivered", bridgeID, string(testSQLLoginID))
-	insertScrubberBridgeMessage(t, db, ctx, "restore-portal-row", bridgeID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "fresh-delivered", bridgeID, "gid:bulk", string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "restore-portal-row", bridgeID, "gid:restore", string(testSQLLoginID))
 	if err := store.upsertMessageBatch(ctx, special); err != nil {
 		t.Fatalf("upsert special messages: %v", err)
 	}
@@ -209,6 +215,206 @@ func TestScrubBridgedBodiesMultiChunkPreservesEligibility(t *testing.T) {
 	}
 }
 
+func TestScrubBridgedBodiesRechecksDeliveryBetweenChunks(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	createScrubberBridgeMessageTable(t, db, ctx)
+
+	const (
+		bridgeID = "test-bridge"
+		lateGUID = "delivered-late"
+	)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	rows := make([]cloudMessageRow, 0, 1001)
+	for i := 0; i < 1000; i++ {
+		guid := fmt.Sprintf("forced-%04d", i)
+		rows = append(rows, cloudMessageRow{
+			GUID: guid, PortalID: "gid:forced", TimestampMS: old,
+			Text: "forced secret", Deleted: true, Service: "iMessage", HasBody: true,
+		})
+	}
+	rows = append(rows, cloudMessageRow{
+		GUID: lateGUID, PortalID: "gid:late", TimestampMS: old,
+		Text: "must survive", Service: "iMessage", HasBody: true,
+	})
+	if err := store.upsertMessageBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert messages: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid LIKE 'forced-%'`,
+		old, testSQLLoginID,
+	); err != nil {
+		t.Fatalf("age forced messages: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+		old+1, testSQLLoginID, lateGUID,
+	); err != nil {
+		t.Fatalf("age delivered message: %v", err)
+	}
+	insertScrubberBridgeMessage(t, db, ctx, lateGUID, bridgeID, "gid:late", string(testSQLLoginID))
+
+	// The first UPDATE contains exactly the 1000 forced rows. Delete the live
+	// delivery witness from inside that statement so the second batch must
+	// observe the deletion without timing hooks or sleeps.
+	if _, err := db.Exec(ctx, `
+		CREATE TRIGGER delete_late_delivery
+		AFTER UPDATE OF body_scrubbed ON cloud_message
+		WHEN OLD.guid='forced-0999'
+		BEGIN
+			DELETE FROM message WHERE id='delivered-late';
+		END
+	`); err != nil {
+		t.Fatalf("create deletion trigger: %v", err)
+	}
+
+	total, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
+	}
+	if total != 1000 {
+		t.Fatalf("scrubbed %d rows, want only 1000 forced rows", total)
+	}
+	var text sql.NullString
+	var scrubbed bool
+	if err := db.QueryRow(ctx,
+		`SELECT text, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, lateGUID,
+	).Scan(&text, &scrubbed); err != nil {
+		t.Fatalf("read delivered candidate: %v", err)
+	}
+	if !text.Valid || text.String != "must survive" || scrubbed {
+		t.Fatalf("late candidate text=%q valid=%v scrubbed=%v, want preserved", text.String, text.Valid, scrubbed)
+	}
+	var bridgeRows int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM message WHERE id=$1`, lateGUID).Scan(&bridgeRows); err != nil {
+		t.Fatalf("count bridge messages: %v", err)
+	}
+	if bridgeRows != 0 {
+		t.Fatalf("bridge message count = %d, want 0 to prove trigger fired", bridgeRows)
+	}
+}
+
+func TestScrubBridgedBodiesRequiresPortalScopedDelivery(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	createScrubberBridgeMessageTable(t, db, ctx)
+
+	const (
+		bridgeID = "test-bridge"
+		portalID = "gid:current"
+		guid     = "portal-scoped-guid"
+	)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: guid, PortalID: portalID, TimestampMS: old,
+		Text: "must survive wrong-room proof", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert message: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+		old, testSQLLoginID, guid,
+	); err != nil {
+		t.Fatalf("age message: %v", err)
+	}
+	insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, "gid:wrong", string(testSQLLoginID))
+
+	if total, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil {
+		t.Fatalf("scrub with wrong-room witness: %v", err)
+	} else if total != 0 {
+		t.Fatalf("scrubbed %d rows with only wrong-room proof, want 0", total)
+	}
+	var text sql.NullString
+	if err := db.QueryRow(ctx,
+		`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, guid,
+	).Scan(&text); err != nil {
+		t.Fatalf("read preserved body: %v", err)
+	}
+	if !text.Valid || text.String != "must survive wrong-room proof" {
+		t.Fatalf("body after wrong-room proof = %q valid=%v, want preserved", text.String, text.Valid)
+	}
+
+	// A matching shared-receiver witness authorizes the same row even while the
+	// wrong-room witness remains, proving that delivery is keyed by GUID+portal.
+	insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, portalID, "")
+	if total, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil {
+		t.Fatalf("scrub with matching-room witness: %v", err)
+	} else if total != 1 {
+		t.Fatalf("scrubbed %d rows with matching-room proof, want 1", total)
+	}
+}
+
+func TestScrubBridgedBodiesPreservesKnownSourceRemap(t *testing.T) {
+	for _, bridgeFiltered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bridge_filtered=%v", bridgeFiltered), func(t *testing.T) {
+			ctx := context.Background()
+			db := newTestSQLiteDB(t)
+			store := newCloudBackfillStore(db, testSQLLoginID, bridgeFiltered)
+			if err := store.ensureSchema(ctx); err != nil {
+				t.Fatalf("ensureSchema: %v", err)
+			}
+			createScrubberBridgeMessageTable(t, db, ctx)
+
+			const (
+				bridgeID  = "test-bridge"
+				chatID    = "remapped-source-chat"
+				oldPortal = "gid:old-portal"
+				newPortal = "gid:new-portal"
+				guid      = "remapped-source-guid"
+			)
+			now := time.Now().UnixMilli()
+			old := now - int64(time.Hour/time.Millisecond)
+			if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+				CloudChatID: chatID, PortalID: newPortal, Service: "iMessage",
+				ParticipantsJSON: "[]", UpdatedTS: now,
+			}}); err != nil {
+				t.Fatalf("upsert remapped source: %v", err)
+			}
+			if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+				GUID: guid, PortalID: oldPortal, CloudChatID: chatID,
+				TimestampMS: old, Text: "must remain recoverable", Service: "iMessage", HasBody: true,
+			}}); err != nil {
+				t.Fatalf("upsert stale message: %v", err)
+			}
+			if _, err := db.Exec(ctx,
+				`UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+				old, testSQLLoginID, guid,
+			); err != nil {
+				t.Fatalf("age stale message: %v", err)
+			}
+			insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, oldPortal, string(testSQLLoginID))
+
+			total, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil)
+			if err != nil {
+				t.Fatalf("scrubBridgedBodies: %v", err)
+			}
+			if total != 0 {
+				t.Fatalf("scrubbed %d rows, want 0 for known source remap", total)
+			}
+			var text sql.NullString
+			if err := db.QueryRow(ctx,
+				`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+				testSQLLoginID, guid,
+			).Scan(&text); err != nil {
+				t.Fatalf("read stale message: %v", err)
+			}
+			if !text.Valid || text.String != "must remain recoverable" {
+				t.Fatalf("message text=%q valid=%v, want preserved", text.String, text.Valid)
+			}
+		})
+	}
+}
+
 func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
@@ -216,11 +422,13 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	if err := store.ensureSchema(ctx); err != nil {
 		t.Fatalf("ensureSchema: %v", err)
 	}
+	createScrubberBridgeMessageTable(t, db, ctx)
 
 	now := time.Now().UnixMilli()
 	old := now - int64(time.Hour/time.Millisecond)
 	const portalID = "gid:newly-pending"
 	const guid = "pending-race-guid"
+	insertScrubberBridgeMessage(t, db, ctx, guid, "bridge", portalID, string(testSQLLoginID))
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
 		GUID: guid, PortalID: portalID, CloudChatID: "pending-race-chat",
 		TimestampMS: old, Text: "must survive", Service: "iMessage", HasBody: true,
@@ -252,8 +460,8 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("upsert pending chat: %v", err)
 	}
-	scrubbed, err := store.scrubBatchIfEligible(ctx, cutoff,
-		map[string]struct{}{guid: {}}, candidates)
+	scrubbed, err := store.scrubBatchIfEligible(ctx, "bridge", cutoff,
+		map[bridgedDeliveryKey]string{{guid: guid, portalID: portalID}: guid}, candidates)
 	if err != nil {
 		t.Fatalf("scrubBatchIfEligible: %v", err)
 	}
@@ -325,8 +533,9 @@ func TestScrubBatchRechecksPermanentFilterAtWriteTime(t *testing.T) {
 	}
 	scrubbed, err := store.scrubBatchIfEligible(
 		ctx,
+		"bridge",
 		now-int64(time.Minute/time.Millisecond),
-		map[string]struct{}{},
+		map[bridgedDeliveryKey]string{},
 		candidates,
 	)
 	if err != nil {

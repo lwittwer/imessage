@@ -4388,37 +4388,50 @@ func pendingBackfillGateSQL(holdPlaceholder string, bridgeFiltered bool) string 
 			      )`
 }
 
-// loadBridgedGUIDSet materializes bridgev2's delivered message IDs once per
-// scrub pass. IDs are normalized exactly like the former SQL UNION: matching
-// is case-insensitive, and part-suffixed IDs (<guid>_<part>) also contribute
-// their base GUID. Receiver scoping prevents one login's delivery from making
-// another login's CloudKit row eligible for scrubbing.
-func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
+type bridgedDeliveryKey struct {
+	guid     string
+	portalID string
+}
+
+// loadBridgedMessageIDs materializes one exact bridgev2 message ID witness for
+// each normalized CloudKit GUID and portal. The witness lets each scrub batch
+// recheck live delivery with indexed equality instead of rescanning message with
+// case-folding and suffix expressions. Matching remains case-insensitive, and
+// part-suffixed IDs (<guid>_<part>) also contribute their base GUID. Receiver
+// scoping prevents one login's delivery from making another login's CloudKit
+// row eligible for scrubbing.
+func (s *cloudBackfillStore) loadBridgedMessageIDs(ctx context.Context, bridgeID string) (map[bridgedDeliveryKey]string, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id FROM message
+		SELECT id, room_id FROM message
 		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')`,
 		bridgeID, string(s.loginID))
 	if err != nil {
-		return nil, fmt.Errorf("failed to load bridged guid set: %w", err)
+		return nil, fmt.Errorf("failed to load bridged message witnesses: %w", err)
 	}
 	defer rows.Close()
 
-	set := make(map[string]struct{})
+	witnesses := make(map[bridgedDeliveryKey]string)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan bridged guid: %w", err)
+		var id, portalID string
+		if err := rows.Scan(&id, &portalID); err != nil {
+			return nil, fmt.Errorf("scan bridged message witness: %w", err)
 		}
 		normalized := strings.ToLower(id)
-		set[normalized] = struct{}{}
+		key := bridgedDeliveryKey{guid: normalized, portalID: portalID}
+		if _, exists := witnesses[key]; !exists {
+			witnesses[key] = id
+		}
 		if suffix := strings.IndexByte(normalized, '_'); suffix > 0 {
-			set[normalized[:suffix]] = struct{}{}
+			key.guid = normalized[:suffix]
+			if _, exists := witnesses[key]; !exists {
+				witnesses[key] = id
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate bridged guid set: %w", err)
+		return nil, fmt.Errorf("iterate bridged message witnesses: %w", err)
 	}
-	return set, nil
+	return witnesses, nil
 }
 
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
@@ -4477,15 +4490,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		return 0, nil
 	}
 
-	// The delivered set replaces the old per-chunk UNION over the entire
-	// bridgev2 message table. Deleted and permanently filtered candidates do not
-	// require this membership check, so a force-only pass skips the scan too.
-	bridged := make(map[string]struct{})
+	// The initial delivery snapshot is only a prefilter: each batch rechecks its
+	// exact message witnesses in the UPDATE. Deleted and permanently filtered
+	// candidates do not require delivery proof, so a force-only pass skips the
+	// snapshot too.
+	bridged := make(map[bridgedDeliveryKey]string)
 	for _, candidate := range candidates {
 		if candidate.forceScrub {
 			continue
 		}
-		bridged, err = s.loadBridgedGUIDSet(ctx, bridgeID)
+		bridged, err = s.loadBridgedMessageIDs(ctx, bridgeID)
 		if err != nil {
 			return 0, err
 		}
@@ -4498,7 +4512,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		if end > len(candidates) {
 			end = len(candidates)
 		}
-		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridged, candidates[start:end])
+		n, err := s.scrubBatchIfEligible(ctx, bridgeID, cutoff, bridged, candidates[start:end])
 		if err != nil {
 			return total, err
 		}
@@ -4568,6 +4582,7 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 
 type cloudScrubCandidate struct {
 	guid       string
+	portalID   string
 	forceScrub bool
 }
 
@@ -4592,13 +4607,14 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 	}
 
 	rows, err := s.db.Query(ctx, `
-		SELECT guid, CASE WHEN (`+forceWhere+`) THEN TRUE ELSE FALSE END
+		SELECT guid, COALESCE(portal_id, ''), CASE WHEN (`+forceWhere+`) THEN TRUE ELSE FALSE END
 		FROM cloud_message
 		WHERE login_id=$1
 		  AND body_scrubbed=FALSE
 		  AND (tapback_type IS NULL OR tapback_type < 2000)
 		  AND updated_ts < $2
-		  AND ((`+forceWhere+`) OR (`+pendingGate+`))`+exclusionSQL+`
+		  AND ((`+forceWhere+`) OR ((`+pendingGate+`)
+		    `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`))`+exclusionSQL+`
 		ORDER BY updated_ts ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list scrub candidates: %w", err)
@@ -4608,7 +4624,7 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 	var candidates []cloudScrubCandidate
 	for rows.Next() {
 		var candidate cloudScrubCandidate
-		if err := rows.Scan(&candidate.guid, &candidate.forceScrub); err != nil {
+		if err := rows.Scan(&candidate.guid, &candidate.portalID, &candidate.forceScrub); err != nil {
 			return nil, fmt.Errorf("scan scrub candidate: %w", err)
 		}
 		candidates = append(candidates, candidate)
@@ -4619,29 +4635,37 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 	return candidates, nil
 }
 
-// scrubBatchIfEligible filters one candidate chunk through the delivered set
-// and applies a small UPDATE. It keeps forced and delivered GUIDs separate so
-// the write can recheck why each row is eligible. In particular, a source that
-// becomes a recoverable routing mismatch after enumeration is not scrubbed from
-// a stale permanently-filtered classification.
-func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridged map[string]struct{}, candidates []cloudScrubCandidate) (int64, error) {
+// scrubBatchIfEligible applies one small candidate UPDATE. Forced and delivered
+// GUIDs stay separate so the write can recheck why each row is eligible. The
+// delivered branch joins exact message ID and portal witnesses inside the
+// UPDATE, while both branches recheck source eligibility. A deleted witness or
+// a newly recoverable routing mismatch therefore preserves the plaintext.
+func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, bridgeID string, cutoff int64, bridged map[bridgedDeliveryKey]string, candidates []cloudScrubCandidate) (int64, error) {
 	forceGUIDs := make([]string, 0, len(candidates))
-	deliveredGUIDs := make([]string, 0, len(candidates))
+	type deliveryProof struct {
+		guid      string
+		portalID  string
+		messageID string
+	}
+	delivered := make([]deliveryProof, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.forceScrub {
 			forceGUIDs = append(forceGUIDs, candidate.guid)
 			continue
 		}
-		if _, ok := bridged[strings.ToLower(candidate.guid)]; ok {
-			deliveredGUIDs = append(deliveredGUIDs, candidate.guid)
+		key := bridgedDeliveryKey{guid: strings.ToLower(candidate.guid), portalID: candidate.portalID}
+		if messageID, ok := bridged[key]; ok {
+			delivered = append(delivered, deliveryProof{
+				guid: candidate.guid, portalID: candidate.portalID, messageID: messageID,
+			})
 		}
 	}
-	if len(forceGUIDs) == 0 && len(deliveredGUIDs) == 0 {
+	if len(forceGUIDs) == 0 && len(delivered) == 0 {
 		return 0, nil
 	}
 
 	holdCutoff := time.Now().Add(-pendingBackfillScrubHold).UnixMilli()
-	args := make([]any, 0, len(forceGUIDs)+len(deliveredGUIDs)+3)
+	args := make([]any, 0, len(forceGUIDs)+3*len(delivered)+4)
 	args = append(args, s.loginID, cutoff, holdCutoff)
 	appendGUIDs := func(guids []string) string {
 		placeholders := make([]string, len(guids))
@@ -4656,11 +4680,30 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff in
 		forceWhere := `cloud_message.deleted=TRUE OR (` + permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered) + `)`
 		eligibility = append(eligibility, `(guid IN (`+appendGUIDs(forceGUIDs)+`) AND (`+forceWhere+`))`)
 	}
-	if len(deliveredGUIDs) > 0 {
+	queryPrefix := ""
+	if len(delivered) > 0 {
+		args = append(args, bridgeID)
+		bridgePlaceholder := fmt.Sprintf("$%d", len(args))
+		proofRows := make([]string, 0, len(delivered))
+		for _, proof := range delivered {
+			args = append(args, proof.guid, proof.portalID, proof.messageID)
+			proofRows = append(proofRows, fmt.Sprintf("($%d, $%d, $%d)", len(args)-2, len(args)-1, len(args)))
+		}
+		queryPrefix = `WITH live_delivery(guid, portal_id, message_id) AS (VALUES ` + strings.Join(proofRows, ",") + `) `
 		pendingGate := pendingBackfillGateSQL("$3", s.bridgeFiltered)
-		eligibility = append(eligibility, `(guid IN (`+appendGUIDs(deliveredGUIDs)+`) AND (`+pendingGate+`))`)
+		eligibility = append(eligibility, `(EXISTS (
+			SELECT 1 FROM live_delivery proof
+			JOIN message delivered
+			  ON delivered.bridge_id=`+bridgePlaceholder+`
+			 AND (delivered.room_receiver=$1 OR delivered.room_receiver='')
+			 AND delivered.room_id=proof.portal_id
+			 AND delivered.id=proof.message_id
+			WHERE proof.guid=cloud_message.guid
+			  AND proof.portal_id=cloud_message.portal_id
+		  ) AND (`+pendingGate+`)
+		  `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`)`)
 	}
-	result, err := s.db.Exec(ctx, `
+	result, err := s.db.Exec(ctx, queryPrefix+`
 		UPDATE cloud_message
 		SET text=NULL, subject=NULL, sender='',
 		    tapback_emoji=NULL, body_scrubbed=TRUE

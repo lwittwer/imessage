@@ -57,19 +57,24 @@ Perl substitutions.
 ### Privacy scrubber and forward backfill
 
 Upstream's core scrubber contention improvements were retained: an index-backed
-finite candidate pass, one delivered-message materialization per scrub pass,
-and chunked updates. Forward backfills retain the cancellable semaphore, but
-not the delayed retry that upstream attached to cancellation.
+finite candidate pass, one delivered-message materialization as a prefilter,
+and chunked updates. Each chunk rechecks its exact bridgev2 message IDs and
+portal IDs inside the update, so the prefilter is not treated as durable proof.
+Forward backfills retain the cancellable semaphore, but not the delayed retry
+that upstream attached to cancellation.
 
 The implementation was adapted to preserve beta's existing data contracts:
 
 - Candidate and write-time predicates remain scoped by login and receiver.
 - Filtered and deleted sibling chats cannot authorize or suppress the wrong
   portal's history.
-- A CloudKit source remapped to another portal stays unreadable but retains its
-  plaintext for authoritative re-ingest.
+- Ordinary delivered-body scrubbing requires the CloudKit source to remain
+  mapped to the candidate portal, so a known remap retains plaintext for
+  authoritative re-ingest.
 - Permanently filtered/deleted candidates remain distinct from candidates that
   require proof of Matrix delivery.
+- Matrix delivery proof is portal-scoped and revalidated in the same statement
+  that scrubs the body; a deleted witness cannot authorize a later chunk.
 - Pending initial backfills and active restore pipelines remain excluded.
 - Restore lifecycle changes are serialized across candidate selection and the
   scrub update, preventing a restore from starting inside that window.
@@ -126,6 +131,7 @@ The merged tree passed:
 
 - focused and full `pkg/connector` tests;
 - focused race-detector tests and the full connector race suite;
+- deterministic multi-chunk witness-deletion and portal-remap regressions;
 - broader Go tests for the connector, CLI, bbctl, command, and macOS packages;
 - `go vet` across those packages;
 - workflow YAML and trigger/permission inspection;

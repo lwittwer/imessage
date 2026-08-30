@@ -576,10 +576,11 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 	}
 
 	// bridgev2's message table, which scrubBridgedBodies joins against. Only
-	// the three columns the query touches are needed.
+	// the columns the query touches are needed.
 	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
 		id TEXT NOT NULL,
 		bridge_id TEXT NOT NULL,
+		room_id TEXT NOT NULL,
 		room_receiver TEXT NOT NULL DEFAULT ''
 	)`); err != nil {
 		t.Fatalf("create message table: %v", err)
@@ -631,8 +632,8 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 	// instr()-based normalisation is what has to match it) older than the
 	// grace window must have its body cleared.
 	if _, err := db.Exec(ctx,
-		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-		"GUID-MISROUTED_1", "test-bridge", string(testSQLLoginID),
+		`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+		"GUID-MISROUTED_1", "test-bridge", "gid:right-portal", string(testSQLLoginID),
 	); err != nil {
 		t.Fatalf("insert bridgev2 message row: %v", err)
 	}
