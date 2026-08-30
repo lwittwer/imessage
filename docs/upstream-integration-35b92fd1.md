@@ -56,10 +56,10 @@ Perl substitutions.
 
 ### Privacy scrubber and forward backfill
 
-Upstream's core contention improvements were retained: an index-backed finite
-candidate pass, one delivered-message materialization per scrub pass, chunked
-updates, and delayed forward-backfill retry when semaphore acquisition is
-cancelled.
+Upstream's core scrubber contention improvements were retained: an index-backed
+finite candidate pass, one delivered-message materialization per scrub pass,
+and chunked updates. Forward backfills retain the cancellable semaphore, but
+not the delayed retry that upstream attached to cancellation.
 
 The implementation was adapted to preserve beta's existing data contracts:
 
@@ -73,14 +73,21 @@ The implementation was adapted to preserve beta's existing data contracts:
 - Pending initial backfills and active restore pipelines remain excluded.
 - Restore lifecycle changes are serialized across candidate selection and the
   scrub update, preventing a restore from starting inside that window.
-- Cancellation that races a successful semaphore send returns the slot and
-  schedules the replacement attempt.
-- Retry diagnostics use sanitized portal and receiver identifiers.
+- Cancellation that races a successful semaphore send returns the slot.
+- Cancellation ends the current attempt and releases its bootstrap accounting.
+  The context belongs to the portal lifecycle, so cancellation means portal
+  deletion or bridge shutdown rather than a semaphore timeout. Unfinished
+  history remains eligible for the existing startup reconciliation and
+  backfill-task recovery paths.
 
-These are not speculative recovery layers. Removing them could permanently
-scrub recoverable message content or leave forward-backfill bootstrap accounting
-stuck. The implementation uses the existing restore mutex and existing SQL
-eligibility predicates rather than introducing new persisted state.
+The scrubber protections are not speculative recovery layers: removing them
+could permanently scrub recoverable message content. The implementation uses
+the existing restore mutex and SQL eligibility predicates rather than new
+persisted state. Conversely, the delayed retry was removed because enqueue
+acceptance does not prove dispatch, its forced resync can be dropped before
+`FetchMessages`, and its timer can cross client generations. Making that retry
+safe would require lifecycle and ownership machinery disproportionate to a
+teardown-only cancellation path.
 
 ### Release workflow
 

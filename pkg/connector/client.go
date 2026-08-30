@@ -8432,48 +8432,6 @@ type cloudBackfillCursor struct {
 // line; wall time says almost nothing.
 const maxBackwardDeferAttempts = 20
 
-const forwardBackfillRetryDelay = time.Second
-
-// scheduleForwardBackfillRetry queues a forced resync after the cancelled
-// FetchMessages call has returned and bridgev2 has released the portal's
-// forward-backfill lock. The delayed event must not reuse the cancelled
-// request context.
-func (c *IMClient) scheduleForwardBackfillRetry(portalKey networkid.PortalKey) {
-	login := c.UserLogin
-	time.AfterFunc(forwardBackfillRetryDelay, func() {
-		runForwardBackfillRetry(func() bool {
-			if login == nil {
-				log.Warn().
-					Str("portal_id", logSafeHandle(string(portalKey.ID))).
-					Str("receiver", logSafeHandle(string(portalKey.Receiver))).
-					Msg("Forward backfill retry rejected: user login is unavailable")
-				return false
-			}
-			result := login.QueueRemoteEvent(&simplevent.ChatResync{
-				EventMeta: simplevent.EventMeta{
-					Type:      bridgev2.RemoteEventChatResync,
-					PortalKey: portalKey,
-					LogContext: func(logContext zerolog.Context) zerolog.Context {
-						return logContext.Str("source", "forward_backfill_retry")
-					},
-				},
-				CheckNeedsBackfillFunc: func(context.Context, *database.Message) (bool, error) {
-					return true, nil
-				},
-			})
-			accepted := result.Success && !result.Ignored
-			if !accepted {
-				login.Log.Warn().Err(result.Error).
-					Str("portal_id", logSafeHandle(string(portalKey.ID))).
-					Str("receiver", logSafeHandle(string(portalKey.Receiver))).
-					Bool("ignored", result.Ignored).
-					Msg("Forward backfill retry was not accepted; releasing bootstrap accounting")
-			}
-			return accepted
-		}, c.onForwardBackfillDone)
-	})
-}
-
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8481,14 +8439,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	// For forward backfill calls: ensure the bootstrap pending counter is
 	// decremented on every terminal return path. The normal path (with messages)
 	// sets forwardDone=true and uses CompleteCallback to decrement AFTER bridgev2
-	// delivers the batch to Matrix. A semaphore cancellation schedules another
-	// forward attempt, so that path deliberately leaves the original pending
-	// count in place for the retry to complete (or the watchdog to force-flush).
+	// delivers the batch to Matrix. Semaphore cancellation is terminal for this
+	// attempt because ctx is the portal lifecycle context; restart reconciliation
+	// is responsible for retrying unfinished history.
 	var forwardDone bool
-	var forwardRetryScheduled bool
 	if params.Forward {
 		defer func() {
-			if !forwardDone && !forwardRetryScheduled {
+			if !forwardDone {
 				c.onForwardBackfillDone()
 			}
 		}()
@@ -8561,15 +8518,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Acquire semaphore to limit concurrent forward backfills.
 		// This prevents overwhelming CloudKit/Matrix with simultaneous
 		// attachment downloads and uploads across many portals.
-		// If the request is cancelled while waiting, schedule a new forward
-		// attempt after bridgev2 releases the portal lock. Returning the
-		// cancellation error prevents this attempt from being marked done.
-		if err := waitForForwardBackfillSlot(ctx, c.forwardBackfillSem, func() {
-			c.scheduleForwardBackfillRetry(params.Portal.PortalKey)
-		}); err != nil {
-			forwardRetryScheduled = true
+		// Cancellation means the portal is being deleted or the bridge is
+		// stopping, not that semaphore contention timed out. Do not queue work
+		// beyond that lifecycle boundary; the next startup will reconcile the
+		// still-incomplete backfill.
+		if err := waitForForwardBackfillSlot(ctx, c.forwardBackfillSem); err != nil {
 			log.Warn().Err(err).Str("portal_id", logPortalID).
-				Msg("Forward backfill: context cancelled while waiting for semaphore; retry scheduled")
+				Msg("Forward backfill: context cancelled while waiting for semaphore")
 			return nil, err
 		}
 		defer func() { <-c.forwardBackfillSem }()
