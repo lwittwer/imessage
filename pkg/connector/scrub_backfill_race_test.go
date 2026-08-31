@@ -36,6 +36,7 @@ func scrubRaceFixture(t *testing.T) (context.Context, *dbutil.Database, *cloudBa
 	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
 		id TEXT NOT NULL,
 		bridge_id TEXT NOT NULL,
+		room_id TEXT NOT NULL,
 		room_receiver TEXT NOT NULL DEFAULT ''
 	)`); err != nil {
 		t.Fatalf("create message table: %v", err)
@@ -121,8 +122,8 @@ func TestScrubHoldsOffPendingBackfillPortals(t *testing.T) {
 		}
 		// Delivered to Matrix — the precondition scrubBridgedBodies requires.
 		if _, err := db.Exec(ctx,
-			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-			guid, bridgeID, string(testSQLLoginID),
+			`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+			guid, bridgeID, p.id, string(testSQLLoginID),
 		); err != nil {
 			t.Fatalf("insert bridgev2 message row %s: %v", p.id, err)
 		}
@@ -317,8 +318,8 @@ func TestScrubPendingGateIgnoresStaleDeletedOrFilteredDoneSiblings(t *testing.T)
 				t.Fatalf("upsertMessageBatch: %v", err)
 			}
 			if _, err := db.Exec(ctx,
-				`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-				"GUID-LIVE-PENDING", bridgeID, string(testSQLLoginID),
+				`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+				"GUID-LIVE-PENDING", bridgeID, portalID, string(testSQLLoginID),
 			); err != nil {
 				t.Fatalf("insert bridge message: %v", err)
 			}
@@ -374,8 +375,8 @@ func TestScrubPendingGateCorrelatesLiveSiblingCompletion(t *testing.T) {
 	}
 	for _, guid := range []string{"GUID-LIVE-PENDING", "GUID-LIVE-DONE"} {
 		if _, err := db.Exec(ctx,
-			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-			guid, bridgeID, string(testSQLLoginID),
+			`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+			guid, bridgeID, portalID, string(testSQLLoginID),
 		); err != nil {
 			t.Fatalf("insert bridge message %s: %v", guid, err)
 		}
@@ -470,8 +471,8 @@ func TestScrubHoldsOffOptedInFilteredBackfillPortals(t *testing.T) {
 		t.Fatalf("upsertMessageBatch: %v", err)
 	}
 	if _, err := db.Exec(ctx,
-		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-		"GUID-FILTERED-OPTED-IN", bridgeID, string(testSQLLoginID),
+		`INSERT INTO message (id, bridge_id, room_id, room_receiver) VALUES ($1, $2, $3, $4)`,
+		"GUID-FILTERED-OPTED-IN", bridgeID, portalID, string(testSQLLoginID),
 	); err != nil {
 		t.Fatalf("insert bridgev2 message row: %v", err)
 	}

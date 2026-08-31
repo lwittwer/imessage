@@ -338,6 +338,16 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	// Privacy-scrubber fast path: both body and reaction scrubs select old,
+	// un-scrubbed rows by login. Keep this partial so its steady-state size is
+	// proportional to the pending plaintext backlog rather than all history.
+	// It must be created after the column migrations above because legacy
+	// databases do not have body_scrubbed until those migrations complete.
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_idx
+		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
+		return fmt.Errorf("failed to create cloud_message_scrub_idx: %w", err)
+	}
+
 	// Privacy migration: pre-existing soft-deleted rows from before the
 	// privacy branch never went through softDeleteMessageByGUID's inline
 	// scrub. They sit with deleted=TRUE and original text/subject/sender,
@@ -4378,6 +4388,52 @@ func pendingBackfillGateSQL(holdPlaceholder string, bridgeFiltered bool) string 
 			      )`
 }
 
+type bridgedDeliveryKey struct {
+	guid     string
+	portalID string
+}
+
+// loadBridgedMessageIDs materializes one exact bridgev2 message ID witness for
+// each normalized CloudKit GUID and portal. The witness lets each scrub batch
+// recheck live delivery with indexed equality instead of rescanning message with
+// case-folding and suffix expressions. Matching remains case-insensitive, and
+// part-suffixed IDs (<guid>_<part>) also contribute their base GUID. Receiver
+// scoping prevents one login's delivery from making another login's CloudKit
+// row eligible for scrubbing.
+func (s *cloudBackfillStore) loadBridgedMessageIDs(ctx context.Context, bridgeID string) (map[bridgedDeliveryKey]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id, room_id FROM message
+		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')`,
+		bridgeID, string(s.loginID))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load bridged message witnesses: %w", err)
+	}
+	defer rows.Close()
+
+	witnesses := make(map[bridgedDeliveryKey]string)
+	for rows.Next() {
+		var id, portalID string
+		if err := rows.Scan(&id, &portalID); err != nil {
+			return nil, fmt.Errorf("scan bridged message witness: %w", err)
+		}
+		normalized := strings.ToLower(id)
+		key := bridgedDeliveryKey{guid: normalized, portalID: portalID}
+		if _, exists := witnesses[key]; !exists {
+			witnesses[key] = id
+		}
+		if suffix := strings.IndexByte(normalized, '_'); suffix > 0 {
+			key.guid = normalized[:suffix]
+			if _, exists := witnesses[key]; !exists {
+				witnesses[key] = id
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate bridged message witnesses: %w", err)
+	}
+	return witnesses, nil
+}
+
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
 // tapback_emoji) on cloud_message rows whose corresponding Matrix event has
 // been successfully delivered (an entry exists in bridgev2's `message` table)
@@ -4421,93 +4477,47 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		return 0, nil
 	}
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
-	var total int64
-	// Small chunks + a brief yield between chunks so the scrubber doesn't
-	// contend with live upsertMessageBatch / APNs ingestion when the
-	// first-boot backlog is large.
 	const chunkSize = 1000
 
-	// Build optional NOT IN clause for portals with active restore pipelines.
-	// Large portals (50k+ messages) can take many minutes to backfill, and
-	// the updated_ts grace window only buys ~5 min; without this exclusion
-	// the scrubber would re-scrub partway through, and cloudRowToBackfillMessages'
-	// BodyScrubbed skip would silently drop the un-backfilled tail.
-	exclusionSQL := ""
-	args := []any{s.loginID, cutoff, bridgeID}
-	// $4: the pending-backfill hold cutoff. See pendingBackfillGateSQL.
-	args = append(args, time.Now().Add(-pendingBackfillScrubHold).UnixMilli())
-	pendingGate := pendingBackfillGateSQL(fmt.Sprintf("$%d", len(args)), s.bridgeFiltered)
-	if len(excludePortals) > 0 {
-		placeholders := make([]string, 0, len(excludePortals))
-		for _, pid := range excludePortals {
-			args = append(args, pid)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
-		}
-		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	// Candidate enumeration is one index-backed pass, so undelivered rows cannot
+	// be re-scanned forever. Avoid touching bridgev2's large message table at all
+	// when this pass has no eligible rows (the normal steady-state case).
+	candidates, err := s.scrubCandidates(ctx, cutoff, excludePortals)
+	if err != nil {
+		return 0, err
 	}
-	args = append(args, chunkSize)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+	if len(candidates) == 0 {
+		return 0, nil
+	}
 
-	// The outer UPDATE re-checks body_scrubbed=FALSE AND updated_ts < cutoff
-	// at write time so concurrent upsert / clearBodyScrubByPortalID between
-	// subquery eval and outer apply can't be silently overwritten. The
-	// subquery picks candidate guids; the outer WHERE confirms the row's
-	// state hasn't changed under us. Required because SQLite's IN-subquery
-	// materializes the guid list once, then applies the UPDATE without
-	// re-evaluating the predicate per row.
-	// Match bridged rows by membership in the set of guids that have a `message`
-	// row, computed ONCE per chunk, instead of a per-row correlated EXISTS with
-	// UPPER()+LIKE (which can't use an index and ran ~25s over a 40k-row backlog,
-	// tripping dbutil's 1s slow-query warning every chunk). bridgev2 stores the
-	// base message id in `id`; part-suffixed ids (`<guid>_<part>`) are normalised
-	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
-	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
-	// CloudKit-mixed-case matching the EXISTS form had.
-	// instr() is SQLite-only; Postgres spells the same function strpos().
-	query := strings.ReplaceAll(`
-		UPDATE cloud_message
-		SET text=NULL,
-		    subject=NULL,
-		    sender='',
-		    tapback_emoji=NULL,
-		    body_scrubbed=TRUE
-		WHERE login_id=$1
-		  AND body_scrubbed=FALSE
-		  AND updated_ts < $2
-		  AND guid IN (
-		    SELECT guid FROM cloud_message
-		    WHERE login_id=$1
-		      AND body_scrubbed=FALSE
-		      AND (tapback_type IS NULL OR tapback_type < 2000)
-		      AND updated_ts < $2
-		      AND (
-		        deleted=TRUE
-		        OR (
-		          `+permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered)+`
-		        )
-		        OR (
-		          UPPER(guid) IN (
-		            SELECT UPPER(id) FROM message
-		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
-		            UNION
-		            SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		            WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
-		              AND (room_receiver=$1 OR room_receiver='')
-		          )
-		          AND `+pendingGate+`
-		        )
-		      )`+exclusionSQL+`
-		    LIMIT `+limitPlaceholder+`
-		  )
-	`, "{{INSTR}}", sqlInstrFunc(s.db))
-	for {
-		result, err := s.db.Exec(ctx, query, args...)
-		if err != nil {
-			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+	// The initial delivery snapshot is only a prefilter: each batch rechecks its
+	// exact message witnesses in the UPDATE. Deleted and permanently filtered
+	// candidates do not require delivery proof, so a force-only pass skips the
+	// snapshot too.
+	bridged := make(map[bridgedDeliveryKey]string)
+	for _, candidate := range candidates {
+		if candidate.forceScrub {
+			continue
 		}
-		n, _ := result.RowsAffected()
+		bridged, err = s.loadBridgedMessageIDs(ctx, bridgeID)
+		if err != nil {
+			return 0, err
+		}
+		break
+	}
+
+	var total int64
+	for start := 0; start < len(candidates); start += chunkSize {
+		end := start + chunkSize
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		n, err := s.scrubBatchIfEligible(ctx, bridgeID, cutoff, bridged, candidates[start:end])
+		if err != nil {
+			return total, err
+		}
 		total += n
-		if n < chunkSize {
+		if end == len(candidates) {
 			break
 		}
 		select {
@@ -4568,6 +4578,145 @@ func permanentlyFilteredMessageWhere(alias string, bridgeFiltered bool) string {
 		)
 		%s
 	)`, alias, alias, alias, alias, eligibleFilter, legacyMixedPortal)
+}
+
+type cloudScrubCandidate struct {
+	guid       string
+	portalID   string
+	forceScrub bool
+}
+
+// scrubCandidates lists the finite set of rows this pass may scrub. The
+// partial index serves the login/body_scrubbed/updated_ts prefix. Pending
+// initial backfills and active restore portals retain beta's source-aware
+// protections. Deleted and permanently filtered rows bypass the delivered and
+// pending gates because no backfill reader can deliver them.
+func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, excludePortals []string) ([]cloudScrubCandidate, error) {
+	holdCutoff := time.Now().Add(-pendingBackfillScrubHold).UnixMilli()
+	args := []any{s.loginID, cutoff, holdCutoff}
+	pendingGate := pendingBackfillGateSQL("$3", s.bridgeFiltered)
+	forceWhere := `cloud_message.deleted=TRUE OR (` + permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered) + `)`
+	exclusionSQL := ""
+	if len(excludePortals) > 0 {
+		placeholders := make([]string, 0, len(excludePortals))
+		for _, portalID := range excludePortals {
+			args = append(args, portalID)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT guid, COALESCE(portal_id, ''), CASE WHEN (`+forceWhere+`) THEN TRUE ELSE FALSE END
+		FROM cloud_message
+		WHERE login_id=$1
+		  AND body_scrubbed=FALSE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND updated_ts < $2
+		  AND ((`+forceWhere+`) OR ((`+pendingGate+`)
+		    `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`))`+exclusionSQL+`
+		ORDER BY updated_ts ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list scrub candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []cloudScrubCandidate
+	for rows.Next() {
+		var candidate cloudScrubCandidate
+		if err := rows.Scan(&candidate.guid, &candidate.portalID, &candidate.forceScrub); err != nil {
+			return nil, fmt.Errorf("scan scrub candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate scrub candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+// scrubBatchIfEligible applies one small candidate UPDATE. Forced and delivered
+// GUIDs stay separate so the write can recheck why each row is eligible. The
+// delivered branch joins exact message ID and portal witnesses inside the
+// UPDATE, while both branches recheck source eligibility. A deleted witness or
+// a newly recoverable routing mismatch therefore preserves the plaintext.
+func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, bridgeID string, cutoff int64, bridged map[bridgedDeliveryKey]string, candidates []cloudScrubCandidate) (int64, error) {
+	forceGUIDs := make([]string, 0, len(candidates))
+	type deliveryProof struct {
+		guid      string
+		portalID  string
+		messageID string
+	}
+	delivered := make([]deliveryProof, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.forceScrub {
+			forceGUIDs = append(forceGUIDs, candidate.guid)
+			continue
+		}
+		key := bridgedDeliveryKey{guid: strings.ToLower(candidate.guid), portalID: candidate.portalID}
+		if messageID, ok := bridged[key]; ok {
+			delivered = append(delivered, deliveryProof{
+				guid: candidate.guid, portalID: candidate.portalID, messageID: messageID,
+			})
+		}
+	}
+	if len(forceGUIDs) == 0 && len(delivered) == 0 {
+		return 0, nil
+	}
+
+	holdCutoff := time.Now().Add(-pendingBackfillScrubHold).UnixMilli()
+	args := make([]any, 0, len(forceGUIDs)+3*len(delivered)+4)
+	args = append(args, s.loginID, cutoff, holdCutoff)
+	appendGUIDs := func(guids []string) string {
+		placeholders := make([]string, len(guids))
+		for i, guid := range guids {
+			args = append(args, guid)
+			placeholders[i] = fmt.Sprintf("$%d", len(args))
+		}
+		return strings.Join(placeholders, ",")
+	}
+	eligibility := make([]string, 0, 2)
+	if len(forceGUIDs) > 0 {
+		forceWhere := `cloud_message.deleted=TRUE OR (` + permanentlyFilteredMessageWhere("cloud_message", s.bridgeFiltered) + `)`
+		eligibility = append(eligibility, `(guid IN (`+appendGUIDs(forceGUIDs)+`) AND (`+forceWhere+`))`)
+	}
+	queryPrefix := ""
+	if len(delivered) > 0 {
+		args = append(args, bridgeID)
+		bridgePlaceholder := fmt.Sprintf("$%d", len(args))
+		proofRows := make([]string, 0, len(delivered))
+		for _, proof := range delivered {
+			args = append(args, proof.guid, proof.portalID, proof.messageID)
+			proofRows = append(proofRows, fmt.Sprintf("($%d, $%d, $%d)", len(args)-2, len(args)-1, len(args)))
+		}
+		queryPrefix = `WITH live_delivery(guid, portal_id, message_id) AS (VALUES ` + strings.Join(proofRows, ",") + `) `
+		pendingGate := pendingBackfillGateSQL("$3", s.bridgeFiltered)
+		eligibility = append(eligibility, `(EXISTS (
+			SELECT 1 FROM live_delivery proof
+			JOIN message delivered
+			  ON delivered.bridge_id=`+bridgePlaceholder+`
+			 AND (delivered.room_receiver=$1 OR delivered.room_receiver='')
+			 AND delivered.room_id=proof.portal_id
+			 AND delivered.id=proof.message_id
+			WHERE proof.guid=cloud_message.guid
+			  AND proof.portal_id=cloud_message.portal_id
+		  ) AND (`+pendingGate+`)
+		  `+cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)+`)`)
+	}
+	result, err := s.db.Exec(ctx, queryPrefix+`
+		UPDATE cloud_message
+		SET text=NULL, subject=NULL, sender='',
+		    tapback_emoji=NULL, body_scrubbed=TRUE
+		WHERE login_id=$1
+		  AND body_scrubbed=FALSE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND updated_ts < $2
+		  AND (`+strings.Join(eligibility, ` OR `)+`)`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),

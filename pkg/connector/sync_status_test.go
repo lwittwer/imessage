@@ -39,6 +39,7 @@ const syncStatusFrameworkSchema = `
 	CREATE TABLE message (
 		bridge_id     TEXT   NOT NULL,
 		id            TEXT   NOT NULL,
+		room_id       TEXT   NOT NULL,
 		room_receiver TEXT   NOT NULL,
 		timestamp     BIGINT NOT NULL
 	);
@@ -148,10 +149,10 @@ func (h *syncStatusHarness) msg(m msg) {
 // actually stores. tsMS is given in milliseconds for symmetry with
 // cloud_message, and written out in nanoseconds because that is what bridgev2
 // stores in message.timestamp.
-func (h *syncStatusHarness) delivered(id, roomReceiver string, tsMS int64) {
+func (h *syncStatusHarness) delivered(id, portalID, roomReceiver string, tsMS int64) {
 	h.t.Helper()
-	h.exec(`INSERT INTO message (bridge_id, id, room_receiver, timestamp) VALUES ($1, $2, $3, $4)`,
-		syncStatusTestBridgeID, id, roomReceiver, tsMS*int64(time.Millisecond))
+	h.exec(`INSERT INTO message (bridge_id, id, room_id, room_receiver, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+		syncStatusTestBridgeID, id, portalID, roomReceiver, tsMS*int64(time.Millisecond))
 }
 
 func TestGetSyncStatus(t *testing.T) {
@@ -178,7 +179,7 @@ func TestGetSyncStatus(t *testing.T) {
 				for i := 1; i <= 3; i++ {
 					guid := fmt.Sprintf("guid-%d", i)
 					h.msg(msg{guid: guid, portal: "tel:+15550100", ts: int64(i) * 1000, text: "hello"})
-					h.delivered(guid, loginID, int64(i)*1000)
+					h.delivered(guid, "tel:+15550100", loginID, int64(i)*1000)
 				}
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
@@ -213,8 +214,8 @@ func TestGetSyncStatus(t *testing.T) {
 				// Delivered in the two spellings bridgev2 really writes: an
 				// uppercase APNs guid, and a part-suffixed id from a message
 				// that produced several events.
-				h.delivered("GUID-1", loginID, 1000)
-				h.delivered("guid-2_1", "", 2000)
+				h.delivered("GUID-1", "tel:+15550100", loginID, 1000)
+				h.delivered("guid-2_1", "tel:+15550100", "", 2000)
 				h.exec(`INSERT INTO backfill_task (bridge_id, portal_id, user_login_id, is_done, dispatched_at)
 					VALUES ($1, 'tel:+15550100', $2, FALSE, NULL)`, syncStatusTestBridgeID, testSQLLoginID)
 			},
@@ -288,8 +289,8 @@ func TestGetSyncStatus(t *testing.T) {
 				h.msg(msg{guid: "gone-1", portal: "tel:+15550100", ts: 2000, text: "bye", deleted: true})
 				h.msg(msg{guid: "stub-1", portal: "tel:+15550100", ts: 1000, noRecord: true})
 
-				h.delivered("ok-1", loginID, 5000)
-				h.delivered("ok-2", loginID, 5000)
+				h.delivered("ok-1", "tel:+15550100", loginID, 5000)
+				h.delivered("ok-2", "tel:+15550200", loginID, 5000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
 				assertCounts(t, r, counts{candidates: 5, deliverable: 3, delivered: 2, filtered: 1, empty: 1})
@@ -375,7 +376,7 @@ func TestGetSyncStatus(t *testing.T) {
 
 				h.chat("tel:+15550700", "scrubbed-delivered", false, false)
 				h.msg(msg{guid: "scrubbed-delivered-guid", portal: "tel:+15550700", chatID: "scrubbed-delivered", ts: 1000, scrubbed: true})
-				h.delivered("scrubbed-delivered-guid", loginID, 1000)
+				h.delivered("scrubbed-delivered-guid", "tel:+15550700", loginID, 1000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
 				assertCounts(t, r, counts{candidates: 5, deliverable: 2, delivered: 1, empty: 2, unavailable: 1})
@@ -398,7 +399,7 @@ func TestGetSyncStatus(t *testing.T) {
 				h.msg(msg{guid: "m-3", portal: "tel:+15550100", ts: 3000, text: "older"})
 				h.msg(msg{guid: "m-2", portal: "tel:+15550100", ts: 2000, text: "older still"})
 				h.msg(msg{guid: "m-1", portal: "tel:+15550100", ts: 1000, text: "oldest"})
-				h.delivered("m-4", loginID, 4000)
+				h.delivered("m-4", "tel:+15550100", loginID, 4000)
 			},
 			check: func(t *testing.T, r *SyncStatusReport) {
 				assertCounts(t, r, counts{candidates: 4, deliverable: 1, delivered: 1, beyondCap: 3})
@@ -467,6 +468,24 @@ func TestGetSyncStatus(t *testing.T) {
 			},
 		},
 		{
+			name: "delivery in another portal is not proof",
+			setup: func(t *testing.T, h *syncStatusHarness) {
+				zonesSynced(h)
+				h.chat("gid:current", "current-chat", false, false)
+				h.msg(msg{
+					guid: "portal-scoped-guid", portal: "gid:current",
+					chatID: "current-chat", ts: 2000, text: "pending here",
+				})
+				h.delivered("portal-scoped-guid", "gid:old", loginID, 2000)
+			},
+			check: func(t *testing.T, r *SyncStatusReport) {
+				assertCounts(t, r, counts{candidates: 1, deliverable: 1})
+				if got := r.PendingMessages(); got != 1 {
+					t.Errorf("PendingMessages = %d, want 1", got)
+				}
+			},
+		},
+		{
 			name: "scrubbed rows still count as content",
 			setup: func(t *testing.T, h *syncStatusHarness) {
 				zonesSynced(h)
@@ -475,7 +494,7 @@ func TestGetSyncStatus(t *testing.T) {
 				// bridged. Read as "empty", these would file a healthy
 				// long-running bridge under "not bridgeable".
 				h.msg(msg{guid: "scrubbed-1", portal: "tel:+15550100", ts: 1000, scrubbed: true})
-				h.delivered("scrubbed-1", loginID, 1000)
+				h.delivered("scrubbed-1", "tel:+15550100", loginID, 1000)
 				// A scrubbed row without bridgev2 evidence cannot be called
 				// pending: its body is gone and there is no safe local event path.
 				h.msg(msg{guid: "scrubbed-undelivered", portal: "tel:+15550100", ts: 2000, scrubbed: true})

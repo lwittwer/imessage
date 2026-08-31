@@ -302,10 +302,10 @@ func messageSourceMismatchSQL(messageCol, loginParam string) string {
 		)`
 }
 
-// deliveredGUIDSetSQL builds the subquery of iMessage GUIDs that reached
-// Matrix, in the same spelling scrubBridgedBodies uses to decide a row is
-// safe to scrub — the two have to agree or the bridge would scrub bodies the
-// report still counts as pending.
+// deliveredMessageSetSQL builds the set of iMessage GUID and portal pairs that
+// reached Matrix, in the same spelling scrubBridgedBodies uses to decide a row
+// is safe to scrub. Portal scope prevents delivery in an old room from proving
+// a CloudKit row whose authoritative source moved elsewhere.
 //
 // Two normalizations matter. bridgev2 stores the base message ID in `id`, but
 // a row that produced several events (text plus attachments) is stored as
@@ -315,13 +315,14 @@ func messageSourceMismatchSQL(messageCol, loginParam string) string {
 //
 // Parameters: $1 login_id (matched against room_receiver, which bridgev2
 // leaves empty for shared portals), $2 bridge_id.
-func deliveredGUIDSetSQL(db *dbutil.Database) string {
+func deliveredMessageSetSQL(db *dbutil.Database) string {
 	instr := sqlInstrFunc(db)
 	return `
-		SELECT UPPER(m.id) FROM message m
+		SELECT UPPER(m.id) AS guid, m.room_id AS portal_id FROM message m
 		WHERE m.bridge_id=$2 AND (m.room_receiver=$1 OR m.room_receiver='')
 		UNION
-		SELECT UPPER(substr(m.id, 1, ` + instr + `(m.id, '_') - 1)) FROM message m
+		SELECT UPPER(substr(m.id, 1, ` + instr + `(m.id, '_') - 1)) AS guid,
+		       m.room_id AS portal_id FROM message m
 		WHERE m.bridge_id=$2 AND ` + instr + `(m.id, '_') > 0
 		  AND (m.room_receiver=$1 OR m.room_receiver='')`
 }
@@ -643,8 +644,11 @@ func (r *SyncStatusReport) readMessageCounts(ctx context.Context, db *dbutil.Dat
 							THEN 1 ELSE 0 END AS source_mismatch,
 						CASE WHEN ` + messageBridgeableSQL("cm", "$1", "$4") + `
 							THEN 1 ELSE 0 END AS portal_bridgeable,
-						CASE WHEN UPPER(cm.guid) IN (` + deliveredGUIDSetSQL(db) + `
-						          ) THEN 1 ELSE 0 END AS delivered
+						CASE WHEN EXISTS (
+							SELECT 1 FROM (` + deliveredMessageSetSQL(db) + `) delivered_set
+							WHERE delivered_set.guid=UPPER(cm.guid)
+							  AND delivered_set.portal_id=cm.portal_id
+						) THEN 1 ELSE 0 END AS delivered
 					FROM cloud_message cm
 					WHERE cm.login_id=$1 AND cm.deleted=FALSE AND cm.record_name <> ''
 					  AND cm.portal_id IS NOT NULL AND cm.portal_id <> ''
