@@ -658,6 +658,24 @@ Before changing portal identity, chat.db backfill, SMS routing, reset behavior,
 or stacked pull requests, read the contributor
 [engineering invariants](docs/ENGINEERING.md).
 
+### Maintainer release builds
+
+Maintainers with the private OpenCider deploy key can manually run **Build
+release binaries** in GitHub Actions. Select Mac only, either Linux
+architecture, both Linux architectures, or All platforms. Platform-only runs
+upload binaries without creating tags or releases.
+
+All platforms requires a release title and creates a draft containing exactly
+the universal macOS binary and the two Linux binaries. Choose a patch, minor,
+or major increment from the latest published release, or enter an exact manual
+version (also supported for a repository's first release). An existing tag is
+reusable only when it points directly to the dispatched public commit.
+Review the draft and add release notes before publishing it manually.
+
+Every build job uses the same private builder revision selected at preflight,
+represented by an opaque token in the workflow. A fresh full run resolves
+private `master` again. Private build output is withheld from public logs.
+
 ## Source layout
 
 ```

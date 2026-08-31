@@ -215,6 +215,14 @@ boundaries, or the `main`/`beta-latest` stacked-PR workflow. Those rules are
 lifecycle contracts: preserve them across creation, restart, retry, restore,
 and publication rather than validating only the immediate call path.
 
+## Release workflow verification
+
+For release CI changes, run `bash scripts/tests/next-release-tag-test.sh` and
+`bash .github/workflows/tests/build-release-binaries-contract.sh`, plus workflow
+linting and shell syntax checks. These use synthetic inputs; they do not
+validate private OpenCider builds or create a real release. Preserve the
+release provenance and private-source boundaries in `docs/ENGINEERING.md`.
+
 ## Documentation Hygiene
 
 If you change a user-facing workflow or hard engineering constraint, update docs
