@@ -1622,27 +1622,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 // concurrent connects can't both decide the user needs a room and build two.
 var mgmtRoomEnsureMu sync.Mutex
 
-// ensureManagementRoom makes sure the user's management room is the kind that
-// actually works: a room the USER created with the bridge bot invited — the
-// exact shape a user gets by DMing the bot themselves, which is the shape
-// clients handle correctly (bot on the participant list, normal chat controls,
-// leave/archive/delete all available).
-//
-// bridgev2's own GetManagementRoom builds the room backwards: the BOT creates
-// it and pulls the user in via BeeperInitialMembers/auto-join. That room is the
-// bug as reported — the client treats it as bridge infrastructure the user is
-// stuck inside rather than a chat the user owns, while a management room made
-// by DMing the bot behaves normally. Same members, opposite creator.
-//
-// Runs on every connect. Three cases:
-//
-//  1. Fresh install (no room, welcome never sent): create the room as the user
-//     via their double puppet and post the welcome into it.
-//  2. Existing BOT-created room: self-heal — create a correct room, welcome,
-//     repoint, then delete the old room. Detected by the m.room.create sender,
-//     so it runs exactly once per install and never touches a healthy room.
-//  3. Healthy room, or no room because the user left theirs on purpose
-//     (welcome already sent): do nothing.
+// ensureManagementRoom creates user-owned rooms and migrates legacy bot-created
+// rooms. Existing rooms keep custom names/avatars and receive missing defaults.
+// A room the user deliberately left is not recreated.
 func (c *IMClient) ensureManagementRoom(ctx context.Context, log zerolog.Logger) {
 	mgmtRoomEnsureMu.Lock()
 	defer mgmtRoomEnsureMu.Unlock()
@@ -1669,7 +1651,7 @@ func (c *IMClient) ensureManagementRoom(ctx context.Context, log zerolog.Logger)
 		return
 	}
 	if pl.CreateEvent.Sender != c.Main.Bridge.Bot.GetMXID() {
-		// User-created: the good shape. Nothing to do.
+		c.ensureManagementRoomState(ctx, log, roomID)
 		return
 	}
 	log.Info().Str("management_room", string(roomID)).
@@ -1677,11 +1659,54 @@ func (c *IMClient) ensureManagementRoom(ctx context.Context, log zerolog.Logger)
 	c.createManagementRoom(ctx, log, meta, roomID)
 }
 
+// managementRoomState uses the same defaults as bridgev2's management room.
+func (c *IMClient) managementRoomState() []*event.Event {
+	network := c.Main.GetName()
+	return []*event.Event{
+		{Type: event.StateRoomName, Content: event.Content{Parsed: &event.RoomNameEventContent{Name: network.DisplayName}}},
+		{Type: event.StateRoomAvatar, Content: event.Content{Parsed: &event.RoomAvatarEventContent{URL: network.NetworkIcon}}},
+	}
+}
+
+// ensureManagementRoomState fills missing name/avatar without overwriting custom
+// values or depending on matrix.sync_direct_chat_list and bot profile rendering.
+func (c *IMClient) ensureManagementRoomState(ctx context.Context, log zerolog.Logger, roomID id.RoomID) {
+	stateReader, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
+	if !ok {
+		return
+	}
+	for _, state := range c.managementRoomState() {
+		stateLog := log.With().Stringer("event_type", state.Type).Logger()
+		evt, err := stateReader.GetStateEvent(ctx, roomID, state.Type, "")
+		if err != nil && !errors.Is(err, mautrix.MNotFound) {
+			stateLog.Warn().Err(err).Msg("Management room: failed to read room state")
+			continue
+		}
+		if evt != nil {
+			switch current := evt.Content.Parsed.(type) {
+			case *event.RoomNameEventContent:
+				if current.Name != "" {
+					continue
+				}
+			case *event.RoomAvatarEventContent:
+				if current.URL != "" || current.MSC3414File != nil {
+					continue
+				}
+			}
+		}
+		state.Content.Raw = map[string]any{"com.beeper.exclude_from_timeline": true}
+		if _, err = c.Main.Bridge.Bot.SendState(ctx, roomID, state.Type, "", &state.Content, time.Time{}); err != nil {
+			stateLog.Warn().Err(err).Msg("Management room: failed to set missing room state")
+		} else {
+			stateLog.Info().Msg("Management room: set missing room state")
+		}
+	}
+}
+
 // createManagementRoom creates the management room as the USER (double puppet),
-// with the bridge bot invited — a plain trusted private DM, no name, topic, or
-// avatar of its own, so clients render it off the bot's profile exactly like a
-// DM the user opened by hand. Posts the welcome, and when oldRoom is set
-// (migration), deletes the bot-created room it replaces.
+// with the bridge bot invited and the same name and icon as bridgev2's fallback.
+// Posts the welcome, and when oldRoom is set (migration), deletes the bot-created
+// room it replaces.
 func (c *IMClient) createManagementRoom(ctx context.Context, log zerolog.Logger, meta *UserLoginMetadata, oldRoom id.RoomID) {
 	user := c.UserLogin.User
 	dp := user.DoublePuppet(ctx)
@@ -1702,10 +1727,11 @@ func (c *IMClient) createManagementRoom(ctx context.Context, log zerolog.Logger,
 	}
 	bot := c.Main.Bridge.Bot.GetMXID()
 	req := &mautrix.ReqCreateRoom{
-		Visibility: "private",
-		Preset:     "trusted_private_chat",
-		IsDirect:   true,
-		Invite:     []id.UserID{bot},
+		Visibility:   "private",
+		Preset:       "trusted_private_chat",
+		IsDirect:     true,
+		Invite:       []id.UserID{bot},
+		InitialState: c.managementRoomState(),
 	}
 	if c.Main.Bridge.Matrix.GetCapabilities().AutoJoinInvites {
 		// Hungryserv accepts the invite server-side at creation, so the bot

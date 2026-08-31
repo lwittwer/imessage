@@ -201,6 +201,11 @@ Incoming iMessages automatically create Matrix rooms. History backfill uses **Cl
 
 ## Bridge commands
 
+The default room name is **iMessage**, with the network's iMessage icon. On
+reconnect, missing names and avatars are filled in without recreating the
+management room; custom names and avatars are preserved. These defaults do not
+require `matrix.sync_direct_chat_list` to be enabled.
+
 In the **management room** (the bot DM, opened automatically when you log in), type commands bare — no prefix:
 
 ```

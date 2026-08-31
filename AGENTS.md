@@ -171,6 +171,10 @@ config YAML is loaded. Keep existing overrides such as
 - `corten-matrix logs` tails the first account; `corten-matrix logs 1` tails the
   second.
 - Structured bridge logs live under each data dir's `logs/bridge.log`.
+- Management rooms use the connector's network display name (`iMessage`) and
+  network icon. Repair missing names/avatars in place on reconnect and preserve
+  custom values; do not rely on `matrix.sync_direct_chat_list` or bot profile
+  rendering for a visible room name/avatar.
 - macOS services use `launchd` with `com.lrhodin.corten-matrix`; Linux services
   use `systemd` as `corten-matrix`. The single `bridge-all` service supervises
   configured accounts independently, so one account may restart without
