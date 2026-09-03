@@ -235,3 +235,19 @@ Before delivery, run focused package tests for changed behavior, the applicable
 build described in `AGENTS.md`, `git diff --check`, and a final review that no
 real account data, logs, credentials, or machine-local artifacts entered the
 patch.
+
+## Release workflow provenance
+
+The release-binary workflow is manual-only. Resolve one private OpenCider
+revision in preflight and share its opaque token with every build and finalizer
+job; never print private commit metadata or compiler transcripts. A fresh full
+run may resolve a newer private revision. Only the separate packaging job may
+receive release-write permissions, and it must not receive the private key.
+
+Manual and automatically selected release tags must point directly to the
+dispatched public commit. Serialize packaging jobs by the resolved tag, check
+the ref before draft creation, and verify it again afterward. These checks do
+not lock out other privileged tag writers; publishing the draft remains the
+manual approval boundary. Attach only the three intended final binaries and
+never replace assets on an existing release. Manual version selection must
+work without a previously published release.
