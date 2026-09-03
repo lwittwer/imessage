@@ -3372,10 +3372,10 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		ORDER BY activity_ts DESC
 	`
 	rows, err := s.db.Query(ctx, query, args...)
-
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var out []portalWithNewestMessage
 	for rows.Next() {
@@ -3385,12 +3385,7 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		}
 		out = append(out, p)
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-	return out, nil
+	return out, rows.Err()
 }
 
 // cloudChatPortalSyncCandidateWhere matches chat metadata rows that should make
