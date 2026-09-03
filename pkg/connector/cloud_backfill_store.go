@@ -2199,8 +2199,7 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 	if err != nil {
 		return 0, fmt.Errorf("list gid portals in cloud_message: %w", err)
 	}
-	type move struct{ from, to string }
-	var moves []move
+	moves := make(map[string]string)
 	for portals.Next() {
 		var portalID string
 		if err := portals.Scan(&portalID); err != nil {
@@ -2209,7 +2208,7 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 		}
 		for _, target := range canonical[strings.ToLower(strings.TrimPrefix(portalID, "gid:"))] {
 			if target != portalID {
-				moves = append(moves, move{from: portalID, to: target})
+				moves[portalID] = target
 				break
 			}
 		}
@@ -2219,115 +2218,37 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 		return 0, fmt.Errorf("iterate gid portals: %w", err)
 	}
 
-	// Find mapping cycles before ordering the remaining moves. A cycle has no
-	// safe sequential order: updating A→B first makes those rows indistinguishable
-	// from B's original rows. Each cycle is handled later with one CASE update,
-	// whose expressions all see the original portal_id.
-	moveByFrom := make(map[string]move, len(moves))
-	for _, m := range moves {
-		moveByFrom[m.from] = m
+	if len(moves) == 0 {
+		return 0, nil
 	}
-	visited := make(map[string]bool, len(moves))
-	cycleFrom := make(map[string]bool)
-	var cycles [][]move
-	for start := range moveByFrom {
-		if visited[start] {
-			continue
-		}
-		positions := make(map[string]int)
-		var path []string
-		current := start
-		for {
-			if position, found := positions[current]; found {
-				cycle := make([]move, 0, len(path)-position)
-				for _, portalID := range path[position:] {
-					cycle = append(cycle, moveByFrom[portalID])
-					cycleFrom[portalID] = true
-				}
-				cycles = append(cycles, cycle)
-				break
-			}
-			if visited[current] {
-				break
-			}
-			m, found := moveByFrom[current]
-			if !found {
-				break
-			}
-			positions[current] = len(path)
-			path = append(path, current)
-			current = m.to
-		}
-		for _, portalID := range path {
-			visited[portalID] = true
-		}
+	// One JSON mapping avoids per-portal parameters and ordering/cycle logic.
+	// Materialize the affected GUIDs through the portal index before writing.
+	// This makes chains/swaps use original IDs and avoids scanning all history
+	// for each mapping. An error rolls back every move in this statement.
+	mappingJSON, err := json.Marshal(moves)
+	if err != nil {
+		return 0, fmt.Errorf("encode portal mappings: %w", err)
 	}
-
-	linearMoves := make([]move, 0, len(moves)-len(cycleFrom))
-	for _, m := range moves {
-		if !cycleFrom[m.from] {
-			linearMoves = append(linearMoves, m)
-		}
+	mappingTable := "json_each($2)"
+	if s.db.Dialect == dbutil.Postgres {
+		mappingTable = "jsonb_each_text($2::jsonb)"
 	}
-	// Cycles are written first. Their CASE expressions all see the original
-	// portal_id, and a linear move that feeds a cycle member must land after
-	// the swap, or the swap would carry those rows one hop further than the
-	// former single statement did.
-	var total int64
-	for _, cycle := range cycles {
-		args := make([]any, 0, 1+2*len(cycle))
-		args = append(args, s.loginID)
-		whenClauses := make([]string, len(cycle))
-		fromPlaceholders := make([]string, len(cycle))
-		for i, m := range cycle {
-			fromPlaceholder := fmt.Sprintf("$%d", 2+i*2)
-			toPlaceholder := fmt.Sprintf("$%d", 3+i*2)
-			whenClauses[i] = "WHEN " + fromPlaceholder + " THEN " + toPlaceholder
-			fromPlaceholders[i] = fromPlaceholder
-			args = append(args, m.from, m.to)
-		}
-		res, err := s.db.Exec(ctx, `
-			UPDATE cloud_message
-			SET portal_id=CASE portal_id `+strings.Join(whenClauses, " ")+` ELSE portal_id END
-			WHERE login_id=$1 AND portal_id IN (`+strings.Join(fromPlaceholders, ",")+`)
-		`, args...)
-		if err != nil {
-			return total, fmt.Errorf("normalize portal mapping cycle: %w", err)
-		}
-		n, _ := res.RowsAffected()
-		total += n
+	result, err := s.db.Exec(ctx, `
+		WITH moves AS MATERIALIZED (
+			SELECT original.guid, mapping.value AS portal_id
+			FROM `+mappingTable+` AS mapping
+			CROSS JOIN cloud_message AS original
+			WHERE original.login_id=$1 AND original.portal_id=mapping.key
+		)
+		UPDATE cloud_message AS cm
+		SET portal_id = moves.portal_id
+		FROM moves
+		WHERE cm.login_id=$1 AND cm.guid=moves.guid
+	`, s.loginID, string(mappingJSON))
+	if err != nil {
+		return 0, fmt.Errorf("normalize message portal mappings: %w", err)
 	}
-	// Sequential updates reproduce the former single statement for acyclic
-	// mappings if a target that is also a source is drained first.
-	for done := 0; done < len(linearMoves); done++ {
-		pick := done
-		for i := done; i < len(linearMoves); i++ {
-			drainedLater := false
-			for j := done; j < len(linearMoves); j++ {
-				if j != i && linearMoves[j].from == linearMoves[i].to {
-					drainedLater = true
-					break
-				}
-			}
-			if !drainedLater {
-				pick = i
-				break
-			}
-		}
-		linearMoves[done], linearMoves[pick] = linearMoves[pick], linearMoves[done]
-	}
-
-	for _, m := range linearMoves {
-		res, err := s.db.Exec(ctx,
-			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
-			s.loginID, m.from, m.to)
-		if err != nil {
-			return total, fmt.Errorf("normalize portal %s to %s: %w", m.from, m.to, err)
-		}
-		n, _ := res.RowsAffected()
-		total += n
-	}
-	return total, nil
+	return result.RowsAffected()
 }
 
 // getMessageRecordNamesByGroupID returns all non-empty message record_names
@@ -3304,13 +3225,6 @@ func (s *cloudBackfillStore) listPendingAttachmentMessages(ctx context.Context) 
 	return s.queryMessages(ctx, query, s.loginID)
 }
 
-// listAllAttachmentMessages is retained for the legacy store test helper. The
-// attachment retry path now deliberately uses the bounded pending-portal
-// query above; keeping this narrow alias avoids a second unbounded scan.
-func (s *cloudBackfillStore) listAllAttachmentMessages(ctx context.Context) ([]cloudMessageRow, error) {
-	return s.listPendingAttachmentMessages(ctx)
-}
-
 func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, args ...any) ([]cloudMessageRow, error) {
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -4245,11 +4159,10 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context, record
 }
 
 // loadCurrentAttachmentRetryRow re-reads the live message and attachment
-// descriptor for a retained retry. The failure entry's copy is deliberately
-// stale: the message may have been scrubbed, deleted, moved to another portal,
-// or become filtered since the download failed. Applying the normal source
-// predicate here keeps retries aligned with the rows backfill can currently
-// deliver and returns the current portal/attachment metadata for routing.
+// descriptor for a retained retry. The message may have been scrubbed, deleted,
+// moved to another portal, or become filtered since the download failed.
+// The normal source predicate keeps retries aligned with deliverable rows,
+// using the current portal and attachment metadata for routing.
 func (s *cloudBackfillStore) loadCurrentAttachmentRetryRow(ctx context.Context, guid, recordName string) (cloudMessageRow, cloudAttachmentRow, int, bool, error) {
 	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message cm
@@ -4273,15 +4186,6 @@ func (s *cloudBackfillStore) loadCurrentAttachmentRetryRow(ctx context.Context, 
 		}
 	}
 	return cloudMessageRow{}, cloudAttachmentRow{}, 0, false, nil
-}
-
-// messageStillReferencesAttachment verifies a retained retry descriptor with a
-// source-aware primary-key lookup. This prevents a delayed retry from
-// uploading media after its message was deleted, scrubbed, filtered, moved to
-// another portal, or replaced since the failure occurred.
-func (s *cloudBackfillStore) messageStillReferencesAttachment(ctx context.Context, guid, recordName string) (bool, error) {
-	_, _, _, found, err := s.loadCurrentAttachmentRetryRow(ctx, guid, recordName)
-	return found, err
 }
 
 // portalsFullyBackfilledNoNewContent returns the set of portal_ids whose
@@ -4991,9 +4895,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	if debugDisablePrivacy {
 		return 0, nil
 	}
-	// The periodic ticker and post-sync housekeeping both run passes. They
-	// share the delivered-ID set, and overlapping passes would only double the
-	// reads without scrubbing anything extra.
+	// Serialize ticker and post-sync passes to avoid duplicate database work.
 	s.scrubMu.Lock()
 	defer s.scrubMu.Unlock()
 

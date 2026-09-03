@@ -117,10 +117,10 @@ func TestPruneOrphanedAttachmentCacheUsesLiveReferences(t *testing.T) {
 			t.Fatalf("insert cache %s: %v", name, err)
 		}
 	}
-	if live, err := store.messageStillReferencesAttachment(ctx, "live-message", "live-cache"); err != nil || !live {
+	if _, _, _, live, err := store.loadCurrentAttachmentRetryRow(ctx, "live-message", "live-cache"); err != nil || !live {
 		t.Errorf("live attachment reference = %v, %v; want true", live, err)
 	}
-	if live, err := store.messageStillReferencesAttachment(ctx, "deleted-message", "deleted-cache"); err != nil || live {
+	if _, _, _, live, err := store.loadCurrentAttachmentRetryRow(ctx, "deleted-message", "deleted-cache"); err != nil || live {
 		t.Errorf("deleted attachment reference = %v, %v; want false", live, err)
 	}
 
@@ -273,6 +273,31 @@ func TestCachedAttachmentContentFallsBackToPersistedCache(t *testing.T) {
 
 	if content, err := c.cachedAttachmentContent(ctx, "unknown-record"); err != nil || content != nil {
 		t.Fatalf("unknown lookup = %+v, %v; want a miss", content, err)
+	}
+}
+
+func TestRestoreAttachmentCacheSkipsInvalidEntries(t *testing.T) {
+	ctx := context.Background()
+	store := newCloudBackfillStore(newTestSQLiteDB(t), testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string]string{
+		"image":       `{"body":"photo.png","info":{"mimetype":"image/png"}}`,
+		"video":       `{"body":"clip.mov","info":{"mimetype":"video/quicktime"}}`,
+		"corrupt":     `{`,
+		"unrequested": `{"body":"not requested"}`,
+	} {
+		store.saveAttachmentCacheEntry(ctx, name, []byte(raw))
+	}
+	c := &IMClient{cloudStore: store}
+	c.restoreAttachmentCache(ctx, []string{"image", "video", "corrupt", "missing"}, zerolog.Nop())
+	for name, want := range map[string]bool{
+		"image": true, "video": false, "corrupt": false, "missing": false, "unrequested": false,
+	} {
+		if _, got := c.attachmentContentCache.Load(name); got != want {
+			t.Errorf("cache contains %q = %v, want %v", name, got, want)
+		}
 	}
 }
 

@@ -432,8 +432,7 @@ func TestPreUploadCloudAttachmentsRetriesRetainedFailuresWhenCapped(t *testing.T
 	}
 	const recordName = "retained-but-no-longer-referenced"
 	client.failedAttachments.Store(recordName, &failedAttachmentEntry{
-		row:        cloudMessageRow{GUID: "missing-cloud-message"},
-		attachment: cloudAttachmentRow{RecordName: recordName},
+		messageGUID: "missing-cloud-message",
 	})
 
 	// A capped pass skips the bulk pending-history scan, but it must still
@@ -448,24 +447,26 @@ func TestPreUploadCloudAttachmentsRetriesRetainedFailuresWhenCapped(t *testing.T
 func TestRecordAttachmentFailurePreservesSubjectOnlyRetryIDContext(t *testing.T) {
 	client := &IMClient{}
 	row := cloudMessageRow{GUID: "subject-only-guid", Subject: "A subject without body text"}
-	attachment := cloudAttachmentRow{RecordName: "subject-only-attachment"}
-	entry := client.recordAttachmentFailure(row, 0, attachment, "temporary upload failure")
+	const recordName = "subject-only-attachment"
+	hasText := normalizedBackfillText(row.Text) != "" || normalizedBackfillSubject(row.Subject) != ""
+	entry := client.recordAttachmentFailure(row.GUID, recordName, hasText, "temporary upload failure")
 
 	if !entry.hasText {
 		t.Fatal("subject-only attachment failure lost body context for retry")
 	}
-	if entry.row.Text != "" || entry.row.Subject != "" {
-		t.Fatalf("retained retry row kept plaintext: text=%q subject=%q", entry.row.Text, entry.row.Subject)
+	if entry.messageGUID != row.GUID {
+		t.Fatalf("retry GUID = %q, want %q", entry.messageGUID, row.GUID)
 	}
 
-	// Retry attachment 0 must retain the suffix used by the initial
-	// subject-bearing backfill, or it collides with the base message event ID.
-	retryID := entry.row.GUID
-	if entry.index > 0 || entry.hasText {
-		retryID = fmt.Sprintf("%s_att%d", entry.row.GUID, entry.index)
+	// A later attempt can read an already-scrubbed body. Its failure must not
+	// erase the bit that keeps attachment 0 distinct from the base message ID.
+	entry = client.recordAttachmentFailure(row.GUID, recordName, false, "another temporary failure")
+	if !entry.hasText || entry.retries != 2 || entry.abandoned {
+		t.Fatalf("retry lost body context or budget: %+v", entry)
 	}
-	if got, want := makeMessageID(retryID), makeMessageID("subject-only-guid_att0"); got != want {
-		t.Fatalf("subject-only retry attachment ID = %q, want %q", got, want)
+	entry = client.recordAttachmentFailure(row.GUID, recordName, false, "retry exhausted")
+	if !entry.hasText || entry.retries != maxAttachmentRetries || !entry.abandoned {
+		t.Fatalf("exhausted retry lost body context or budget: %+v", entry)
 	}
 }
 
@@ -525,13 +526,8 @@ func TestPreUploadCloudAttachmentsDropsStaleSourceRetries(t *testing.T) {
 				cloudStore: store,
 			}
 			client.failedAttachments.Store(recordName, &failedAttachmentEntry{
-				// Keep the descriptor deliberately stale. The current row is
-				// filtered or mapped to another portal, depending on the case.
-				row: cloudMessageRow{
-					GUID: guid, RecordName: "message-record", CloudChatID: tc.chatID,
-					PortalID: oldPortal, AttachmentsJSON: attachmentJSON,
-				},
-				attachment: cloudAttachmentRow{RecordName: recordName},
+				// The retry must consult the current row's filter and mapping.
+				messageGUID: guid,
 			})
 
 			client.preUploadCloudAttachments(ctx, false)

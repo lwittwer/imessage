@@ -451,7 +451,7 @@ Message **deletes and unsends** scrub the cached body right away — not waiting
 
 In the bridge's own connector code, raw iMessage handles (phone numbers, email addresses) and full URLs are not written to logs: handles are replaced with a stable, non-reversible token (SHA-256 → UUID form) so you can still correlate one person across log lines without recording the PII, and URLs are reduced to scheme+host. This is anonymization at the log-write boundary — the values used for routing, handle matching, and StatusKit alias resolution are always the real ones, so functionality is unaffected.
 
-**Caveat:** this covers log lines emitted by this connector (`pkg/connector`). The underlying bridgev2 framework emits its own logs and can still print raw handles/identifiers in its messages — those are outside the connector's control. So "anonymized logs" means the connector's own output, not a guarantee across every line in the file.
+**Caveat:** this covers logs authored by this connector (`pkg/connector`), not arbitrary third-party log text. Rust diagnostics are forwarded into `bridge.log` alongside Go logs, so `corten-matrix logs` shows both. The underlying bridgev2 framework and Rust libraries can still log raw identifiers, URLs, or authentication details; `debug_disable_privacy: false` does not sanitize those lines. Keep log files local and redact them before sharing.
 
 ### What is *not* scrubbed (by design)
 

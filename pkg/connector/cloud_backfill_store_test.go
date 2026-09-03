@@ -374,9 +374,9 @@ func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 		})
 	}
 
-	attachmentRows, err := store.listAllAttachmentMessages(ctx)
+	attachmentRows, err := store.listPendingAttachmentMessages(ctx)
 	if err != nil {
-		t.Fatalf("listAllAttachmentMessages: %v", err)
+		t.Fatalf("listPendingAttachmentMessages: %v", err)
 	}
 	if len(attachmentRows) != 1 || attachmentRows[0].GUID != "attachment-visible" {
 		t.Fatalf("attachment pre-upload rows = %#v, want only unfiltered attachment", attachmentRows)

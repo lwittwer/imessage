@@ -117,21 +117,10 @@ func (c cloudSyncCounters) hasChanges() bool {
 	return c.Imported+c.Updated+c.Deleted+c.Filtered > 0
 }
 
-// canSkipDelayedCloudReconciliation permits the cheap no-change path only
-// after both CloudKit ingestion and the most recent portal candidate scan
-// completed. A successful empty CloudKit pass is not evidence that portal rows
-// left behind by either kind of failure have already been reconciled.
-func canSkipDelayedCloudReconciliation(counts cloudSyncCounters, previousPassFailed, portalReconciliationPending bool) bool {
-	return !counts.hasChanges() && !previousPassFailed && !portalReconciliationPending
-}
-
-// shouldRunDelayedCloudReconciliation also keeps the local reconciliation path
-// running after the current CloudKit pass fails. Each successfully fetched page
-// is committed before a later page can fail, so even the final delayed pass may
-// have left rows that need attachment restoration, deletion filtering, and
-// portal creation.
+// Reconcile new rows and retry incomplete ingestion or portal scans. A failed
+// CloudKit pass may have committed pages even when its counters are empty.
 func shouldRunDelayedCloudReconciliation(counts cloudSyncCounters, currentPassFailed, previousPassFailed, portalReconciliationPending bool) bool {
-	return currentPassFailed || !canSkipDelayedCloudReconciliation(counts, previousPassFailed, portalReconciliationPending)
+	return counts.hasChanges() || currentPassFailed || previousPassFailed || portalReconciliationPending
 }
 
 func (c *IMClient) setCloudSyncDone() {
@@ -2271,12 +2260,9 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			// propagated records. Re-running the account-wide attachment and
 			// portal scans in that case used to monopolize Keith's one SQLite
 			// connection for minutes despite having no work to discover. Failed
-			// attachments are the only useful retry work that can exist without a
-			// new CloudKit record; their descriptors are retained in memory, so
-			// retry them without touching the message tables.
-			if c.hasRetryableAttachmentFailures() {
-				c.preUploadCloudAttachments(ctx, false)
-			}
+			// attachments can still need retries; reload those messages by GUID
+			// without scanning the account's history.
+			c.preUploadCloudAttachments(ctx, false)
 			resyncLog.Debug().Msg("Delayed CloudKit re-sync returned no changes; skipped attachment-message and portal rescans")
 			c.cloudSyncRunningLock.Lock()
 			c.cloudSyncRunning = false
