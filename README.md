@@ -328,7 +328,7 @@ The bridge converts a handful of formats automatically so attachments render in 
 
 ### Live Photos
 
-iMessage Live Photos arrive as a HEIC still + MOV pair. The still goes through HEIC conversion if `heic_conversion` is on; the MOV goes through video transcoding if `video_transcoding` is on. Both pieces are delivered to Matrix as adjacent messages.
+iMessage Live Photos contain a HEIC still and a MOV motion companion. This branch bridges only the still, with HEIC conversion if `heic_conversion` is on, and reuses its attachment cache during backfill. The motion companion is not delivered as a separate video. Ordinary video attachments are unaffected.
 
 ### Size limit
 

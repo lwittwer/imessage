@@ -2,10 +2,14 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 )
 
@@ -273,6 +277,67 @@ func TestCachedAttachmentContentFallsBackToPersistedCache(t *testing.T) {
 
 	if content, err := c.cachedAttachmentContent(ctx, "unknown-record"); err != nil || content != nil {
 		t.Fatalf("unknown lookup = %+v, %v; want a miss", content, err)
+	}
+}
+
+func TestLivePhotoStillUsesAttachmentCache(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		name := "memory"
+		if persisted {
+			name = "persisted"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db := newTestSQLiteDB(t)
+			bridgeDB := database.New("bridge", database.MetaTypes{}, db)
+			if err := bridgeDB.Upgrade(ctx); err != nil {
+				t.Fatal(err)
+			}
+			store := newCloudBackfillStore(db, testSQLLoginID)
+			if err := store.ensureSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// No Rust client or Matrix media API: a cache miss cannot download
+			// or upload anything, and will fail the returned-message assertion.
+			c := &IMClient{
+				Main: &IMConnector{Bridge: &bridgev2.Bridge{
+					ID: "bridge", DB: bridgeDB, Log: zerolog.Nop(),
+					Config: &bridgeconfig.BridgeConfig{},
+				}},
+				UserLogin:  &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: testSQLLoginID}},
+				cloudStore: store,
+			}
+			const recordName = "live-photo-still-record"
+			content := &event.MessageEventContent{
+				MsgType: event.MsgImage, Body: "still.jpg", URL: "mxc://example/still",
+				Info: &event.FileInfo{MimeType: "image/jpeg"},
+			}
+			if persisted {
+				raw, err := json.Marshal(content)
+				if err != nil {
+					t.Fatal(err)
+				}
+				store.saveAttachmentCacheEntry(ctx, recordName, raw)
+			} else {
+				c.attachmentContentCache.Store(recordName, content)
+			}
+			row := cloudMessageRow{GUID: "live-photo-message", PortalID: "gid:photo-chat"}
+			attachment := cloudAttachmentRow{RecordName: recordName, MimeType: "image/heic", HasAvid: true, FileSize: 1}
+			for pass := 0; pass < 2; pass++ {
+				messages := c.downloadAndUploadAttachment(ctx, row, bridgev2.EventSender{}, time.Unix(1, 0), false, 0, attachment)
+				if len(messages) != 1 || len(messages[0].ConvertedMessage.Parts) != 1 {
+					t.Fatalf("pass %d: expected exactly one cached still, got %d messages", pass, len(messages))
+				}
+				got := messages[0].ConvertedMessage.Parts[0].Content
+				if messages[0].ID != makeMessageID(row.GUID) || got.MsgType != event.MsgImage || got.URL != content.URL {
+					t.Fatalf("pass %d: did not reuse the still's ID and cached image: %+v", pass, messages[0])
+				}
+				// Even a cold-start persisted hit must warm memory for reuse.
+				if _, err := db.Exec(ctx, `DELETE FROM cloud_attachment_cache WHERE login_id=$1`, testSQLLoginID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

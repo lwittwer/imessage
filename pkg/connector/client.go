@@ -10056,30 +10056,27 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
-	// CloudKit, keeping the portal event loop unblocked. Skip old Live Photo cache
-	// entries, which contain only one part rather than the still and video pair.
+	// CloudKit, keeping the portal event loop unblocked. Live Photos use the same
+	// cached still: this path does not download or emit the avid motion companion.
 	mediaID := makeMessageID(attID)
-	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
-	if !isLivePhoto {
-		cachedContent, err := c.cachedAttachmentContent(ctx, att.RecordName)
-		if err != nil {
-			log.Debug().Err(err).Str("record_name", att.RecordName).
-				Msg("Could not read the persisted attachment cache, downloading instead")
-		}
-		if cachedContent != nil {
-			c.redactCloudAttachmentNotices(ctx, row, mediaID)
-			return []*bridgev2.BackfillMessage{{
-				Sender:    sender,
-				ID:        mediaID,
-				Timestamp: ts,
-				ConvertedMessage: &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{{
-						Type:    event.EventMessage,
-						Content: cachedContent,
-					}},
-				},
-			}}
-		}
+	cachedContent, err := c.cachedAttachmentContent(ctx, att.RecordName)
+	if err != nil {
+		log.Debug().Err(err).Str("record_name", att.RecordName).
+			Msg("Could not read the persisted attachment cache, downloading instead")
+	}
+	if cachedContent != nil {
+		c.redactCloudAttachmentNotices(ctx, row, mediaID)
+		return []*bridgev2.BackfillMessage{{
+			Sender:    sender,
+			ID:        mediaID,
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: cachedContent,
+				}},
+			},
+		}}
 	}
 
 	// Always download the lqa to a temp file rather than returning the bytes
