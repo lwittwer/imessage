@@ -50,12 +50,31 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 
 	var indexSQL string
 	if err := db.QueryRow(ctx,
-		`SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_idx'`,
+		`SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_cover_idx'`,
 	).Scan(&indexSQL); err != nil {
-		t.Fatalf("read cloud_message_scrub_idx: %v", err)
+		t.Fatalf("read cloud_message_scrub_cover_idx: %v", err)
 	}
 	if !strings.Contains(indexSQL, "WHERE body_scrubbed") {
-		t.Fatalf("cloud_message_scrub_idx is not partial: %s", indexSQL)
+		t.Fatalf("cloud_message_scrub_cover_idx is not partial: %s", indexSQL)
+	}
+
+	// A database that already carries the earlier two-column index must end
+	// up with only the covering one.
+	if _, err := db.Exec(ctx, `CREATE INDEX cloud_message_scrub_idx
+		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
+		t.Fatalf("create legacy index: %v", err)
+	}
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("second ensureSchema: %v", err)
+	}
+	var legacy int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_idx'`,
+	).Scan(&legacy); err != nil {
+		t.Fatalf("count legacy index: %v", err)
+	}
+	if legacy != 0 {
+		t.Fatal("legacy cloud_message_scrub_idx survived ensureSchema")
 	}
 
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
@@ -68,8 +87,10 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 		t.Fatalf("ANALYZE: %v", err)
 	}
 	rows, err := db.Query(ctx,
-		`EXPLAIN QUERY PLAN SELECT guid FROM cloud_message
-		 WHERE login_id=$1 AND body_scrubbed=FALSE AND updated_ts < $2`,
+		`EXPLAIN QUERY PLAN SELECT guid, COALESCE(deleted, FALSE), COALESCE(portal_id, '') FROM cloud_message
+		 WHERE login_id=$1 AND body_scrubbed=FALSE
+		   AND (tapback_type IS NULL OR tapback_type < 2000) AND updated_ts < $2
+		 ORDER BY updated_ts ASC`,
 		testSQLLoginID, time.Now().UnixMilli(),
 	)
 	if err != nil {
@@ -90,8 +111,8 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate plan rows: %v", err)
 	}
-	if got := plan.String(); !strings.Contains(got, "cloud_message_scrub_idx") {
-		t.Fatalf("candidate query does not use cloud_message_scrub_idx; plan:\n%s", got)
+	if got := plan.String(); !strings.Contains(got, "COVERING INDEX cloud_message_scrub_cover_idx") {
+		t.Fatalf("candidate query is not served from cloud_message_scrub_cover_idx alone; plan:\n%s", got)
 	}
 }
 

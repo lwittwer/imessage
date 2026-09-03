@@ -3,13 +3,17 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
@@ -24,8 +28,8 @@ import (
 //
 // Making those portable meant touching statements that SQLite users depend on
 // every day, so the point of these tests is the other direction: proving the
-// portable spelling still behaves correctly on SQLite, which is the only
-// database this bridge supports.
+// portable spelling still behaves correctly on SQLite, the primary database
+// exercised by this test file.
 
 const testSQLLoginID = networkid.UserLoginID("test-login")
 
@@ -109,35 +113,6 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 	}
 	if exists {
 		t.Error("columnExists reported a nonexistent column as present")
-	}
-}
-
-func TestDeletedMessageLookupUsesFunctionalIndex(t *testing.T) {
-	ctx := context.Background()
-	db := newTestSQLiteDB(t)
-	store := newCloudBackfillStore(db, testSQLLoginID)
-	if err := store.ensureSchema(ctx); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
-	if err := store.softDeleteMessageByGUID(ctx, "mixed-Case-guid"); err != nil {
-		t.Fatalf("softDeleteMessageByGUID: %v", err)
-	}
-	if err := store.persistMessageUUID(ctx, "mixed-Case-guid", "gid:portal", 1, false); err != nil {
-		t.Fatalf("persistMessageUUID: %v", err)
-	}
-
-	var id, parent, unused int
-	var detail string
-	if err := db.QueryRow(ctx, "EXPLAIN QUERY PLAN "+messageDeletedInPortalQuery,
-		testSQLLoginID, "MIXED-case-GUID", "gid:portal").Scan(&id, &parent, &unused, &detail); err != nil {
-		t.Fatalf("explain deleted-message lookup: %v", err)
-	}
-	if !strings.Contains(detail, "cloud_message_deleted_guid_idx") {
-		t.Fatalf("deleted-message lookup plan = %q", detail)
-	}
-	deleted, err := store.isMessageDeletedInPortal(ctx, "MIXED-case-GUID", "gid:portal")
-	if err != nil || !deleted {
-		t.Fatalf("indexed mixed-case lookup = %v, %v, want true", deleted, err)
 	}
 }
 
@@ -230,7 +205,7 @@ func TestExistingDatabaseSurvivesTheDialectChanges(t *testing.T) {
 	// Honest about what this proves: on SQLite, TRUE and FALSE are literally
 	// aliases for 1 and 0, so this assertion cannot fail there and reverting
 	// the boolean change would not break it. It is here to pin that the
-	// change is a genuine NO-OP on the supported database — which is the
+	// change is a genuine NO-OP on the primary database — which is the
 	// claim being made — not to catch a SQLite regression. The change exists
 	// for Postgres, where `BOOLEAN = 1` is a hard error and no test here can
 	// reach.
@@ -338,6 +313,465 @@ func TestBatchUpsertsUseWorkingPlaceholders(t *testing.T) {
 	}
 	if text != "hello" {
 		t.Errorf("text = %q, want %q — placeholders may be binding out of order", text, "hello")
+	}
+}
+
+func TestPendingAttachmentMessagesExcludeCompletedPortals(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	for _, chat := range []struct {
+		id, portal string
+		done       bool
+	}{
+		{"pending-chat", "gid:pending", false},
+		{"done-chat", "gid:done", true},
+		// One completed sibling makes the whole portal complete, matching
+		// getForwardBackfillDonePortals and markForwardBackfillDone.
+		{"mixed-pending", "gid:mixed", false},
+		{"mixed-done", "gid:mixed", true},
+	} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_chat
+				(login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
+			VALUES ($1, $2, $3, $4, $5)
+		`, testSQLLoginID, chat.id, chat.portal, now, chat.done); err != nil {
+			t.Fatalf("insert chat %s: %v", chat.id, err)
+		}
+	}
+
+	attachmentJSON := `[{"guid":"att-guid","record_name":"attachment-record","file_size":1}]`
+	for i, portal := range []string{"gid:pending", "gid:done", "gid:mixed", "gid:no-chat"} {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID:            "attachment-message-" + portal,
+			RecordName:      "message-record-" + portal,
+			PortalID:        portal,
+			TimestampMS:     now + int64(i),
+			AttachmentsJSON: attachmentJSON,
+			HasBody:         true,
+		}}); err != nil {
+			t.Fatalf("insert message for %s: %v", portal, err)
+		}
+	}
+
+	rows, err := store.listPendingAttachmentMessages(ctx)
+	if err != nil {
+		t.Fatalf("listPendingAttachmentMessages: %v", err)
+	}
+	got := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		got[row.PortalID] = true
+	}
+	if !got["gid:pending"] || !got["gid:no-chat"] {
+		t.Errorf("pending rows = %v, want pending and chatless portals", got)
+	}
+	if got["gid:done"] || got["gid:mixed"] {
+		t.Errorf("pending rows = %v, completed portal leaked in", got)
+	}
+}
+
+func TestLoadAttachmentCacheJSONIsSelectiveAndChunked(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	for _, name := range []string{"wanted-first", "wanted-second", "not-wanted"} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+			VALUES ($1, $2, $3, $4)
+		`, testSQLLoginID, name, []byte(`{"body":"`+name+`"}`), time.Now().UnixMilli()); err != nil {
+			t.Fatalf("insert cache entry %s: %v", name, err)
+		}
+	}
+
+	// Cross the function's 400-name boundary so both queries execute.
+	names := make([]string, 0, 402)
+	names = append(names, "wanted-first")
+	for i := 0; i < 400; i++ {
+		names = append(names, fmt.Sprintf("absent-%d", i))
+	}
+	names = append(names, "wanted-second")
+
+	got, err := store.loadAttachmentCacheJSON(ctx, names)
+	if err != nil {
+		t.Fatalf("loadAttachmentCacheJSON: %v", err)
+	}
+	if len(got) != 2 || got["wanted-first"] == nil || got["wanted-second"] == nil {
+		t.Errorf("loaded cache entries = %v, want exactly both requested entries", got)
+	}
+	if got["not-wanted"] != nil {
+		t.Error("loadAttachmentCacheJSON returned an unrequested entry")
+	}
+}
+
+func TestPreUploadCloudAttachmentsRetriesRetainedFailuresWhenCapped(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	bridge := &bridgev2.Bridge{
+		Log: zerolog.Nop(),
+		Config: &bridgeconfig.BridgeConfig{
+			Backfill: bridgeconfig.BackfillConfig{MaxInitialMessages: 1},
+		},
+	}
+	client := &IMClient{
+		Main:       &IMConnector{Bridge: bridge},
+		cloudStore: store,
+	}
+	const recordName = "retained-but-no-longer-referenced"
+	client.failedAttachments.Store(recordName, &failedAttachmentEntry{
+		messageGUID: "missing-cloud-message",
+	})
+
+	// A capped pass skips the bulk pending-history scan, but it must still
+	// inspect retained failures. The descriptor's message was deleted, so the
+	// retry path removes it; an early return would leave it behind.
+	client.preUploadCloudAttachments(ctx, false)
+	if _, loaded := client.failedAttachments.Load(recordName); loaded {
+		t.Fatal("capped no-change pre-upload skipped retained failure cleanup")
+	}
+}
+
+func TestRecordAttachmentFailurePreservesSubjectOnlyRetryIDContext(t *testing.T) {
+	client := &IMClient{}
+	row := cloudMessageRow{GUID: "subject-only-guid", Subject: "A subject without body text"}
+	const recordName = "subject-only-attachment"
+	hasText := normalizedBackfillText(row.Text) != "" || normalizedBackfillSubject(row.Subject) != ""
+	entry := client.recordAttachmentFailure(row.GUID, recordName, hasText, "temporary upload failure")
+
+	if !entry.hasText {
+		t.Fatal("subject-only attachment failure lost body context for retry")
+	}
+	if entry.messageGUID != row.GUID {
+		t.Fatalf("retry GUID = %q, want %q", entry.messageGUID, row.GUID)
+	}
+
+	// A later attempt can read an already-scrubbed body. Its failure must not
+	// erase the bit that keeps attachment 0 distinct from the base message ID.
+	entry = client.recordAttachmentFailure(row.GUID, recordName, false, "another temporary failure")
+	if !entry.hasText || entry.retries != 2 || entry.abandoned {
+		t.Fatalf("retry lost body context or budget: %+v", entry)
+	}
+	entry = client.recordAttachmentFailure(row.GUID, recordName, false, "retry exhausted")
+	if !entry.hasText || entry.retries != maxAttachmentRetries || !entry.abandoned {
+		t.Fatalf("exhausted retry lost body context or budget: %+v", entry)
+	}
+}
+
+func TestPreUploadCloudAttachmentsDropsStaleSourceRetries(t *testing.T) {
+	ctx := context.Background()
+	const (
+		guid       = "stale-source-retry-guid"
+		recordName = "stale-source-retry-record"
+		oldPortal  = "gid:stale-source-portal"
+		newPortal  = "gid:current-source-portal"
+	)
+	attachmentJSON := `[{"guid":"attachment-guid","record_name":"` + recordName + `","file_size":1}]`
+
+	for _, tc := range []struct {
+		name          string
+		chatID        string
+		messagePortal string
+		chatPortal    string
+		filtered      int64
+	}{
+		{
+			name:          "filtered source",
+			chatID:        "filtered-retry-source",
+			messagePortal: oldPortal,
+			chatPortal:    oldPortal,
+			filtered:      1,
+		},
+		{
+			name:          "remapped source",
+			chatID:        "remapped-retry-source",
+			messagePortal: oldPortal,
+			chatPortal:    newPortal,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestSQLiteDB(t)
+			store := newCloudBackfillStore(db, testSQLLoginID)
+			if err := store.ensureSchema(ctx); err != nil {
+				t.Fatalf("ensureSchema: %v", err)
+			}
+			if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{{
+				CloudChatID: tc.chatID, PortalID: tc.chatPortal, Service: "iMessage",
+				ParticipantsJSON: "[]", UpdatedTS: 1000, IsFiltered: tc.filtered,
+			}}); err != nil {
+				t.Fatalf("upsertChatBatch: %v", err)
+			}
+			if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+				GUID: guid, RecordName: "message-record", CloudChatID: tc.chatID,
+				PortalID: tc.messagePortal, TimestampMS: 1000, Text: "current body",
+				AttachmentsJSON: attachmentJSON, HasBody: true,
+			}}); err != nil {
+				t.Fatalf("upsertMessageBatch: %v", err)
+			}
+
+			client := &IMClient{
+				Main:       &IMConnector{Bridge: &bridgev2.Bridge{Log: zerolog.Nop(), Config: &bridgeconfig.BridgeConfig{}}},
+				cloudStore: store,
+			}
+			client.failedAttachments.Store(recordName, &failedAttachmentEntry{
+				// The retry must consult the current row's filter and mapping.
+				messageGUID: guid,
+			})
+
+			client.preUploadCloudAttachments(ctx, false)
+			if _, loaded := client.failedAttachments.Load(recordName); loaded {
+				t.Fatalf("stale %s retry was retained", tc.name)
+			}
+		})
+	}
+}
+
+func TestPruneOrphanedAttachmentCachePreservesSameNameRefresh(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const recordName = "same-name-refresh"
+	// Leave enough time for the real save path below to receive a timestamp
+	// newer than the captured cutoff without relying on a scheduler-sensitive
+	// sleep or a same-millisecond clock edge.
+	cutoff := time.Now().Add(-time.Second).UnixMilli()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+		VALUES ($1, $2, $3, $4)
+	`, testSQLLoginID, recordName, []byte(`{"body":"old"}`), cutoff-1); err != nil {
+		t.Fatalf("insert old cache entry: %v", err)
+	}
+
+	// This is the two-step race in pruneOrphanedAttachmentCache: the old row
+	// is selected into the page, then a same-name cache refresh arrives before
+	// the keyed delete runs.
+	var selected string
+	if err := db.QueryRow(ctx, `
+		SELECT record_name FROM cloud_attachment_cache
+		WHERE login_id=$1 AND record_name=$2 AND created_ts < $3
+	`, testSQLLoginID, recordName, cutoff).Scan(&selected); err != nil {
+		t.Fatalf("select prune candidate: %v", err)
+	}
+	store.saveAttachmentCacheEntry(ctx, selected, []byte(`{"body":"refreshed"}`))
+
+	deleted, err := store.deleteOrphanedAttachmentCacheEntries(ctx, []string{selected}, cutoff)
+	if err != nil {
+		t.Fatalf("deleteOrphanedAttachmentCacheEntries: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("same-name refresh was deleted: deleted %d rows", deleted)
+	}
+
+	var content string
+	if err := db.QueryRow(ctx, `
+		SELECT content_json FROM cloud_attachment_cache
+		WHERE login_id=$1 AND record_name=$2
+	`, testSQLLoginID, recordName).Scan(&content); err != nil {
+		t.Fatalf("read refreshed cache entry: %v", err)
+	}
+	if content != `{"body":"refreshed"}` {
+		t.Errorf("cache content = %q, want refreshed content", content)
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampPreservesFilteringSemantics(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	filteredStore := newCloudBackfillStore(db, testSQLLoginID, true)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const now = int64(1000)
+	for _, chat := range []struct {
+		id, portal string
+		updated    int64
+		filtered   int
+		deleted    bool
+	}{
+		{"filtered", "message-filtered", 10, 1, false},
+		{"mixed-filtered", "message-mixed", 20, 1, false},
+		{"mixed-live", "message-mixed", 21, 0, false},
+		{"deleted-filtered", "message-deleted-filtered", 30, 1, true},
+		{"chat-live", "chat-only-live", 40, 0, false},
+		{"chat-filtered", "chat-only-filtered", 50, 1, false},
+	} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_chat
+				(login_id, cloud_chat_id, portal_id, updated_ts, created_ts, is_filtered, deleted)
+			VALUES ($1, $2, $3, $4, $4, $5, $6)
+		`, testSQLLoginID, chat.id, chat.portal, chat.updated, chat.filtered, chat.deleted); err != nil {
+			t.Fatalf("insert chat %s: %v", chat.id, err)
+		}
+	}
+
+	for i, message := range []struct {
+		portal, chat, text string
+		ts                 int64
+	}{
+		{"message-no-chat", "", "legacy", 100},
+		{"message-filtered", "filtered", "filtered", 110},
+		{"message-mixed", "mixed-live", "mixed", 120},
+		{"message-deleted-filtered", "deleted-filtered", "deleted", 130},
+	} {
+		row := cloudMessageRow{
+			GUID: "portal-list-message-" + fmt.Sprint(i), RecordName: "record-" + fmt.Sprint(i),
+			CloudChatID: message.chat, PortalID: message.portal, TimestampMS: message.ts,
+			Sender: "tel:+15551111111", Text: message.text, HasBody: true, Service: "iMessage",
+		}
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{row}); err != nil {
+			t.Fatalf("insert message for %s: %v", message.portal, err)
+		}
+	}
+
+	assertPortals := func(name string, candidateStore *cloudBackfillStore, want map[string]bool) {
+		t.Helper()
+		gotRows, err := candidateStore.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1)
+		if err != nil {
+			t.Fatalf("%s listPortalIDsWithNewestTimestamp: %v", name, err)
+		}
+		got := make(map[string]portalWithNewestMessage, len(gotRows))
+		for _, row := range gotRows {
+			got[row.PortalID] = row
+		}
+		for portalID, expected := range want {
+			_, present := got[portalID]
+			if present != expected {
+				t.Errorf("%s portal %q present=%v, want %v (rows=%#v)", name, portalID, present, expected, gotRows)
+			}
+		}
+		if mixed, ok := got["message-mixed"]; ok {
+			if mixed.NewestTS != 120 || mixed.MessageActivityTS != 120 || mixed.MessageCount != 1 || mixed.ContentfulCount != 1 {
+				t.Errorf("%s mixed portal watermarks = %#v, want timestamp/counts from its live source", name, mixed)
+			}
+		}
+	}
+
+	assertPortals("default", store, map[string]bool{
+		"message-no-chat": true, "message-filtered": false, "message-mixed": true,
+		"message-deleted-filtered": false, "chat-only-live": true, "chat-only-filtered": false,
+	})
+	assertPortals("bridge_filtered", filteredStore, map[string]bool{
+		"message-no-chat": true, "message-filtered": true, "message-mixed": true,
+		"message-deleted-filtered": false, "chat-only-live": true, "chat-only-filtered": true,
+	})
+}
+
+// TestInsertOrIgnoreReplacementsAreNoOpOnConflict covers the four statements
+// that changed from SQLite's INSERT OR IGNORE to the portable
+// ON CONFLICT DO NOTHING. The conflict target has to name the right unique
+// index or the insert errors instead of quietly doing nothing.
+func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	now := time.Now().UnixMilli()
+
+	for i := 0; i < 2; i++ {
+		if err := store.persistMessageUUID(ctx, "uuid-msg", "gid:portal-1", now, true); err != nil {
+			t.Fatalf("persistMessageUUID call %d: %v", i+1, err)
+		}
+		if err := store.persistTapbackUUID(ctx, "uuid-tap", "gid:portal-1", now, false, 2000); err != nil {
+			t.Fatalf("persistTapbackUUID call %d: %v", i+1, err)
+		}
+		if err := store.insertDeletedChatTombstone(
+			ctx, "chat-tomb", "gid:portal-2", "rec", "grp", "iMessage", nil, "[]",
+		); err != nil {
+			t.Fatalf("insertDeletedChatTombstone call %d: %v", i+1, err)
+		}
+		// Stub-insert path: no cloud_message row exists for this guid, so
+		// softDeleteMessageByGUID falls through to the ON CONFLICT insert.
+		if err := store.softDeleteMessageByGUID(ctx, "uuid-never-synced"); err != nil {
+			t.Fatalf("softDeleteMessageByGUID call %d: %v", i+1, err)
+		}
+		// markForwardBackfillDone's synthetic-row fallback.
+		store.markForwardBackfillDone(ctx, "gid:portal-3")
+	}
+
+	for _, uuid := range []string{"uuid-msg", "uuid-tap", "uuid-never-synced"} {
+		ok, err := store.hasMessageUUID(ctx, uuid)
+		if err != nil {
+			t.Fatalf("hasMessageUUID(%s): %v", uuid, err)
+		}
+		if !ok {
+			t.Errorf("hasMessageUUID(%s) = false, want true", uuid)
+		}
+	}
+
+	// The repeated calls must not have duplicated rows.
+	var msgCount int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1`, testSQLLoginID,
+	).Scan(&msgCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if msgCount != 3 {
+		t.Errorf("cloud_message row count = %d, want 3 (duplicate inserts leaked)", msgCount)
+	}
+
+	// fwd_backfill_done round-trips through boolean literals rather than 0/1.
+	if !store.isForwardBackfillDone(ctx, "gid:portal-3") {
+		t.Error("isForwardBackfillDone(gid:portal-3) = false, want true")
+	}
+	done, err := store.getForwardBackfillDonePortals(ctx)
+	if err != nil {
+		t.Fatalf("getForwardBackfillDonePortals: %v", err)
+	}
+	if !done["gid:portal-3"] {
+		t.Errorf("getForwardBackfillDonePortals missing gid:portal-3, got %v", done)
+	}
+}
+
+func TestDeletedMessageLookupUsesFunctionalIndex(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	if err := store.softDeleteMessageByGUID(ctx, "mixed-Case-guid"); err != nil {
+		t.Fatalf("softDeleteMessageByGUID: %v", err)
+	}
+	if err := store.persistMessageUUID(ctx, "mixed-Case-guid", "gid:portal", 1, false); err != nil {
+		t.Fatalf("persistMessageUUID: %v", err)
+	}
+
+	var id, parent, unused int
+	var detail string
+	// The portal covering index may win the unconstrained planner choice on a
+	// tiny fixture. Force the functional index here so this test verifies that
+	// the mixed-case lookup can actually use the intended expression index.
+	explainQuery := strings.Replace(messageDeletedInPortalQuery, "FROM cloud_message", "FROM cloud_message INDEXED BY cloud_message_deleted_guid_idx", 1)
+	if err := db.QueryRow(ctx, "EXPLAIN QUERY PLAN "+explainQuery,
+		testSQLLoginID, "MIXED-case-GUID", "gid:portal").Scan(&id, &parent, &unused, &detail); err != nil {
+		t.Fatalf("explain deleted-message lookup: %v", err)
+	}
+	if !strings.Contains(detail, "cloud_message_deleted_guid_idx") {
+		t.Fatalf("deleted-message lookup plan = %q", detail)
+	}
+	deleted, err := store.isMessageDeletedInPortal(ctx, "MIXED-case-GUID", "gid:portal")
+	if err != nil || !deleted {
+		t.Fatalf("indexed mixed-case lookup = %v, %v, want true", deleted, err)
 	}
 }
 
@@ -576,7 +1010,7 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 	}
 
 	// bridgev2's message table, which scrubBridgedBodies joins against. Only
-	// the columns the query touches are needed.
+	// the three columns the query touches are needed.
 	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
 		id TEXT NOT NULL,
 		bridge_id TEXT NOT NULL,
@@ -834,12 +1268,6 @@ func TestDialectHelpersSpellEachDialectCorrectly(t *testing.T) {
 	}
 }
 
-// TestColumnExistsPostgresScopesCurrentSchema protects the migration check
-// from finding a same-named table in another schema visible to the connection.
-// A live Postgres server is unnecessary here: the important contract is that
-// the query includes current_schema(). Without that predicate, a table in any
-// other search_path schema could make an ALTER TABLE migration skip its
-// intended change.
 func TestColumnExistsPostgresScopesCurrentSchema(t *testing.T) {
 	if !strings.Contains(postgresColumnExistsQuery, "table_schema = current_schema()") {
 		t.Fatalf("postgres columnExists query is not scoped to current_schema(): %q", postgresColumnExistsQuery)

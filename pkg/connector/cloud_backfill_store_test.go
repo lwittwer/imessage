@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 	"go.mau.fi/util/dbutil"
@@ -17,6 +18,32 @@ func newTestCloudBackfillStore(t *testing.T, bridgeFiltered ...bool) (*dbutil.Da
 		t.Fatalf("ensureSchema: %v", err)
 	}
 	return db, store
+}
+
+func TestListPortalIDsWithNewestTimestampClosesRowsOnScanError(t *testing.T) {
+	db, store := newTestCloudBackfillStore(t)
+	ctx := context.Background()
+	// SQLite permits text in a BIGINT column. The query succeeds, but scanning
+	// this timestamp into an int64 must fail while the result set is still open.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, updated_ts)
+		VALUES ($1, 'malformed-chat', 'gid:malformed-chat', 1, 'invalid-timestamp')
+	`, testSQLLoginID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.listPortalIDsWithNewestTimestamp(ctx, 1<<31-1); err == nil || !strings.Contains(err.Error(), "Scan error") {
+		t.Fatalf("expected a scan error, got %v", err)
+	}
+	if inUse := db.RawDB.Stats().InUse; inUse != 0 {
+		t.Fatalf("scan error left %d connections checked out", inUse)
+	}
+	// The single-connection pool must remain usable without waiting for GC.
+	checkCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	var one int
+	if err := db.QueryRow(checkCtx, `SELECT 1`).Scan(&one); err != nil || one != 1 {
+		t.Fatalf("database unusable after scan error: value=%d err=%v", one, err)
+	}
 }
 
 func TestStrandedBackfillReconciliationQueryUsesPostgresBoolean(t *testing.T) {
@@ -374,9 +401,9 @@ func TestMixedFilteredSiblingMessageReadersExcludeFilteredRows(t *testing.T) {
 		})
 	}
 
-	attachmentRows, err := store.listAllAttachmentMessages(ctx)
+	attachmentRows, err := store.listPendingAttachmentMessages(ctx)
 	if err != nil {
-		t.Fatalf("listAllAttachmentMessages: %v", err)
+		t.Fatalf("listPendingAttachmentMessages: %v", err)
 	}
 	if len(attachmentRows) != 1 || attachmentRows[0].GUID != "attachment-visible" {
 		t.Fatalf("attachment pre-upload rows = %#v, want only unfiltered attachment", attachmentRows)

@@ -99,6 +99,10 @@ type failedAttachmentEntry struct {
 	lastError string
 	retries   int
 	abandoned bool
+	// Reload routing and attachment metadata by GUID on retry. Only the body
+	// presence bit must survive scrubbing, to keep attachment part IDs stable.
+	messageGUID string
+	hasText     bool
 }
 
 // unrecoverableAttachmentMarker is the prefix the Rust download path stamps on
@@ -133,12 +137,18 @@ const maxAttachmentRetries = 3
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
-func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
-	entry := &failedAttachmentEntry{lastError: errMsg, retries: 1}
+func (c *IMClient) recordAttachmentFailure(messageGUID, recordName string, hasText bool, errMsg string) *failedAttachmentEntry {
+	entry := &failedAttachmentEntry{
+		lastError:   errMsg,
+		retries:     1,
+		messageGUID: messageGUID,
+		hasText:     hasText,
+	}
 	if prev, loaded := c.failedAttachments.Load(recordName); loaded {
 		old := prev.(*failedAttachmentEntry)
 		entry.retries = old.retries + 1
 		entry.abandoned = old.abandoned
+		entry.hasText = entry.hasText || old.hasText
 	}
 	// Permanently-gone assets (Apple no longer serves them) get a persistent
 	// tombstone on the FIRST failure so the bridge never re-downloads them,
@@ -1052,14 +1062,61 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 func safeRestoreTokenProvider(
 	config *rustpushgo.WrappedOsConfig,
 	conn *rustpushgo.WrappedApsConnection,
-	username, hashedPwHex, pet, spdBase64 string,
+	username, hashedPwHex, pet, spdBase64, persistBlob string,
 ) (tp *rustpushgo.WrappedTokenProvider, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
 		}
 	}()
-	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
+	// The blob is optional: sessions that predate it restore from the legacy
+	// SPD fields, and rustpush falls back to those itself if it cannot use it.
+	var blob *string
+	if persistBlob != "" {
+		blob = &persistBlob
+	}
+	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64, blob)
+}
+
+// safeLoginStart, safeSubmit2fa, and safeFinish wrap the interactive login
+// FFI calls with the same panic recovery as safeRestoreTokenProvider. An
+// unexpected Apple response that unwinds inside rustpush must surface as a
+// failed login step the user can retry, not take the bridge process down.
+func safeLoginStart(
+	username, password string,
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+) (session *rustpushgo.LoginSession, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("LoginStart panicked: %v", r)
+		}
+	}()
+	return rustpushgo.LoginStart(username, password, config, conn)
+}
+
+func safeSubmit2fa(session *rustpushgo.LoginSession, code string) (ok bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Submit2fa panicked: %v", r)
+		}
+	}()
+	return session.Submit2fa(code)
+}
+
+func safeFinish(
+	session *rustpushgo.LoginSession,
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+	existingIdentity **rustpushgo.WrappedIdsngmIdentity,
+	existingUsers **rustpushgo.WrappedIdsUsers,
+) (result rustpushgo.IdsUsersWithIdentityRecord, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Finish panicked: %v", r)
+		}
+	}()
+	return session.Finish(config, conn, existingIdentity, existingUsers)
 }
 
 func (c *IMClient) Connect(ctx context.Context) {
@@ -1097,7 +1154,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
 			tp, err := safeRestoreTokenProvider(c.config, c.connection,
 				meta.AccountUsername, meta.AccountHashedPasswordHex,
-				meta.AccountPET, meta.AccountSPDBase64)
+				meta.AccountPET, meta.AccountSPDBase64, meta.AccountPersistBlob)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
@@ -9879,6 +9936,75 @@ func (c *IMClient) downloadAttachmentToTempFile(recordName string) (string, int6
 	return tmpPath, int64(n), nil
 }
 
+// cachedAttachmentContent returns the Matrix content a CloudKit attachment was
+// already uploaded as, from memory first and then from cloud_attachment_cache.
+// The persisted table is authoritative across restarts: pre-upload only warms
+// memory for portals still awaiting their first forward backfill, so without
+// this fallback a completed portal's backward backfill after a restart would
+// download from CloudKit and upload to Matrix again every attachment it had
+// already bridged. A hit read from the table is kept in memory. A stale entry
+// for a video that still needs transcoding is reported as a miss and dropped
+// from memory so the caller re-downloads.
+func (c *IMClient) cachedAttachmentContent(ctx context.Context, recordName string) (*event.MessageEventContent, error) {
+	if cached, ok := c.attachmentContentCache.Load(recordName); ok {
+		content := cached.(*event.MessageEventContent)
+		if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+			c.attachmentContentCache.Delete(recordName)
+			return nil, nil
+		}
+		return content, nil
+	}
+	if c.cloudStore == nil {
+		return nil, nil
+	}
+	cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx, []string{recordName})
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := cachedJSON[recordName]
+	if !ok {
+		return nil, nil
+	}
+	var content event.MessageEventContent
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, fmt.Errorf("decode cached attachment content: %w", err)
+	}
+	if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+		return nil, nil
+	}
+	c.attachmentContentCache.Store(recordName, &content)
+	return &content, nil
+}
+
+// restoreAttachmentCache warms memory for either pre-upload path using bounded
+// database queries. Corrupt entries and videos needing transcoding stay misses.
+func (c *IMClient) restoreAttachmentCache(ctx context.Context, recordNames []string, log zerolog.Logger) {
+	if c.cloudStore == nil || len(recordNames) == 0 {
+		return
+	}
+	cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx, recordNames)
+	if err != nil {
+		log.Warn().Err(err).Msg("Could not restore attachment cache; uncached attachments will be downloaded")
+		return
+	}
+	loaded := 0
+	for recordName, raw := range cachedJSON {
+		var content event.MessageEventContent
+		if err := json.Unmarshal(raw, &content); err != nil {
+			log.Debug().Err(err).Str("record_name", recordName).Msg("Skipping corrupt attachment cache entry")
+			continue
+		}
+		if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+			continue
+		}
+		c.attachmentContentCache.Store(recordName, &content)
+		loaded++
+	}
+	if loaded > 0 {
+		log.Debug().Int("loaded", loaded).Msg("Restored attachment cache entries")
+	}
+}
+
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -9930,28 +10056,27 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
-	// CloudKit, keeping the portal event loop unblocked.
-	// NOTE: Skip cache for non-MP4 videos that need transcoding.
+	// CloudKit, keeping the portal event loop unblocked. Live Photos use the same
+	// cached still: this path does not download or emit the avid motion companion.
 	mediaID := makeMessageID(attID)
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
-		cachedContent := cached.(*event.MessageEventContent)
-		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
-			// Stale cache entry — video needs transcoding. Fall through to re-download.
-			c.attachmentContentCache.Delete(att.RecordName)
-		} else {
-			c.redactCloudAttachmentNotices(ctx, row, mediaID)
-			return []*bridgev2.BackfillMessage{{
-				Sender:    sender,
-				ID:        mediaID,
-				Timestamp: ts,
-				ConvertedMessage: &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{{
-						Type:    event.EventMessage,
-						Content: cachedContent,
-					}},
-				},
-			}}
-		}
+	cachedContent, err := c.cachedAttachmentContent(ctx, att.RecordName)
+	if err != nil {
+		log.Debug().Err(err).Str("record_name", att.RecordName).
+			Msg("Could not read the persisted attachment cache, downloading instead")
+	}
+	if cachedContent != nil {
+		c.redactCloudAttachmentNotices(ctx, row, mediaID)
+		return []*bridgev2.BackfillMessage{{
+			Sender:    sender,
+			ID:        mediaID,
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: cachedContent,
+				}},
+			},
+		}}
 	}
 
 	// Always download the lqa to a temp file rather than returning the bytes
@@ -9961,7 +10086,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// disk-space guarded. We learn the real size from the file, then decide.
 	tmpPath, n, err := c.downloadAttachmentToTempFile(att.RecordName)
 	if err != nil {
-		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		fe := c.recordAttachmentFailure(row.GUID, att.RecordName, hasText, err.Error())
 		log.Warn().Err(err).
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
@@ -9972,7 +10097,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
 	if n == 0 {
-		c.recordAttachmentFailure(att.RecordName, "empty data")
+		c.recordAttachmentFailure(row.GUID, att.RecordName, hasText, "empty data")
 		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
 			Msg("CloudKit attachment returned empty data")
 		return nil
@@ -9997,14 +10122,14 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Small enough: read it back for the normal in-memory pipeline.
 	data, err := os.ReadFile(tmpPath)
 	if err != nil {
-		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		fe := c.recordAttachmentFailure(row.GUID, att.RecordName, hasText, err.Error())
 		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
 			Int("attempt", fe.retries).
 			Msg("Failed to read downloaded attachment, skipping")
 		return nil
 	}
 	if len(data) == 0 {
-		fe := c.recordAttachmentFailure(att.RecordName, "empty data")
+		fe := c.recordAttachmentFailure(row.GUID, att.RecordName, hasText, "empty data")
 		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
 			Int("attempt", fe.retries).
 			Msg("CloudKit attachment returned empty data")
@@ -10112,7 +10237,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
 	if uploadErr != nil {
-		fe := c.recordAttachmentFailure(att.RecordName, uploadErr.Error())
+		fe := c.recordAttachmentFailure(row.GUID, att.RecordName, hasText, uploadErr.Error())
 		log.Warn().Err(uploadErr).
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
@@ -10248,8 +10373,8 @@ func clampAttachmentWeight(fileSize int64) int64 {
 	return fileSize
 }
 
-// preUploadCloudAttachments downloads every CloudKit attachment recorded in the
-// cloud message store and uploads it to Matrix, caching the resulting
+// preUploadCloudAttachments uploads pending and retryable CloudKit attachments
+// to Matrix, caching the resulting
 // *event.MessageEventContent in attachmentContentCache keyed by record_name.
 //
 // Call this in the cloud sync goroutine BEFORE createPortalsFromCloudSync.
@@ -10257,62 +10382,25 @@ func clampAttachmentWeight(fileSize int64) int64 {
 // every downloadAndUploadAttachment invocation becomes an instant cache lookup
 // instead of a multi-second CloudKit download — eliminating the 30+ minute
 // portal event loop stall caused by image-heavy conversations (e.g. 486 pics).
-func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
+// includePending controls the bulk scan for portals awaiting first backfill.
+// No-change passes skip that scan and reload only individual failed messages.
+func (c *IMClient) preUploadCloudAttachments(ctx context.Context, includePending bool) {
 	if c.cloudStore == nil {
 		return
 	}
-	// When the user has capped max_initial_messages, skip the bulk startup
-	// pre-upload. The per-chunk preUploadChunkAttachments in FetchMessages
-	// already handles attachments for the rows actually being backfilled.
-	// The startup pre-upload is an optimization for the unlimited case where
-	// thousands of attachments need warming before portal creation.
-	if c.Main.Bridge.Config.Backfill.MaxInitialMessages < math.MaxInt32 {
-		return
-	}
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_preupload").Logger()
-
-	rows, err := c.cloudStore.listAllAttachmentMessages(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Pre-upload: failed to list attachment messages, skipping")
-		return
-	}
-
-	// Load previously persisted mxc URIs into the in-memory cache.
-	// This means attachments uploaded in any prior run are instant cache hits
-	// in the pending-list filter below — zero CloudKit downloads needed.
-	if cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx); err != nil {
-		log.Warn().Err(err).Msg("Pre-upload: failed to load persistent attachment cache, will re-download")
-	} else {
-		loaded := 0
-		for recordName, jsonBytes := range cachedJSON {
-			var content event.MessageEventContent
-			if err := json.Unmarshal(jsonBytes, &content); err != nil {
-				log.Debug().Err(err).Str("record_name", recordName).
-					Msg("Pre-upload: skipping corrupted attachment cache entry")
-			} else {
-				// Skip stale cache entries for non-MP4 videos that need transcoding
-				if content.Info != nil && content.Info.MimeType == "video/quicktime" {
-					continue
-				}
-				c.attachmentContentCache.Store(recordName, &content)
-				loaded++
-			}
+	var rows []cloudMessageRow
+	// When the user has capped max_initial_messages, skip only the bulk startup
+	// pre-upload. The per-chunk preUploadChunkAttachments in FetchMessages
+	// handles the rows actually being backfilled, while retained failed
+	// descriptors below still need retrying on delayed/no-change passes.
+	if includePending && c.Main.Bridge.Config.Backfill.MaxInitialMessages >= math.MaxInt32 {
+		var err error
+		rows, err = c.cloudStore.listPendingAttachmentMessages(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Pre-upload: failed to list pending attachment messages, skipping")
+			return
 		}
-		if loaded > 0 {
-			log.Debug().Int("loaded", loaded).Msg("Pre-upload: restored attachment cache from SQLite")
-		}
-	}
-
-	// Build the set of portal IDs whose forward FetchMessages has already
-	// completed successfully. These portals don't need pre-upload on restart:
-	// - Normal restart: all portals are done → skip everything (no re-upload storm)
-	// - Interrupted backfill: that portal is NOT in the done set → still pre-uploads
-	// Using fwd_backfill_done (set by FetchMessages via CompleteCallback) rather than
-	// MXID-existence avoids the interrupted-backfill edge case.
-	donePortals, err := c.cloudStore.getForwardBackfillDonePortals(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Pre-upload: failed to query fwd_backfill_done, skipping pre-upload entirely")
-		return
 	}
 
 	// Build the list of attachments that still need to be uploaded.
@@ -10324,9 +10412,9 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		ts      time.Time
 		hasText bool
 	}
-	var pending []pendingUpload
+	var candidates []pendingUpload
+	seen := make(map[string]struct{})
 	for _, row := range rows {
-		portalDone := donePortals[row.PortalID]
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
 			log.Warn().Err(err).Str("guid", row.GUID).
@@ -10345,53 +10433,81 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 			if isPluginPayloadAttachment(att) {
 				continue
 			}
-			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
-				continue // already cached from a previous pass
-			}
-			// Permanently tombstoned (CloudKit no longer serves it). Skip
-			// without re-attempting — this is what stops the dead old
-			// attachments from being re-downloaded on every sync sweep.
-			if c.isDeadAttachment(att.RecordName) {
+			if _, duplicate := seen[att.RecordName]; duplicate {
 				continue
 			}
-			// Check if this attachment has failed before and whether
-			// it has exceeded the retry limit.
-			prev, isFailed := c.failedAttachments.Load(att.RecordName)
-			if isFailed {
-				fe := prev.(*failedAttachmentEntry)
-				if fe.abandoned || fe.retries >= maxAttachmentRetries {
-					// Don't delete the entry — keep it so this attachment stays
-					// skipped for the rest of the session. Deleting it reset the
-					// retry counter and made the same dead attachment re-download
-					// on the next sweep (the infinite-loop bug).
-					log.Debug().
-						Str("record_name", att.RecordName).
-						Str("portal_id", row.PortalID).
-						Str("last_error", fe.lastError).
-						Int("retries", fe.retries).
-						Msg("Pre-upload: skipping attachment, retry budget exhausted")
-					continue
-				}
-			}
-			// For done portals, only retry attachments that previously
-			// failed (transient). New uncached attachments in done portals
-			// were already handled by FetchMessages — no re-upload needed.
-			if portalDone {
-				if !isFailed {
-					continue
-				}
-				fe := prev.(*failedAttachmentEntry)
-				log.Info().
-					Str("record_name", att.RecordName).
-					Str("portal_id", row.PortalID).
-					Int("attempt", fe.retries+1).
-					Msg("Pre-upload: retrying previously failed attachment for completed portal")
-			}
-			pending = append(pending, pendingUpload{
+			seen[att.RecordName] = struct{}{}
+			candidates = append(candidates, pendingUpload{
 				row: row, idx: i, att: att,
 				sender: sender, ts: ts, hasText: hasText,
 			})
 		}
+	}
+
+	// Failed attachments may belong to completed portals, which the database
+	// query intentionally excludes. Reload those messages by GUID rather than
+	// scanning history or trusting routing metadata from the failed attempt.
+	c.failedAttachments.Range(func(key, value any) bool {
+		recordName := key.(string)
+		entry := value.(*failedAttachmentEntry)
+		if entry.abandoned || entry.retries >= maxAttachmentRetries {
+			return true
+		}
+		if _, duplicate := seen[recordName]; duplicate {
+			return true
+		}
+		row, att, index, stillReferenced, err := c.cloudStore.loadCurrentAttachmentRetryRow(ctx, entry.messageGUID, recordName)
+		if err != nil {
+			log.Warn().Err(err).Str("guid", entry.messageGUID).Str("record_name", recordName).
+				Msg("Pre-upload: failed to verify retained attachment retry")
+			return true
+		}
+		if !stillReferenced || isPluginPayloadAttachment(att) {
+			c.failedAttachments.Delete(recordName)
+			return true
+		}
+		seen[recordName] = struct{}{}
+		hasText := entry.hasText || normalizedBackfillText(row.Text) != "" || normalizedBackfillSubject(row.Subject) != ""
+		candidates = append(candidates, pendingUpload{
+			row: row, idx: index, att: att,
+			sender:  c.makeCloudSender(row),
+			ts:      time.UnixMilli(row.TimestampMS),
+			hasText: hasText,
+		})
+		return true
+	})
+
+	// Load only persistent cache entries relevant to this pass, in bounded
+	// chunks. Entries already in memory are not read again on delayed syncs.
+	cacheNames := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := c.attachmentContentCache.Load(candidate.att.RecordName); !ok {
+			cacheNames = append(cacheNames, candidate.att.RecordName)
+		}
+	}
+	c.restoreAttachmentCache(ctx, cacheNames, log)
+
+	pending := make([]pendingUpload, 0, len(candidates))
+	for _, candidate := range candidates {
+		recordName := candidate.att.RecordName
+		if _, ok := c.attachmentContentCache.Load(recordName); ok {
+			continue
+		}
+		if c.isDeadAttachment(recordName) {
+			continue
+		}
+		if prev, failed := c.failedAttachments.Load(recordName); failed {
+			entry := prev.(*failedAttachmentEntry)
+			if entry.abandoned || entry.retries >= maxAttachmentRetries {
+				log.Debug().Str("record_name", recordName).Str("portal_id", candidate.row.PortalID).
+					Str("last_error", entry.lastError).Int("retries", entry.retries).
+					Msg("Pre-upload: skipping attachment, retry budget exhausted")
+				continue
+			}
+			log.Info().Str("record_name", recordName).Str("portal_id", candidate.row.PortalID).
+				Int("attempt", entry.retries+1).Msg("Pre-upload: retrying previously failed attachment")
+		}
+		pending = append(pending, candidate)
 	}
 
 	if len(pending) == 0 {
@@ -10474,7 +10590,9 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		ts      time.Time
 		hasText bool
 	}
-	var pending []pendingAtt
+	var candidates []pendingAtt
+	cacheNames := make([]string, 0)
+	cacheNamesSeen := make(map[string]struct{})
 	for _, row := range rows {
 		if row.AttachmentsJSON == "" {
 			continue
@@ -10492,14 +10610,36 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 			if att.RecordName == "" {
 				continue
 			}
-			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
-				continue
+			if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+				content := cached.(*event.MessageEventContent)
+				if content.Info == nil || content.Info.MimeType != "video/quicktime" {
+					continue
+				}
+				// A stale non-MP4 video must be downloaded and transcoded again.
+				c.attachmentContentCache.Delete(att.RecordName)
 			}
-			pending = append(pending, pendingAtt{
+			if _, seen := cacheNamesSeen[att.RecordName]; !seen {
+				cacheNamesSeen[att.RecordName] = struct{}{}
+				cacheNames = append(cacheNames, att.RecordName)
+			}
+			candidates = append(candidates, pendingAtt{
 				row: row, idx: i, att: att,
 				sender: sender, ts: ts, hasText: hasText,
 			})
 		}
+	}
+
+	// Restore all persisted hits for this chunk in bounded IN queries. The
+	// previous per-attachment fallback was correct but issued one SQLite query
+	// for every cold memory-cache entry, which adds up on large portals.
+	c.restoreAttachmentCache(ctx, cacheNames, log)
+
+	pending := make([]pendingAtt, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := c.attachmentContentCache.Load(candidate.att.RecordName); ok {
+			continue
+		}
+		pending = append(pending, candidate)
 	}
 	if len(pending) == 0 {
 		return
@@ -10736,6 +10876,8 @@ func (c *IMClient) periodicPetRefresh(log zerolog.Logger) {
 				log.Warn().Err(err).Msg("Periodic PET refresh failed")
 			} else {
 				log.Debug().Msg("Periodic PET refresh completed")
+				// Save the refreshed tokens so a restart reuses them.
+				c.persistMmeDelegate(log)
 			}
 		case <-c.stopChan:
 			return
@@ -10822,30 +10964,38 @@ func contactSyncBackoff(base, max time.Duration, failures int) time.Duration {
 	return d
 }
 
-// persistMmeDelegate saves the current MobileMe delegate to user_login metadata
-// so it can be seeded on restore without needing a fresh PET-based auth.
+// persistMmeDelegate saves the current MobileMe delegate and the account
+// state rustpush persisted (tokens with their real expirations plus the
+// delegate state) to user_login metadata so a restart reuses them without
+// needing a fresh PET-based auth. Saves only when something changed.
 func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
 	if c.tokenProvider == nil || *c.tokenProvider == nil {
 		return
 	}
 	tp := *c.tokenProvider
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	changed := false
 	delegateJSON, err := tp.GetMmeDelegateJson()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to get MobileMe delegate for persistence")
+	} else if delegateJSON != nil && *delegateJSON != "" && meta.MmeDelegateJSON != *delegateJSON {
+		meta.MmeDelegateJSON = *delegateJSON
+		changed = true
+	}
+	blob, err := tp.GetAccountPersistBlob()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get rustpush account state for persistence")
+	} else if blob != nil && *blob != "" && meta.AccountPersistBlob != *blob {
+		meta.AccountPersistBlob = *blob
+		changed = true
+	}
+	if !changed {
 		return
 	}
-	if delegateJSON == nil || *delegateJSON == "" {
-		return
-	}
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-	if meta.MmeDelegateJSON == *delegateJSON {
-		return // unchanged
-	}
-	meta.MmeDelegateJSON = *delegateJSON
 	if err = c.UserLogin.Save(context.Background()); err != nil {
-		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate")
+		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate and account state")
 	} else {
-		log.Info().Msg("Persisted MobileMe delegate to user_login metadata")
+		log.Info().Msg("Persisted MobileMe delegate and rustpush account state to user_login metadata")
 	}
 }
 

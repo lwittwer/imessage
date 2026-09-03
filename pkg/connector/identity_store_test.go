@@ -28,6 +28,7 @@ func TestPersistedSessionStateFromMetadata(t *testing.T) {
 		AccountDSID:              "dsid",
 		AccountSPDBase64:         "spd",
 		MmeDelegateJSON:          "delegate",
+		AccountPersistBlob:       "persisted-account",
 	}
 
 	got := persistedSessionStateFromMetadata(meta)
@@ -37,7 +38,7 @@ func TestPersistedSessionStateFromMetadata(t *testing.T) {
 		got.AccountUsername != meta.AccountUsername || got.AccountHashedPasswordHex != meta.AccountHashedPasswordHex ||
 		got.AccountPET != meta.AccountPET || got.AccountADSID != meta.AccountADSID ||
 		got.AccountDSID != meta.AccountDSID || got.AccountSPDBase64 != meta.AccountSPDBase64 ||
-		got.MmeDelegateJSON != meta.MmeDelegateJSON {
+		got.MmeDelegateJSON != meta.MmeDelegateJSON || got.AccountPersistBlob != meta.AccountPersistBlob {
 		t.Fatalf("metadata was not fully copied: %#v", got)
 	}
 }
@@ -58,6 +59,7 @@ func TestUserLoginMetadataFromPersistedSessionState(t *testing.T) {
 		AccountDSID:              "dsid",
 		AccountSPDBase64:         "spd",
 		MmeDelegateJSON:          "delegate",
+		AccountPersistBlob:       "persisted-account",
 	}
 
 	got := userLoginMetadataFromPersistedSessionState(state, "fallback-os")
@@ -69,7 +71,7 @@ func TestUserLoginMetadataFromPersistedSessionState(t *testing.T) {
 		got.AccountHashedPasswordHex != state.AccountHashedPasswordHex ||
 		got.AccountPET != state.AccountPET || got.AccountADSID != state.AccountADSID ||
 		got.AccountDSID != state.AccountDSID || got.AccountSPDBase64 != state.AccountSPDBase64 ||
-		got.MmeDelegateJSON != state.MmeDelegateJSON {
+		got.MmeDelegateJSON != state.MmeDelegateJSON || got.AccountPersistBlob != state.AccountPersistBlob {
 		t.Fatalf("persisted session was not fully restored: %#v", got)
 	}
 	if got.ChatsSynced {

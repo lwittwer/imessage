@@ -48,6 +48,8 @@ func (c *IMConnector) GetName() bridgev2.BridgeName {
 
 func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 	c.Bridge = bridge
+	// Install before other FFI calls so Rust diagnostics use the bridge logger.
+	installRustLogSink(bridge.Log)
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
@@ -336,22 +338,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	if meta.IDSUsers == "" && meta.IDSIdentity == "" && meta.APSState == "" {
 		log.Warn().Msg("LoadUserLogin: meta has no IDSUsers/IDSIdentity/APSState; skipping session.json overwrite to preserve existing backup")
 	} else {
-		saveSessionState(log, PersistedSessionState{
-			IDSIdentity:              meta.IDSIdentity,
-			APSState:                 meta.APSState,
-			IDSUsers:                 meta.IDSUsers,
-			PreferredHandle:          meta.PreferredHandle,
-			Platform:                 meta.Platform,
-			HardwareKey:              meta.HardwareKey,
-			DeviceID:                 meta.DeviceID,
-			AccountUsername:          meta.AccountUsername,
-			AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-			AccountPET:               meta.AccountPET,
-			AccountADSID:             meta.AccountADSID,
-			AccountDSID:              meta.AccountDSID,
-			AccountSPDBase64:         meta.AccountSPDBase64,
-			MmeDelegateJSON:          meta.MmeDelegateJSON,
-		})
+		saveSessionState(log, persistedSessionStateFromMetadata(meta))
 	}
 
 	client := &IMClient{

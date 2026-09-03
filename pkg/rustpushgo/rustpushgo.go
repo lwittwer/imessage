@@ -354,6 +354,7 @@ func readFloat64(reader io.Reader) float64 {
 func init() {
 
 	(&FfiConverterCallbackInterfaceMessageCallback{}).register()
+	(&FfiConverterCallbackInterfaceRustLogSink{}).register()
 	(&FfiConverterCallbackInterfaceStatusCallback{}).register()
 	(&FfiConverterCallbackInterfaceUpdateUsersCallback{}).register()
 	uniffiInitContinuationCallback()
@@ -436,6 +437,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_init_logger_with_sink(uniffiStatus)
+		})
+		if checksum != 53126 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_init_logger_with_sink: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_login_start(uniffiStatus)
 		})
 		if checksum != 53356 {
@@ -465,7 +475,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_restore_token_provider(uniffiStatus)
 		})
-		if checksum != 43442 {
+		if checksum != 65214 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_func_restore_token_provider: UniFFI API checksum mismatch")
 		}
@@ -1615,6 +1625,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob(uniffiStatus)
+		})
+		if checksum != 63205 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_contacts_url(uniffiStatus)
 		})
 		if checksum != 29421 {
@@ -1728,6 +1747,15 @@ func uniffiCheckChecksums() {
 		if checksum != 9227 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_messagecallback_on_message: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_rustlogsink_log(uniffiStatus)
+		})
+		if checksum != 29422 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_rustlogsink_log: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5519,6 +5547,31 @@ func (_self *WrappedTokenProvider) AppleAccountFullName() string {
 		})
 }
 
+func (_self *WrappedTokenProvider) GetAccountPersistBlob() (*string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_account_persist_blob(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterOptionalStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedTokenProvider) GetContactsUrl() (*string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
 	defer _self.ffiObject.decrementPointer()
@@ -7672,6 +7725,68 @@ type FfiDestroyerCallbackInterfaceMessageCallback struct{}
 func (FfiDestroyerCallbackInterfaceMessageCallback) Destroy(value MessageCallback) {
 }
 
+type RustLogSink interface {
+	Log(level string, target string, message string)
+}
+
+// foreignCallbackCallbackInterfaceRustLogSink cannot be callable be a compiled function at a same time
+type foreignCallbackCallbackInterfaceRustLogSink struct{}
+
+//export rustpushgo_cgo_RustLogSink
+func rustpushgo_cgo_RustLogSink(handle C.uint64_t, method C.int32_t, argsPtr *C.uint8_t, argsLen C.int32_t, outBuf *C.RustBuffer) C.int32_t {
+	cb := FfiConverterCallbackInterfaceRustLogSinkINSTANCE.Lift(uint64(handle))
+	switch method {
+	case 0:
+		// 0 means Rust is done with the callback, and the callback
+		// can be dropped by the foreign language.
+		*outBuf = rustBufferToC(FfiConverterCallbackInterfaceRustLogSinkINSTANCE.drop(uint64(handle)))
+		// See docs of ForeignCallback in `uniffi/src/ffi/foreigncallbacks.rs`
+		return C.int32_t(uniffiIdxCallbackFree)
+
+	case 1:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceRustLogSink{}.InvokeLog(cb, args, outBuf)
+		return C.int32_t(result)
+
+	default:
+		// This should never happen, because an out of bounds method index won't
+		// ever be used. Once we can catch errors, we should return an InternalException.
+		// https://github.com/mozilla/uniffi-rs/issues/351
+		return C.int32_t(uniffiCallbackUnexpectedResultError)
+	}
+}
+
+func (foreignCallbackCallbackInterfaceRustLogSink) InvokeLog(callback RustLogSink, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	reader := bytes.NewReader(args)
+	callback.Log(FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+
+type FfiConverterCallbackInterfaceRustLogSink struct {
+	FfiConverterCallbackInterface[RustLogSink]
+}
+
+var FfiConverterCallbackInterfaceRustLogSinkINSTANCE = &FfiConverterCallbackInterfaceRustLogSink{
+	FfiConverterCallbackInterface: FfiConverterCallbackInterface[RustLogSink]{
+		handleMap: newConcurrentHandleMap[RustLogSink](),
+	},
+}
+
+// This is a static function because only 1 instance is supported for registering
+func (c *FfiConverterCallbackInterfaceRustLogSink) register() {
+	rustCall(func(status *C.RustCallStatus) int32 {
+		C.uniffi_rustpushgo_fn_init_callback_rustlogsink(C.ForeignCallback(C.rustpushgo_cgo_RustLogSink), status)
+		return 0
+	})
+}
+
+type FfiDestroyerCallbackInterfaceRustLogSink struct{}
+
+func (FfiDestroyerCallbackInterfaceRustLogSink) Destroy(value RustLogSink) {
+}
+
 type StatusCallback interface {
 	OnStatusUpdate(user string, mode *string, available bool)
 
@@ -9042,6 +9157,13 @@ func InitLogger() {
 	})
 }
 
+func InitLoggerWithSink(sink RustLogSink) {
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_func_init_logger_with_sink(FfiConverterCallbackInterfaceRustLogSinkINSTANCE.Lower(sink), _uniffiStatus)
+		return false
+	})
+}
+
 func LoginStart(appleId string, password string, config *WrappedOsConfig, connection *WrappedApsConnection) (*LoginSession, error) {
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
@@ -9093,11 +9215,11 @@ func RegisterFordKey(key []byte) {
 	})
 }
 
-func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string) (*WrappedTokenProvider, error) {
+func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string, persistBlob *string) (*WrappedTokenProvider, error) {
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)),
+			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(persistBlob)),
 				status,
 			))
 		},
