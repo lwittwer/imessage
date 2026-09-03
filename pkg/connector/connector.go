@@ -336,22 +336,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	if meta.IDSUsers == "" && meta.IDSIdentity == "" && meta.APSState == "" {
 		log.Warn().Msg("LoadUserLogin: meta has no IDSUsers/IDSIdentity/APSState; skipping session.json overwrite to preserve existing backup")
 	} else {
-		saveSessionState(log, PersistedSessionState{
-			IDSIdentity:              meta.IDSIdentity,
-			APSState:                 meta.APSState,
-			IDSUsers:                 meta.IDSUsers,
-			PreferredHandle:          meta.PreferredHandle,
-			Platform:                 meta.Platform,
-			HardwareKey:              meta.HardwareKey,
-			DeviceID:                 meta.DeviceID,
-			AccountUsername:          meta.AccountUsername,
-			AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-			AccountPET:               meta.AccountPET,
-			AccountADSID:             meta.AccountADSID,
-			AccountDSID:              meta.AccountDSID,
-			AccountSPDBase64:         meta.AccountSPDBase64,
-			MmeDelegateJSON:          meta.MmeDelegateJSON,
-		})
+		saveSessionState(log, persistedSessionStateFromMetadata(meta))
 	}
 
 	client := &IMClient{

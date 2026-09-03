@@ -109,6 +109,31 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Filtered += other.Filtered
 }
 
+// hasChanges reports whether the pass wrote anything to the cloud tables.
+// Filtered chats count: with bridge_filtered_chats on they are portal
+// candidates, and a delayed pass that skips its rescans must have had nothing
+// at all to act on.
+func (c cloudSyncCounters) hasChanges() bool {
+	return c.Imported+c.Updated+c.Deleted+c.Filtered > 0
+}
+
+// canSkipDelayedCloudReconciliation permits the cheap no-change path only
+// after both CloudKit ingestion and the most recent portal candidate scan
+// completed. A successful empty CloudKit pass is not evidence that portal rows
+// left behind by either kind of failure have already been reconciled.
+func canSkipDelayedCloudReconciliation(counts cloudSyncCounters, previousPassFailed, portalReconciliationPending bool) bool {
+	return !counts.hasChanges() && !previousPassFailed && !portalReconciliationPending
+}
+
+// shouldRunDelayedCloudReconciliation also keeps the local reconciliation path
+// running after the current CloudKit pass fails. Each successfully fetched page
+// is committed before a later page can fail, so even the final delayed pass may
+// have left rows that need attachment restoration, deletion filtering, and
+// portal creation.
+func shouldRunDelayedCloudReconciliation(counts cloudSyncCounters, currentPassFailed, previousPassFailed, portalReconciliationPending bool) bool {
+	return currentPassFailed || !canSkipDelayedCloudReconciliation(counts, previousPassFailed, portalReconciliationPending)
+}
+
 func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDoneLock.Lock()
 	c.cloudSyncDone = true
@@ -2002,9 +2027,9 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	//
 	// The crash this was written for lands in the delayed-resync loop, which
 	// runs after setCloudSyncDone(), so it takes the recover path: the gate is
-	// already open, messages keep flowing, and the incomplete resync is picked
-	// up on the next cycle. The Rust side (ids_guard) contains lookup panics
-	// before they reach here; this is the backstop for everything else.
+	// already open and messages keep flowing. A restart is required to resume
+	// CloudKit sync. The Rust side (ids_guard) contains lookup panics before
+	// they reach here; this is the backstop for everything else.
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -2016,7 +2041,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			panic(r)
 		}
 		log.Error().Interface("panic", r).
-			Msg("CloudKit sync controller panicked after sync completed — bridge stays up, resync resumes on the next cycle")
+			Msg("CloudKit sync controller panicked after sync completed — bridge stays up, but a restart is required to resume CloudKit sync")
 	}()
 
 	// Derive a cancellable context from stopChan so that preUploadCloudAttachments
@@ -2080,7 +2105,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Unlock()
 	}()
 	for {
-		err := c.runCloudSyncOnceSerialized(ctx, log, true)
+		_, err := c.runCloudSyncOnceSerialized(ctx, log, true)
 		if err != nil {
 			log.Error().Err(err).
 				Dur("retry_in", cloudSyncRetryInterval).
@@ -2120,7 +2145,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// creation. This populates attachmentContentCache so that FetchMessages
 	// (which runs inside the portal event loop goroutine) gets instant cache
 	// hits instead of blocking on CloudKit for 30+ minutes.
-	c.preUploadCloudAttachments(ctx)
+	c.preUploadCloudAttachments(ctx, true)
 
 	// Seed delete knowledge from Apple's recycle bin BEFORE creating portals.
 	// Must run after runCloudSyncOnce (PCS keys needed) but before
@@ -2163,13 +2188,22 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log, skipPortals)
+	// Tracks a failed portal candidate scan, not a failed individual portal;
+	// see createPortalsFromCloudSync.
+	portalReconciliationPending := !c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
-	log.Info().
-		Dur("portal_creation_elapsed", time.Since(portalStart)).
-		Dur("total_elapsed", time.Since(controllerStart)).
-		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+	if portalReconciliationPending {
+		log.Warn().
+			Dur("portal_creation_elapsed", time.Since(portalStart)).
+			Dur("total_elapsed", time.Since(controllerStart)).
+			Msg("CloudKit bootstrap complete but the portal candidate scan failed — the delayed passes below will retry it")
+	} else {
+		log.Info().
+			Dur("portal_creation_elapsed", time.Since(portalStart)).
+			Dur("total_elapsed", time.Since(controllerStart)).
+			Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+	}
 
 	// Notify the user about chats blocked from Apple's recycle bin.
 	c.notifyRecycleBinCandidates(log)
@@ -2195,6 +2229,12 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// returned immediately after launching it — the defer cancel() killed
 	// the context, causing every re-sync to fail with "context canceled".
 	delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
+	// syncCloudMessages saves its continuation token per page and returns the
+	// error after ingesting the earlier pages, so a failed pass can leave rows
+	// behind that still need portals and the recently-deleted soft-deletes.
+	// The pass after a failure therefore always runs the full path, whatever
+	// its own counts say.
+	previousPassFailed := false
 	for i, delay := range delays {
 		select {
 		case <-time.After(delay):
@@ -2210,13 +2250,43 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = true
 		c.cloudSyncRunningLock.Unlock()
-		if err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false); err != nil {
+		counts, err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false)
+		currentPassFailed := err != nil
+		if ctx.Err() != nil {
+			// Shutdown cancelled the pass. Reconciling now would run every
+			// scan against a dead context, and the warnings after this loop
+			// would report a stopping bridge as unrecovered data loss.
 			c.cloudSyncRunningLock.Lock()
 			c.cloudSyncRunning = false
 			c.cloudSyncRunningLock.Unlock()
-			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+			resyncLog.Debug().Msg("Delayed CloudKit re-sync interrupted by shutdown")
+			return
+		}
+		if currentPassFailed {
+			resyncLog.Warn().Err(err).
+				Msg("Delayed incremental re-sync failed; reconciling any CloudKit rows saved before the failure")
+		}
+		if !shouldRunDelayedCloudReconciliation(counts, currentPassFailed, previousPassFailed, portalReconciliationPending) {
+			// The delayed passes usually confirm that CloudKit has no newly
+			// propagated records. Re-running the account-wide attachment and
+			// portal scans in that case used to monopolize Keith's one SQLite
+			// connection for minutes despite having no work to discover. Failed
+			// attachments are the only useful retry work that can exist without a
+			// new CloudKit record; their descriptors are retained in memory, so
+			// retry them without touching the message tables.
+			if c.hasRetryableAttachmentFailures() {
+				c.preUploadCloudAttachments(ctx, false)
+			}
+			resyncLog.Debug().Msg("Delayed CloudKit re-sync returned no changes; skipped attachment-message and portal rescans")
+			c.cloudSyncRunningLock.Lock()
+			c.cloudSyncRunning = false
+			c.cloudSyncRunningLock.Unlock()
 			continue
 		}
+		// Keep a failed pass pending even after reconciling the rows it managed
+		// to save. The next successful pass must still run the full path because
+		// it may resume pagination and discover more rows.
+		previousPassFailed = currentPassFailed
 		// Extend skipPortals with any portals deleted since bootstrap.
 		// The delayed re-sync may have imported new cloud_message records
 		// for these portals (deleted=FALSE). Soft-delete them now so they
@@ -2237,11 +2307,21 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.recentlyDeletedPortalsMu.RUnlock()
 		// Pre-upload any new attachments discovered by this re-sync;
 		// already-cached record_names are skipped instantly.
-		c.preUploadCloudAttachments(ctx)
-		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+		c.preUploadCloudAttachments(ctx, true)
+		portalReconciliationPending = !c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = false
 		c.cloudSyncRunningLock.Unlock()
+	}
+	if previousPassFailed {
+		log.Warn().Msg("Delayed CloudKit re-syncs ended after a sync failure — saved rows were reconciled, but remaining remote changes require a restart or manual recovery")
+	}
+	if portalReconciliationPending {
+		// The delayed passes are a fixed, short sequence. Once they are spent
+		// nothing reconciles portals again until a restart or manual recovery,
+		// so this is the last chance to say so.
+		log.Warn().Msg("Delayed CloudKit re-syncs finished with the portal candidate scan still failing — " +
+			"cloud rows may have no portal until a restart or manual recovery")
 	}
 }
 
@@ -2274,7 +2354,7 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 	}
 }
 
-func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.Logger, isBootstrap bool) (cloudSyncCounters, error) {
 	c.cloudSyncRunMu.Lock()
 	defer c.cloudSyncRunMu.Unlock()
 	return c.runCloudSyncOnce(ctx, log, isBootstrap)
@@ -2284,7 +2364,7 @@ func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.L
 // (isBootstrap=true) it detects fresh vs. interrupted state and clears stale
 // data if needed. On subsequent runs it's purely incremental — the saved
 // continuation tokens mean CloudKit only returns changes since last sync.
-func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) (cloudSyncCounters, error) {
 	if isBootstrap {
 		// DEVELOPMENT-ONLY re-fill: when privacy is disabled, undo the scrubber's
 		// NULLing so plaintext returns to the local cache. clearAllBodyScrub flips
@@ -2391,7 +2471,7 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 	backfillStart := time.Now()
 	counts, err := c.runCloudKitBackfill(ctx, log)
 	if err != nil {
-		return fmt.Errorf("CloudKit sync failed after %s: %w", time.Since(backfillStart).Round(time.Second), err)
+		return counts, fmt.Errorf("CloudKit sync failed after %s: %w", time.Since(backfillStart).Round(time.Second), err)
 	}
 
 	log.Info().
@@ -2448,7 +2528,7 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		// avoids the trigger.)
 	}
 
-	return nil
+	return counts, nil
 }
 
 func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
@@ -4020,9 +4100,18 @@ type cloudCatchupBackfillBundle struct {
 	AfterWriteTS int64
 }
 
-func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
+// createPortalsFromCloudSync returns whether the portal candidate scan
+// completed, meaning the listing succeeded and every candidate was considered.
+// A false result must be retried even when the next CloudKit pass contains no
+// changes: otherwise a transient database error can leave existing cloud rows
+// without portals until another record arrives or the bridge restarts.
+//
+// It reports only the scan, not the outcome of each candidate. Failures while
+// queueing or processing an individual candidate are logged by their own paths
+// and do not change this return value.
+func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) bool {
 	if c.cloudStore == nil {
-		return
+		return true
 	}
 
 	// Get portal IDs sorted by newest CloudKit activity timestamp (most recent
@@ -4035,11 +4124,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
-		return
+		return false
 	}
 
 	if len(portalInfos) == 0 {
-		return
+		return true
 	}
 
 	// Tombstoned (deleted) chats are already removed from cloud_chat/cloud_message
@@ -4378,6 +4467,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			c.Main.Bridge.WakeupBackfillQueue()
 		}
 	}
+	return true
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

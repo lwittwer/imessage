@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,6 +20,10 @@ type cloudBackfillStore struct {
 	db             *dbutil.Database
 	loginID        networkid.UserLoginID
 	bridgeFiltered bool
+
+	// scrubMu serializes body-scrub passes, which the periodic ticker and
+	// post-sync housekeeping can otherwise run concurrently.
+	scrubMu sync.Mutex
 }
 
 type cloudMessageRow struct {
@@ -265,10 +270,14 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			updated_ts BIGINT NOT NULL,
 			PRIMARY KEY (login_id, portal_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS cloud_maintenance (
+			login_id TEXT NOT NULL,
+			task TEXT NOT NULL,
+			completed_ts BIGINT NOT NULL,
+			PRIMARY KEY (login_id, task)
+		)`,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
-		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
-			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
 			ON cloud_message (login_id, chat_id, timestamp_ms, guid)`,
 		cloudMessageDeletedGUIDIndex,
@@ -280,7 +289,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to ensure cloud backfill schema: %w", err)
 		}
 	}
-
 	// Migrations: add missing columns to cloud_chat (SQLite doesn't support IF NOT EXISTS on ALTER).
 	// fwd_backfill_done: set to 1 when FetchMessages(forward) completes for a portal so that
 	// preUploadCloudAttachments skips those portals on restart. Default 0 means "not yet done".
@@ -338,14 +346,43 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-	// Privacy-scrubber fast path: both body and reaction scrubs select old,
-	// un-scrubbed rows by login. Keep this partial so its steady-state size is
-	// proportional to the pending plaintext backlog rather than all history.
-	// It must be created after the column migrations above because legacy
-	// databases do not have body_scrubbed until those migrations complete.
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_idx
-		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
-		return fmt.Errorf("failed to create cloud_message_scrub_idx: %w", err)
+	// Keep the old paging prefix while covering the account-wide portal and
+	// freshness summaries. On a large SQLite database this avoids a table
+	// lookup for every message while the bridge's sole connection is held.
+	// These indexes must be created after legacy schemas gain record_name and
+	// the other migrated columns they reference.
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_portal_cover_idx
+		ON cloud_message (login_id, portal_id, timestamp_ms, guid, deleted, record_name, updated_ts)`); err != nil {
+		return fmt.Errorf("failed to create cloud message portal covering index: %w", err)
+	}
+	// The replacement retains the complete leading-column order, so all paging
+	// queries keep the same plan. Drop the duplicate only after it exists.
+	if _, err := s.db.Exec(ctx, `DROP INDEX IF EXISTS cloud_message_portal_ts_idx`); err != nil {
+		return fmt.Errorf("failed to retire old cloud message portal index: %w", err)
+	}
+	// Only attachment-bearing rows enter this compact partial index. Its order
+	// satisfies the pending pre-upload and cache-prune queries without sorting.
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_attachment_idx
+		ON cloud_message (login_id, timestamp_ms, guid, portal_id)
+		WHERE deleted=FALSE AND attachments_json IS NOT NULL AND attachments_json <> ''`); err != nil {
+		return fmt.Errorf("failed to create cloud message attachment index: %w", err)
+	}
+
+	// Privacy-scrubber fast path: both body and reaction scrubs enumerate old,
+	// un-scrubbed rows by login, and every column those enumerations read or
+	// filter on is in the index so they never touch the table. Partial, so its
+	// steady-state size is proportional to the pending plaintext backlog rather
+	// than all history. It must be created after the column migrations above
+	// because legacy databases do not have body_scrubbed until those migrations
+	// complete. The earlier two-column form is dropped so no database carries
+	// both.
+	if _, err := s.db.Exec(ctx, `DROP INDEX IF EXISTS cloud_message_scrub_idx`); err != nil {
+		return fmt.Errorf("failed to drop cloud_message_scrub_idx: %w", err)
+	}
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_cover_idx
+		ON cloud_message (login_id, updated_ts, guid, deleted, tapback_type, portal_id)
+		WHERE body_scrubbed=FALSE`); err != nil {
+		return fmt.Errorf("failed to create cloud_message_scrub_cover_idx: %w", err)
 	}
 
 	// Privacy migration: pre-existing soft-deleted rows from before the
@@ -376,26 +413,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	//   2. text matches the portal's display_name + no attachments + no tapback
 	//      — older rows whose has_body defaulted to TRUE but whose content
 	//      reveals them as group-rename notifications.
-	// This runs every startup and is idempotent: after the first pass it
-	// matches zero rows.
-	if _, err := s.db.Exec(ctx, `
-		DELETE FROM cloud_message
-		WHERE login_id = $1
-		  AND COALESCE(attachments_json, '') = ''
-		  AND tapback_type IS NULL
-		  AND (
-		    has_body = FALSE
-		    OR (
-		      text IS NOT NULL AND text <> ''
-		      AND portal_id IN (
-		        SELECT portal_id FROM cloud_chat c
-		        WHERE c.login_id = $1
-		          AND c.display_name IS NOT NULL AND c.display_name <> ''
-		          AND c.display_name = cloud_message.text
-		      )
-		    )
-		  )
-	`, s.loginID); err != nil {
+	// This migration is versioned and recorded after a successful pass. The
+	// scan itself is paged and deletes are keyed, so even its first run never
+	// owns SQLite's write lock for the duration of the whole message table.
+	if err := s.deleteLegacySystemMessages(ctx); err != nil {
 		return fmt.Errorf("failed to delete system messages: %w", err)
 	}
 
@@ -452,6 +473,133 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+const legacySystemMessageCleanupTask = "legacy-system-messages-v1"
+
+func (s *cloudBackfillStore) deleteLegacySystemMessages(ctx context.Context) error {
+	var completed int
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_maintenance WHERE login_id=$1 AND task=$2
+	`, s.loginID, legacySystemMessageCleanupTask).Scan(&completed)
+	if err != nil || completed > 0 {
+		return err
+	}
+
+	chatRows, err := s.db.Query(ctx, `
+		SELECT portal_id, display_name FROM cloud_chat
+		WHERE login_id=$1 AND display_name IS NOT NULL AND display_name <> ''
+	`, s.loginID)
+	if err != nil {
+		return err
+	}
+	displayNames := make(map[string]map[string]struct{})
+	for chatRows.Next() {
+		var portalID, displayName string
+		if err := chatRows.Scan(&portalID, &displayName); err != nil {
+			chatRows.Close()
+			return err
+		}
+		if displayNames[portalID] == nil {
+			displayNames[portalID] = make(map[string]struct{})
+		}
+		displayNames[portalID][displayName] = struct{}{}
+	}
+	if err := chatRows.Err(); err != nil {
+		chatRows.Close()
+		return err
+	}
+	chatRows.Close()
+
+	const pageSize = 1000
+	const deleteChunkSize = 250
+	lastGUID := ""
+	for {
+		rows, err := s.db.Query(ctx, `
+			SELECT guid, portal_id, text, attachments_json, tapback_type, has_body
+			FROM cloud_message
+			WHERE login_id=$1 AND guid > $2
+			ORDER BY guid
+			LIMIT $3
+		`, s.loginID, lastGUID, pageSize)
+		if err != nil {
+			return err
+		}
+		var candidates []string
+		count := 0
+		for rows.Next() {
+			var portalID, textValue, attachmentsJSON sql.NullString
+			var tapbackType sql.NullInt64
+			var hasBody bool
+			if err := rows.Scan(&lastGUID, &portalID, &textValue, &attachmentsJSON, &tapbackType, &hasBody); err != nil {
+				rows.Close()
+				return err
+			}
+			count++
+			if (attachmentsJSON.Valid && attachmentsJSON.String != "") || tapbackType.Valid {
+				continue
+			}
+			legacyRename := false
+			if portalID.Valid && textValue.Valid && textValue.String != "" {
+				_, legacyRename = displayNames[portalID.String][textValue.String]
+			}
+			if !hasBody || legacyRename {
+				candidates = append(candidates, lastGUID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		for start := 0; start < len(candidates); start += deleteChunkSize {
+			end := start + deleteChunkSize
+			if end > len(candidates) {
+				end = len(candidates)
+			}
+			chunk := candidates[start:end]
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, s.loginID)
+			placeholders := make([]string, len(chunk))
+			for i, guid := range chunk {
+				args = append(args, guid)
+				placeholders[i] = fmt.Sprintf("$%d", i+2)
+			}
+			// Recheck the full legacy predicate so a row changed after the read
+			// page is not deleted based on stale metadata.
+			if _, err := s.db.Exec(ctx, `
+				DELETE FROM cloud_message
+				WHERE login_id=$1 AND guid IN (`+strings.Join(placeholders, ",")+`)
+				  AND COALESCE(attachments_json, '') = ''
+				  AND tapback_type IS NULL
+				  AND (
+				    has_body=FALSE
+				    OR (
+				      text IS NOT NULL AND text <> ''
+				      AND portal_id IN (
+				        SELECT portal_id FROM cloud_chat c
+				        WHERE c.login_id=$1
+				          AND c.display_name IS NOT NULL AND c.display_name <> ''
+				          AND c.display_name=cloud_message.text
+				      )
+				    )
+				  )
+			`, args...); err != nil {
+				return err
+			}
+		}
+		if count < pageSize {
+			break
+		}
+	}
+
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO cloud_maintenance (login_id, task, completed_ts)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (login_id, task) DO UPDATE SET completed_ts=excluded.completed_ts
+	`, s.loginID, legacySystemMessageCleanupTask, time.Now().UnixMilli())
+	return err
 }
 
 func (s *cloudBackfillStore) getSyncState(ctx context.Context, zone string) (*string, error) {
@@ -584,7 +732,7 @@ func (s *cloudBackfillStore) setChatSyncVersion(ctx context.Context, version int
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
-	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache", "cloud_attachment_dead"} {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache", "cloud_attachment_dead", "cloud_maintenance"} {
 		if _, err := s.db.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
 			s.loginID,
@@ -1998,36 +2146,188 @@ func (s *cloudBackfillStore) normalizeGroupChatPortalIDs(ctx context.Context) (i
 // cloud_chat. This happens when resolveConversationID used the CloudKit chat_id
 // UUID (before the getChatPortalID-first fix) instead of the group_id UUID.
 // Returns the number of rows updated.
+//
+// The mapping is resolved in Go, one cloud_chat read plus one index-only read
+// of the distinct gid: portals messages reference, and only portals that
+// actually need to move are written. The former single UPDATE correlated every
+// gid: message row against every cloud_chat row through LOWER(), which SQLite
+// cannot index; on a 278k-message database that held the write lock for 33
+// minutes at every bootstrap to change nothing.
 func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context) (int64, error) {
-	// Find cloud_message rows with gid: portal_ids where the UUID matches
-	// a cloud_chat row's group_id but the portal_id doesn't match.
-	// Update them to use the canonical portal_id from cloud_chat.
-	res, err := s.db.Exec(ctx, `
-		UPDATE cloud_message
-		SET portal_id = (
-			SELECT cc.portal_id FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-			LIMIT 1
-		)
-		WHERE login_id = $1
-		  AND portal_id LIKE 'gid:%'
-		  AND EXISTS (
-			SELECT 1 FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-		  )
-	`, s.loginID)
+	// Canonical portal candidates per UUID. The order mirrors the scan order
+	// of the former correlated subquery (cloud_chat_portal_idx), so the same
+	// portal wins when several chats share a UUID.
+	chats, err := s.db.Query(ctx, `
+		SELECT portal_id, LOWER(group_id), LOWER(cloud_chat_id) FROM cloud_chat
+		WHERE login_id=$1 AND portal_id <> ''
+		ORDER BY portal_id, cloud_chat_id`, s.loginID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("list cloud_chat portal mappings: %w", err)
 	}
-	return res.RowsAffected()
+	canonical := make(map[string][]string)
+	for chats.Next() {
+		var portalID, groupID, chatID string
+		if err := chats.Scan(&portalID, &groupID, &chatID); err != nil {
+			chats.Close()
+			return 0, fmt.Errorf("scan cloud_chat portal mapping: %w", err)
+		}
+		for _, key := range []string{groupID, chatID} {
+			if key != "" {
+				canonical[key] = append(canonical[key], portalID)
+			}
+		}
+	}
+	chats.Close()
+	if err := chats.Err(); err != nil {
+		return 0, fmt.Errorf("iterate cloud_chat portal mappings: %w", err)
+	}
+	if len(canonical) == 0 {
+		return 0, nil
+	}
+
+	// Every distinct gid: portal a message references, straight from the
+	// (login_id, portal_id, ...) index. SQLite compares bytes, so the prefix
+	// is a plain range; Postgres orders text by collation, where ':' and ';'
+	// need not bracket the prefix, so it keeps the LIKE.
+	prefixPredicate := `portal_id >= 'gid:' AND portal_id < 'gid;'`
+	if s.db.Dialect == dbutil.Postgres {
+		prefixPredicate = `portal_id LIKE 'gid:%'`
+	}
+	portals, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id FROM cloud_message
+		WHERE login_id=$1 AND `+prefixPredicate, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("list gid portals in cloud_message: %w", err)
+	}
+	type move struct{ from, to string }
+	var moves []move
+	for portals.Next() {
+		var portalID string
+		if err := portals.Scan(&portalID); err != nil {
+			portals.Close()
+			return 0, fmt.Errorf("scan gid portal: %w", err)
+		}
+		for _, target := range canonical[strings.ToLower(strings.TrimPrefix(portalID, "gid:"))] {
+			if target != portalID {
+				moves = append(moves, move{from: portalID, to: target})
+				break
+			}
+		}
+	}
+	portals.Close()
+	if err := portals.Err(); err != nil {
+		return 0, fmt.Errorf("iterate gid portals: %w", err)
+	}
+
+	// Find mapping cycles before ordering the remaining moves. A cycle has no
+	// safe sequential order: updating A→B first makes those rows indistinguishable
+	// from B's original rows. Each cycle is handled later with one CASE update,
+	// whose expressions all see the original portal_id.
+	moveByFrom := make(map[string]move, len(moves))
+	for _, m := range moves {
+		moveByFrom[m.from] = m
+	}
+	visited := make(map[string]bool, len(moves))
+	cycleFrom := make(map[string]bool)
+	var cycles [][]move
+	for start := range moveByFrom {
+		if visited[start] {
+			continue
+		}
+		positions := make(map[string]int)
+		var path []string
+		current := start
+		for {
+			if position, found := positions[current]; found {
+				cycle := make([]move, 0, len(path)-position)
+				for _, portalID := range path[position:] {
+					cycle = append(cycle, moveByFrom[portalID])
+					cycleFrom[portalID] = true
+				}
+				cycles = append(cycles, cycle)
+				break
+			}
+			if visited[current] {
+				break
+			}
+			m, found := moveByFrom[current]
+			if !found {
+				break
+			}
+			positions[current] = len(path)
+			path = append(path, current)
+			current = m.to
+		}
+		for _, portalID := range path {
+			visited[portalID] = true
+		}
+	}
+
+	linearMoves := make([]move, 0, len(moves)-len(cycleFrom))
+	for _, m := range moves {
+		if !cycleFrom[m.from] {
+			linearMoves = append(linearMoves, m)
+		}
+	}
+	// Cycles are written first. Their CASE expressions all see the original
+	// portal_id, and a linear move that feeds a cycle member must land after
+	// the swap, or the swap would carry those rows one hop further than the
+	// former single statement did.
+	var total int64
+	for _, cycle := range cycles {
+		args := make([]any, 0, 1+2*len(cycle))
+		args = append(args, s.loginID)
+		whenClauses := make([]string, len(cycle))
+		fromPlaceholders := make([]string, len(cycle))
+		for i, m := range cycle {
+			fromPlaceholder := fmt.Sprintf("$%d", 2+i*2)
+			toPlaceholder := fmt.Sprintf("$%d", 3+i*2)
+			whenClauses[i] = "WHEN " + fromPlaceholder + " THEN " + toPlaceholder
+			fromPlaceholders[i] = fromPlaceholder
+			args = append(args, m.from, m.to)
+		}
+		res, err := s.db.Exec(ctx, `
+			UPDATE cloud_message
+			SET portal_id=CASE portal_id `+strings.Join(whenClauses, " ")+` ELSE portal_id END
+			WHERE login_id=$1 AND portal_id IN (`+strings.Join(fromPlaceholders, ",")+`)
+		`, args...)
+		if err != nil {
+			return total, fmt.Errorf("normalize portal mapping cycle: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	// Sequential updates reproduce the former single statement for acyclic
+	// mappings if a target that is also a source is drained first.
+	for done := 0; done < len(linearMoves); done++ {
+		pick := done
+		for i := done; i < len(linearMoves); i++ {
+			drainedLater := false
+			for j := done; j < len(linearMoves); j++ {
+				if j != i && linearMoves[j].from == linearMoves[i].to {
+					drainedLater = true
+					break
+				}
+			}
+			if !drainedLater {
+				pick = i
+				break
+			}
+		}
+		linearMoves[done], linearMoves[pick] = linearMoves[pick], linearMoves[done]
+	}
+
+	for _, m := range linearMoves {
+		res, err := s.db.Exec(ctx,
+			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, m.from, m.to)
+		if err != nil {
+			return total, fmt.Errorf("normalize portal %s to %s: %w", m.from, m.to, err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
 }
 
 // getMessageRecordNamesByGroupID returns all non-empty message record_names
@@ -2860,7 +3160,7 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 	return count, nil
 }
 
-const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
+const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), COALESCE(portal_id, ''), timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
 	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE),
@@ -2976,20 +3276,39 @@ func (s *cloudBackfillStore) listOldestMessages(ctx context.Context, portalID st
 	return s.queryMessages(ctx, query, s.loginID, portalID, count)
 }
 
-// listAllAttachmentMessages returns every non-deleted cloud_message row that
-// has at least one attachment. Used by preUploadCloudAttachments to drive the
-// pre-upload pass before portal creation.
-func (s *cloudBackfillStore) listAllAttachmentMessages(ctx context.Context) ([]cloudMessageRow, error) {
+// listPendingAttachmentMessages returns attachment-bearing rows from portals
+// whose initial forward backfill has not completed. Completed portals handle
+// newly arrived attachments in FetchMessages itself, so rereading their entire
+// history before every delayed sync is pure overhead. A portal is considered
+// done when any of its cloud_chat rows carries fwd_backfill_done, matching
+// getForwardBackfillDonePortals and the former Go-side filter.
+func (s *cloudBackfillStore) listPendingAttachmentMessages(ctx context.Context) ([]cloudMessageRow, error) {
+	messageTable := "cloud_message cm"
+	if s.db.Dialect == dbutil.SQLite {
+		messageTable += " INDEXED BY cloud_message_attachment_idx"
+	}
 	query := `SELECT ` + cloudMessageSelectCols + `
-		FROM cloud_message
-		WHERE login_id=$1
-		  AND deleted=FALSE
-		  AND attachments_json IS NOT NULL
-		  AND attachments_json <> ''
-		  ` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `
-		ORDER BY timestamp_ms ASC, guid ASC
+		FROM ` + messageTable + `
+		WHERE cm.login_id=$1
+		  AND cm.deleted=FALSE
+		  AND cm.attachments_json IS NOT NULL
+		  AND cm.attachments_json <> ''
+		  ` + cloudMessageChatFilterWhere("cm", s.bridgeFiltered) + `
+		  AND NOT EXISTS (
+			SELECT 1 FROM cloud_chat cc
+			WHERE cc.login_id=cm.login_id AND cc.portal_id=cm.portal_id
+			  AND cc.fwd_backfill_done=TRUE
+		  )
+		ORDER BY cm.timestamp_ms ASC, cm.guid ASC
 	`
 	return s.queryMessages(ctx, query, s.loginID)
+}
+
+// listAllAttachmentMessages is retained for the legacy store test helper. The
+// attachment retry path now deliberately uses the bounded pending-portal
+// query above; keeping this narrow alias avoids a second unbounded scan.
+func (s *cloudBackfillStore) listAllAttachmentMessages(ctx context.Context) ([]cloudMessageRow, error) {
+	return s.listPendingAttachmentMessages(ctx)
 }
 
 func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, args ...any) ([]cloudMessageRow, error) {
@@ -3139,10 +3458,10 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		ORDER BY activity_ts DESC
 	`
 	rows, err := s.db.Query(ctx, query, args...)
+
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var out []portalWithNewestMessage
 	for rows.Next() {
@@ -3152,7 +3471,12 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	return out, nil
 }
 
 // cloudChatPortalSyncCandidateWhere matches chat metadata rows that should make
@@ -3877,29 +4201,87 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 	`, s.loginID, chatID, portalID, groupID, dnPtr, photoPtr, participantsJSON, nowMS)
 }
 
-// loadAttachmentCacheJSON returns every persisted record_name → content_json
-// pair for this login. The caller deserialises the JSON into
-// *event.MessageEventContent and populates the in-memory attachmentContentCache
-// so pre-upload skips already-uploaded attachments without touching CloudKit.
-func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[string][]byte, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT record_name, content_json FROM cloud_attachment_cache WHERE login_id=$1`,
-		s.loginID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// loadAttachmentCacheJSON returns persisted content only for the requested
+// record names. The in-memory cache survives between sync passes, so loading
+// all tens of thousands of historical entries each time needlessly monopolized
+// the single SQLite connection. Chunking also stays below SQLite's bind limit.
+func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context, recordNames []string) (map[string][]byte, error) {
 	cache := make(map[string][]byte)
-	for rows.Next() {
-		var recordName string
-		var contentJSON []byte
-		if err := rows.Scan(&recordName, &contentJSON); err != nil {
+	const chunkSize = 400
+	for start := 0; start < len(recordNames); start += chunkSize {
+		end := start + chunkSize
+		if end > len(recordNames) {
+			end = len(recordNames)
+		}
+		args := make([]any, 0, end-start+1)
+		args = append(args, s.loginID)
+		placeholders := make([]string, end-start)
+		for i, recordName := range recordNames[start:end] {
+			args = append(args, recordName)
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+		}
+		rows, err := s.db.Query(ctx, `
+			SELECT record_name, content_json FROM cloud_attachment_cache
+			WHERE login_id=$1 AND record_name IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		if err != nil {
 			return nil, err
 		}
-		cache[recordName] = contentJSON
+		for rows.Next() {
+			var recordName string
+			var contentJSON []byte
+			if err := rows.Scan(&recordName, &contentJSON); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			cache[recordName] = contentJSON
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return cache, rows.Err()
+	return cache, nil
+}
+
+// loadCurrentAttachmentRetryRow re-reads the live message and attachment
+// descriptor for a retained retry. The failure entry's copy is deliberately
+// stale: the message may have been scrubbed, deleted, moved to another portal,
+// or become filtered since the download failed. Applying the normal source
+// predicate here keeps retries aligned with the rows backfill can currently
+// deliver and returns the current portal/attachment metadata for routing.
+func (s *cloudBackfillStore) loadCurrentAttachmentRetryRow(ctx context.Context, guid, recordName string) (cloudMessageRow, cloudAttachmentRow, int, bool, error) {
+	query := `SELECT ` + cloudMessageSelectCols + `
+		FROM cloud_message cm
+		WHERE cm.login_id=$1 AND cm.guid=$2 AND cm.deleted=FALSE
+		` + cloudMessageChatFilterWhere("cm", s.bridgeFiltered)
+	rows, err := s.queryMessages(ctx, query, s.loginID, guid)
+	if err != nil {
+		return cloudMessageRow{}, cloudAttachmentRow{}, 0, false, err
+	}
+	if len(rows) == 0 || rows[0].AttachmentsJSON == "" {
+		return cloudMessageRow{}, cloudAttachmentRow{}, 0, false, nil
+	}
+
+	var attachments []cloudAttachmentRow
+	if err := json.Unmarshal([]byte(rows[0].AttachmentsJSON), &attachments); err != nil {
+		return cloudMessageRow{}, cloudAttachmentRow{}, 0, false, err
+	}
+	for index, attachment := range attachments {
+		if attachment.RecordName == recordName {
+			return rows[0], attachment, index, true, nil
+		}
+	}
+	return cloudMessageRow{}, cloudAttachmentRow{}, 0, false, nil
+}
+
+// messageStillReferencesAttachment verifies a retained retry descriptor with a
+// source-aware primary-key lookup. This prevents a delayed retry from
+// uploading media after its message was deleted, scrubbed, filtered, moved to
+// another portal, or replaced since the failure occurred.
+func (s *cloudBackfillStore) messageStillReferencesAttachment(ctx context.Context, guid, recordName string) (bool, error) {
+	_, _, _, found, err := s.loadCurrentAttachmentRetryRow(ctx, guid, recordName)
+	return found, err
 }
 
 // portalsFullyBackfilledNoNewContent returns the set of portal_ids whose
@@ -3909,8 +4291,12 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 // chats) is a ~30-minute startup that re-confirms "no messages to backfill"
 // for nearly every portal.
 //
-// The freshness test keys on created_ts/updated_ts (when the ROW was written,
-// ms) versus completed_at (ns), NOT the message timestamp. That way it still
+// The freshness test keys on updated_ts (when the row was last written, ms)
+// versus completed_at (ns), NOT the message timestamp. Every insert initializes
+// updated_ts alongside created_ts, and every conflict update advances it. This
+// is therefore equivalent to MAX(created_ts, updated_ts), while allowing the
+// portal covering index to answer the test without fetching every table row.
+// That way it still
 // re-backfills a portal when a previously-undecryptable record becomes
 // readable on a version-upgrade re-sync — those land as freshly-written rows
 // with old message times, so message-time alone would wrongly skip them.
@@ -4004,14 +4390,18 @@ const strandedBackfillReconciliationQuery = `
 `
 
 func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Context) (map[string]bool, error) {
+	messageTable := "cloud_message cm"
+	if s.db.Dialect == dbutil.SQLite {
+		messageTable += " INDEXED BY cloud_message_portal_cover_idx"
+	}
 	rows, err := s.db.Query(ctx, `
 		SELECT bt.portal_id
 		FROM backfill_task bt
-		WHERE bt.user_login_id=$1 AND bt.is_done=1 AND bt.completed_at > 0
+		WHERE bt.user_login_id=$1 AND bt.is_done=TRUE AND bt.completed_at > 0
 		  AND NOT EXISTS (
-		    SELECT 1 FROM cloud_message cm
+		    SELECT 1 FROM `+messageTable+`
 		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
-		      AND MAX(cm.created_ts, cm.updated_ts) > bt.completed_at/1000000
+		      AND cm.updated_ts > bt.completed_at/1000000
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM cloud_chat cc
@@ -4075,7 +4465,9 @@ func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recor
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
 		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (login_id, record_name) DO UPDATE SET content_json=excluded.content_json
+		ON CONFLICT (login_id, record_name) DO UPDATE SET
+			content_json=excluded.content_json,
+			created_ts=excluded.created_ts
 	`, s.loginID, recordName, contentJSON, time.Now().UnixMilli())
 }
 
@@ -4267,21 +4659,144 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 // This prevents unbounded growth after portal deletions or message tombstones
 // remove the messages that originally needed those cached attachments.
 func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
+	// The old DELETE expanded JSON from every message inside one write
+	// statement. On a slow host it held SQLite's write lock for minutes. Build
+	// the reference set through short indexed reads, then perform keyed deletes
+	// in small transactions instead.
+	// Captured before the reference scan begins, not after: an entry written
+	// while the scan runs is exactly the kind the scan can miss, so the cutoff
+	// has to predate the reads it is protecting against.
+	scanStart := time.Now().UnixMilli()
+	referenced := make(map[string]struct{})
+	const readChunkSize = 500
+	var lastTimestamp int64
+	var lastGUID string
+	for {
+		messageTable := "cloud_message"
+		if s.db.Dialect == dbutil.SQLite {
+			messageTable += " INDEXED BY cloud_message_attachment_idx"
+		}
+		rows, err := s.db.Query(ctx, `
+			SELECT timestamp_ms, guid, attachments_json
+			FROM `+messageTable+`
+			WHERE login_id=$1 AND deleted=FALSE
+			  AND attachments_json IS NOT NULL AND attachments_json <> ''
+			  AND (timestamp_ms > $2 OR (timestamp_ms = $2 AND guid > $3))
+			ORDER BY timestamp_ms, guid
+			LIMIT $4
+		`, s.loginID, lastTimestamp, lastGUID, readChunkSize)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list attachment references: %w", err)
+		}
+		count := 0
+		for rows.Next() {
+			var attachmentsJSON string
+			if err := rows.Scan(&lastTimestamp, &lastGUID, &attachmentsJSON); err != nil {
+				rows.Close()
+				return 0, fmt.Errorf("failed to scan attachment references: %w", err)
+			}
+			var attachments []cloudAttachmentRow
+			if err := json.Unmarshal([]byte(attachmentsJSON), &attachments); err != nil {
+				rows.Close()
+				// Retaining stale cache entries is safer than deleting a live one
+				// when one message's metadata cannot be understood.
+				return 0, fmt.Errorf("failed to parse attachment references for message %s: %w", lastGUID, err)
+			}
+			for _, attachment := range attachments {
+				if attachment.RecordName != "" {
+					referenced[attachment.RecordName] = struct{}{}
+				}
+			}
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to iterate attachment references: %w", err)
+		}
+		rows.Close()
+		if count < readChunkSize {
+			break
+		}
+	}
+
+	// The reference scan above is paged, so unlike the former single statement
+	// it cannot see a message inserted below its cursor while it ran. Entries
+	// written since scanStart are skipped below, because they belong to
+	// exactly the messages it could have missed. An older entry whose only
+	// message arrived mid-scan is still prunable, which costs one re-download
+	// and never content.
+	const deleteChunkSize = 250
+	var total int64
+	lastRecordName := ""
+	for {
+		rows, err := s.db.Query(ctx, `
+			SELECT record_name FROM cloud_attachment_cache
+			WHERE login_id=$1 AND record_name > $2 AND created_ts < $4
+			ORDER BY record_name
+			LIMIT $3
+		`, s.loginID, lastRecordName, readChunkSize, scanStart)
+		if err != nil {
+			return total, fmt.Errorf("failed to list attachment cache entries: %w", err)
+		}
+		var orphans []string
+		count := 0
+		for rows.Next() {
+			if err := rows.Scan(&lastRecordName); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("failed to scan attachment cache entry: %w", err)
+			}
+			if _, live := referenced[lastRecordName]; !live {
+				orphans = append(orphans, lastRecordName)
+			}
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("failed to iterate attachment cache entries: %w", err)
+		}
+		rows.Close()
+
+		for start := 0; start < len(orphans); start += deleteChunkSize {
+			end := start + deleteChunkSize
+			if end > len(orphans) {
+				end = len(orphans)
+			}
+			chunk := orphans[start:end]
+			n, err := s.deleteOrphanedAttachmentCacheEntries(ctx, chunk, scanStart)
+			if err != nil {
+				return total, err
+			}
+			total += n
+		}
+		if count < readChunkSize {
+			break
+		}
+	}
+	return total, nil
+}
+
+// deleteOrphanedAttachmentCacheEntries deletes only the cache rows that were
+// old enough to be considered by the current prune pass. The name list was
+// selected in an earlier read, so keeping the cutoff in the DELETE protects a
+// same-name cache refresh that happens between those two operations.
+func (s *cloudBackfillStore) deleteOrphanedAttachmentCacheEntries(ctx context.Context, recordNames []string, cutoff int64) (int64, error) {
+	if len(recordNames) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(recordNames)+2)
+	args = append(args, s.loginID, cutoff)
+	placeholders := make([]string, len(recordNames))
+	for i, recordName := range recordNames {
+		args = append(args, recordName)
+		placeholders[i] = fmt.Sprintf("$%d", i+3)
+	}
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_attachment_cache
-		WHERE login_id=$1
-		  AND record_name NOT IN (
-			SELECT DISTINCT json_extract(je.value, '$.record_name')
-			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
-			WHERE cloud_message.login_id=$1
-			  AND cloud_message.deleted=FALSE
-			  AND cloud_message.attachments_json IS NOT NULL
-			  AND cloud_message.attachments_json <> ''
-			  AND json_extract(je.value, '$.record_name') IS NOT NULL
-		  )
-	`, s.loginID)
+		WHERE login_id=$1 AND created_ts < $2
+		  AND record_name IN (`+strings.Join(placeholders, ",")+`)
+	`, args...)
 	if err != nil {
-		return 0, fmt.Errorf("failed to prune orphaned attachment cache: %w", err)
+		return 0, fmt.Errorf("failed to delete orphaned attachment cache entries: %w", err)
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
@@ -4476,10 +4991,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	if debugDisablePrivacy {
 		return 0, nil
 	}
+	// The periodic ticker and post-sync housekeeping both run passes. They
+	// share the delivered-ID set, and overlapping passes would only double the
+	// reads without scrubbing anything extra.
+	s.scrubMu.Lock()
+	defer s.scrubMu.Unlock()
+
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 	const chunkSize = 1000
 
-	// Candidate enumeration is one index-backed pass, so undelivered rows cannot
+	// Candidate enumeration is one index-only pass, so undelivered rows cannot
 	// be re-scanned forever. Avoid touching bridgev2's large message table at all
 	// when this pass has no eligible rows (the normal steady-state case).
 	candidates, err := s.scrubCandidates(ctx, cutoff, excludePortals)
@@ -4519,6 +5040,13 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		total += n
 		if end == len(candidates) {
 			break
+		}
+		// Yield between writes so live traffic gets the database in between,
+		// but not after a chunk that wrote nothing: in the steady state most
+		// chunks are undelivered rows that stay put, and sleeping through them
+		// would turn a millisecond pass into most of a second.
+		if n == 0 {
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -4730,6 +5258,12 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, bridgeID 
 // clearing it past the grace window is safe whether or not it was delivered.
 // sender and tapback_emoji are preserved so re-backfill still attributes and
 // renders the reaction (including custom emoji).
+//
+// Candidates are listed first and written by guid afterwards: the listing walks
+// the partial scrub index (tapback_type is in it, so non-reaction rows are
+// rejected without touching the table) and takes no write lock, and in the
+// steady state, where nothing needs scrubbing, no write transaction is opened
+// at all.
 func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
 	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
 	if debugDisablePrivacy {
@@ -4739,26 +5273,36 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 	const chunkSize = 1000
 	var total int64
 	for {
+		guids, err := s.reactionScrubCandidates(ctx, cutoff, chunkSize)
+		if err != nil {
+			return total, err
+		}
+		if len(guids) == 0 {
+			return total, nil
+		}
+		args := make([]any, 0, len(guids)+2)
+		args = append(args, s.loginID, cutoff)
+		placeholders := make([]string, len(guids))
+		for i, guid := range guids {
+			args = append(args, guid)
+			placeholders[i] = fmt.Sprintf("$%d", i+3)
+		}
 		result, err := s.db.Exec(ctx, `
 			UPDATE cloud_message
 			SET text=NULL, subject=NULL, body_scrubbed=TRUE
 			WHERE login_id=$1 AND tapback_type >= 2000
 			  AND body_scrubbed=FALSE AND updated_ts < $2
-			  AND guid IN (
-			    SELECT guid FROM cloud_message
-			    WHERE login_id=$1 AND tapback_type >= 2000
-			      AND body_scrubbed=FALSE AND updated_ts < $2
-			      AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
-			    LIMIT $3
-			  )
-		`, s.loginID, cutoff, chunkSize)
+			  AND guid IN (`+strings.Join(placeholders, ",")+`)`, args...)
 		if err != nil {
 			return total, fmt.Errorf("failed to scrub reaction text: %w", err)
 		}
 		n, _ := result.RowsAffected()
 		total += n
-		if n < chunkSize {
-			break
+		// A short chunk means the backlog is drained. A chunk that scrubbed
+		// nothing means every listed row was re-ingested under us; leave the
+		// rest to the next pass rather than spin on the same list.
+		if len(guids) < chunkSize || n == 0 {
+			return total, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -4766,7 +5310,33 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return total, nil
+}
+
+// reactionScrubCandidates lists up to limit reaction rows that still carry a
+// descriptor and are past the grace window.
+func (s *cloudBackfillStore) reactionScrubCandidates(ctx context.Context, cutoff int64, limit int) ([]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT guid FROM cloud_message
+		WHERE login_id=$1 AND body_scrubbed=FALSE
+		  AND tapback_type >= 2000 AND updated_ts < $2
+		  AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
+		LIMIT $3`, s.loginID, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list reaction scrub candidates: %w", err)
+	}
+	defer rows.Close()
+	var guids []string
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			return nil, fmt.Errorf("scan reaction scrub candidate: %w", err)
+		}
+		guids = append(guids, guid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reaction scrub candidates: %w", err)
+	}
+	return guids, nil
 }
 
 // scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE
@@ -4926,20 +5496,108 @@ const orphanStubReapAge = 24 * time.Hour
 // reaped via the age-gated `portal_id IS NULL` branch instead.
 func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64, error) {
 	stubCutoff := time.Now().Add(-orphanStubReapAge).UnixMilli()
-	result, err := s.db.Exec(ctx, `
-		DELETE FROM cloud_message
-		WHERE login_id=$1
-		  AND deleted=TRUE
-		  AND (
-		    portal_id NOT IN (
-		      SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
-		    )
-		    OR (portal_id IS NULL AND created_ts < $2)
-		  )
-	`, s.loginID, stubCutoff)
+	chatRows, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+	`, s.loginID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to delete orphaned messages: %w", err)
+		return 0, fmt.Errorf("failed to list cloud chat portals: %w", err)
 	}
-	n, _ := result.RowsAffected()
-	return n, nil
+	chatPortals := make(map[string]struct{})
+	for chatRows.Next() {
+		var portalID string
+		if err := chatRows.Scan(&portalID); err != nil {
+			chatRows.Close()
+			return 0, fmt.Errorf("failed to scan cloud chat portal: %w", err)
+		}
+		chatPortals[portalID] = struct{}{}
+	}
+	if err := chatRows.Err(); err != nil {
+		chatRows.Close()
+		return 0, fmt.Errorf("failed to iterate cloud chat portals: %w", err)
+	}
+	chatRows.Close()
+
+	// Page by the primary key and filter in Go. This does the same total read
+	// work as the old full-table DELETE but releases the only SQLite connection
+	// after each small page instead of holding a write lock for the whole scan.
+	const pageSize = 1000
+	const deleteChunkSize = 250
+	lastGUID := ""
+	var total int64
+	for {
+		rows, err := s.db.Query(ctx, `
+			SELECT guid, portal_id, created_ts, deleted
+			FROM cloud_message
+			WHERE login_id=$1 AND guid > $2
+			ORDER BY guid
+			LIMIT $3
+		`, s.loginID, lastGUID, pageSize)
+		if err != nil {
+			return total, fmt.Errorf("failed to page cloud messages for orphan cleanup: %w", err)
+		}
+		var candidates []string
+		count := 0
+		for rows.Next() {
+			var portalID sql.NullString
+			var createdTS int64
+			var deleted bool
+			if err := rows.Scan(&lastGUID, &portalID, &createdTS, &deleted); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("failed to scan cloud message for orphan cleanup: %w", err)
+			}
+			count++
+			if !deleted {
+				continue
+			}
+			if portalID.Valid {
+				if _, exists := chatPortals[portalID.String]; !exists {
+					candidates = append(candidates, lastGUID)
+				}
+			} else if createdTS < stubCutoff {
+				candidates = append(candidates, lastGUID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("failed to iterate cloud messages for orphan cleanup: %w", err)
+		}
+		rows.Close()
+
+		for start := 0; start < len(candidates); start += deleteChunkSize {
+			end := start + deleteChunkSize
+			if end > len(candidates) {
+				end = len(candidates)
+			}
+			chunk := candidates[start:end]
+			args := make([]any, 0, len(chunk)+2)
+			args = append(args, s.loginID, stubCutoff)
+			placeholders := make([]string, len(chunk))
+			for i, guid := range chunk {
+				args = append(args, guid)
+				placeholders[i] = fmt.Sprintf("$%d", i+3)
+			}
+			// Recheck the orphan predicate at delete time so a stub populated by
+			// a concurrent sync cannot be removed based on the earlier snapshot.
+			result, err := s.db.Exec(ctx, `
+				DELETE FROM cloud_message
+				WHERE login_id=$1 AND deleted=TRUE
+				  AND guid IN (`+strings.Join(placeholders, ",")+`)
+				  AND (
+				    portal_id NOT IN (
+				      SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+				    )
+				    OR (portal_id IS NULL AND created_ts < $2)
+				  )
+			`, args...)
+			if err != nil {
+				return total, fmt.Errorf("failed to delete orphaned cloud messages: %w", err)
+			}
+			n, _ := result.RowsAffected()
+			total += n
+		}
+		if count < pageSize {
+			break
+		}
+	}
+	return total, nil
 }

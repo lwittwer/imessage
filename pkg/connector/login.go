@@ -121,7 +121,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -158,7 +158,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -194,7 +194,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -367,7 +367,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -400,7 +400,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -436,7 +436,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -840,28 +840,21 @@ func completeLoginWithMeta(
 				meta.MmeDelegateJSON = *delegateJSON
 				log.Info().Msg("Captured MobileMe delegate for persistence")
 			}
+			// And the account state rustpush persisted, so the next restart
+			// reuses tokens that are still valid instead of re-running SRP.
+			if blob, blobErr := tp.GetAccountPersistBlob(); blobErr == nil && blob != nil {
+				meta.AccountPersistBlob = *blob
+				log.Info().Msg("Captured rustpush account state for persistence")
+			} else if blobErr != nil {
+				log.Warn().Err(blobErr).Msg("Failed to capture rustpush account state for persistence")
+			}
 		}
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
 
 	// Persist full session state to backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-	})
+	saveSessionState(log, persistedSessionStateFromMetadata(meta))
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
