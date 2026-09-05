@@ -301,6 +301,11 @@ func anyNameWordFuzzyMatches(qw string, nameWords []string) bool {
 		if strings.HasPrefix(nw, qw) {
 			return true
 		}
+		// Each edit changes the length by at most one byte. Keep the prefix
+		// check above this bound: a prefix may match a much longer name.
+		if len(qw)-len(nw) > threshold || len(nw)-len(qw) > threshold {
+			continue
+		}
 		// Edit-distance match for longer query words.
 		if threshold > 0 && levenshtein(qw, nw) <= threshold {
 			return true
