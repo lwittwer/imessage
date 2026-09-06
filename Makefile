@@ -28,8 +28,11 @@ RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(RUSTPUSH_DIR)/open-
 # .rs files before that recipe patches them: a patch that lands during the run
 # would otherwise not rebuild the archive until the next invocation.
 PATCH_FILES := $(shell find third_party/patches -name '*.patch' 2>/dev/null)
-CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
+# Prune build output before searching: filtering results afterwards still walks
+# the large Rust target trees on every make invocation.
+CARGO_FILES := $(shell find . -type d -name target -prune -o \( -name 'Cargo.toml' -o -name 'Cargo.lock' \) -print 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
+NATIVE_SRC  := $(shell find . -type d -name target -prune -o \( -name '*.m' -o -name '*.h' \) -print 2>/dev/null | grep -v target)
 
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
@@ -369,7 +372,7 @@ bindings: $(RUST_LIB)
 build: check-deps $(RUST_LIB) $(BINARY)
 	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT)) — run './$(BINARY) help' for setup/ops"
 
-$(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
+$(BINARY): $(GO_SRC) $(NATIVE_SRC) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 	@# Sign with a STABLE identifier so macOS/TCC can track this binary across

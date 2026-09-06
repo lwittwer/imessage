@@ -2999,34 +2999,34 @@ func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (in
 }
 
 func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID string) (bool, error) {
-	var count int
+	var found bool
 	query := `
-		SELECT COUNT(*)
+		SELECT EXISTS(SELECT 1
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered)
-	err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count)
+	` + cloudMessageChatFilterWhere("cloud_message", s.bridgeFiltered) + `)`
+	err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&found)
 	if err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	return found, nil
 }
 
 // hasContentfulMessages checks if a portal has at least one non-deleted row
 // that can produce a Matrix backfill message. Seeded placeholder rows from the
 // recycle bin have record_name but empty text/attachments, and don't count.
 func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID string) (bool, error) {
-	var count int
+	var found bool
 	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*)
+		SELECT EXISTS(SELECT 1
 		FROM cloud_message cm
 		WHERE `+cloudBackfillableEventWhere("cm", s.bridgeFiltered)+`
 		  AND cm.portal_id=$2
-	`, s.loginID, portalID).Scan(&count)
+	)`, s.loginID, portalID).Scan(&found)
 	if err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	return found, nil
 }
 
 func (s *cloudBackfillStore) hasContentfulMessagesInLatestWindow(ctx context.Context, portalID string, maxInitialMessages int) (bool, error) {
