@@ -31,10 +31,11 @@ const (
 	// this window. UpdatedTS is bumped on every successful fetch (not only
 	// on actual changes) so steady-state ticks become near-no-ops.
 	sharedProfileFreshnessWindow = 6 * time.Hour
-	// sharedProfileFetchPace leaves a conservative gap after each completed
-	// CloudKit fetch. Background name/photo freshness can tolerate the delay;
-	// stop the pass on throttling even with this pacing.
-	sharedProfileFetchPace       = 5 * time.Second
+	// sharedProfileFetchPace preserves the existing CardDAV refresh pacing.
+	sharedProfileFetchPace = 500 * time.Millisecond
+	// localSharedProfileFetchPace leaves a more conservative gap in the new
+	// chat.db-only worker. Background name/photo freshness can tolerate it.
+	localSharedProfileFetchPace  = 5 * time.Second
 	sharedProfileRefreshInterval = 15 * time.Minute
 )
 
@@ -164,6 +165,68 @@ func (s *sharedProfileStore) loadAll(ctx context.Context) ([]*sharedProfileRow, 
 	return out, rows.Err()
 }
 
+func cloneSharedProfileRow(row *sharedProfileRow) *sharedProfileRow {
+	cloned := *row
+	cloned.Avatar = append([]byte(nil), row.Avatar...)
+	cloned.DecryptionKey = append([]byte(nil), row.DecryptionKey...)
+	return &cloned
+}
+
+// cacheSharedProfileIfAbsent installs a DB-loaded row without replacing a
+// newer in-memory version. The returned pointer is the canonical version token
+// for background refreshes.
+func (c *IMClient) cacheSharedProfileIfAbsent(row *sharedProfileRow) *sharedProfileRow {
+	c.sharedProfileMu.Lock()
+	defer c.sharedProfileMu.Unlock()
+	actual, _ := c.sharedProfiles.LoadOrStore(row.Identifier, row)
+	canonical, _ := actual.(*sharedProfileRow)
+	return canonical
+}
+
+// publishSharedProfile atomically publishes an incoming profile to the DB and
+// cache. A new immutable pointer is installed for every successful incoming
+// share, including updates that reuse the same CloudKit keys.
+func (c *IMClient) publishSharedProfile(row *sharedProfileRow) error {
+	c.sharedProfileMu.Lock()
+	defer c.sharedProfileMu.Unlock()
+	cacheRow := cloneSharedProfileRow(row)
+	var err error
+	if c.sharedProfileStore != nil {
+		err = c.sharedProfileStore.save(context.Background(), cacheRow)
+	}
+	if err != nil {
+		// Keep the incoming content and version token live, but leave it stale
+		// so an existing persisted row gets another save opportunity.
+		cacheRow.UpdatedTS = 0
+	}
+	c.sharedProfiles.Store(cacheRow.Identifier, cacheRow)
+	return err
+}
+
+// publishRefreshedSharedProfile publishes a background result only while the
+// exact row it fetched is still current. Pointer identity catches a newer
+// incoming share even when it reuses the same keys and content.
+func (c *IMClient) publishRefreshedSharedProfile(snapshot, replacement *sharedProfileRow) (bool, error) {
+	c.sharedProfileMu.Lock()
+	defer c.sharedProfileMu.Unlock()
+	current, ok := c.sharedProfiles.Load(snapshot.Identifier)
+	currentRow, rowOK := current.(*sharedProfileRow)
+	if !ok || !rowOK || currentRow != snapshot {
+		return false, nil
+	}
+	var err error
+	if c.sharedProfileStore != nil {
+		err = c.sharedProfileStore.save(context.Background(), replacement)
+	}
+	if err != nil {
+		// Keep the old token and timestamp so a later pass retries rather than
+		// treating a result that wasn't persisted as fresh.
+		return false, err
+	}
+	c.sharedProfiles.Store(replacement.Identifier, replacement)
+	return true, err
+}
+
 // -- IMClient wiring ---------------------------------------------------------
 
 // loadSharedProfilesIntoCache hydrates the in-memory cache from the DB so a
@@ -181,7 +244,7 @@ func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.
 		return
 	}
 	for _, r := range rows {
-		c.sharedProfiles.Store(r.Identifier, r)
+		c.cacheSharedProfileIfAbsent(r)
 	}
 	if len(rows) > 0 {
 		log.Info().Int("count", len(rows)).Msg("Loaded shared iMessage profiles from DB")
@@ -270,11 +333,8 @@ func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.Wrappe
 		}
 	}
 
-	c.sharedProfiles.Store(sender, row)
-	if c.sharedProfileStore != nil {
-		if err := c.sharedProfileStore.save(context.Background(), row); err != nil {
-			log.Warn().Err(err).Msg("Failed to persist shared profile")
-		}
+	if err := c.publishSharedProfile(row); err != nil {
+		log.Warn().Err(err).Msg("Failed to persist shared profile")
 	}
 
 	log.Info().
@@ -329,9 +389,12 @@ func (c *IMClient) lookupSharedProfile(identifier string) *rustpushgo.WrappedPro
 		return nil
 	}
 	for _, r := range rows {
-		c.sharedProfiles.Store(r.Identifier, r)
+		canonical := c.cacheSharedProfileIfAbsent(r)
 		if r.Identifier == identifier {
-			return r.asProfileRecord()
+			if canonical == nil {
+				return nil
+			}
+			return canonical.asProfileRecord()
 		}
 	}
 	return nil
@@ -374,7 +437,7 @@ func (c *IMClient) runLocalSharedProfileRefresh(log zerolog.Logger, stop <-chan 
 	default:
 	}
 	c.applyCachedSharedProfilesToGhosts(log)
-	c.refreshAllSharedProfilesForConnection(log, stop, fetcher)
+	c.refreshAllSharedProfilesForConnection(log, stop, fetcher, localSharedProfileFetchPace)
 	for {
 		timer := time.NewTimer(interval)
 		select {
@@ -382,7 +445,7 @@ func (c *IMClient) runLocalSharedProfileRefresh(log zerolog.Logger, stop <-chan 
 			timer.Stop()
 			return
 		case <-timer.C:
-			c.refreshAllSharedProfilesForConnection(log, stop, fetcher)
+			c.refreshAllSharedProfilesForConnection(log, stop, fetcher, localSharedProfileFetchPace)
 		}
 	}
 }
@@ -410,8 +473,9 @@ func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
 // refreshes the corresponding ghost when the record changed.
 //
 // Throttling: rows whose UpdatedTS is within sharedProfileFreshnessWindow
-// are skipped, and the remaining fetches are paced by
-// sharedProfileFetchPace. On a CloudKit TooManyRequests response we abort
+// are skipped, and the remaining fetches are paced by the caller: CardDAV
+// keeps its existing short delay while the local worker uses a conservative
+// delay. On a CloudKit TooManyRequests response we abort
 // the rest of the pass. A later startup or periodic refresh can retry stale
 // rows. UpdatedTS is bumped on every successful fetch, so after the first full
 // pass the steady-state tick becomes a near-no-op.
@@ -424,10 +488,10 @@ func (c *IMClient) refreshAllSharedProfiles(log zerolog.Logger) {
 	if client == nil {
 		return
 	}
-	c.refreshAllSharedProfilesForConnection(log, c.stopChan, client)
+	c.refreshAllSharedProfilesForConnection(log, c.stopChan, client, sharedProfileFetchPace)
 }
 
-func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, stop <-chan struct{}, fetcher sharedProfileFetcher) {
+func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, stop <-chan struct{}, fetcher sharedProfileFetcher, fetchPace time.Duration) {
 	if c.sharedProfileStore == nil || fetcher == nil {
 		return
 	}
@@ -445,13 +509,17 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 	cutoffMS := nowMS - sharedProfileFreshnessWindow.Milliseconds()
 	var refreshed, changed, skippedFresh int
 	fetchCount := 0
-	for i, r := range rows {
+	for i, storedRow := range rows {
+		r := c.cacheSharedProfileIfAbsent(storedRow)
+		if r == nil {
+			continue
+		}
 		if r.UpdatedTS > cutoffMS {
 			skippedFresh++
 			continue
 		}
 		if fetchCount > 0 {
-			timer := time.NewTimer(sharedProfileFetchPace)
+			timer := time.NewTimer(fetchPace)
 			select {
 			case <-timer.C:
 			case <-stop:
@@ -487,7 +555,6 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 				Msg("Periodic shared-profile fetch failed")
 			continue
 		}
-		refreshed++
 		newAvatar := []byte(nil)
 		if record.Avatar != nil {
 			newAvatar = *record.Avatar
@@ -496,21 +563,29 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 			record.FirstName != r.FirstName ||
 			record.LastName != r.LastName ||
 			!bytes.Equal(newAvatar, r.Avatar)
+		replacement := cloneSharedProfileRow(r)
 		// Always bump UpdatedTS on a successful fetch so the freshness
 		// window can skip this row on subsequent ticks even when the
 		// record itself didn't change.
-		r.UpdatedTS = nowMS
+		replacement.UpdatedTS = nowMS
 		if recordChanged {
-			r.DisplayName = record.DisplayName
-			r.FirstName = record.FirstName
-			r.LastName = record.LastName
-			r.Avatar = append([]byte(nil), newAvatar...)
+			replacement.DisplayName = record.DisplayName
+			replacement.FirstName = record.FirstName
+			replacement.LastName = record.LastName
+			replacement.Avatar = append([]byte(nil), newAvatar...)
 		}
-		if err := c.sharedProfileStore.save(context.Background(), r); err != nil {
+		published, err := c.publishRefreshedSharedProfile(r, replacement)
+		if err != nil {
 			log.Warn().Err(err).Str("identifier", r.Identifier).
 				Msg("Failed to persist refreshed shared profile")
+			continue
 		}
-		c.sharedProfiles.Store(r.Identifier, r)
+		if !published {
+			log.Debug().Str("identifier", logSafeHandle(r.Identifier)).
+				Msg("Discarded superseded shared-profile refresh result")
+			continue
+		}
+		refreshed++
 		if recordChanged {
 			c.refreshGhostFromSharedProfile(log, r.Identifier)
 			changed++
