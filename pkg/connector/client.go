@@ -236,6 +236,9 @@ type IMClient struct {
 	// across restarts; see pkg/connector/shared_profile.go.
 	sharedProfiles     sync.Map
 	sharedProfileStore *sharedProfileStore
+	// sharedProfileMu serializes DB/cache publication. Cached rows are
+	// immutable version tokens used to reject superseded background fetches.
+	sharedProfileMu sync.Mutex
 
 	// statusKitPresence tracks the last-known availability state per contact
 	// handle, keyed by iMessage identifier string (e.g. "tel:+1234567890").
@@ -1519,12 +1522,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
 	} else {
 		c.loadSharedProfilesIntoCache(context.Background(), log)
-		// Independent of CardDAV: push cached state to ghosts immediately
-		// and re-fetch each row from CloudKit. Decoupled from
-		// setContactsReady so a slow MobileMe-delegate retry doesn't gate
-		// the share-profile path (it only depends on ProfilesClient /
-		// keychain init, not on contacts).
-		go c.refreshSharedProfilesOnConnect(log)
+		// Shared-profile refresh only needs ProfilesClient/keychain state. In
+		// chat.db mode with local Contacts, give it its own periodic worker;
+		// CardDAV modes retain their existing contact-sync cadence.
+		profileClient := c.client
+		if c.Main.Config.UseChatDBBackfill() && !c.Main.Config.CardDAV.IsConfigured() && profileClient != nil {
+			go c.runLocalSharedProfileRefresh(log, c.stopChan, profileClient, sharedProfileRefreshInterval)
+		} else {
+			go c.refreshSharedProfilesOnConnect(log)
+		}
 	}
 
 	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
