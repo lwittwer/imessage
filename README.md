@@ -343,6 +343,8 @@ Attachments larger than `max_attachment_size_mb` (default `100`) are **skipped e
 
 The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with **local NAC validation** — no SIP bypass, no relay server, and no background process on a Mac. When `backfill_source: chatdb` is set on macOS, it additionally reads `~/Library/Messages/chat.db` for backfill and uses the local Contacts framework for name resolution; the default CloudKit path uses iCloud for both.
 
+Shared names/photos use CloudKit independently of message backfill. In chat.db mode with local Contacts, the bridge refreshes cached shared profiles at startup and every 15 minutes after the preceding pass finishes. Profiles fetched successfully within six hours are skipped. A rate limit stops the pass until a later refresh; persistently failing profiles can be tried again on every pass. External and iCloud CardDAV retain their existing contact/profile refresh schedule.
+
 NAC validation runs entirely in-process on the host running the bridge:
 
 - **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework.

@@ -23,7 +23,7 @@ import (
 )
 
 // CloudKit rate-limit guards for the periodic shared-profile re-fetch.
-// The ticker fires every 15 minutes (see periodicCloudContactSync); without
+// The refresh workers run at a base 15-minute cadence; without
 // these we'd burst a FetchProfile call per cached row on every tick, which
 // trips CloudKit's TooManyRequests for users with many shared contacts.
 const (
@@ -31,9 +31,11 @@ const (
 	// this window. UpdatedTS is bumped on every successful fetch (not only
 	// on actual changes) so steady-state ticks become near-no-ops.
 	sharedProfileFreshnessWindow = 6 * time.Hour
-	// sharedProfileFetchPace inserts a small gap between consecutive
-	// CloudKit fetches in a single tick so we don't burst-hit the API.
-	sharedProfileFetchPace = 500 * time.Millisecond
+	// sharedProfileFetchPace leaves a conservative gap after each completed
+	// CloudKit fetch. Background name/photo freshness can tolerate the delay;
+	// stop the pass on throttling even with this pacing.
+	sharedProfileFetchPace       = 5 * time.Second
+	sharedProfileRefreshInterval = 15 * time.Minute
 )
 
 // Shared iMessage profile (Name & Photo Sharing) ingestion, caching, and
@@ -51,11 +53,9 @@ const (
 //     need to re-fetch it, so the photo survives bridge restarts without the
 //     iPhone side re-sending a share.
 //   - An in-memory `sync.Map` fronts the DB for read hot paths.
-//   - `refreshSharedProfilesWithContacts` rides setContactsReady so the
-//     refresh runs on the same cadence as CardDAV (initial sync + every
-//     periodic re-sync). Profile edits that don't trigger a fresh
-//     ShareProfile message still propagate to Matrix on the next CardDAV
-//     tick.
+//   - CardDAV refreshes shared profiles on its existing contact-sync cadence.
+//     Chat.db with local Contacts uses a profile-only worker on the same base
+//     cadence, without reloading the local address book.
 
 // sharedProfileStore persists decrypted iMessage shared profiles keyed by
 // (login_id, identifier).
@@ -351,6 +351,42 @@ func (c *IMClient) refreshSharedProfilesOnConnect(log zerolog.Logger) {
 	c.refreshAllSharedProfiles(log)
 }
 
+type sharedProfileFetcher interface {
+	FetchProfile(recordKey string, decryptionKey []byte, hasPoster bool) (rustpushgo.WrappedProfileRecord, error)
+}
+
+// runLocalSharedProfileRefresh gives chat.db with local Contacts the same
+// later refresh opportunity as CardDAV, without reloading local contacts.
+// The timer starts after each completed pass so a slow pass cannot queue an
+// immediate follow-up. FetchProfile itself cannot be cancelled by stop.
+func (c *IMClient) runLocalSharedProfileRefresh(log zerolog.Logger, stop <-chan struct{}, fetcher sharedProfileFetcher, interval time.Duration) {
+	defer func() {
+		// Disconnect can destroy the captured UniFFI client between a stop
+		// check and FetchProfile. Keep that narrow shutdown race from taking
+		// down the bridge; a later connection starts its own worker.
+		if recover() != nil {
+			log.Error().Msg("Local shared-profile refresh worker stopped after panic")
+		}
+	}()
+	select {
+	case <-stop:
+		return
+	default:
+	}
+	c.applyCachedSharedProfilesToGhosts(log)
+	c.refreshAllSharedProfilesForConnection(log, stop, fetcher)
+	for {
+		timer := time.NewTimer(interval)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+			c.refreshAllSharedProfilesForConnection(log, stop, fetcher)
+		}
+	}
+}
+
 // applyCachedSharedProfilesToGhosts pushes every cached shared profile to
 // its corresponding Matrix ghost without any CloudKit fetch. Runs once on
 // connect so warm restarts re-render names + avatars immediately.
@@ -376,16 +412,29 @@ func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
 // Throttling: rows whose UpdatedTS is within sharedProfileFreshnessWindow
 // are skipped, and the remaining fetches are paced by
 // sharedProfileFetchPace. On a CloudKit TooManyRequests response we abort
-// the rest of the tick — the next tick (15min later) resumes with whatever
-// rows are still stale. UpdatedTS is bumped on every successful fetch, so
-// after the first full pass the steady-state tick becomes a near-no-op.
+// the rest of the pass. A later startup or periodic refresh can retry stale
+// rows. UpdatedTS is bumped on every successful fetch, so after the first full
+// pass the steady-state tick becomes a near-no-op.
 //
 // Push-driven updates (ShareProfile / UpdateProfile messages) take the
 // handleSharedProfile path and bypass this throttle, so profile changes
 // the peer iPhone announces are still applied immediately.
 func (c *IMClient) refreshAllSharedProfiles(log zerolog.Logger) {
-	if c.sharedProfileStore == nil || c.client == nil {
+	client := c.client
+	if client == nil {
 		return
+	}
+	c.refreshAllSharedProfilesForConnection(log, c.stopChan, client)
+}
+
+func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, stop <-chan struct{}, fetcher sharedProfileFetcher) {
+	if c.sharedProfileStore == nil || fetcher == nil {
+		return
+	}
+	select {
+	case <-stop:
+		return
+	default:
 	}
 	rows, err := c.sharedProfileStore.loadAll(context.Background())
 	if err != nil {
@@ -402,23 +451,36 @@ func (c *IMClient) refreshAllSharedProfiles(log zerolog.Logger) {
 			continue
 		}
 		if fetchCount > 0 {
+			timer := time.NewTimer(sharedProfileFetchPace)
 			select {
-			case <-time.After(sharedProfileFetchPace):
-			case <-c.stopChan:
+			case <-timer.C:
+			case <-stop:
+				timer.Stop()
 				return
 			}
 		}
 		fetchCount++
-		record, err := c.client.FetchProfile(r.RecordKey, r.DecryptionKey, r.HasPoster)
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		record, err := fetcher.FetchProfile(r.RecordKey, r.DecryptionKey, r.HasPoster)
+		// Closing stop cannot cancel an in-flight FFI call, but it prevents a
+		// result from a disconnected connection from being applied afterward.
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		if err != nil {
 			// CloudKit rate-limited us — stop the rest of this tick. The
-			// rows we didn't touch keep their old UpdatedTS, so the next
-			// tick picks them up.
+			// rows we didn't touch keep their old UpdatedTS for a later pass.
 			if strings.Contains(err.Error(), "TooManyRequests") {
 				log.Info().
 					Int("processed", refreshed).
 					Int("remaining", len(rows)-i-1).
-					Msg("CloudKit rate-limited periodic shared-profile fetch; deferring rest to next tick")
+					Msg("CloudKit rate-limited shared-profile fetch; deferring rest to a later refresh")
 				break
 			}
 			log.Debug().Err(err).Str("identifier", r.Identifier).
