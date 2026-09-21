@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -424,47 +425,36 @@ func TestLocalSharedProfileRefreshUsesCapturedStopChannel(t *testing.T) {
 	newStopOnce.Do(func() { close(newStop) })
 }
 
-func TestLocalSharedProfileRefreshRetriesStartupThrottleAndSkipsFreshRow(t *testing.T) {
+func TestSharedProfileRefreshCooldownAndRecovery(t *testing.T) {
 	c, store := newLocalProfileSyncTestClient(t)
-	stop := make(chan struct{})
-	secondSucceeded := make(chan struct{})
-	var calls atomic.Int32
-	var successOnce sync.Once
+	calls := 0
 	fetcher := testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
-		if calls.Add(1) == 1 {
+		calls++
+		if calls == 1 {
 			return rustpushgo.WrappedProfileRecord{}, errors.New("synthetic TooManyRequests")
 		}
-		successOnce.Do(func() { close(secondSucceeded) })
 		return rustpushgo.WrappedProfileRecord{DisplayName: "Stored profile"}, nil
 	})
-
-	done := make(chan struct{})
-	var stopOnce sync.Once
-	go func() {
-		defer close(done)
-		c.runLocalSharedProfileRefresh(zerolog.Nop(), stop, fetcher, 30*time.Millisecond)
-	}()
-	t.Cleanup(func() {
-		stopOnce.Do(func() { close(stop) })
-		waitForProfileSyncSignal(t, done, "profile refresh worker leaked after test cleanup")
-	})
-	waitForProfileSyncSignal(t, secondSucceeded, "periodic refresh did not retry the startup throttle")
-
-	// Let several more worker intervals elapse. The successful unchanged
-	// fetch must still mark the row fresh, so they should make no Apple calls.
-	time.Sleep(110 * time.Millisecond)
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("fresh profile was fetched again: calls=%d, want 2", got)
+	refresh := func() { c.refreshAllSharedProfilesForConnection(zerolog.Nop(), nil, fetcher, 0) }
+	refresh()
+	refresh()
+	if calls != 1 {
+		t.Fatalf("cooldown allowed another fetch: %d", calls)
 	}
-	rows, err := store.loadAll(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	row := cachedSharedProfileRow(t, c, loadSingleSharedProfile(t, store).Identifier)
+	until := c.sharedProfileCooldownUntil
+	if c.sharedProfileRefreshEligible(row, until.Add(-time.Nanosecond)) || !c.sharedProfileRefreshEligible(row, until) {
+		t.Fatal("incorrect cooldown boundary")
 	}
-	if len(rows) != 1 || rows[0].DisplayName != "Stored profile" || rows[0].UpdatedTS == 0 {
-		t.Fatalf("recovered profile was not persisted as fresh: %+v", rows)
+	c.sharedProfileCooldownUntil = time.Now().Add(-time.Second)
+	refresh()
+	refresh()
+	if calls != 2 {
+		t.Fatalf("recovery/freshness calls=%d, want 2", calls)
 	}
-	stopOnce.Do(func() { close(stop) })
-	waitForProfileSyncSignal(t, done, "profile refresh worker did not stop")
+	if loadSingleSharedProfile(t, store).UpdatedTS == 0 {
+		t.Fatal("successful retry not marked fresh")
+	}
 }
 
 func TestRefreshAllSharedProfilesReturnsWithNilClient(t *testing.T) {
@@ -479,5 +469,121 @@ func TestRefreshAllSharedProfilesReturnsWithNilClient(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].DisplayName != "Stored profile" || rows[0].UpdatedTS != 0 {
 		t.Fatalf("nil-client refresh changed stored row: %+v", rows)
+	}
+}
+
+func TestSharedProfileMissingRecordBackoff(t *testing.T) {
+	c := &IMClient{}
+	row := c.cacheSharedProfileIfAbsent(&sharedProfileRow{Identifier: "synthetic", RecordKey: "old"})
+	now := time.Unix(1000, 0)
+	missing := errors.New(sharedProfileMissingRecordError)
+	for _, delay := range []time.Duration{6 * time.Hour, 12 * time.Hour, 24 * time.Hour, 24 * time.Hour} {
+		c.recordSharedProfileFetchResult(row, missing, now)
+		if c.sharedProfileRefreshEligible(row, now.Add(delay-time.Nanosecond)) {
+			t.Fatal("retry eligible too soon")
+		}
+		now = now.Add(delay)
+		if !c.sharedProfileRefreshEligible(row, now) {
+			t.Fatal("bounded retry never became eligible")
+		}
+	}
+	healthy := c.cacheSharedProfileIfAbsent(&sharedProfileRow{Identifier: "healthy"})
+	if !c.sharedProfileRefreshEligible(healthy, now.Add(-time.Hour)) {
+		t.Fatal("failing record delayed healthy record")
+	}
+	c.recordSharedProfileFetchResult(row, nil, now)
+	c.recordSharedProfileFetchResult(row, missing, now)
+	if c.sharedProfileRetries[row.Identifier].delay != sharedProfileRetryInitial {
+		t.Fatal("success did not reset backoff")
+	}
+	c.recordSharedProfileFetchResult(row, errors.New("connection reset by peer"), now)
+	if !c.sharedProfileRefreshEligible(row, now) {
+		t.Fatal("transient error treated as missing record")
+	}
+}
+
+func TestSharedProfileRetryNewAnnouncement(t *testing.T) {
+	for _, change := range []string{"record key", "decryption key", "same keys"} {
+		t.Run(change, func(t *testing.T) {
+			c := &IMClient{}
+			row := c.cacheSharedProfileIfAbsent(&sharedProfileRow{Identifier: "synthetic", RecordKey: "old", DecryptionKey: []byte("old")})
+			now := time.Now()
+			missing := errors.New(sharedProfileMissingRecordError)
+			c.recordSharedProfileFetchResult(row, missing, now)
+			replacement := cloneSharedProfileRow(row)
+			if change == "record key" {
+				replacement.RecordKey = "new"
+			}
+			if change == "decryption key" {
+				replacement.DecryptionKey = []byte("new")
+			}
+			if err := c.publishSharedProfile(replacement); err != nil {
+				t.Fatal(err)
+			}
+			current := cachedSharedProfileRow(t, c, row.Identifier)
+			c.recordSharedProfileFetchResult(row, missing, now) // late old failure
+			if !c.sharedProfileRefreshEligible(current, now) {
+				t.Fatal("new announcement inherited old failure")
+			}
+		})
+	}
+}
+
+func TestSharedProfileFailedFetchPreservesCache(t *testing.T) {
+	for _, fetchErr := range []error{errors.New(sharedProfileMissingRecordError), errors.New("connection reset by peer"), errors.New("TooManyRequests")} {
+		t.Run(fetchErr.Error(), func(t *testing.T) {
+			c, store := newLocalProfileSyncTestClient(t)
+			original := loadSingleSharedProfile(t, store)
+			original.FirstName, original.LastName = "Stored", "Person"
+			original.Avatar = []byte("synthetic avatar")
+			if err := store.save(context.Background(), original); err != nil {
+				t.Fatal(err)
+			}
+			c.refreshAllSharedProfilesForConnection(zerolog.Nop(), nil, testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
+				return rustpushgo.WrappedProfileRecord{}, fetchErr
+			}), 0)
+			if !reflect.DeepEqual(original, loadSingleSharedProfile(t, store)) || !reflect.DeepEqual(original, cachedSharedProfileRow(t, c, original.Identifier)) {
+				t.Fatal("failed fetch changed cached or persisted profile")
+			}
+		})
+	}
+}
+
+func TestSharedProfileRetrySkipsOnlyFailingRecord(t *testing.T) {
+	c, store := newLocalProfileSyncTestClient(t)
+	row := c.cacheSharedProfileIfAbsent(loadSingleSharedProfile(t, store))
+	c.recordSharedProfileFetchResult(row, errors.New(sharedProfileMissingRecordError), time.Now())
+	healthy := &sharedProfileRow{Identifier: "healthy", RecordKey: "healthy-key", DecryptionKey: []byte("synthetic"), DisplayName: "Healthy"}
+	if err := store.save(context.Background(), healthy); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	c.refreshAllSharedProfilesForConnection(zerolog.Nop(), nil, testSharedProfileFetcher(func(key string, _ []byte, _ bool) (rustpushgo.WrappedProfileRecord, error) {
+		calls++
+		if key != healthy.RecordKey {
+			t.Fatal("retried backed-off record")
+		}
+		return rustpushgo.WrappedProfileRecord{DisplayName: healthy.DisplayName}, nil
+	}), 0)
+	if calls != 1 {
+		t.Fatalf("healthy calls=%d, want 1", calls)
+	}
+}
+
+func TestSharedProfileRateLimitStopsPass(t *testing.T) {
+	c, store := newLocalProfileSyncTestClient(t)
+	if err := store.save(context.Background(), &sharedProfileRow{Identifier: "second", RecordKey: "second-key", DecryptionKey: []byte("synthetic")}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	fetcher := testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
+		calls++
+		return rustpushgo.WrappedProfileRecord{}, errors.New("TooManyRequests")
+	})
+	for range 2 {
+		c.refreshAllSharedProfilesForConnection(zerolog.Nop(), nil, fetcher, 0)
+	}
+	if calls != 1 {
+		t.Fatalf("429 did not stop and defer background pass: calls=%d", calls)
 	}
 }
