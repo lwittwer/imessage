@@ -561,7 +561,7 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 	}
 	nowMS := time.Now().UnixMilli()
 	cutoffMS := nowMS - sharedProfileFreshnessWindow.Milliseconds()
-	var refreshed, changed, skippedFresh int
+	var refreshed, changed, skippedFresh, skippedBackoff int
 	fetchCount := 0
 	for i, storedRow := range rows {
 		r := c.cacheSharedProfileIfAbsent(storedRow)
@@ -573,6 +573,7 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 			continue
 		}
 		if !c.sharedProfileRefreshEligible(r, time.Now()) {
+			skippedBackoff++
 			continue
 		}
 		if fetchCount > 0 {
@@ -584,7 +585,10 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 				return
 			}
 		}
+		// CardDAV startup and periodic passes can overlap. Recheck after
+		// pacing in case another pass recorded backoff while this one waited.
 		if !c.sharedProfileRefreshEligible(r, time.Now()) {
+			skippedBackoff++
 			continue
 		}
 		fetchCount++
@@ -594,6 +598,9 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 		default:
 		}
 		record, err := fetcher.FetchProfile(r.RecordKey, r.DecryptionKey, r.HasPoster)
+		// Keep completed request bookkeeping across reconnects, even if stop
+		// closed during the call. Row-version checks still reject old failures.
+		c.recordSharedProfileFetchResult(r, err, time.Now())
 		// Closing stop cannot cancel an in-flight FFI call, but it prevents a
 		// result from a disconnected connection from being applied afterward.
 		select {
@@ -601,7 +608,6 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 			return
 		default:
 		}
-		c.recordSharedProfileFetchResult(r, err, time.Now())
 		if err != nil {
 			// CloudKit rate-limited us — stop the rest of this tick. The
 			// rows we didn't touch keep their old UpdatedTS for a later pass.
@@ -652,11 +658,12 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 			changed++
 		}
 	}
-	if refreshed > 0 || skippedFresh > 0 {
+	if refreshed > 0 || skippedFresh > 0 || skippedBackoff > 0 {
 		log.Debug().
 			Int("refreshed", refreshed).
 			Int("changed", changed).
 			Int("skipped_fresh", skippedFresh).
+			Int("skipped_backoff", skippedBackoff).
 			Msg("Periodic shared-profile sync completed")
 	}
 }

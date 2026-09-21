@@ -1,7 +1,9 @@
 package connector
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"sync"
@@ -585,5 +587,52 @@ func TestSharedProfileRateLimitStopsPass(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("429 did not stop and defer background pass: calls=%d", calls)
+	}
+}
+
+func TestSharedProfileFailureAfterStopSurvivesReconnect(t *testing.T) {
+	for _, fetchErr := range []error{errors.New(sharedProfileMissingRecordError), errors.New("TooManyRequests")} {
+		t.Run(fetchErr.Error(), func(t *testing.T) {
+			c, store := newLocalProfileSyncTestClient(t)
+			original := loadSingleSharedProfile(t, store)
+			stop := make(chan struct{})
+			c.refreshAllSharedProfilesForConnection(zerolog.Nop(), stop, testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
+				close(stop)
+				return rustpushgo.WrappedProfileRecord{}, fetchErr
+			}), 0)
+			c.refreshAllSharedProfilesForConnection(zerolog.Nop(), make(chan struct{}), testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
+				t.Fatal("reconnected worker forgot completed fetch failure")
+				return rustpushgo.WrappedProfileRecord{}, nil
+			}), 0)
+			if !reflect.DeepEqual(original, loadSingleSharedProfile(t, store)) || !reflect.DeepEqual(original, cachedSharedProfileRow(t, c, original.Identifier)) {
+				t.Fatal("disconnected failure changed cached or persisted profile")
+			}
+		})
+	}
+}
+
+func TestSharedProfileBackoffPassIsLogged(t *testing.T) {
+	for _, fetchErr := range []error{errors.New(sharedProfileMissingRecordError), errors.New("TooManyRequests")} {
+		t.Run(fetchErr.Error(), func(t *testing.T) {
+			c, store := newLocalProfileSyncTestClient(t)
+			row := c.cacheSharedProfileIfAbsent(loadSingleSharedProfile(t, store))
+			c.recordSharedProfileFetchResult(row, fetchErr, time.Now())
+			var output bytes.Buffer
+			log := zerolog.New(&output).Level(zerolog.DebugLevel)
+			c.refreshAllSharedProfilesForConnection(log, nil, testSharedProfileFetcher(func(string, []byte, bool) (rustpushgo.WrappedProfileRecord, error) {
+				t.Fatal("backed-off pass made a request")
+				return rustpushgo.WrappedProfileRecord{}, nil
+			}), 0)
+			var event struct {
+				Message string
+				Skipped int `json:"skipped_backoff"`
+			}
+			if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &event); err != nil {
+				t.Fatalf("missing pass log: %v", err)
+			}
+			if event.Message != "Periodic shared-profile sync completed" || event.Skipped != 1 {
+				t.Fatalf("unexpected pass log: %+v", event)
+			}
+		})
 	}
 }
