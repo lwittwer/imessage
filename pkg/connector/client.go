@@ -239,6 +239,9 @@ type IMClient struct {
 	// sharedProfileMu serializes DB/cache publication. Cached rows are
 	// immutable version tokens used to reject superseded background fetches.
 	sharedProfileMu sync.Mutex
+	// Retry state is process-local and protected by sharedProfileMu.
+	sharedProfileRetries       map[string]sharedProfileRetry
+	sharedProfileCooldownUntil time.Time
 
 	// statusKitPresence tracks the last-known availability state per contact
 	// handle, keyed by iMessage identifier string (e.g. "tel:+1234567890").

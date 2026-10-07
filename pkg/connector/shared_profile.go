@@ -35,9 +35,61 @@ const (
 	sharedProfileFetchPace = 500 * time.Millisecond
 	// localSharedProfileFetchPace leaves a more conservative gap in the new
 	// chat.db-only worker. Background name/photo freshness can tolerate it.
-	localSharedProfileFetchPace  = 5 * time.Second
-	sharedProfileRefreshInterval = 15 * time.Minute
+	localSharedProfileFetchPace    = 5 * time.Second
+	sharedProfileRefreshInterval   = 15 * time.Minute
+	sharedProfileRetryInitial      = 6 * time.Hour
+	sharedProfileRetryMax          = 24 * time.Hour
+	sharedProfileRateLimitCooldown = time.Hour
 )
+
+// The wrapper's missing-record text also covers caught upstream panics. Treat
+// it as a bounded retry hint, never proof that a record is permanently gone.
+const sharedProfileMissingRecordError = "Shared profile record not found in CloudKit (rotated/deleted)"
+
+type sharedProfileRetry struct {
+	snapshot *sharedProfileRow
+	delay    time.Duration
+	after    time.Time
+}
+
+func (c *IMClient) sharedProfileRefreshEligible(row *sharedProfileRow, now time.Time) bool {
+	c.sharedProfileMu.Lock()
+	defer c.sharedProfileMu.Unlock()
+	retry := c.sharedProfileRetries[row.Identifier]
+	return !now.Before(c.sharedProfileCooldownUntil) &&
+		(retry.snapshot != row || !now.Before(retry.after))
+}
+
+// Record only failures of the current immutable version. An old in-flight
+// failure must not suppress a newly announced profile, even with reused keys.
+// The cooldown is a conservative policy for this client's background profile
+// traffic only; it makes no claim about Apple's rate-limit scope.
+func (c *IMClient) recordSharedProfileFetchResult(row *sharedProfileRow, err error, now time.Time) {
+	c.sharedProfileMu.Lock()
+	defer c.sharedProfileMu.Unlock()
+	if err != nil && strings.Contains(err.Error(), "TooManyRequests") {
+		c.sharedProfileCooldownUntil = now.Add(sharedProfileRateLimitCooldown)
+		return
+	}
+	current, _ := c.sharedProfiles.Load(row.Identifier)
+	if current != row {
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), sharedProfileMissingRecordError) {
+		// Network and other unclassified errors retain the normal refresh cadence.
+		delete(c.sharedProfileRetries, row.Identifier)
+		return
+	}
+	retry := c.sharedProfileRetries[row.Identifier]
+	delay := sharedProfileRetryInitial
+	if retry.snapshot == row {
+		delay = min(retry.delay*2, sharedProfileRetryMax)
+	}
+	if c.sharedProfileRetries == nil {
+		c.sharedProfileRetries = make(map[string]sharedProfileRetry)
+	}
+	c.sharedProfileRetries[row.Identifier] = sharedProfileRetry{snapshot: row, delay: delay, after: now.Add(delay)}
+}
 
 // Shared iMessage profile (Name & Photo Sharing) ingestion, caching, and
 // persistence. These are the "Me card" shares an iPhone sends automatically
@@ -199,6 +251,7 @@ func (c *IMClient) publishSharedProfile(row *sharedProfileRow) error {
 		// so an existing persisted row gets another save opportunity.
 		cacheRow.UpdatedTS = 0
 	}
+	delete(c.sharedProfileRetries, cacheRow.Identifier)
 	c.sharedProfiles.Store(cacheRow.Identifier, cacheRow)
 	return err
 }
@@ -476,8 +529,9 @@ func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
 // are skipped, and the remaining fetches are paced by the caller: CardDAV
 // keeps its existing short delay while the local worker uses a conservative
 // delay. On a CloudKit TooManyRequests response we abort
-// the rest of the pass. A later startup or periodic refresh can retry stale
-// rows. UpdatedTS is bumped on every successful fetch, so after the first full
+// the rest of the pass and defer background attempts for one hour. Missing
+// record hints back off per version from six hours to at most one day.
+// UpdatedTS is bumped on every successful fetch, so after the first full
 // pass the steady-state tick becomes a near-no-op.
 //
 // Push-driven updates (ShareProfile / UpdateProfile messages) take the
@@ -507,7 +561,7 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 	}
 	nowMS := time.Now().UnixMilli()
 	cutoffMS := nowMS - sharedProfileFreshnessWindow.Milliseconds()
-	var refreshed, changed, skippedFresh int
+	var refreshed, changed, skippedFresh, skippedBackoff int
 	fetchCount := 0
 	for i, storedRow := range rows {
 		r := c.cacheSharedProfileIfAbsent(storedRow)
@@ -516,6 +570,10 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 		}
 		if r.UpdatedTS > cutoffMS {
 			skippedFresh++
+			continue
+		}
+		if !c.sharedProfileRefreshEligible(r, time.Now()) {
+			skippedBackoff++
 			continue
 		}
 		if fetchCount > 0 {
@@ -527,6 +585,12 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 				return
 			}
 		}
+		// CardDAV startup and periodic passes can overlap. Recheck after
+		// pacing in case another pass recorded backoff while this one waited.
+		if !c.sharedProfileRefreshEligible(r, time.Now()) {
+			skippedBackoff++
+			continue
+		}
 		fetchCount++
 		select {
 		case <-stop:
@@ -534,6 +598,9 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 		default:
 		}
 		record, err := fetcher.FetchProfile(r.RecordKey, r.DecryptionKey, r.HasPoster)
+		// Keep completed request bookkeeping across reconnects, even if stop
+		// closed during the call. Row-version checks still reject old failures.
+		c.recordSharedProfileFetchResult(r, err, time.Now())
 		// Closing stop cannot cancel an in-flight FFI call, but it prevents a
 		// result from a disconnected connection from being applied afterward.
 		select {
@@ -591,11 +658,12 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 			changed++
 		}
 	}
-	if refreshed > 0 || skippedFresh > 0 {
+	if refreshed > 0 || skippedFresh > 0 || skippedBackoff > 0 {
 		log.Debug().
 			Int("refreshed", refreshed).
 			Int("changed", changed).
 			Int("skipped_fresh", skippedFresh).
+			Int("skipped_backoff", skippedBackoff).
 			Msg("Periodic shared-profile sync completed")
 	}
 }
