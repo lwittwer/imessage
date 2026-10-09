@@ -1092,14 +1092,13 @@ func safeLoginStart(
 	username, password string,
 	config *rustpushgo.WrappedOsConfig,
 	conn *rustpushgo.WrappedApsConnection,
-	preferSMS bool,
 ) (session *rustpushgo.LoginSession, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("LoginStart panicked: %v", r)
 		}
 	}()
-	return rustpushgo.LoginStart(username, password, config, conn, preferSMS)
+	return rustpushgo.LoginStart(username, password, config, conn)
 }
 
 func safeSubmit2fa(session *rustpushgo.LoginSession, code string) (ok bool, err error) {
@@ -1622,8 +1621,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 		} else {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
-	} else if c.Main.Config.DisableICloudContacts {
-		log.Info().Msg("iCloud contacts disabled before CardDAV setup")
 	} else {
 		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {

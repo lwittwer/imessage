@@ -1502,7 +1502,7 @@ async fn create_keychain_clients(
             if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
                 warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
             } else {
-                debug!("Persisted keychain state to {}", path_for_closure);
+                info!("Persisted keychain state to {}", path_for_closure);
             }
         }),
         container: tokio::sync::Mutex::new(None),
@@ -1543,17 +1543,11 @@ async fn join_keychain_with_bottles(
     let passcode_bytes = passcode.as_bytes();
     let mut last_err = String::new();
 
-    // Build iteration order: preferred bottle first (if specified), then only
-    // the other bottles from that same device. The passcode belongs to the
-    // chosen device; offering it to another device's escrow record is a wrong
-    // SRP proof that spends one of that record's limited recovery attempts
-    // and buries the chosen bottle's real error under "-6015 Credential is
-    // not verified".
+    // Build iteration order: preferred bottle first (if specified), then the rest.
     let indices: Vec<usize> = if let Some(pref) = preferred_index {
         let pref = pref as usize;
-        let serial = &bottles[pref].1.serial;
         let mut order = vec![pref];
-        order.extend((0..bottles.len()).filter(|&i| i != pref && &bottles[i].1.serial == serial));
+        order.extend((0..bottles.len()).filter(|&i| i != pref));
         order
     } else {
         (0..bottles.len()).collect()
@@ -1601,17 +1595,23 @@ async fn join_keychain_with_bottles(
                     }
                 }
                 Err(e) => {
-                    // A BadMsg here is a signature check inside
-                    // join_clique_from_escrow failing after the passcode was
-                    // already accepted: the bottle's escrow-key or peer-key
-                    // signature, or a trust record of the device that made
-                    // it. A peer ID is the hash of its signing key, so this is
-                    // not the device having re-keyed. It can also be a TLK
-                    // share signature in fetch_shares_for.
+                    // A BadMsg here is the escrow record's peer-key signature
+                    // failing to verify against that peer's CURRENT signing key
+                    // (rustpush keychain.rs, verify_signature on the outer
+                    // bottle). It means the device re-keyed after this record
+                    // was written — a macOS/iOS major upgrade, a re-enrollment,
+                    // or an earlier bridge install that has since generated a
+                    // fresh identity. Such a record can never open again, and
+                    // Apple keeps serving it, so this is expected on accounts
+                    // with any device history. Say so, rather than leaving a
+                    // bare "Bad message" that reads like the login broke.
                     if matches!(e, rustpush::PushError::BadMsg) {
                         warn!(
-                            "Bottle {}: the passcode was accepted, but a \
-                             signature in the bottle, its device's trust record, or a shared key did not verify.",
+                            "Bottle {} has a stale signature — that device \
+                             re-keyed after this escrow record was written (OS upgrade, \
+                             re-enrollment, or an earlier bridge install), so it can never be \
+                             opened. Skipping to the next bottle; this is not a failure as long \
+                             as a later one succeeds.",
                             i
                         );
                     } else {
@@ -3961,16 +3961,10 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                             AttachmentType::Inline(data) => {
                                 (true, Some(data.clone()), data.len() as u64, None)
                             }
-                            // An MMCS attachment can carry several variants; the
-                            // biggest is the main file, as rustpush's own
-                            // Attachment::get_attachment picks it.
-                            AttachmentType::MMCS(mmcs) => match mmcs.iter().max_by_key(|m| m.size) {
-                                Some(main) => {
-                                    let descriptor = MmcsDescriptor::from_file(main);
-                                    let json = serde_json::to_string(&descriptor).ok();
-                                    (false, None, main.size as u64, json)
-                                }
-                                None => (false, None, 0, None),
+                            AttachmentType::MMCS(mmcs) => {
+                                let descriptor = MmcsDescriptor::from_file(mmcs);
+                                let json = serde_json::to_string(&descriptor).ok();
+                                (false, None, mmcs.size as u64, json)
                             }
                         };
                     w.attachments.push(WrappedAttachment {
@@ -5466,7 +5460,6 @@ pub async fn login_start(
     password: String,
     config: &WrappedOSConfig,
     connection: &WrappedAPSConnection,
-    prefer_sms: bool,
 ) -> Result<Arc<LoginSession>, WrappedError> {
     ensure_crypto_provider();
     let os_config = config.config.clone();
@@ -5482,22 +5475,23 @@ pub async fn login_start(
         hasher.finalize().to_vec()
     };
     {
-        // The Matrix input layer has delivered HTML-escaped passwords before. The
-        // SHA-256 above is what GSA SRP takes as the password, so it is never logged.
+        // Diagnostic: confirm the password reaching us is the raw user password and
+        // not HTML/markdown-escaped or truncated by the matrix input layer. Compare
+        // pw_sha256 to `printf %s 'yourpassword' | shasum -a 256` to verify.
         let tp = password.trim();
         let html_escaped = tp.contains("&amp;") || tp.contains("&lt;") || tp.contains("&gt;")
             || tp.contains("&quot;") || tp.contains("&#") || tp.contains("&apos;");
-        if html_escaped {
-            warn!("login_start: the password looks HTML-escaped; if login fails, the Matrix client may have mangled it");
-        }
+        let pw_hex: String = pw_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        info!("LOGIN-DEBUG user={:?} user_len={} pw_raw_bytes={} pw_trim_chars={} pw_trim_bytes={} pw_html_escaped={} pw_sha256={}",
+            user_trimmed, user_trimmed.len(), password.len(), tp.chars().count(), tp.len(), html_escaped, pw_hex);
     }
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     info!("login_start: mme_client_info={}", client_info.mme_client_info);
     info!("login_start: mme_client_info_akd={}", client_info.mme_client_info_akd);
     info!("login_start: akd_user_agent={}", client_info.akd_user_agent);
-    debug!("login_start: hardware_headers={:?}", client_info.hardware_headers);
-    debug!("login_start: push_token={:?}", client_info.push_token);
+    info!("login_start: hardware_headers={:?}", client_info.hardware_headers);
+    info!("login_start: push_token={:?}", client_info.push_token);
     // Persist the provisioned ADI machine in the absolute XDG data dir (same place
     // every other subsystem uses), NOT a cwd-relative path. With the relative
     // "state/anisette" the machine was re-provisioned on every login (state.plist
@@ -5515,7 +5509,7 @@ pub async fn login_start(
     let mut account = AppleAccount::new_with_anisette(client_info, anisette, None, update_persist)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
-    info!("login_start: calling login_email_pass");
+    info!("login_start: calling login_email_pass for {}", user_trimmed);
     // The clean-room now registers as a phantom Mac (synthetic identity), so the
     // GSA init no longer presents a clone of a live Mac and the -22421 native-sync
     // challenge should not fire. The old capture-SIM + anisette-sync + retry dance
@@ -5534,24 +5528,13 @@ pub async fn login_start(
         }
         icloud_auth::LoginState::Needs2FAVerification => {
             info!("2FA required (Needs2FAVerification — push already sent by Apple)");
-            if prefer_sms {
-                sms_verify_body = request_sms_2fa(&account).await;
-            }
             true
         }
         icloud_auth::LoginState::NeedsDevice2FA => {
-            // The user asked for an SMS code: text it instead of pushing to devices,
-            // falling back to the push if the SMS request fails. A failed login step
-            // would discard the whole login, so never return an error here.
-            if prefer_sms {
-                sms_verify_body = request_sms_2fa(&account).await;
-            }
-            if sms_verify_body.is_none() {
-                info!("Trusted-device 2FA — sending device push (verified via verify_2fa)");
-                match account.send_2fa_to_devices().await {
-                    Ok(_) => info!("send_2fa_to_devices succeeded"),
-                    Err(e) => error!("send_2fa_to_devices failed: {}", e),
-                }
+            info!("Trusted-device 2FA — sending device push (verified via verify_2fa)");
+            match account.send_2fa_to_devices().await {
+                Ok(_) => info!("send_2fa_to_devices succeeded"),
+                Err(e) => error!("send_2fa_to_devices failed: {}", e),
             }
             true
         }
@@ -5559,7 +5542,15 @@ pub async fn login_start(
             // secondaryAuth account: the trusted-device verify (verify_2fa) accepts the
             // code but does NOT satisfy secondaryAuth (re-login loops). We must request an
             // SMS and verify via verify_sms_2fa with the returned body.
-            sms_verify_body = request_sms_2fa(&account).await;
+            info!("SMS (secondaryAuth) 2FA — requesting code to trusted phone 1");
+            match account.send_sms_2fa_to_devices(1).await {
+                Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
+                    info!("SMS 2FA code sent; awaiting code");
+                    sms_verify_body = Some(body);
+                }
+                Ok(other) => error!("send_sms_2fa_to_devices: unexpected state {:?}", other),
+                Err(e) => error!("send_sms_2fa_to_devices failed: {}", e),
+            }
             true
         }
         icloud_auth::LoginState::NeedsSMS2FAVerification(body) => {
@@ -5590,35 +5581,10 @@ pub async fn login_start(
     }))
 }
 
-/// Text a 2FA code to trusted phone 1 and return the verify body that
-/// submit_2fa hands to verify_sms_2fa, or None if the request failed.
-async fn request_sms_2fa(account: &AppleAccount<BridgeDefaultAnisetteProvider>) -> Option<icloud_auth::VerifyBody> {
-    info!("SMS 2FA — requesting code to trusted phone 1");
-    match account.send_sms_2fa_to_devices(1).await {
-        Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
-            info!("SMS 2FA code sent; awaiting code");
-            Some(body)
-        }
-        Ok(other) => {
-            error!("send_sms_2fa_to_devices: unexpected state {:?}", other);
-            None
-        }
-        Err(e) => {
-            error!("send_sms_2fa_to_devices failed: {}", e);
-            None
-        }
-    }
-}
-
 #[uniffi::export(async_runtime = "tokio")]
 impl LoginSession {
     pub fn needs_2fa(&self) -> bool {
         self.needs_2fa
-    }
-
-    /// Whether the 2FA code was texted (SMS) rather than pushed to trusted devices.
-    pub fn sms_2fa_sent(&self) -> bool {
-        self.sms_verify_body.lock().unwrap().is_some()
     }
 
     pub async fn submit_2fa(&self, code: String) -> Result<bool, WrappedError> {
@@ -5627,9 +5593,7 @@ impl LoginSession {
 
         // SMS (secondaryAuth) accounts must verify via verify_sms_2fa with the body
         // captured at login_start; trusted-device accounts use verify_2fa.
-        // Clone rather than take so a mistyped code can be retried on the same
-        // session instead of falling through to verify_2fa.
-        let sms_body = self.sms_verify_body.lock().unwrap().clone();
+        let sms_body = self.sms_verify_body.lock().unwrap().take();
         let result = if let Some(body) = sms_body {
             info!("Verifying 2FA code via SMS securitycode endpoint (verify_sms_2fa)");
             account.verify_sms_2fa(code, body).await
@@ -6043,12 +6007,7 @@ async fn download_mmcs_attachments(
         let mut att_idx = 0;
         for indexed_part in &normal.parts.0 {
             if let MessagePart::Attachment(att) = &indexed_part.part {
-                if let AttachmentType::MMCS(variants) = &att.a_type {
-                    let Some(mmcs) = variants.iter().max_by_key(|m| m.size) else {
-                        warn!("MMCS attachment {} has no files", att.name);
-                        att_idx += 1;
-                        continue;
-                    };
+                if let AttachmentType::MMCS(mmcs) = &att.a_type {
                     if att_idx < wrapped.attachments.len() {
                         match download_one_mmcs_attachment(mmcs, conn, &att.name).await {
                             Ok(buf) => {
@@ -6244,7 +6203,7 @@ async fn download_icon_change_photo(
     if let Message::IconChange(change) = &msg_inst.message {
         if let Some(mmcs_file) = &change.file {
             let att = Attachment {
-                a_type: AttachmentType::MMCS(vec![mmcs_file.clone()]),
+                a_type: AttachmentType::MMCS(mmcs_file.clone()),
                 part: 0,
                 uti_type: String::new(),
                 mime: String::from("image/jpeg"),

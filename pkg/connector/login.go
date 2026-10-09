@@ -9,9 +9,7 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -51,7 +49,6 @@ type AppleIDLogin struct {
 	handle         string                                 // chosen handle
 	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
 	selectedDevice int                                    // index into devices (-1 = not yet selected)
-	twoFactor      twoFactorPrompt                        // 2FA instructions and attempts so far
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -124,7 +121,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		}
 		l.username = username
 
-		session, err := safeLoginStart(username, password, l.cfg, l.conn, false)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -133,12 +130,21 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 
 		if session.Needs2fa() {
 			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
-			l.twoFactor = twoFactorPrompt{instructions: "Enter your Apple ID verification code.\n\n" +
-				"You may see a notification on your trusted Apple devices. " +
-				"If not, you can generate a code manually:\n" +
-				"• iPhone/iPad: Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code\n" +
-				"• Mac: System Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code"}
-			return l.twoFactor.step(""), nil
+			return &bridgev2.LoginStep{
+				Type:   bridgev2.LoginStepTypeUserInput,
+				StepID: LoginStepTwoFactor,
+				Instructions: "Enter your Apple ID verification code.\n\n" +
+					"You may see a notification on your trusted Apple devices. " +
+					"If not, you can generate a code manually:\n" +
+					"• iPhone/iPad: Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code\n" +
+					"• Mac: System Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code",
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{{
+						ID:   "code",
+						Name: "2FA Code",
+					}},
+				},
+			}, nil
 		}
 
 		// No 2FA needed — skip straight to IDS registration
@@ -147,11 +153,20 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 	}
 
 	// Step 2: 2FA code
-	return l.twoFactor.submit(l.Main.Bridge.Log, input["code"], func(code string) (bool, error) {
-		return submit2fa(l.session, code)
-	}, func() (*bridgev2.LoginStep, error) {
-		return l.finishLogin(ctx)
-	})
+	code := input["code"]
+	if code == "" {
+		return nil, fmt.Errorf("2FA code is required")
+	}
+
+	success, err := safeSubmit2fa(l.session, code)
+	if err != nil {
+		return nil, fmt.Errorf("2FA verification failed: %w", err)
+	}
+	if !success {
+		return nil, fmt.Errorf("2FA verification failed — invalid code")
+	}
+
+	return l.finishLogin(ctx)
 }
 
 func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
@@ -256,7 +271,6 @@ type ExternalKeyLogin struct {
 	handle         string                                 // chosen handle
 	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
 	selectedDevice int                                    // index into devices (-1 = not yet selected)
-	twoFactor      twoFactorPrompt                        // 2FA instructions and attempts so far
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -328,7 +342,15 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 			StepID:       LoginStepAppleIDPassword,
 			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
-				Fields: appleIDCredentialFields(!isRunningOnMacOS()),
+				Fields: []bridgev2.LoginInputDataField{{
+					Type: bridgev2.LoginInputFieldTypeEmail,
+					ID:   "username",
+					Name: "Apple ID",
+				}, {
+					Type: bridgev2.LoginInputFieldTypePassword,
+					ID:   "password",
+					Name: "Password",
+				}},
 			},
 		}, nil
 	}
@@ -345,8 +367,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		}
 		l.username = username
 
-		preferSMS := !isRunningOnMacOS() && wantsSMS2FA(input["sms_2fa"])
-		session, err := safeLoginStart(username, password, l.cfg, l.conn, preferSMS)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -354,15 +375,19 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		l.session = session
 
 		if session.Needs2fa() {
-			l.Main.Bridge.Log.Info().Str("username", username).Bool("sms", session.Sms2faSent()).Msg("Login succeeded, waiting for 2FA")
-			where := "You may see a notification on your trusted Apple devices."
-			if session.Sms2faSent() {
-				where = "A code was sent to your trusted phone number by SMS."
-			} else if preferSMS {
-				where = "The SMS code couldn't be requested, so check your trusted Apple devices instead."
-			}
-			l.twoFactor = twoFactorPrompt{instructions: "Enter your Apple ID verification code.\n\n" + where}
-			return l.twoFactor.step(""), nil
+			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
+			return &bridgev2.LoginStep{
+				Type:   bridgev2.LoginStepTypeUserInput,
+				StepID: LoginStepTwoFactor,
+				Instructions: "Enter your Apple ID verification code.\n\n" +
+					"You may see a notification on your trusted Apple devices.",
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{{
+						ID:   "code",
+						Name: "2FA Code",
+					}},
+				},
+			}, nil
 		}
 
 		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded without 2FA")
@@ -370,11 +395,20 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 	}
 
 	// Step 3: 2FA code
-	return l.twoFactor.submit(l.Main.Bridge.Log, input["code"], func(code string) (bool, error) {
-		return submit2fa(l.session, code)
-	}, func() (*bridgev2.LoginStep, error) {
-		return l.finishLogin(ctx)
-	})
+	code := input["code"]
+	if code == "" {
+		return nil, fmt.Errorf("2FA code is required")
+	}
+
+	success, err := safeSubmit2fa(l.session, code)
+	if err != nil {
+		return nil, fmt.Errorf("2FA verification failed: %w", err)
+	}
+	if !success {
+		return nil, fmt.Errorf("2FA verification failed — invalid code")
+	}
+
+	return l.finishLogin(ctx)
 }
 
 func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
@@ -883,164 +917,4 @@ func completeLoginWithMeta(
 			UserLogin:   ul,
 		},
 	}, nil
-}
-
-// appleIDCredentialFields returns the Apple ID + password form, plus the
-// "send the 2FA code by SMS?" question when askSMS is set. It's asked up front
-// because the trusted-device push goes out as soon as the credentials are
-// submitted.
-func appleIDCredentialFields(askSMS bool) []bridgev2.LoginInputDataField {
-	fields := []bridgev2.LoginInputDataField{{
-		Type: bridgev2.LoginInputFieldTypeEmail,
-		ID:   "username",
-		Name: "Apple ID",
-	}, {
-		Type: bridgev2.LoginInputFieldTypePassword,
-		ID:   "password",
-		Name: "Password",
-	}}
-	if askSMS {
-		// A plain text field rather than a select: a select renders as a
-		// numbered menu in the terminal login, which reads badly for a y/n.
-		fields = append(fields, bridgev2.LoginInputDataField{
-			ID:           "sms_2fa",
-			Name:         "Send 2FA code by SMS? (y/n)",
-			Description:  "y texts the code to your trusted phone number; n sends it to your Apple devices.",
-			DefaultValue: "n",
-			Pattern:      "^([yYnN]|[yY][eE][sS]|[nN][oO])?$",
-			Validate: func(s string) (string, error) {
-				switch strings.ToLower(strings.TrimSpace(s)) {
-				case "", "n", "no":
-					return "n", nil
-				case "y", "yes":
-					return "y", nil
-				}
-				return "", fmt.Errorf("answer y or n")
-			},
-		})
-	}
-	return fields
-}
-
-func wantsSMS2FA(answer string) bool {
-	answer = strings.ToLower(strings.TrimSpace(answer))
-	return answer == "y" || answer == "yes"
-}
-
-// submit2fa sends a 2FA code to Apple for a login session. A variable so the
-// login flows can be tested without an Apple account.
-var submit2fa = safeSubmit2fa
-
-// postTwoFactorReloginFailed is the prefix of the error submit_2fa
-// (pkg/rustpushgo/src/lib.rs) returns when Apple accepted the code but the
-// login re-run after it failed.
-const postTwoFactorReloginFailed = "Post-2FA re-login failed"
-
-// maxTwoFactorAttempts caps how many incorrect codes one login may try. Apple
-// locks an account after repeated wrong codes, so stop well short of that and
-// make the user start the login again.
-const maxTwoFactorAttempts = 3
-
-// twoFactorPrompt is the 2FA step of a login. A rejected code offers the same
-// step again rather than failing the login: every front end (terminal login,
-// provisioning API, Matrix commands) ends the login on an error, so returning
-// one made a mistyped code throw away the whole sign-in. The session that
-// Submit2fa runs against is kept, so the retry needs no new password or push.
-type twoFactorPrompt struct {
-	instructions string // shown on every offer of the step
-	attempts     int    // explicitly rejected codes submitted so far
-}
-
-// step renders the 2FA step, with problem (if any) above the instructions.
-func (p *twoFactorPrompt) step(problem string) *bridgev2.LoginStep {
-	instructions := p.instructions
-	if problem != "" {
-		instructions = problem + "\n\n" + instructions
-	}
-	return &bridgev2.LoginStep{
-		Type:         bridgev2.LoginStepTypeUserInput,
-		StepID:       LoginStepTwoFactor,
-		Instructions: instructions,
-		UserInputParams: &bridgev2.LoginUserInputParams{
-			Fields: []bridgev2.LoginInputDataField{{
-				ID:   "code",
-				Name: "2FA Code",
-			}},
-		},
-	}
-}
-
-// submit verifies code with verify and, once Apple accepts it, continues with
-// finish. A known rejected code offers the step again until
-// maxTwoFactorAttempts incorrect codes have been tried; transient verification
-// errors offer the step again without consuming an incorrect-code attempt.
-// Failures that happen after Apple accepted the code end the login at once. An
-// empty code is asked for again without using up an attempt, since nothing was
-// sent to Apple.
-func (p *twoFactorPrompt) submit(
-	log zerolog.Logger, code string, verify func(string) (bool, error), finish func() (*bridgev2.LoginStep, error),
-) (*bridgev2.LoginStep, error) {
-	if p.attempts >= maxTwoFactorAttempts {
-		return nil, twoFactorFailed(fmt.Sprintf("the verification code didn't work %d times; start the login again to get a new code", p.attempts))
-	}
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return p.step("No code was entered."), nil
-	}
-	ok, err := verify(code)
-	if err == nil && ok {
-		return finish()
-	}
-	if err == nil {
-		// Apple didn't reject the code (a wrong code is always an error from
-		// verify_2fa and verify_sms_2fa), but no PET came back. Another code
-		// won't fix that.
-		log.Warn().Msg("2FA code was accepted but Apple issued no login token")
-		return nil, twoFactorFailed("the verification code was accepted, but Apple didn't finish signing in; start the login again")
-	}
-	reason := err.Error()
-	var generic *rustpushgo.WrappedErrorGenericError
-	if errors.As(err, &generic) {
-		reason = generic.Msg
-	}
-	if strings.Contains(reason, postTwoFactorReloginFailed) {
-		// The code was accepted and the login re-run after it failed. Saying
-		// the code was wrong and asking for another would be misleading.
-		log.Warn().Str("reason", reason).Msg("2FA code was accepted but the sign-in after it failed")
-		return nil, twoFactorFailed("the verification code was accepted, but signing in after it failed; start the login again")
-	}
-	if !isWrongTwoFactorCodeError(reason) {
-		// A network failure or recovered panic does not tell us that Apple
-		// rejected the code. Keep the same session and let the user retry, but
-		// don't spend one of the limited incorrect-code attempts.
-		log.Warn().Int("incorrect_attempts", p.attempts).Str("reason", reason).Msg("2FA code verification failed")
-		return p.step("Apple couldn't verify the code just now. Please try again; this wasn't counted as an incorrect code."), nil
-	}
-
-	p.attempts++
-	// Apple error details stay in the log; the user gets a clear retry prompt.
-	log.Warn().Int("attempt", p.attempts).Str("reason", reason).Msg("2FA code was not accepted")
-	if p.attempts >= maxTwoFactorAttempts {
-		return nil, twoFactorFailed(fmt.Sprintf("the verification code didn't work %d times; start the login again to get a new code", p.attempts))
-	}
-	return p.step(fmt.Sprintf("That code didn't work. Check it and try again (attempt %d of %d).",
-		p.attempts+1, maxTwoFactorAttempts)), nil
-}
-
-// isWrongTwoFactorCodeError recognizes only explicit wrong-code errors from
-// the two Apple verification endpoints. Other errors can be network failures
-// or recovered panics, so they must not consume the limited wrong-code tries.
-func isWrongTwoFactorCodeError(reason string) bool {
-	lower := strings.ToLower(reason)
-	return strings.Contains(reason, "Bad2faCode") ||
-		strings.Contains(lower, "bad 2fa code.") ||
-		strings.Contains(lower, "incorrect verification code")
-}
-
-// twoFactorFailed is the error that ends a login at the 2FA step. It's a
-// bridgev2.RespError so the provisioning API (the Beeper app's login) shows
-// msg instead of a generic "Internal error submitting input"; the terminal
-// login and bot commands print it as is.
-func twoFactorFailed(msg string) error {
-	return bridgev2.RespError{ErrCode: "FI.MAU.IMESSAGE.2FA_FAILED", Err: msg, StatusCode: http.StatusBadRequest}
 }

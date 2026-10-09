@@ -178,12 +178,7 @@ config YAML is loaded. Keep existing overrides such as
 - macOS services use `launchd` with `com.lrhodin.corten-matrix`; Linux services
   use `systemd` as `corten-matrix`. The single `bridge-all` service supervises
   configured accounts independently, so one account may restart without
-  interrupting the other; service stop still terminates and reaps both. If a
-  Linux unit exists in both user and system scopes, setup/install/start/restart
-  must stop until the operator removes one; never delete a duplicate
-  automatically. Setup must also stop when a user unit exists but its manager
-  is unreachable, before falling back to system scope. A stop must attempt every
-  installed scope and report failures.
+  interrupting the other; service stop still terminates and reaps both.
 - `corten-matrix reset` is the preferred interactive reset path. For Beeper it
   rebuilds the remote registration and local bridge database by default while
   preserving Apple/iMessage identity state. `--delete-imessage-state` is the
