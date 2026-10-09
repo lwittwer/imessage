@@ -333,6 +333,11 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "keychain passcode_generation default" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^    pub passcode_generation: u32,$$/    #[serde(default)] pub passcode_generation: u32,/' \
 	  '#\[serde\(default\)\] pub passcode_generation: u32,'
+# Register password/keychain notifications for fresh or changed APNs tokens;
+# only an already-registered token should skip prepare_watch.
+	@$(RP_PATCH) rp_patch "password notification registration guard" $(RUSTPUSH_DIR)/src/passwords.rs \
+	  's/^        if state\.my_token_registered != Some\(connection\.get_token\(\)\.await\) \{ return Ok\(\(\)\) \}$$/        if state.my_token_registered == Some(connection.get_token().await) { return Ok(()) }/' \
+	  '^        if state\.my_token_registered == Some\(connection\.get_token\(\)\.await\) \{ return Ok\(\(\)\) \}$$'
 # Recover an escrow bottle by the keys it holds. rustpush rejects a bottle
 # whenever its peer-key signature does not verify against the named peer,
 # even after the passcode, the escrow-key checks and AES-GCM authenticated
