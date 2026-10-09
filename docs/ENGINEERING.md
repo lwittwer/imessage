@@ -201,6 +201,12 @@ child before the supervisor exits.
 - On Linux, resolve service scope from where the unit actually exists, not only
   from user-bus reachability. A system unit can coexist with a reachable user
   bus.
+- If the bridge unit exists in both user and system scopes, block setup,
+  install, start, and restart until the operator chooses one. Never delete or
+  disable a duplicate automatically. A stop must attempt every installed scope
+  and return any scope's failure.
+- If a user unit file exists but the user manager is unreachable, setup must
+  stop before the system-scope fallback can install or start a second bridge.
 - `install-service` may overwrite only units bearing its managed marker and
   must preserve their runtime identity and XDG data directory. Uninstall must
   inspect and verify both user and system scopes.

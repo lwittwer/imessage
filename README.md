@@ -61,7 +61,7 @@ The bridge runs on Linux using a hardware key extracted once from a real Mac. **
 
 Ubuntu 22.04+ (or equivalent). The setup step installs the runtime dependencies for you across the common package managers (apt / dnf / pacman / zypper / apk). Nothing is compiled on your machine — the bridge binary is prebuilt.
 
-Containers are supported: in an LXC container (or anywhere `systemctl --user` has no session bus — e.g. running as root, or SSH without lingering), setup automatically installs the service as a **system** unit instead of a user unit. See the note under [Management → Linux](#linux).
+Containers are supported: on a fresh install where `systemctl --user` has no session bus (for example, in LXC or over SSH without lingering), setup installs a **system** unit. If a user unit file already exists, setup stops until it can reach that user manager, so it will not install a second service. See the note under [Management → Linux](#linux).
 
 ### Step 1: Extract hardware key (one-time, on a Mac)
 
@@ -128,7 +128,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
 | `corten-matrix sync-status` / `sync-status 1` | Read a persisted backfill report for the first / second account without needing the daemon. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
-| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If a unit is already there it refuses and tells you to use `uninstall-service` first. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
+| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If an unmanaged unit is already there it refuses and tells you to use `uninstall-service` first. If units exist in both user and system scopes, setup/start/restart/install stop with an error until you choose and remove one; the CLI never deletes a duplicate automatically. Setup also refuses system-scope fallback when a user unit exists but its manager is unreachable. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
 | `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
 | `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
 | `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
@@ -184,6 +184,8 @@ There are two ways to log in:
 - **Through the bridge bot (alternative).** DM the bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow. Useful if you skipped the setup login step, want to switch handles, or are re-logging without re-running setup. `corten-matrix login` re-runs the terminal flow.
 
 Either path follows the same prompts: Apple ID → password → 2FA (if needed) → handle selection. On macOS, if the Mac is signed into iCloud with the same Apple ID, login completes without 2FA. On Linux, you additionally paste the hardware key from [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac).
+
+If Apple rejects a verification code, the login keeps its session and offers another try; a verification/network error can also be retried without using a wrong-code attempt.
 
 If your Apple ID has multiple identities registered (e.g. a phone number and an email address), you'll be asked which one to use for outgoing messages. This is what recipients see your messages "from". To change it later, set `preferred_handle` in the config (see [Configuration](#configuration)) or log in again.
 
@@ -508,7 +510,7 @@ tail -f ~/.local/share/corten-matrix-1/logs/bridge.log    # second account, if c
 ./corten-matrix -c ~/.local/share/corten-matrix/config.yaml
 ```
 
-You don't have to know which mode you're in: `corten-matrix start` / `stop` / `restart` / `status` detect it — they drive the user unit when a session bus is reachable and fall back to the system unit otherwise (using `sudo` when you're not root). The raw commands above are only for wiring your own tooling.
+You don't have to know which mode you're in: the CLI resolves the service scope from where the unit is installed, even when a user session bus is reachable, and uses `sudo` for system-scope actions when needed. If units exist in both scopes, setup/start/restart stop until you remove one; stop attempts both scopes and reports failures. The raw commands above are only for wiring your own tooling.
 
 ## Configuration
 
@@ -613,6 +615,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `bridge_filtered_chats` | `false` | Bridge chats iCloud filed under "Unknown Senders" instead of skipping them. That filtering comes from your iCloud settings, not the bridge, and the bucket catches real conversation too — delivery notifications, 2FA codes, a business replying to you. |
 | `statuskit_share_on_startup` | `true` | Publish "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their Focus/DND state. |
 | `statuskit_notifications` | `true` | Append a 🌙 to a contact's chat title (+ ghost presence) when they toggle iOS 18 Focus / DND. The underlying StatusKit registration runs either way. |
+| `disable_icloud_contacts` | `false` | Skip iCloud CardDAV and background shared-profile refreshes. Cached shared profiles remain available; configured external CardDAV and local macOS Contacts are unaffected. Message and history sync continue. |
 | `video_transcoding` | `false` | Auto-remux non-MP4 videos (e.g. QuickTime `.mov`) to MP4 for broad Matrix client compatibility. Requires `ffmpeg`. |
 | `heic_conversion` | `false` | Auto-convert HEIC/HEIF images to JPEG. Requires `libheif`. |
 | `heic_jpeg_quality` | `95` | JPEG output quality (1–100) when HEIC conversion is enabled. |

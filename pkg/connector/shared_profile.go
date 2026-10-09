@@ -549,6 +549,9 @@ func (c *IMClient) refreshAllSharedProfilesForConnection(log zerolog.Logger, sto
 	if c.sharedProfileStore == nil || fetcher == nil {
 		return
 	}
+	if c.Main != nil && c.Main.Config.DisableICloudContacts {
+		return
+	}
 	select {
 	case <-stop:
 		return
