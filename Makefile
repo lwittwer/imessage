@@ -333,6 +333,10 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "keychain passcode_generation default" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^    pub passcode_generation: u32,$$/    #[serde(default)] pub passcode_generation: u32,/' \
 	  '#\[serde\(default\)\] pub passcode_generation: u32,'
+# Preserve legacy password groups and invitations when the token field is absent.
+	@$(RP_PATCH) rp_patch "password registration token restore default" $(RUSTPUSH_DIR)/src/passwords.rs \
+	  's/^    pub my_token_registered: Option<\[u8; 32\]>,$$/    #[serde(default)] pub my_token_registered: Option<[u8; 32]>,/' \
+	  '^    #\[serde\(default\)\] pub my_token_registered: Option<\[u8; 32\]>,'
 # Register password/keychain notifications for fresh or changed APNs tokens;
 # only an already-registered token should skip prepare_watch.
 	@$(RP_PATCH) rp_patch "password notification registration guard" $(RUSTPUSH_DIR)/src/passwords.rs \
