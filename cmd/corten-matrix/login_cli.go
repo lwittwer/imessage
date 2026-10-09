@@ -15,6 +15,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 	"maunium.net/go/mautrix/id"
@@ -24,10 +25,33 @@ import (
 // input is piped rather than typed interactively).
 var stdinReader = bufio.NewReader(os.Stdin)
 
+// muteInfoLogs raises the global log level to warn until the returned func is
+// called. Background info logs (e.g. the APNs keepalive) otherwise land in the
+// middle of a prompt while it waits for input.
+func muteInfoLogs() (restore func()) {
+	prev := zerolog.GlobalLevel()
+	if prev < zerolog.WarnLevel {
+		zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	}
+	return func() { zerolog.SetGlobalLevel(prev) }
+}
+
 func prompt(label string) string {
+	defer muteInfoLogs()()
 	fmt.Fprintf(os.Stderr, "%s: ", label)
-	line, _ := stdinReader.ReadString('\n')
-	return sanitizeInput(line)
+	return sanitizeInput(readLine())
+}
+
+// readLine reads one line of input, and ends the login when stdin is closed
+// (Ctrl-D, or no terminal attached) with nothing left to read. Treating that as
+// an empty answer would spin forever on any step that asks again.
+func readLine() string {
+	line, err := stdinReader.ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Fprintln(os.Stderr, "\n[!] Input closed; login canceled.")
+		os.Exit(1)
+	}
+	return line
 }
 
 // sanitizeInput strips terminal bracketed-paste markers (ESC[200~ … ESC[201~)
@@ -59,13 +83,27 @@ func sanitizeInput(s string) string {
 
 // promptSelect displays numbered options and returns the selected value.
 func promptSelect(label string, options []string) string {
+	defer muteInfoLogs()()
 	fmt.Fprintf(os.Stderr, "%s:\n", label)
+	// The connector already numbers some option lists ("1. Mac…") for the
+	// Matrix bot; don't number those a second time.
+	prenumbered := true
 	for i, opt := range options {
-		fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, opt)
+		if !strings.HasPrefix(opt, fmt.Sprintf("%d. ", i+1)) {
+			prenumbered = false
+			break
+		}
+	}
+	for i, opt := range options {
+		if prenumbered {
+			fmt.Fprintf(os.Stderr, "  %s\n", opt)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, opt)
+		}
 	}
 	for {
 		fmt.Fprintf(os.Stderr, "Enter number (1-%d): ", len(options))
-		line, _ := stdinReader.ReadString('\n')
+		line := readLine()
 		trimmed := strings.TrimSpace(line)
 		var idx int
 		if _, err := fmt.Sscanf(trimmed, "%d", &idx); err == nil && idx >= 1 && idx <= len(options) {
@@ -85,6 +123,7 @@ func promptSelect(label string, options []string) string {
 // all whitespace. Used for fields like hardware keys that are long base64
 // strings which get split across lines when pasted.
 func promptMultiline(label string) string {
+	defer muteInfoLogs()()
 	fmt.Fprintf(os.Stderr, "%s (paste, then press Enter on a blank line):\n", label)
 	var parts []string
 	for {
@@ -132,8 +171,8 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 	//
 	// This used to wrap context.Background() in context.WithCancel and discard
 	// the cancel func, which go vet flags as a context leak. Since the cancel
-	// was never called the context could never be cancelled, so it behaved
-	// exactly as its parent — dropping WithCancel is behaviour-identical and
+	// was never called the context could never be canceled, so it behaved
+	// exactly as its parent — dropping WithCancel is behavior-identical and
 	// leaks nothing.
 	br.Bridge.BackgroundCtx = br.Log.WithContext(context.Background())
 

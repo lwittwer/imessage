@@ -448,7 +448,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_login_start(uniffiStatus)
 		})
-		if checksum != 53356 {
+		if checksum != 5806 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_func_login_start: UniFFI API checksum mismatch")
 		}
@@ -1198,6 +1198,15 @@ func uniffiCheckChecksums() {
 		if checksum != 10863 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_loginsession_needs_2fa: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_loginsession_sms_2fa_sent(uniffiStatus)
+		})
+		if checksum != 38693 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_loginsession_sms_2fa_sent: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -4072,6 +4081,15 @@ func (_self *LoginSession) Needs2fa() bool {
 	defer _self.ffiObject.decrementPointer()
 	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
 		return C.uniffi_rustpushgo_fn_method_loginsession_needs_2fa(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *LoginSession) Sms2faSent() bool {
+	_pointer := _self.ffiObject.incrementPointer("*LoginSession")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_rustpushgo_fn_method_loginsession_sms_2fa_sent(
 			_pointer, _uniffiStatus)
 	}))
 }
@@ -9164,11 +9182,11 @@ func InitLoggerWithSink(sink RustLogSink) {
 	})
 }
 
-func LoginStart(appleId string, password string, config *WrappedOsConfig, connection *WrappedApsConnection) (*LoginSession, error) {
+func LoginStart(appleId string, password string, config *WrappedOsConfig, connection *WrappedApsConnection, preferSms bool) (*LoginSession, error) {
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_func_login_start(rustBufferToC(FfiConverterStringINSTANCE.Lower(appleId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(password)), FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection),
+			return (*C.void)(C.uniffi_rustpushgo_fn_func_login_start(rustBufferToC(FfiConverterStringINSTANCE.Lower(appleId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(password)), FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), FfiConverterBoolINSTANCE.Lower(preferSms),
 				status,
 			))
 		},
