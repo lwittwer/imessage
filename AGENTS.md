@@ -106,10 +106,12 @@ cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bin
 If generated Go changes, check whether `scripts/patch_bindings.py` also needs an
 update.
 
-### Generated And Derived Artifacts
+### Escrow Bottle Recovery
 
 - Preserve upstream's escrow and named-peer bottle signature checks; do not
   replace them with recovered-key equality. See `docs/ENGINEERING.md`.
+
+### Generated And Derived Artifacts
 
 - `pkg/rustpushgo/rustpushgo.go` and `pkg/rustpushgo/rustpushgo.h` are generated.
 - `librustpushgo.a`, `corten-matrix`, `.build-commit`, `pkg/rustpushgo/target/`,
