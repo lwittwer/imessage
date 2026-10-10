@@ -5,6 +5,15 @@ when changing portal identity, chat.db backfill, SMS routing, reset behavior, or
 stacked pull requests. Treat the rules as lifecycle contracts: a focused test
 that bypasses creation, restart, retry, or restore behavior is not sufficient.
 
+## Escrow bottle recovery
+
+Preserve upstream's checks of both the escrow signature and the named peer's
+signature over the exact bottle. Matching recovered private keys to a peer's
+public keys does not replace that peer's authorization of the bottle. Invalid
+peer signatures must fail recovery; do not search other peer records to bypass
+the check. Source preparation removes the retired held-keys override from
+already-prepared dependency trees before reapplying the retained patches.
+
 ## Portal identity and transport identity
 
 A Matrix portal key is stable room identity. The handle used for the next
@@ -201,6 +210,12 @@ child before the supervisor exits.
 - On Linux, resolve service scope from where the unit actually exists, not only
   from user-bus reachability. A system unit can coexist with a reachable user
   bus.
+- If the bridge unit exists in both user and system scopes, block setup,
+  install, start, and restart until the operator chooses one. Never delete or
+  disable a duplicate automatically. A stop must attempt every installed scope
+  and return any scope's failure.
+- If a user unit file exists but the user manager is unreachable, setup must
+  stop before the system-scope fallback can install or start a second bridge.
 - `install-service` may overwrite only units bearing its managed marker and
   must preserve their runtime identity and XDG data directory. Uninstall must
   inspect and verify both user and system scopes.

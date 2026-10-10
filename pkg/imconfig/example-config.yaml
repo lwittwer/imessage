@@ -107,6 +107,11 @@ read_receipts: true
 # typing indicators from iMessage contacts are unaffected.
 typing_notifications: true
 
+# Disable iCloud CardDAV and background shared-profile refreshes. Cached
+# profiles remain available, and external CardDAV and local macOS Contacts
+# are unaffected. Message and history sync continue.
+disable_icloud_contacts: false
+
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
 # When configured, this is used instead of iCloud contacts.

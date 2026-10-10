@@ -298,7 +298,7 @@ ensure-rustpush-source:
 # sync_controller.go:3369) — without this they decode empty, land with
 # has_body=0, and ensureSchema's cleanup DELETEs them: silent history loss.
 	@$(RP_PATCH) rp_patch "decode msgType=0 as a message" $(RUSTPUSH_DIR)/src/imessage/cloud_messages.rs \
-	  's/^                1\.\.=2 => CloudMessageType::Message \{/                0..=2 => CloudMessageType::Message {/' \
+	  's/^                1\.\.=2 => CloudMessageType::Message \{[ \t]*$$/                0..=2 => CloudMessageType::Message {/' \
 	  '^                0\.\.=2 => CloudMessageType::Message \{'
 # ids_guard + the IDS query call sites use rustpush::ids::*.
 	@$(RP_PATCH) rp_patch "pub mod ids" $(RUSTPUSH_DIR)/src/lib.rs \
@@ -324,6 +324,12 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_apply "fallible GSA token header parsing" $(APA_DIR) \
 	  third_party/patches/apple-private-apis/fallible-gsa-token-header-parsing.patch \
 	  icloud-auth/src/client.rs '^fn parse_token_header\('
+# Retire the former held-keys recovery override in already-prepared trees.
+# Restore this generated file from the pin, then reapply retained patches below.
+	@if [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ] && \
+	  grep -q '^fn peer_holds_keys(' $(RUSTPUSH_DIR)/src/icloud/keychain.rs; then \
+	  git -C $(RUSTPUSH_DIR) restore --source=HEAD -- src/icloud/keychain.rs; \
+	fi
 # Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
 	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \
@@ -333,6 +339,15 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "keychain passcode_generation default" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^    pub passcode_generation: u32,$$/    #[serde(default)] pub passcode_generation: u32,/' \
 	  '#\[serde\(default\)\] pub passcode_generation: u32,'
+# Preserve legacy password groups and invitations when the token field is absent.
+	@$(RP_PATCH) rp_patch "password registration token restore default" $(RUSTPUSH_DIR)/src/passwords.rs \
+	  's/^    pub my_token_registered: Option<\[u8; 32\]>,$$/    #[serde(default)] pub my_token_registered: Option<[u8; 32]>,/' \
+	  '^    #\[serde\(default\)\] pub my_token_registered: Option<\[u8; 32\]>,'
+# Register password/keychain notifications for fresh or changed APNs tokens;
+# only an already-registered token should skip prepare_watch.
+	@$(RP_PATCH) rp_patch "password notification registration guard" $(RUSTPUSH_DIR)/src/passwords.rs \
+	  's/^        if state\.my_token_registered != Some\(connection\.get_token\(\)\.await\) \{ return Ok\(\(\)\) \}$$/        if state.my_token_registered == Some(connection.get_token().await) { return Ok(()) }/' \
+	  '^        if state\.my_token_registered == Some\(connection\.get_token\(\)\.await\) \{ return Ok\(\(\)\) \}$$'
 # Soften statuskit.rs:119 panic to warn + default APSChannel (StatusKit reliability).
 	@$(RP_PATCH) rp_patch "statuskit no-saved-channel panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
 	  's/            panic!\("No saved channel for identifier!"\)$$/            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };/' \
