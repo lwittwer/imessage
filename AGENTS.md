@@ -108,6 +108,9 @@ update.
 
 ### Generated And Derived Artifacts
 
+- Preserve upstream's escrow and named-peer bottle signature checks; do not
+  replace them with recovered-key equality. See `docs/ENGINEERING.md`.
+
 - `pkg/rustpushgo/rustpushgo.go` and `pkg/rustpushgo/rustpushgo.h` are generated.
 - `librustpushgo.a`, `corten-matrix`, `.build-commit`, `pkg/rustpushgo/target/`,
   and `rustpush/target/` are build output.

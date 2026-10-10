@@ -1894,6 +1894,11 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 const contactsWaitTimeout = 30 * time.Second
 
 func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
+	// The opt-out leaves no contact source to satisfy this gate. External
+	// CardDAV and local contacts retain their normal startup precedence.
+	if c.Main.Config.DisableICloudContacts && !c.Main.Config.CardDAV.IsConfigured() && !c.Main.Config.UseChatDBBackfill() {
+		return true
+	}
 	c.contactsReadyLock.RLock()
 	alreadyReady := c.contactsReady
 	readyCh := c.contactsReadyCh

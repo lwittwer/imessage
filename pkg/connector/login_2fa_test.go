@@ -34,9 +34,9 @@ func (f *fakeVerify) verify(code string) (bool, error) {
 func accepted() (bool, error) { return true, nil }
 
 // rejected is how a wrong code reaches Go: verify_2fa fails in check_error and
-// verify_sms_2fa returns Bad2faCode.
+// verify_sms_2fa returns Bad2faCode, formatted with its Display implementation.
 func rejected() (bool, error) {
-	return false, rustpushgo.NewWrappedErrorGenericError("2FA verification failed: Bad2faCode")
+	return false, rustpushgo.NewWrappedErrorGenericError("2FA verification failed: Bad 2fa code.")
 }
 
 func failedWith(msg string) func() (bool, error) {
@@ -256,7 +256,7 @@ func TestLoginFlowsOfferTwoFactorAgainOnVerificationFailure(t *testing.T) {
 				if len(sent) == 1 {
 					return false, errors.New("connection reset")
 				}
-				return false, rustpushgo.NewWrappedErrorGenericError("2FA verification failed: Bad2faCode")
+				return false, rustpushgo.NewWrappedErrorGenericError("2FA verification failed: Bad 2fa code.")
 			}
 			var flow bridgev2.LoginProcessUserInput
 			if name == "apple-id" {

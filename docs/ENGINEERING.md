@@ -5,6 +5,15 @@ when changing portal identity, chat.db backfill, SMS routing, reset behavior, or
 stacked pull requests. Treat the rules as lifecycle contracts: a focused test
 that bypasses creation, restart, retry, or restore behavior is not sufficient.
 
+## Escrow bottle recovery
+
+Preserve upstream's checks of both the escrow signature and the named peer's
+signature over the exact bottle. Matching recovered private keys to a peer's
+public keys does not replace that peer's authorization of the bottle. Invalid
+peer signatures must fail recovery; do not search other peer records to bypass
+the check. Source preparation removes the retired held-keys override from
+already-prepared dependency trees before reapplying the retained patches.
+
 ## Portal identity and transport identity
 
 A Matrix portal key is stable room identity. The handle used for the next

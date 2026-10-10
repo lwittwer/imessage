@@ -217,13 +217,13 @@ func adoptUserBus() {
 	// Only when a user unit already exists or the user lingers. Otherwise the
 	// manager is up only for an open SSH session, and a fresh install from the
 	// console would land in a user unit that dies at logout and never boots.
-	_, unitErr := os.Stat(filepath.Join(userUnitDir(effectiveHome()), "corten-matrix.service"))
+	unitPresent := existingUserUnit(effectiveHome()) != ""
 	lingers := false
 	if u, err := user.Current(); err == nil {
 		_, lerr := os.Stat(filepath.Join("/var/lib/systemd/linger", u.Username))
 		lingers = lerr == nil
 	}
-	if unitErr != nil && !lingers {
+	if !unitPresent && !lingers {
 		return
 	}
 	_ = os.Setenv("XDG_RUNTIME_DIR", dir)

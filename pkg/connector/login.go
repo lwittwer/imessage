@@ -1032,8 +1032,7 @@ func (p *twoFactorPrompt) submit(
 // or recovered panics, so they must not consume the limited wrong-code tries.
 func isWrongTwoFactorCodeError(reason string) bool {
 	lower := strings.ToLower(reason)
-	return strings.Contains(reason, "Bad2faCode") ||
-		strings.Contains(lower, "bad 2fa code.") ||
+	return strings.Contains(lower, "bad 2fa code.") ||
 		strings.Contains(lower, "incorrect verification code")
 }
 

@@ -10,6 +10,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestContactsReadinessWithICloudOptOut(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		config      IMConfig
+		wantProceed bool
+	}{
+		{"disabled", IMConfig{DisableICloudContacts: true}, true},
+		{"enabled", IMConfig{}, false},
+		{"external", IMConfig{DisableICloudContacts: true, CardDAV: CardDAVConfig{Email: "synthetic@example.invalid", PasswordEncrypted: "synthetic"}}, false},
+		{"local", IMConfig{DisableICloudContacts: true, CloudKitBackfill: true, BackfillSource: "chatdb"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &IMClient{Main: &IMConnector{Config: tc.config}, contactsReadyCh: make(chan struct{}), stopChan: make(chan struct{})}
+			// An unavailable contact source must respect cancellation; the
+			// intentional opt-out needs no readiness signal or timeout.
+			close(client.stopChan)
+			if got := client.waitForContactsReady(zerolog.Nop()); got != tc.wantProceed {
+				t.Fatalf("proceed = %v, want %v", got, tc.wantProceed)
+			}
+		})
+	}
+}
+
 func TestDisableICloudContactsConfigAndUpgrade(t *testing.T) {
 	var exampleConfig IMConfig
 	if err := yaml.Unmarshal([]byte(ExampleConfig), &exampleConfig); err != nil {
