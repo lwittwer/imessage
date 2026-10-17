@@ -7,6 +7,7 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
@@ -36,26 +37,18 @@ func TestReceiptConversation(t *testing.T) {
 		name           string
 		conv           rustpushgo.WrappedConversation
 		notifyContacts bool
-		haveExact      bool
 		want           rustpushgo.WrappedConversation
-		wantSend       bool
 	}{
-		{"iMessage notifies contacts", dm, true, true, dm, true},
-		{"iMessage without exact message still notifies contacts", dm, true, false, dm, true},
-		{"iMessage with read_receipts off syncs own devices", dm, false, true, selfOnly(dm), true},
-		{"iMessage group with read_receipts off keeps group identity", group, false, true, selfOnly(group), true},
-		{"carrier DM syncs own devices", carrier(dm), true, true, selfOnly(carrier(dm)), true},
-		{"carrier DM with read_receipts off syncs own devices", carrier(dm), false, true, selfOnly(carrier(dm)), true},
-		{"carrier group keeps group identity", carrier(group), true, true, selfOnly(carrier(group)), true},
-		{"carrier without exact message sends nothing", carrier(dm), true, false, carrier(dm), false},
-		{"own-devices receipt without exact message sends nothing", dm, false, false, dm, false},
+		{"iMessage notifies contacts", dm, true, dm},
+		{"iMessage with read_receipts off syncs own devices", dm, false, selfOnly(dm)},
+		{"iMessage group with read_receipts off keeps group identity", group, false, selfOnly(group)},
+		{"carrier DM syncs own devices", carrier(dm), true, selfOnly(carrier(dm))},
+		{"carrier DM with read_receipts off syncs own devices", carrier(dm), false, selfOnly(carrier(dm))},
+		{"carrier group keeps group identity", carrier(group), true, selfOnly(carrier(group))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, send := receiptConversation(tt.conv, self, tt.notifyContacts, tt.haveExact)
-			if send != tt.wantSend {
-				t.Fatalf("send = %v, want %v", send, tt.wantSend)
-			}
+			got := receiptConversation(tt.conv, self, tt.notifyContacts)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("conversation = %+v, want %+v", got, tt.want)
 			}
@@ -63,10 +56,37 @@ func TestReceiptConversation(t *testing.T) {
 	}
 }
 
-// An RCS chat is a carrier portal, so its receipts take the own-devices path.
-func TestReceiptConversation_RCSPortalIsCarrier(t *testing.T) {
-	if !isCarrierService("RCS") {
-		t.Fatal("RCS should be a carrier service")
+func TestReadTargetUUID(t *testing.T) {
+	const (
+		self  = "mailto:me@example.com"
+		alias = "tel:+15559999999"
+		peer  = "tel:+15550000001"
+		guid  = "00000000-0000-4000-8000-000000000002"
+	)
+	c := &IMClient{handle: self, allHandles: []string{self, alias}}
+	msg := func(id string, sender string) *database.Message {
+		return &database.Message{ID: networkid.MessageID(id), SenderID: networkid.UserID(sender)}
+	}
+
+	tests := []struct {
+		name     string
+		msg      *database.Message
+		wantUUID string
+		wantOK   bool
+	}{
+		{"incoming message", msg(guid, peer), guid, true},
+		{"attachment part strips suffix", msg(guid+"_att1", peer), guid, true},
+		{"no message sends nothing", nil, "", false},
+		{"own message sends nothing", msg(guid, self), "", false},
+		{"own message from another handle sends nothing", msg(guid, alias), "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uuid, ok := c.readTargetUUID(tt.msg)
+			if uuid != tt.wantUUID || ok != tt.wantOK {
+				t.Errorf("readTargetUUID = (%q, %v), want (%q, %v)", uuid, ok, tt.wantUUID, tt.wantOK)
+			}
+		})
 	}
 }
 

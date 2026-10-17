@@ -99,10 +99,9 @@ debug_disable_privacy: false
 
 # Send read receipts to iMessage contacts when you read their messages in
 # Matrix. Set to false to stop iMessage contacts seeing when you have read
-# their messages. Your own Apple devices are marked read either way, for
-# iMessage and SMS/RCS chats; for SMS/RCS, your iPhone's own read-receipt
-# setting then applies. Incoming read receipts from iMessage contacts are
-# unaffected.
+# their messages. SMS/RCS chats follow your iPhone's read-receipt setting.
+# Your own Apple devices are marked read either way. Incoming read receipts
+# from iMessage contacts are unaffected.
 read_receipts: true
 
 # Send typing indicators to iMessage contacts while you compose a reply in

@@ -7179,22 +7179,13 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	if c.client == nil {
 		return nil
 	}
-	conv, ok := receiptConversation(c.portalToConversation(receipt.Portal), c.handle,
-		c.Main.Config.ReadReceipts, receipt.ExactMessage != nil)
+	uuid, ok := c.receiptTargetUUID(ctx, receipt)
 	if !ok {
 		return nil
 	}
-	var forUuid *string
-	if receipt.ExactMessage != nil {
-		uuid := string(receipt.ExactMessage.ID)
-		// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
-		if idx := strings.Index(uuid, "_att"); idx > 0 {
-			uuid = uuid[:idx]
-		}
-		forUuid = &uuid
-	}
+	conv := receiptConversation(c.portalToConversation(receipt.Portal), c.handle, c.Main.Config.ReadReceipts)
 	err := retrySendOnAPNsFlap(func() error {
-		return c.client.SendReadReceipt(conv, c.handle, forUuid)
+		return c.client.SendReadReceipt(conv, c.handle, &uuid)
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -7213,23 +7204,54 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	return nil
 }
 
+// receiptTargetUUID returns the GUID of the message a Matrix read receipt
+// marks read: the receipt's own message, or the latest message at or before
+// the read point when the receipt targets a non-message event.
+func (c *IMClient) receiptTargetUUID(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) (string, bool) {
+	msg := receipt.ExactMessage
+	if msg == nil {
+		var err error
+		msg, err = receipt.Portal.Bridge.DB.Message.GetLastPartAtOrBeforeTime(ctx, receipt.Portal.PortalKey, receipt.ReadUpTo)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).
+				Str("portal_id", string(receipt.Portal.ID)).
+				Msg("Failed to find message for read receipt")
+			return "", false
+		}
+	}
+	return c.readTargetUUID(msg)
+}
+
+// readTargetUUID returns msg's iMessage GUID, or false when there is nothing
+// to mark read. Apple never sends a read receipt for the user's own message,
+// and none is needed: replying means everything before it was already read.
+func (c *IMClient) readTargetUUID(msg *database.Message) (string, bool) {
+	if msg == nil || c.isMyHandle(string(msg.SenderID)) {
+		return "", false
+	}
+	uuid := string(msg.ID)
+	// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
+	if idx := strings.Index(uuid, "_att"); idx > 0 {
+		uuid = uuid[:idx]
+	}
+	return uuid, true
+}
+
 // receiptConversation picks the audience for a Matrix read receipt. The user's
 // own Apple devices always receive it so their read state follows Matrix.
 // Contacts receive it only for iMessage chats with notifyContacts set: carrier
 // (SMS/RCS/MMS) contacts can't receive iMessage receipts, and read_receipts:
 // false withholds them. An own-devices-only receipt is sent with the user's
 // handle as the sole participant, which rustpush delivers to the account's
-// other devices. It needs an exact message: without one rustpush would mark a
-// random message ID read. Returns false when nothing should be sent.
-func receiptConversation(conv rustpushgo.WrappedConversation, self string, notifyContacts, haveExact bool) (rustpushgo.WrappedConversation, bool) {
+// other devices. A read receipt carries no conversation data, only the message
+// GUID, so the participants choose its targets without changing what the
+// receiving devices see.
+func receiptConversation(conv rustpushgo.WrappedConversation, self string, notifyContacts bool) rustpushgo.WrappedConversation {
 	if notifyContacts && !conv.IsSms {
-		return conv, true
-	}
-	if !haveExact {
-		return conv, false
+		return conv
 	}
 	conv.Participants = []string{self}
-	return conv, true
+	return conv
 }
 
 func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
