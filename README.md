@@ -1,193 +1,158 @@
 # Corten-Matrix
 
-> **NEW** This branch has breaking changes! Corten-Matrix now ships as **prebuilt binaries**, and moving to them requires a clean reinstall and a fresh backfill, and on Linux, a new key [extraction](#step-1-extract-hardware-key-one-time-on-a-mac) with a new [tool](https://github.com/lrhodin/corten-matrix/tree/2d3e3f5ac7fd312a23993c9083df2d6dba2495ef/tools) — see [Upgrading to binary releases](#upgrading-to-binary-releases) before you update.
+A Matrix–iMessage bridge built on [rustpush](https://github.com/OpenBubbles/rustpush)
+and [bridgev2](https://mau.fi/blog/megabridge-twilio/). Send and receive iMessages
+from any Matrix client through a direct connection to Apple's IDS/APNs services.
 
-A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
+Supports messages, attachments, reactions, edits, unsends, typing indicators,
+read receipts, groups, SMS forwarding, contacts, FaceTime notices, Focus status,
+and iCloud Shared Albums.
 
-This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
+Download a self-contained `corten-matrix` binary from
+[Releases](https://github.com/lrhodin/corten-matrix/releases). It includes the
+bridge and management CLI. macOS uses native validation; Linux uses a hardware
+key extracted once from a Mac, with no Mac or relay needed at runtime.
+[Source builds](#build-from-source-macos) are macOS-only. Docker images are not
+currently maintained.
 
-**Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, incoming **FaceTime call notices**, **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
-
-**Platforms**: macOS (full features) and Linux (via a hardware key extracted from a Mac once). On Linux, the Mac is needed **only** for the one-time key extraction — there is no relay or background process running on the Mac at runtime. Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
-
-## How it's distributed
-
-Corten-Matrix ships as a **prebuilt, self-contained binary** called `corten-matrix`, downloaded from the [Releases page](https://github.com/lrhodin/corten-matrix/releases). The binary *is* the bridge **and** its management CLI — there is **nothing to compile** and no first-run build step. The native pieces the bridge needs are already baked into the release, so you download one file, mark it executable, and run it.
-
-**Building from source is supported on macOS.** On a Mac the bridge generates its own validation data through Apple's native `AAAbsintheContext` framework, so it builds and runs entirely from this repository — see [Build from source (macOS)](#build-from-source-macos). The prebuilt binary releases remain the easy path (no toolchain to set up) and are the only way to run on **Linux**.
-
-> **Docker is deprecated for the time being.** While we move to binary distribution there is no maintained Docker image; run the native binary directly via `corten-matrix setup` / `setup-beeper`. Docker support may return in a later release.
-
-After downloading the binary you run `corten-matrix setup` (self-hosted) or `corten-matrix setup-beeper` (Beeper), which installs the runtime dependencies, walks you through configuration, logs you in, and installs the background service. See [The `corten-matrix` CLI](#the-corten-matrix-cli) for the full command list.
+**Disable Contact Key Verification before login** — see [Troubleshooting](#troubleshooting).
+If migrating from the old source-build/relay distribution, read the next section;
+current binary users can follow [Updating](#updating).
 
 ## Upgrading to binary releases
 
-Corten-Matrix previously expected you to build from source. The binary releases are a clean break and rebrand to the corten-matrix name, so an in-place upgrade is **not** supported — you need to reinstall:
-
-1. **Reinstall from the binary.** Download `corten-matrix` from the [Releases page](https://github.com/lrhodin/corten-matrix/releases), rename it if desired, make it executable: `chmod +x corten-matrix`, and run `corten-matrix setup` (or `setup-beeper`). Treat this as a fresh install rather than an upgrade of an existing source checkout.
-2. **Re-run backfill.** History must be re-backfilled on the new install; your previous database is not carried forward. CloudKit backfill runs from the binary the same way it did before — see [Receiving messages](#receiving-messages).
-3. **Linux only — re-extract your hardware key.** The legacy NAC relay is gone (see [Quick Start (Linux)](#quick-start-linux)); the binary releases require a **new** key extraction done with the current extractor tool. Old keys and any relay setup will not work — extract fresh.
-
-If you're a brand-new user, ignore this section and follow the Quick Start for your platform.
+Legacy source-build/relay installations require a fresh binary install and
+backfill; their database is not carried forward. Follow the Quick Start for your
+platform. Linux users must also re-extract their hardware key with the current
+tool below: old relay-era keys are incompatible.
 
 ## Quick Start (macOS)
 
-macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
+Requires macOS 13+ and an iCloud sign-in on the host Mac. No hardware-key
+extraction is needed.
 
-> **Registering on a real Mac vs. Linux.** On macOS the bridge registers itself **natively** — validation data is generated on the spot by Apple's own frameworks, so there's **no key to extract**; just sign in. Extracting a hardware key (with an Intel or Apple Silicon Mac — same tool) is only for running the bridge on **Linux**; see [Quick Start (Linux)](#quick-start-linux).
-
-1. Download the `corten-matrix` binary for macOS from the [Releases page](https://github.com/lrhodin/corten-matrix/releases) and make it executable (`chmod +x corten-matrix`). Rename said binary if desired. The platform and architecture name is appended to distinguish between releases. macOS is a universal binary.
-2. Run setup:
+1. Download the universal macOS binary from [Releases](https://github.com/lrhodin/corten-matrix/releases)
+   and rename it to `corten-matrix`.
+2. Make it executable and run one setup command:
 
    ```bash
-   # Beeper
-   ./corten-matrix setup-beeper
-
-   # …or a self-hosted homeserver
-   ./corten-matrix setup
+   chmod +x corten-matrix
+   ./corten-matrix setup-beeper   # Beeper
+   # or: ./corten-matrix setup    # self-hosted homeserver
    ```
 
-`setup` auto-installs Homebrew and dependencies if needed, walks you through homeserver URL / domain / Matrix ID / database choice and a few feature toggles (CloudKit backfill, FaceTime call notices, StatusKit notifications, external CardDAV, HEIC conversion, video transcoding), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. For a self-hosted homeserver it will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge. You can re-run `corten-matrix setup` any time to flip these toggles without wiping your data — see [Reconfiguring without editing YAML](#reconfiguring-without-editing-yaml).
-
-`setup` also offers to symlink `corten-matrix` into `/usr/local/bin` so it's on your `PATH`; after that you can drop the `./` and run `corten-matrix <command>` from anywhere.
+Setup installs dependencies, prompts for configuration and Apple login, and
+starts a LaunchAgent. For self-hosted Matrix, it provides the appservice
+registration to add to `homeserver.yaml`. It also offers a `/usr/local/bin`
+symlink so subsequent commands work without `./`.
 
 ## Quick Start (Linux)
 
-The bridge runs on Linux using a hardware key extracted once from a real Mac. **No Mac is needed at runtime** — a Mac (Intel or Apple Silicon, same tool either way) is used only for the one-time key extraction in Step 1, after which it can go back to normal use.
+Requires Ubuntu 22.04+ or equivalent, plus access to an Intel or Apple Silicon
+Mac for the one-time extraction. Setup installs runtime dependencies through
+apt, dnf, pacman, zypper, or apk. Nothing is compiled locally.
 
-> **The NAC relay is deprecated.** Earlier versions could keep a relay process running on a Mac to answer validation requests. The binary releases drop that entirely: the key is **fully enriched at extraction time**, so nothing runs on the Mac afterward. If you previously used the relay, it no longer applies — perform a **fresh extraction** with the current tool (below). Old keys from the pre-binary era **must** be re-extracted.
-
-### Prerequisites
-
-Ubuntu 22.04+ (or equivalent). The setup step installs the runtime dependencies for you across the common package managers (apt / dnf / pacman / zypper / apk). Nothing is compiled on your machine — the bridge binary is prebuilt.
-
-Containers are supported: on a fresh install where `systemctl --user` has no session bus (for example, in LXC or over SSH without lingering), setup installs a **system** unit. If a user unit file already exists, setup stops until it can reach that user manager, so it will not install a second service. See the note under [Management → Linux](#linux).
+Containers are supported; see [Linux service scope](#linux).
 
 ### Step 1: Extract hardware key (one-time, on a Mac)
 
-Run the extractor on **any** Mac — Intel or Apple Silicon, it's the same tool and both produce an equivalent key. The key is fully enriched at extraction time, so there's nothing to post-process and **no relay to keep running** afterwards. The Mac is not modified and can continue to be used normally.
+Use the current extractor; tools from before the binary switch are incompatible.
+Both options produce the same base64 key on Intel and Apple Silicon Macs.
 
-> Use the extractor tools linked below — extractors from before the binary switch are not compatible.
+- **GUI:** download [ExtractKey.app.zip](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/ExtractKey.app.zip),
+  unzip, launch, then Copy or Save the key.
+- **CLI:** download [extract-key-cli.zip](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/extract-key-cli.zip),
+  unzip, then run `chmod +x extract-key` and `./extract-key`.
 
-**Option A — GUI app (recommended).** Download the hardware-key [extractor app](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/ExtractKey.app.zip), copy it to the Mac, and launch it. It reads the hardware identifiers, displays them, and lets you **Copy** or **Save** the base64 key.
+The GUI app is ad-hoc signed, so Gatekeeper may block its first launch. On
+macOS 13+, launch it once, then use **System Settings → Privacy & Security →
+Open Anyway**. On macOS 10.15–12, right-click the app and choose **Open**.
+Alternatively, run `xattr -cr <AppName>.app` before launching.
 
-> **Gatekeeper**: The app is ad-hoc signed (not notarized — just a fact of macOS), so a downloaded copy is blocked on first launch:
->
-> - **macOS 13+ (Ventura)**: Double-click it, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
-> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu, then **Open** in the dialog.
-> - **Terminal**: Run `xattr -cr <AppName>.app` to strip the quarantine flag, then double-click normally.
-
-**Option B — CLI (fallback).** If you'd rather not use the GUI, download the [command-line extractor](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/extract-key-cli.zip), run it on the Mac, and copy the base64 key it prints:
-
-```bash
-chmod +x extract-key
-./extract-key
-```
-
-Either option produces the same base64 hardware key. Keep it handy for Step 3.
+Save the key for login on Linux. The Mac needs no ongoing process or relay.
 
 ### Step 2: Install the bridge (on Linux)
 
-Download the `corten-matrix` binary for your architecture (`linux-amd64` or `linux-arm64`) from the [Releases page](https://github.com/lrhodin/corten-matrix/releases), rename it if desired, and make it executable, and run setup:
+Download the `linux-amd64` or `linux-arm64` binary from
+[Releases](https://github.com/lrhodin/corten-matrix/releases), rename it to
+`corten-matrix`, then run:
 
 ```bash
 chmod +x corten-matrix
-
-# Beeper
-./corten-matrix setup-beeper
-
-# …or a self-hosted homeserver
-./corten-matrix setup
+./corten-matrix setup-beeper   # Beeper
+# or: ./corten-matrix setup    # self-hosted homeserver
 ```
-
-For self-hosted, setup walks you through homeserver URL → domain → Matrix ID → database choice, then the iMessage login. Nothing compiles — the binary is ready to run immediately.
 
 ### Step 3: Login
 
-`setup` detects that no login exists and runs the iMessage login flow inline at the end. You're prompted right there in the terminal for:
-
-1. Your hardware key (paste the base64 from Step 1)
-2. Your Apple ID and password
-3. The 2FA code sent to your trusted devices
-
-When the script finishes you're already logged in and the bridge is up.
-
-**Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the setup flow, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result. You can also re-run the terminal flow at any time with `corten-matrix login`.
+Setup runs [login](#login) when no saved session exists. Paste the extracted
+hardware key, then enter your Apple ID, password, and 2FA code when prompted.
+Setup starts the service after login.
 
 ## The `corten-matrix` CLI
 
-The `corten-matrix` binary is both the bridge and its management CLI — it replaces the old Makefile targets and platform-specific `launchctl` / `systemctl` incantations. Run `corten-matrix help` for the list:
+Run `corten-matrix help` for the available subcommands on either platform:
 
-| Command | What it does |
+| Command | Purpose |
 |---|---|
-| `corten-matrix setup` | Configure and start the bridge against a self-hosted homeserver. Idempotent — re-run to flip feature toggles. |
-| `corten-matrix setup-beeper` | Same, but configured for Beeper. |
-| `corten-matrix setup 1` / `setup-beeper 1` | Add a **second** iMessage account (a different Apple ID), or reconfigure an existing one later — the same prompts as `setup`, scoped to the second bridge. |
-| `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
-| `corten-matrix status` | Show the service status. |
-| `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
-| `corten-matrix sync-status` / `sync-status 1` | Read a persisted backfill report for the first / second account without needing the daemon. |
-| `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
-| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If an unmanaged unit is already there it refuses and tells you to use `uninstall-service` first. If units exist in both user and system scopes, setup/start/restart/install stop with an error until you choose and remove one; the CLI never deletes a duplicate automatically. Setup also refuses system-scope fallback when a user unit exists but its manager is unreachable. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
-| `corten-matrix reset` | Rebuild local bridge state and, on Beeper, the remote registration; Apple/iMessage state is preserved unless explicitly deleted — see [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery). |
-| `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
-| `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
-| `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
-| `corten-matrix help` | Show the command list. |
-
-> `update` is shown by `corten-matrix help` **only on the official prebuilt binaries**. If you built from source it isn't there — update by pulling this repo and rebuilding (see [Updating](#updating)).
-
-The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.
+| `setup` / `setup-beeper` | Configure a self-hosted / Beeper bridge; rerun to change settings. |
+| `start` / `stop` / `restart` / `status` | Control the service, including both configured accounts. |
+| `logs` / `logs 1` | Tail the first / second account's log. |
+| `sync-status` / `sync-status 1` | Read the account's [backfill status](#inspecting-backfill-status), even with the daemon stopped. |
+| `login` | Repeat interactive Apple login. |
+| `install-service` / `uninstall-service` | Install or remove the service; `uninstall` is an alias for removal. See [Management](#management). |
+| `reset` | Rebuild bridge state; read [Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery) first. |
+| `update` / `update check` / `update force` | Official binaries only: install, preview, or reinstall a release. See [Updating](#updating). |
+| `bbctl <args>` | Beeper bridge-manager commands. |
 
 ### Dual accounts (two Apple IDs)
 
-corten-matrix can bridge **two Apple IDs** on the same machine (max two), each as its own fully-isolated bridge — separate iMessage login/session, data dir, config, and Matrix appservice — run together under a **single** background service.
+Run `corten-matrix setup 1` or `setup-beeper 1` to add or reconfigure a second
+Apple ID. Each has its own login, config, database, and Matrix appservice:
 
-**Add or reconfigure a second account** — it's an explicit one-line command, there's no mid-setup prompt:
-
-- **Add it any time** with `corten-matrix setup 1` (self-hosted) or `corten-matrix setup-beeper 1` (Beeper). You get the same configuration prompts and iMessage login, scoped to the second bridge.
-- **Reconfigure it later** by re-running the same command — e.g. to flip a toggle like CloudKit backfill.
-
-**How it works.** The two accounts never share login state. The first lives in `~/.local/share/corten-matrix`, the second in `~/.local/share/corten-matrix-1`. A single service runs *both* bridge processes (`bridge-all`), supervising them independently: if one account crashes, it restarts that account without taking the other down. `start` / `stop` / `restart` / `status` act on both at once; `corten-matrix logs` tails the first account and `corten-matrix logs 1` the second.
-
-**macOS history-backfill caveat.** Each account backfills message history from either **CloudKit** (iCloud sync) or the local **chat.db** (the Mac's Messages database). chat.db only ever holds the messages of the *one* Apple ID signed into Messages on that Mac, so the two accounts can't both use it:
-
-| Account 1 | Account 2 | Works? |
+| Account | Default data directory | Logs |
 |---|---|---|
-| CloudKit | CloudKit | ✅ |
-| chat.db | CloudKit | ✅ |
-| chat.db | chat.db | ❌ — only one local Messages database exists |
+| First | `~/.local/share/corten-matrix/` | `corten-matrix logs` |
+| Second | `~/.local/share/corten-matrix-1/` | `corten-matrix logs 1` |
 
-So **at most one** account can use chat.db backfill — the Apple ID signed into Messages on the Mac — and the other must use CloudKit. This only limits *history backfill*; real-time messaging works for both accounts regardless. (Linux has no chat.db, so both accounts always use CloudKit.)
+One service supervises both accounts independently: a crash restarts only the
+affected account, while service commands act on both.
+
+Both accounts can use CloudKit backfill. At most one can use local chat.db,
+because it contains only the Apple ID signed into Messages on that Mac. This
+restriction affects history, not live messaging. Linux uses CloudKit only.
 
 ## Updating
 
-How you update depends on how you're running corten-matrix:
+Official binaries include these commands:
 
-- **Official prebuilt binaries (macOS & Linux)** — run `corten-matrix update`. It pulls the latest [release](https://github.com/lrhodin/corten-matrix/releases) for your platform (macOS universal, Linux amd64, or Linux arm64), replaces the installed binary in place, prints the release notes, and restarts the bridge. Your config, login, and data are untouched.
+```bash
+corten-matrix update          # install latest release and restart
+corten-matrix update check    # preview version and release notes
+corten-matrix update force    # reinstall current release
+```
 
-  ```bash
-  corten-matrix update          # update & restart
-  corten-matrix update check    # show what's available + release notes, change nothing
-  corten-matrix update force    # re-download & reinstall the current release
-  ```
+The updater follows the `corten-matrix` symlink on your `PATH`, replaces its
+target, and preserves config, login, and data. Run setup or `install-service`
+and accept the PATH symlink first; it will not guess an installation path.
+It uses `sudo` if replacement requires it.
 
-  **The service must be installed first.** `update` doesn't take a path or guess where your binary lives — it locates it through the `corten-matrix` entry on your `PATH`. That entry is a symlink into `/usr/local/bin` that `corten-matrix setup` (and `install-service`) creates, pointing at wherever you actually keep the binary; `update` follows the symlink to that real file and replaces it in place, leaving the symlink intact. So you must have run `setup` / `install-service` (and added it to `PATH` when prompted) before `update` will work. If `corten-matrix` isn't on your `PATH`, `update` stops and tells you to install the service first rather than guessing. (If the binary lives somewhere only root can write, it uses `sudo` for the swap.)
-
-- **Built from source (macOS)** — the `update` command isn't included in source builds. Update the normal way: `git pull` and rebuild (see [Build from source (macOS)](#build-from-source-macos)), then `corten-matrix restart`.
+Source builds have no `update` command. Pull this repo, rebuild, and run
+`corten-matrix restart`.
 
 ## Login
 
-There are two ways to log in:
+Setup logs in when no saved session exists. To repeat it, run
+`corten-matrix login`, or DM the bridge bot and choose **Apple ID (External Key)**.
+Prompts cover Apple ID, password, 2FA when needed, and outgoing handle selection;
+Linux also requires the extracted hardware key. A Mac signed into the same
+iCloud account can log in without 2FA.
 
-- **Through the setup flow (default).** `corten-matrix setup` and `corten-matrix setup-beeper` detect a missing login and run the iMessage login inline at the end. This is the path almost everyone uses — answer the prompts in the terminal and you're done.
-- **Through the bridge bot (alternative).** DM the bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow. Useful if you skipped the setup login step, want to switch handles, or are re-logging without re-running setup. `corten-matrix login` re-runs the terminal flow.
+Rejected verification codes can be retried in the same session. Verification
+and network errors can also be retried without consuming a wrong-code attempt.
 
-Either path follows the same prompts: Apple ID → password → 2FA (if needed) → handle selection. On macOS, if the Mac is signed into iCloud with the same Apple ID, login completes without 2FA. On Linux, you additionally paste the hardware key from [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac).
-
-If Apple rejects a verification code, the login keeps its session and offers another try; a verification/network error can also be retried without using a wrong-code attempt.
-
-If your Apple ID has multiple identities registered (e.g. a phone number and an email address), you'll be asked which one to use for outgoing messages. This is what recipients see your messages "from". To change it later, set `preferred_handle` in the config (see [Configuration](#configuration)) or log in again.
+The outgoing handle is the phone number or email recipients see. Change it by
+logging in again or setting `preferred_handle` in [Configuration](#configuration).
 
 ### SMS Forwarding
 
@@ -197,32 +162,27 @@ To bridge SMS (green bubble) messages, enable forwarding on your iPhone:
 
 ### Receiving messages
 
-Incoming iMessages automatically create Matrix rooms. History backfill uses **CloudKit** by default — that's the modern, supported path and what almost everyone should pick.
+Live iMessages create Matrix rooms automatically. History backfill is optional
+and off by default. Enable it during setup; CloudKit is the default source and
+requires your device PIN during login to join iCloud Keychain.
 
-**Local chat.db** (`backfill_source: chatdb`) is a last-resort fallback for older macOS versions that can't run CloudKit backfill at all. If your Mac is in that bucket, the **preferred workaround is to run the bridge on Linux instead** (extract the hardware key once via [Quick Start (Linux)](#quick-start-linux), then let the Linux bridge do CloudKit backfill normally). Only choose `chatdb` if you actually have to run the bridge on a legacy Mac and Linux isn't an option — it's macOS-only and requires **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → add the bridge binary or Terminal) to read `~/Library/Messages/chat.db`. Without FDA the bridge can't read the file and chat.db backfill silently does nothing.
+`backfill_source: chatdb` is a legacy macOS fallback. It reads
+`~/Library/Messages/chat.db` and requires **System Settings → Privacy & Security →
+Full Disk Access** for the bridge binary or Terminal. If CloudKit cannot run on
+an older Mac, prefer running the bridge on Linux with CloudKit when possible.
+
+On the first install, setup offers an uncapped backfill or a per-chat limit
+(minimum 100). Later changes to `backfill.max_initial_messages` require editing
+YAML; see [Configuration](#configuration).
 
 ## Bridge commands
 
-The default room name is **iMessage**, with the network's iMessage icon. On
-reconnect, missing names and avatars are filled in without recreating the
-management room; custom names and avatars are preserved. These defaults do not
-require `matrix.sync_direct_chat_list` to be enabled.
+The bot DM is the **iMessage** management room. Missing default names/avatars are
+repaired on reconnect; custom values are preserved.
 
-In the **management room** (the bot DM, opened automatically when you log in), type commands bare — no prefix:
-
-```
-start-chat
-help
-logout
-```
-
-In **portal rooms** (any bridged DM or group), prefix commands with `!im`:
-
-```
-!im help
-```
-
-To abort an interactive command (a picker waiting for your reply), type `cancel` in the management room or `!im cancel` in a portal.
+Type commands without a prefix there (`help`, `start-chat`). In a bridged DM or
+group, use `!im help` or `!im start-chat`. Type `cancel` (or `!im cancel`) to abort
+an interactive picker.
 
 ### Common commands
 
@@ -237,16 +197,9 @@ To abort an interactive command (a picker waiting for your reply), type `cancel`
 
 ### Phone-number format for `start-chat`
 
-Always include the country code with a leading `+`. Spaces, dashes, and parentheses are stripped automatically; you don't need to type `tel:` / `mailto:` prefixes either.
-
-| Country | Format |
-|---|---|
-| USA / Canada | `+1 555 123 4567` |
-| UK | `+44 20 7946 0958` |
-| France | `+33 1 23 45 67 89` |
-| India | `+91 98765 43210` |
-
-A bare US number (`5551234567`) won't work — the country code is required. Look up codes at <https://countrycode.org>.
+Include `+` and the country code, for example `start-chat +15551234567`.
+Spaces, dashes, and parentheses are stripped. Email addresses also work;
+`tel:` / `mailto:` prefixes are optional. A bare local number is not accepted.
 
 ### Logging out
 
@@ -263,38 +216,20 @@ Until you do step 4, Apple still considers the bridge a registered iMessage devi
 
 ## FaceTime
 
-The bridge stays registered for FaceTime, so Apple keeps telling it when someone
-calls you. When that happens it posts a notice in the portal:
-
-> 📞 **Incoming FaceTime call from Alice.**
-
-You get two of these, and only these — someone is calling, or the call went
-unanswered ("Missed FaceTime call from Alice."). That is the whole feature. There are no FaceTime commands, no join links, and no
-way to place or answer a call from Matrix — answer on your iPhone, iPad, or Mac
-like you always have. Falling back to your Apple device is the point: it does
-video and audio properly, and the bridge just makes sure you know the call is
-happening if you're looking at Matrix rather than your phone.
-
-### Turning the notice off
-
-Set `disable_facetime: true` in `~/.local/share/corten-matrix/config.yaml`, or
-answer "Post FaceTime call notices?" with `n` in `corten-matrix setup` — the
-setup flow asks on first install and on every re-run, so you can flip it without
-editing YAML. The bridge stays registered for FaceTime either way; only the
-notice goes away.
+Incoming and missed FaceTime calls post notices in the portal. Answer on an
+Apple device; Matrix cannot place or answer calls. Set `disable_facetime: true`
+or turn notices off during setup to hide them without changing registration.
 
 ## Focus & Do Not Disturb
 
-When a contact toggles a Focus mode (Do Not Disturb, Sleep, Work, etc.) on iOS 18+, the bridge marks it on the **chat title** — appending a 🌙 to the contact's name (e.g. "Alice 🌙") while their Focus/DND is on, and removing it when they turn it off:
+Contacts on iOS 18+ can appear as **Alice 🌙** while Focus/DND is on. The bridge
+updates the DM title and ghost presence in place, without posting a message or
+unarchiving the chat. Groups do not show per-member Focus.
 
-- The 🌙 rides on the DM's name (a room-state change, updated in place), not a posted message — so it never bumps or unarchives the chat, and there's no timeline spam.
-- The contact's Matrix ghost also gets a presence update, so clients that render presence reflect the same state.
-- DM-only: a group has a single shared title, so per-member Focus can't ride on it.
-- Focus is a global on/off and not per contact.
-
-This is the closest analog to the moon Apple shows next to a name. The bridge announces itself as "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their subsequent presence updates — leave `statuskit_share_on_startup: true` for the best chance of seeing contacts' Focus state.
-
-If you'd rather not see the indicator (or you already track Focus on another Apple device), the setup flow asks "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/corten-matrix/config.yaml`.) Disabling suppresses the 🌙 indicator and presence updates while keeping the underlying StatusKit registration intact.
+`statuskit_notifications: false` hides the indicator and presence updates while
+retaining registration. Leave `statuskit_share_on_startup: true` for the startup
+key exchange that helps receive contacts' status. Both settings are described
+in the [config reference](pkg/imconfig/example-config.yaml).
 
 ## Shared Albums
 
@@ -312,334 +247,184 @@ A full list lives under `!im help` in the **Shared Streams** section.
 
 ## Image and video conversion
 
-The bridge converts a handful of formats automatically so attachments render in Matrix clients and reach iMessage in formats Apple's clients accept. Two behaviours are gated on opt-in toggles; the rest run unconditionally.
+| Direction | Conversion | Setting |
+|---|---|---|
+| Both | TIFF → JPEG; Opus voice notes between CAF and OGG without re-encoding | Always on |
+| Matrix → iMessage | Non-JPEG images → JPEG, also updating the Matrix event | Always on |
+| iMessage → Matrix | HEIC/HEIF → JPEG, preserving EXIF/ICC/XMP and normalizing orientation; multi-image files use the primary frame | `heic_conversion`; quality via `heic_jpeg_quality` |
+| iMessage → Matrix | Non-MP4 video → MP4; stream-copy first, H.264/AAC fallback | `video_transcoding` |
 
-### Always on, both directions
+Live Photos bridge only the still image, with optional HEIC conversion; their
+motion companion is not sent as a video. Ordinary videos are unaffected.
 
-- **TIFF ↔ JPEG.** TIFF is re-encoded to JPEG at quality 95 in either direction.
-- **Opus voice notes.** iMessage uses Opus in Apple's CAF container; Matrix clients use Opus in an OGG container. The bridge remuxes between the two (no re-encoding — same codec, different wrapper) in either direction.
+Attachments over `max_attachment_size_mb` (default 100) are skipped before
+download. Raise this only if the homeserver accepts larger files and the host
+has enough RAM; attachments are buffered in memory.
 
-### Always on, outgoing only
-
-- **Other non-JPEG images → JPEG** at quality 95. PNG and similar formats sent from Matrix are re-encoded before being handed to iMessage; the Matrix event is also edited in place so other Matrix clients see the corrected file. Incoming PNG passes through unchanged.
-
-### Opt-in, incoming only
-
-- **HEIC / HEIF → JPEG** — gated on `heic_conversion` (default off). Decoded with `libheif`, re-encoded at `heic_jpeg_quality` (default `95`, clamped to 1–100). EXIF, ICC color profile, and XMP are preserved; orientation is normalised because `libheif` applies the rotation during decode. Animated / multi-image HEICs collapse to the primary frame with a warning. With the toggle off, HEIC bytes pass through to Matrix — modern clients (Element, Beeper) render them, older clients may not.
-- **Non-MP4 video → MP4** — gated on `video_transcoding` (default off). Applies to any `video/*` MIME that isn't already `video/mp4` (`.mov`, `.m4v`, MKV, AVI, WebM, …). The bridge tries a stream-copy remux first (`ffmpeg -c copy -movflags +faststart`) — fast and lossless. If that fails, it falls back to a full re-encode (H.264 `-preset fast -crf 23` plus AAC). Audio tracks are preserved in both modes. The Matrix event ends up as `.mp4` / `video/mp4`.
-
-### Live Photos
-
-iMessage Live Photos contain a HEIC still and a MOV motion companion. This branch bridges only the still, with HEIC conversion if `heic_conversion` is on, and reuses its attachment cache during backfill. The motion companion is not delivered as a separate video. Ordinary video attachments are unaffected.
-
-### Size limit
-
-Attachments larger than `max_attachment_size_mb` (default `100`) are **skipped entirely** — never downloaded, transcoded, or uploaded. The default matches Beeper's upload cap: the homeserver rejects anything bigger, so bridging it would only waste a download (the bytes buffer in memory while fetching), a doomed transcode, and disk — all for a guaranteed rejection, and a multi-GB attachment can exhaust RAM on a small host. CloudKit occasionally surfaces very large attachments (multi-GB videos); skipping them up front keeps a backfill from stalling on files that could never land anyway. Self-hosters whose homeserver accepts larger uploads can raise the cap — see [`max_attachment_size_mb`](#key-options), including the note about needing the RAM for it.
-
-### Dependencies
-
-- **`libheif`** is a runtime dependency the bridge links against. `corten-matrix setup` installs it via Homebrew (macOS) or `apt`/`dnf`/`pacman`/`zypper`/`apk` (Linux), regardless of whether `heic_conversion` is enabled.
-- **`ffmpeg`** is required at runtime only when `video_transcoding` is enabled. The setup flow installs it via the same package manager when you turn the toggle on during the interactive prompts.
+Setup installs `libheif` regardless of the conversion setting, and `ffmpeg`
+when video conversion is enabled.
 
 ## How It Works
 
-The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with **local NAC validation** — no SIP bypass, no relay server, and no background process on a Mac. When `backfill_source: chatdb` is set on macOS, it additionally reads `~/Library/Messages/chat.db` for backfill and uses the local Contacts framework for name resolution; the default CloudKit path uses iCloud for both.
+Matrix client ↔ homeserver ↔ corten-matrix ↔ rustpush ↔ Apple IDS/APNs.
+Live traffic arrives through APNs; optional history comes from CloudKit or
+macOS chat.db. Contacts come from iCloud CardDAV, configured external CardDAV,
+or local macOS Contacts. Shared names/photos use CloudKit independently of
+message backfill. Background refreshes retain cached profiles on failure and
+back off after rate limits or missing records; incoming announcements can
+refresh them immediately.
 
-Shared names/photos use CloudKit independently of message backfill. In chat.db mode with local Contacts, the bridge refreshes cached shared profiles at startup and every 15 minutes after the preceding pass finishes, with five seconds between fetches. The following guards apply to background shared-profile fetches in both local Contacts and CardDAV modes. Profiles fetched successfully within six hours are skipped. A rate limit stops the pass and pauses this client’s background profile fetches for one hour. Missing/rotated-record errors (including upstream panic hints) retry after six hours, then twelve hours, capped at one day; transient and unclassified errors keep the normal refresh cadence. Retry state is in memory and resets on process restart. Incoming profile announcements bypass this background throttle and clear the old version’s backoff when published. Failed fetches preserve cached names/photos. External and iCloud CardDAV retain their existing contact-sync schedule and 500 ms spacing between eligible shared-profile fetches; the shared-profile cooldown and per-record backoff do not delay CardDAV contact syncing. Background results superseded by a newer incoming profile are discarded.
-
-NAC validation runs entirely in-process on the host running the bridge:
-
-- **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework.
-- **Linux**: validation data is generated locally from the hardware key extracted once from a Mac. The key carries everything needed, so no Mac is involved at runtime — Intel and Apple Silicon keys both work the same way, with no relay.
-
-```mermaid
-flowchart TB
-    subgraph macos["macOS"]
-        HS1[Homeserver] -- appservice --> Bridge1[corten-matrix]
-        Bridge1 -- FFI --> RP1[rustpush]
-        RP1 -- AAAbsintheContext --> NAC1[Local NAC]
-    end
-    subgraph linux["Linux"]
-        HS2[Homeserver] -- appservice --> Bridge2[corten-matrix]
-        Bridge2 -- FFI --> RP2[rustpush]
-        RP2 -- hardware key --> NAC2[Local NAC]
-    end
-    Client1[Matrix client] <--> HS1
-    Client2[Matrix client] <--> HS2
-    RP1 <--> Apple[Apple IDS / APNs]
-    RP2 <--> Apple
-
-    style macos fill:#f0f4ff,stroke:#4a6fa5,stroke-width:2px,color:#1a1a2e
-    style linux fill:#f0fff4,stroke:#4aa56f,stroke-width:2px,color:#1a1a2e
-    style Apple fill:#1a1a2e,stroke:#1a1a2e,color:#fff
-    style Client1 fill:#fff,stroke:#999,color:#333
-    style Client2 fill:#fff,stroke:#999,color:#333
-```
-
-### Real-time and backfill
-
-**Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
-
-**CloudKit backfill** (optional, off by default) syncs your iMessage history from iCloud on first login. Enable it during `corten-matrix setup` or by setting `cloudkit_backfill: true` in config. When enabled, the login flow will ask for your device PIN to join the iCloud Keychain trust circle, which grants access to Messages in iCloud.
-
-On the **first** install (before the bridge database exists), setup asks whether you want to cap messages per chat:
-
-- Answer **no** and every available message is backfilled.
-- Answer **yes** and pick a per-chat limit (minimum 100).
-
-The cap can't be changed on later re-runs once the database is in place — edit `~/.local/share/corten-matrix/config.yaml` directly to change it.
-
-### chat.db identity and routing
-
-When `backfill_source: chatdb` is enabled, the bridge treats portal identity,
-Apple's literal chat GUIDs, and the current delivery service as separate state.
-This prevents several similar-looking handles from producing duplicate rooms or
-silently dropping parts of a conversation:
-
-- Phone and email aliases for the same contact are folded into one stable DM
-  portal. An existing populated portal is preserved; a new contact uses a
-  deterministic phone-first choice. Existing Matrix rooms and their history are
-  never merged or deleted automatically.
-- The bridge keeps the complete chat.db GUIDs, including Apple service and
-  suffix variants such as `(smsft)`. Existing-room metadata can grow by union at
-  the next backfill session without creating or re-keying rooms, so discovering
-  a new exact variant does not itself require a reset.
-- The newest chat.db state determines whether the portal currently uses SMS or
-  iMessage. Older exact GUIDs remain available for backfill history but cannot
-  revert a later SMS-to-iMessage upgrade. Messages visible through more than
-  one exact GUID are deduplicated by message GUID.
-
-If an older install already created duplicate Matrix rooms, fixing identity
-selection cannot merge their server-side history. Follow
-[Reset and duplicate-room recovery](#reset-and-duplicate-room-recovery) only
-after verifying the affected rooms and reading the destructive-action warning.
+For chat.db, contact aliases share a stable DM portal, literal Apple GUIDs are
+retained for history, and current SMS/iMessage routing is tracked separately.
+Existing populated rooms are preserved; older histories cannot revert a newer
+route. See [engineering invariants](docs/ENGINEERING.md) for the implementation
+contracts. Existing duplicate Matrix histories require investigation before
+[recovery](#reset-and-duplicate-room-recovery); they are not merged automatically.
 
 ### Inspecting backfill status
 
-`sync-status` is a read-only diagnostic. In the management room, run
-`sync-status` (or `syncstatus`) to see persisted CloudKit zone state, ingested
-chats, bridgeable versus delivered messages, rows excluded as
-filtered/system/capped, and queued backfill tasks. From the host,
-`corten-matrix sync-status` (or `sync-status 1` for the second account) reads
-that account's `config.yaml` and database directly, so it remains useful when
-the daemon is stopped or wedged and does not need a Matrix connection.
+Run `sync-status` in the management room, or `corten-matrix sync-status`
+(`sync-status 1` for the second account) on the host. It reads persisted
+CloudKit zones, eligible/delivered/pending messages, exclusions, and backfill
+queue state without migrating or writing to the database.
 
-The host command reports persisted rows only. It cannot know whether a sync is
-currently in flight or whether the homeserver supports Beeper batch sending;
-those fields are available only to the management-room command. A 100%
-delivery percentage means every currently cached, bridgeable CloudKit message
-has a matching Matrix bridge row. It is not a guarantee about future Apple
-events, StatusKit changes, or reactions, and the report does not run migrations
-or write progress counters.
+The host command works with the daemon stopped, but cannot report live sync or
+batch-send capability. A 100% delivery figure covers currently cached,
+bridgeable CloudKit messages, not future Apple events or all other features.
 
 ## Privacy
 
-The bridge's design goal is the same as every other bridgev2 bridge: **message content lives in Matrix, and the bridge's own database holds only the routing metadata needed to correlate messages, edits, reactions, and deletes.** The bridgev2 `message` table never had a body column to begin with — it stores IDs, timestamps, and sender references, nothing else.
+Bridge message records store routing metadata. CloudKit backfill additionally
+stages plaintext in the local `cloud_message` cache; chat.db backfill reads
+Apple's database directly without copying bodies into this cache.
 
-The one place this bridge has to deviate is **CloudKit backfill**. To turn your iCloud message history into Matrix events, the sync pipeline stages pulled messages — with their plaintext bodies — in a local `cloud_message` cache. That cache is the only spot where message bodies touch disk, and the privacy layer exists to clean it back down to metadata after delivery. (The `chatdb` backfill source never stores bodies at all — it reads `~/Library/Messages/chat.db` live at query time. If you don't enable CloudKit backfill, none of the below applies; no bodies are ever cached.)
+Every five minutes, the scrubber clears cached text, subject, sender, and
+reaction text after delivery to Matrix and a five-minute ingestion grace
+period. Deleted/unsent and permanently excluded content is also scrubbed.
+Pending eligible history is retained for delivery. Deletes and unsends clear
+cached bodies immediately; scrub errors block completion of the removal so
+plaintext remains eligible for cleanup.
 
-### How scrubbing works
+SQLite uses secure deletion to zero freed plaintext. PostgreSQL only clears
+columns; old bytes can remain in dead tuples until vacuuming. Attachment
+metadata, group names, and participant handles remain for routing and retries.
+The cache is not the canonical history; Messages in iCloud is.
 
-A periodic scrubber (every 5 minutes) NULLs the plaintext columns — `text`, `subject`, `sender`, `tapback_emoji` — on `cloud_message` rows, gated by two conditions:
+Connector logs replace handles with stable hash tokens and reduce URLs to
+scheme/host. **Framework and Rust diagnostics can still contain raw identifiers,
+URLs, or authentication details.** Keep logs local and redact before sharing.
 
-- **Already delivered to Matrix.** A row is only scrubbed once its GUID has a corresponding row in bridgev2's `message` table (i.e. the message reached Matrix), *or* it was deleted/unsent. A message that hasn't bridged yet is never scrubbed — bridging always comes first, so the scrubber can never blank a message out from under the backfill pipeline.
-- **Past a 5-minute grace window.** Freshly-ingested rows get a buffer (keyed on last-ingest time) so the backfill pipeline has time to read the body before scrubbing clears it.
-
-Scrubbing the local cache is not data loss: the canonical copy of every message stays in Messages in iCloud on Apple's servers. The `cloud_message` table is only a staging cache for backfill, never the source of truth.
-
-On SQLite — the primary database — the bridge also sets `_secure_delete=on` for every pooled connection, so the freed pages holding the old plaintext are zeroed rather than left readable on disk. There is no equivalent on the Postgres fallback path: the columns are NULLed identically, but the scrubbed bytes sit in dead tuples until a routine `VACUUM` reclaims them (the bridge does not run `VACUUM FULL` automatically), so plaintext stays recoverable from the data files for longer.
-
-Message **deletes and unsends** scrub the cached body right away — not waiting for the periodic tick — and are fail-closed. For inbound (Apple-side) deletes and unsends, a scrub failure makes the bridge skip emitting the Matrix removal, so the row stays scrub-eligible rather than leaking plaintext. For outbound (Matrix-initiated) redactions, the scrub failure is reported back to the framework so it won't drop its own message row before the body is cleared. The row itself is kept (soft-deleted, body NULLed) for echo detection — it isn't removed from the cache.
-
-### Logs
-
-In the bridge's own connector code, raw iMessage handles (phone numbers, email addresses) and full URLs are not written to logs: handles are replaced with a stable, non-reversible token (SHA-256 → UUID form) so you can still correlate one person across log lines without recording the PII, and URLs are reduced to scheme+host. This is anonymization at the log-write boundary — the values used for routing, handle matching, and StatusKit alias resolution are always the real ones, so functionality is unaffected.
-
-**Caveat:** this covers logs authored by this connector (`pkg/connector`), not arbitrary third-party log text. Rust diagnostics are forwarded into `bridge.log` alongside Go logs, so `corten-matrix logs` shows both. The underlying bridgev2 framework and Rust libraries can still log raw identifiers, URLs, or authentication details; `debug_disable_privacy: false` does not sanitize those lines. Keep log files local and redact them before sharing.
-
-### What is *not* scrubbed (by design)
-
-- **Attachment metadata** (`attachments_json`) — filenames, MIME types, sizes, and CloudKit record-names. The record-name is required to re-pull a file from Apple if a Matrix upload fails after bridging. The attachment *bytes* live in CloudKit, not the DB.
-- **Chat metadata** (`cloud_chat`) — group display names and participant handles, kept so a conversation's identity (name, members) survives across re-syncs without a refetch.
-
-### Debugging
-
-Everything above is on by default and has no config toggle. The single escape hatch is `debug_disable_privacy` (see [Key options](#key-options)) — a development-only switch that turns off log anonymization and the scrubber and re-fills previously-scrubbed plaintext on the next sync. Leave it `false` in any real deployment.
+`debug_disable_privacy` is development-only: it disables connector log
+anonymization and the scrubber, then re-fetches previously scrubbed CloudKit
+plaintext. It does not undo deletes/unsends or redeliver messages. Leave it
+`false` in real deployments.
 
 ## Management
 
-The `corten-matrix` CLI is the easy path — `corten-matrix start | stop | restart | status | logs` work the same on both platforms. The raw equivalents (and other knobs) are below if you'd rather wire your own thing.
+Use `corten-matrix start`, `stop`, `restart`, `status`, and `logs` on either
+platform. `uninstall-service` removes the service; `install-service` refuses to
+overwrite units without its managed marker.
+
+Each [account directory](#dual-accounts-two-apple-ids) contains `logs/bridge.log`
+(structured JSON) and `logs/bridge.stdout.log` (raw stdout/crash output).
+`corten-matrix logs` renders the structured log readably.
 
 ### macOS
 
+The LaunchAgent is `com.lrhodin.corten-matrix`. For direct service management:
+
 ```bash
-# View logs — bridge.log is structured JSON; `corten-matrix logs` renders it readably
-tail -f ~/.local/share/corten-matrix/logs/bridge.log            # first account (raw JSON)
-tail -f ~/.local/share/corten-matrix-1/logs/bridge.log          # second account, if configured
-tail -f ~/.local/share/corten-matrix/logs/bridge.stdout.log     # raw process stdout + crash output
-
-# Restart (auto-restarts via KeepAlive)
-launchctl kickstart -k gui/$(id -u)/com.lrhodin.corten-matrix
-
-# Stop until next login
-launchctl bootout gui/$(id -u)/com.lrhodin.corten-matrix
-
-# Uninstall
-corten-matrix uninstall
+launchctl kickstart -k gui/$(id -u)/com.lrhodin.corten-matrix  # restart
+launchctl bootout gui/$(id -u)/com.lrhodin.corten-matrix       # stop until next login
 ```
 
 ### Linux
 
+The systemd unit is `corten-matrix`. Setup normally uses user scope; on a fresh
+install without a user bus (such as LXC), it uses system scope instead. If an
+existing user unit's manager is unreachable, setup stops instead of creating
+a second service. The CLI detects installed scope and uses `sudo` when needed.
+
+If units exist in both scopes, setup/start/restart/install stop until you choose
+and remove one. Stop attempts both scopes; uninstall removes both and reports
+failures. For direct management, use `systemctl --user` / `journalctl --user`
+for user scope, or omit `--user` for system scope:
+
 ```bash
-# If using systemd (from corten-matrix setup / setup-beeper)
 systemctl --user status corten-matrix
 journalctl --user -u corten-matrix -f
-systemctl --user restart corten-matrix
-
-# In containers (LXC) — or anywhere `systemctl --user` can't reach a session bus —
-# setup installs a SYSTEM unit (/etc/systemd/system/corten-matrix.service) instead; drop `--user`:
-systemctl status corten-matrix
-journalctl -u corten-matrix -f
-systemctl restart corten-matrix
-
-# File logs (per account; bridge.log is structured JSON — `corten-matrix logs` renders it readably)
-tail -f ~/.local/share/corten-matrix/logs/bridge.log      # first account
-tail -f ~/.local/share/corten-matrix-1/logs/bridge.log    # second account, if configured
-
-# If running directly (debugging or non-systemd hosts)
-./corten-matrix -c ~/.local/share/corten-matrix/config.yaml
 ```
 
-You don't have to know which mode you're in: the CLI resolves the service scope from where the unit is installed, even when a user session bus is reachable, and uses `sudo` for system-scope actions when needed. If units exist in both scopes, setup/start/restart stop until you remove one; stop attempts both scopes and reports failures. The raw commands above are only for wiring your own tooling.
+Without a service, run `./corten-matrix -c <account-directory>/config.yaml`.
 
 ## Configuration
 
-Config lives in `~/.local/share/corten-matrix/config.yaml` (generated during setup). Override the data directory by setting `XDG_DATA_HOME` before running setup if you want a different location.
+Setup generates `config.yaml` in the [account data directory](#dual-accounts-two-apple-ids).
+Set `XDG_DATA_HOME` before setup to override the base directory.
 
 ### Reconfiguring without editing YAML
 
-The setup commands (`corten-matrix setup` and `corten-matrix setup-beeper`) are idempotent — re-run them any time and they detect the existing config, then walk you through interactive prompts to flip individual settings. Nothing is wiped. You can use a re-run to change:
+Rerun `corten-matrix setup` / `setup-beeper` (add `1` for the second account) to
+change the outgoing handle, CardDAV, FaceTime/Focus notices, or media conversion
+settings without wiping state. Linux also offers a backfill on/off toggle.
+macOS preserves existing backfill settings; its source-selection prompt appears
+only with a fresh database. Edit YAML to change backfill settings without a
+setup prompt.
 
-- **Preferred handle** — pick a different `tel:` / `mailto:` from the registered list
-- **External CardDAV** — change email / server / app password
-- **CloudKit backfill** — enable or disable, switch between CloudKit and `chat.db` sources
-- **FaceTime call notices** — enable or disable (`disable_facetime`)
-- **StatusKit notifications** — enable or disable the iOS 18 Focus / DND 🌙 chat-title indicator (`statuskit_notifications`)
-- **HEIC conversion / video transcoding** — toggle on or off
-
-```bash
-corten-matrix setup              # self-hosted homeserver
-corten-matrix setup-beeper       # Beeper
-```
-
-The per-chat backfill cap (`backfill.max_initial_messages`) is asked only on the **first** install, before the bridge database exists. To change it later, edit `~/.local/share/corten-matrix/config.yaml` directly.
-
-Options with no setup prompt (e.g. `read_receipts`, `typing_notifications`,
-`bridge_filtered_chats`, and `max_attachment_size_mb`) are also changed by
-editing `~/.local/share/corten-matrix/config.yaml` directly, then
-`corten-matrix restart` — see [Key options](#key-options). Enabling
-`bridge_filtered_chats` can create rooms for iCloud's **Unknown Senders**
-bucket, including delivery notices and 2FA messages, so review the expected
-room count before turning it on.
+Options without a setup prompt require editing YAML and running
+`corten-matrix restart`. This includes read receipts, typing indicators,
+attachment limits, Unknown Senders, and later changes to the initial backfill
+cap. Enabling `bridge_filtered_chats` can create rooms for delivery notices,
+2FA codes, and other iCloud **Unknown Senders** messages.
 
 ### Reset and duplicate-room recovery
 
-`corten-matrix reset` follows the upstream Beeper reset flow: it confirms the
-operation, stops the bridge, deletes the fixed `sh-imessage` Beeper
-registration, and removes the primary account's disposable config, default
-SQLite database, and bridge logs. Deleting the registration may remove Matrix
-rooms owned by it and cannot be undone by restoring local files.
+**`corten-matrix reset` deletes the primary Beeper registration, which may remove
+all Matrix rooms owned by it. Restoring local files cannot undo that deletion.**
+It also removes disposable local config, the default SQLite database, and logs.
 
-The fork's one policy change is that the default reset **preserves**
-Apple/iMessage login state. Cleanup enumerates only known disposable bridge
-artifacts, so `session.json`, keystore and trusted-peers data, anisette/state
-directories, config backup files, and unknown future Apple-state files remain
-in place. The bridge also refreshes `session.json` during shutdown, durably
-syncs the replacement, and waits for that final atomic save before disconnect
-completes. After shutdown, reset validates the complete saved session against
-its keystore before deleting the Beeper registration or local bridge database;
-if the final refresh failed, the previous atomic backup remains eligible. It
-also requires restorable token-provider credentials, a saved MobileMe delegate,
-and trust-circle state when the config uses CloudKit backfill. A never-logged-in
-database may proceed only after reset confirms that it contains no Apple login.
+The default preserves Apple/iMessage identity, config backups, and unknown files.
+Before deletion it verifies shutdown and validates the saved session/keystore,
+including CloudKit credentials when needed. A failed final session refresh can
+use the previous valid atomic backup. Validation failures stop recovery.
 
-```bash
-corten-matrix reset
-```
+Only the primary Beeper account with the default SQLite layout is supported.
+Second accounts, self-hosted installs, custom SQLite paths, PostgreSQL, and
+unknown options are rejected before stopping the bridge. Use the command,
+not `scripts/reset-bridge.sh` directly.
 
-Use the command entrypoint rather than invoking `scripts/reset-bridge.sh`
-directly. This intentionally narrow upstream-compatible command targets the
-primary account and default SQLite layout; it does not coordinate a second
-account, a self-hosted homeserver, a custom SQLite path, or an external
-PostgreSQL database. Those configurations are rejected before the bridge is
-stopped. Removed and unknown options are rejected rather than silently treated
-as a default reset.
+For duplicate-DM recovery, first investigate the affected rooms rather than
+assuming an empty room is damaged. Once a rebuild is warranted:
 
-For a clean rebuild after the DM-alias canonicalization fix:
+1. Install the binary containing the identity fix, then back up the data directory.
+2. Run `corten-matrix reset` and read the warning before confirming.
+3. Run `corten-matrix setup-beeper`; it reuses the preserved Apple session.
+4. Verify new traffic and history use one room per DM before archiving old duplicates.
 
-1. Install the binary containing the canonicalization fix **before** starting the rebuilt bridge. Otherwise the first sync can recreate the bad portal IDs.
-2. Back up the primary data directory.
-3. Run `corten-matrix reset` and read the full warning before confirming.
-4. Run `corten-matrix setup-beeper` to create a new registration. The preserved Apple/iMessage session is reused automatically.
-5. Verify that new traffic and backfill use one canonical room per DM before leaving or archiving old duplicate rooms.
-
-To deliberately discard Apple/iMessage identity as well, add
-`--delete-imessage-state`. Interactive use adds a separate exact confirmation
-(`DELETE IMESSAGE STATE`); this forces a fresh Apple login and may cause Apple
-or contacts to treat the rebuilt bridge as a new device:
-
-```bash
-corten-matrix reset --delete-imessage-state
-```
-
-This flag is not required for duplicate-DM recovery. Do not use it merely to rebuild the bridge database.
-
-> **Beeper reset warning:** deleting a Beeper registration may remove **all**
-> Matrix rooms owned by that registration, not just duplicate DMs. It is not
-> reversible by restoring local files.
+`corten-matrix reset --delete-imessage-state` also discards Apple identity and
+forces a fresh login. Interactive use requires the separate exact confirmation
+`DELETE IMESSAGE STATE`. This flag is not needed to rebuild the bridge database.
 
 ### Key options
 
-Most knobs live at the top level of the network connector config. Defaults shown match `pkg/imconfig/example-config.yaml`.
+The commented [network config](pkg/imconfig/example-config.yaml) is the reference
+for connector settings and defaults, including contacts, backfill, media,
+privacy, read receipts, and typing. Avoid copying it wholesale over an existing
+configuration.
 
-| Field | Default | What it does |
-|-------|---------|-------------|
-| `cloudkit_backfill` | `false` | Master switch for message history backfill. Requires device PIN during login to join the iCloud Keychain. |
-| `backfill_source` | `cloudkit` | `cloudkit` (default) or `chatdb` (legacy macOS fallback only — macOS-only, requires Full Disk Access). For legacy Macs prefer running the bridge on Linux with CloudKit instead. Only relevant when `cloudkit_backfill` is true. |
-| `url_previews_in_backfill` | `true` | Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing messages during backfill. Each URL costs up to three HTTP round-trips inline with conversion — set `false` to skip previews during backfill only (live inbound messages and outbound edits still build them). |
-| `displayname_template` | *(see [example-config.yaml](pkg/imconfig/example-config.yaml))* | Go template controlling how iMessage contacts appear in Matrix. Falls through `FirstName → LastName → Nickname → Phone → Email → ID`. Variables: `{{.FirstName}}`, `{{.LastName}}`, `{{.Nickname}}`, `{{.Phone}}`, `{{.Email}}`, `{{.ID}}`. |
-| `preferred_handle` | *(from login)* | Outgoing iMessage identity in URI form (`tel:+15551234567` or `mailto:user@example.com`). |
-| `read_receipts` | `true` | Send read receipts to iMessage contacts when you read their messages in Matrix. Set `false` to stop contacts from seeing when you've read their messages. Incoming read receipts from contacts are unaffected. |
-| `typing_notifications` | `true` | Send typing indicators to iMessage contacts while you compose a reply in Matrix. Set `false` to hide your typing. Incoming typing indicators are unaffected. |
-| `disable_facetime` | `false` | Don't post the incoming / missed FaceTime call notices. The bridge stays registered for FaceTime either way. |
-| `bridge_filtered_chats` | `false` | Bridge chats iCloud filed under "Unknown Senders" instead of skipping them. That filtering comes from your iCloud settings, not the bridge, and the bucket catches real conversation too — delivery notifications, 2FA codes, a business replying to you. |
-| `statuskit_share_on_startup` | `true` | Publish "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their Focus/DND state. |
-| `statuskit_notifications` | `true` | Append a 🌙 to a contact's chat title (+ ghost presence) when they toggle iOS 18 Focus / DND. The underlying StatusKit registration runs either way. |
-| `disable_icloud_contacts` | `false` | Skip iCloud CardDAV and background shared-profile refreshes. Cached shared profiles remain available; configured external CardDAV and local macOS Contacts are unaffected. Message and history sync continue. |
-| `video_transcoding` | `false` | Auto-remux non-MP4 videos (e.g. QuickTime `.mov`) to MP4 for broad Matrix client compatibility. Requires `ffmpeg`. |
-| `heic_conversion` | `false` | Auto-convert HEIC/HEIF images to JPEG. Requires `libheif`. |
-| `heic_jpeg_quality` | `95` | JPEG output quality (1–100) when HEIC conversion is enabled. |
-| `max_attachment_size_mb` | `100` | Skip attachments larger than this many MB — they're never downloaded, transcoded, or uploaded. The default matches Beeper's upload limit; the homeserver rejects anything larger, so bridging it just wastes bandwidth, CPU, and memory for a guaranteed rejection (and a multi-GB attachment can exhaust RAM on a small host, since attachments buffer in memory while downloading). Raise it **only** if your homeserver accepts bigger uploads — e.g. a self-hosted Synapse with a higher `max_upload_size` — **and** the host has the RAM to spare. On Beeper, raising it has no effect: the homeserver still rejects anything over 100 MB. |
-| `carddav.email` / `carddav.url` / `carddav.username` / `carddav.password_encrypted` | *(unset)* | External CardDAV server for contact name resolution (Google with app passwords, Nextcloud, Radicale, Fastmail, etc.). Set up via the setup flow's CardDAV prompt. When configured, used instead of iCloud contacts. |
-| `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). Setup writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
-| `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
-| `database.type` | `sqlite3-fk-wal` | bridgev2 framework option. Setup asks during first run and defaults to SQLite. SQLite is the primary database; `postgres` is an unsupported fallback. It is not deliberately broken and portability fixes are welcome, but it gets no testing, and problems specific to it are yours to diagnose. |
-| `debug_disable_privacy` | `false` | **Development only — leave `false` in any real deployment.** Turns off log anonymization and the message-body scrubber, and re-fills previously-scrubbed plaintext on the next CloudKit sync. See [Privacy](#privacy). Does not undo deletes/unsends and does not re-deliver anything to Matrix. |
+Framework settings also used by setup:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `backfill.max_initial_messages` | `2147483647` | Initial per-chat cap; this value means uncapped. |
+| `encryption.allow` | `false` | Enable end-to-bridge encryption. |
+| `database.type` | `sqlite3-fk-wal` | SQLite is primary; PostgreSQL is an unsupported, untested fallback. |
 
 ## Build from source (macOS)
 
-Instead of downloading a release you can build the bridge yourself on a Mac. This path is **macOS-only**: NAC validation data is produced by Apple's native `AAAbsintheContext` framework, which exists only on macOS, so the bridge is built and run on the same Mac. There is no Linux build-from-source path — for Linux, use the prebuilt releases.
-
-**Requirements**
-
-- macOS 13+ (Ventura or later) — `AAAbsintheContext` requires it.
-- Signed into iCloud on the Mac (so Apple recognizes the device and login works without 2FA prompts).
-- Xcode Command Line Tools (`xcode-select --install`).
-- A checkout path **without spaces** — CGO and the linker can't handle spaces in library paths.
-
-Everything else (Homebrew, Go, Rust, protobuf, libolm, libheif, tmux) is installed for you on the first build.
-
-**Build**
+Requires macOS 13+, an iCloud sign-in, Xcode Command Line Tools
+(`xcode-select --install`), and a checkout path without spaces. Linux users must
+use release binaries because the public source build uses Apple's native NAC.
 
 ```bash
 git clone https://github.com/lrhodin/corten-matrix.git
@@ -647,141 +432,54 @@ cd corten-matrix
 make
 ```
 
-`make` (the default target) installs any missing Homebrew dependencies, clones OpenBubbles `rustpush` at the SHA pinned in `third_party/rustpush-upstream.sha`, applies the bridge's source overlays, builds the Rust core (`librustpushgo.a`) with native NAC, then builds the Go bridge. The result is a single self-contained `corten-matrix` binary in the repository root.
+`make` installs missing Homebrew dependencies, prepares the pinned rustpush
+source and patches, and builds `librustpushgo.a` plus the self-contained
+`corten-matrix` binary. Run `./corten-matrix setup` or `setup-beeper` afterward.
+Other targets: `make rust`, `make bindings`, and `make clean`.
 
-From there it behaves exactly like a downloaded release — the binary is both the bridge and its management CLI:
-
-```bash
-./corten-matrix setup          # self-hosted homeserver
-./corten-matrix setup-beeper   # Beeper
-./corten-matrix help           # full command list
-```
-
-Other targets: `make clean` (remove the binary and Rust build artifacts), and `make rust` / `make bindings` to build just the Rust static library or the UniFFI Go bindings.
-
-Before changing portal identity, chat.db backfill, SMS routing, reset behavior,
-or stacked pull requests, read the contributor
-[engineering invariants](docs/ENGINEERING.md).
+Contributors should read [AGENTS.md](AGENTS.md) for editing and verification
+commands and [engineering invariants](docs/ENGINEERING.md) for lifecycle rules.
 
 ### Maintainer release builds
 
-Maintainers with the private OpenCider deploy key can manually run **Build
-release binaries** in GitHub Actions. Select Mac only, either Linux
-architecture, both Linux architectures, or All platforms. Platform-only runs
-upload binaries without creating tags or releases.
+With the private OpenCider deploy key, manually run **Build release binaries**
+in GitHub Actions. Choose Mac, either/both Linux architectures, or All platforms.
+Platform-only runs upload binaries without tags or releases.
 
-All platforms requires a release title and creates a draft containing exactly
-the universal macOS binary and the two Linux binaries. Choose a patch, minor,
-or major increment from the latest published release, or enter an exact manual
-version (also supported for a repository's first release). An existing tag is
-reusable only when it points directly to the dispatched public commit.
-Review the draft and add release notes before publishing it manually.
-
-Every build job uses the same private builder revision selected at preflight,
-represented by an opaque token in the workflow. A fresh full run resolves
-private `master` again. Private build output is withheld from public logs.
+All platforms requires a release title and creates a draft with three binaries:
+universal macOS, Linux amd64, and Linux arm64. Choose a patch/minor/major increment
+or an exact version (including for the first release). An existing tag is usable
+only if it points directly to the dispatched public commit. Review release notes
+and the draft before publishing. See [release provenance](docs/ENGINEERING.md#release-workflow-provenance)
+for private-source and tagging contracts.
 
 ## Source layout
 
-```
-cmd/corten-matrix/                          # Bridge entrypoint + management CLI dispatch
-  ├── main.go                               #   process bootstrap, config load, subcommand switch
-  ├── login_cli.go                          #   interactive iMessage CLI login (stdin → bridgev2 LoginProcess)
-  ├── ensure_config.go                      #   config bootstrap helper
-  ├── carddav_setup.go                      #   setup helper — CardDAV URL discovery + password encryption
-  ├── setup_darwin.go                       #   macOS chat.db / Full Disk Access permission dialogs
-  ├── setup_other.go                        #   non-Darwin stubs (no-ops)
-  ├── meminfo_*.go / memlimit.go            #   memory-limit detection per platform
-  └── rlimit_*.go                           #   file-descriptor limit bump
-
-pkg/cli/                                    # Management CLI (setup / start / stop / logs / bbctl / …)
-  ├── cli.go                                #   subcommand dispatch, service install (launchd/systemd), help
-  └── ui.go                                 #   terminal styling helpers
-
-pkg/connector/                              # bridgev2 connector — the main Go bridge package
-  ├── connector.go                          #   bridge lifecycle + platform detection
-  ├── client.go                             #   send/receive/reactions/edits/typing
-  ├── login.go                              #   Apple ID + external-key login flows
-  ├── commands.go                           #   `start-chat`, `logout`, `restore-chat`, `msg-debug`, …
-  ├── command_contacts.go                   #   `contacts` command — search + iMessage validation
-  ├── statuskit_commands.go                 #   StatusKit (Focus / DND) commands
-  ├── statuskit_cloudkit.go                 #   StatusKit CloudKit pull — fetches + injects peer presence records
-  ├── statuskit_alias_resolver.go           #   StatusKit alias-cluster resolver
-  ├── sharedstreams.go                      #   iCloud Shared Albums commands + sync
-  ├── shared_profile.go                     #   Name & Photo Sharing fallback
-  ├── external_carddav.go                   #   external CardDAV contact resolution
-  ├── carddav_crypto.go                     #   app-password encryption for carddav config
-  ├── cloud_contacts.go                     #   iCloud CardDAV contact sync (DSID + mmeAuthToken)
-  ├── contacts_local_darwin.go / _other.go  #   macOS Contacts framework lookups + non-Darwin stub
-  ├── contact_merge.go                      #   dedupes portals across multiple handles per contact
-  ├── chatdb.go / chatdb_guid_refresh.go    #   chat.db backfill + exact-GUID lifecycle
-  ├── chatdb_darwin.go                      #   macOS chat.db + contacts implementation
-  ├── permissions_darwin.go / _other.go     #   macOS Full Disk Access checks/prompts + stub
-  ├── bridgeadapter.go                      #   adapter to the legacy `imessage.Bridge` interface
-  ├── identity_store.go                     #   persists APSState / IDSUsers / IDSIdentity
-  ├── group_identity.go                     #   detects group portal IDs from sender + participants
-  ├── ids.go                                #   identifier ↔ portal ID conversion
-  ├── idskeys.go                            #   outbound delivery-identity precheck before send
-  ├── dbmeta.go                             #   portal/ghost/message/login metadata types
-  ├── sync_controller.go                    #   APNs-driven real-time event dispatch
-  ├── ford_cache.go                         #   Ford key cache (cross-batch MMCS dedup)
-  ├── attachment_retrier.go                 #   layer-2 MMCS retry — re-downloads failed attachments
-  ├── pending_attachment_store.go           #   DB-backed queue of attachments awaiting retry
-  ├── cloud_backfill_store.go               #   CloudKit backfill message store + paging
-  ├── recycle_bin_hints.go                  #   recoverable-message metadata for CloudKit recycle bin
-  ├── heic.go                               #   HEIC → JPEG conversion (libheif)
-  ├── audioconvert.go                       #   audio remux to M4A / CAF
-  ├── urlpreview.go                         #   OpenGraph / Twitter Card URL-preview extractor
-  ├── diskspace_unix.go / _other.go         #   free-space checks
-  ├── util.go                               #   phone normalization + group-key helpers
-  ├── capabilities.go                       #   advertised feature set
-  ├── config.go                             #   bridge config schema (YAML + `upgradeConfig` helper)
-  └── *_test.go                             #   unit tests
-
-pkg/imconfig/                               # config defaults + example-config.yaml template
-pkg/bbctl/                                  # Beeper bridge-manager (register / auth / stop / delete),
-                                            #   invoked as `corten-matrix bbctl <args>`
-
-pkg/rustpushgo/                             # Rust FFI wrapper (uniffi → cgo)
-  ├── src/lib.rs                            #   FFI surface — login / send / receive / CloudKit / Ford
-  ├── src/anisette.rs                       #   Linux remote-anisette wrapper (panic/timeout guards)
-  ├── src/local_config.rs                   #   macOS LocalMacOSConfig (IOKit → MacOSConfig + native NAC)
-  ├── src/statuskitgo.rs                    #   StatusKit invite-to-channel wrapper
-  ├── rustpushgo.go                         #   uniffi-generated Go bindings
-  └── build.rs                              #   uniffi codegen + Objective-C cc shim build
-
-nac-validation/                             # Local NAC via Apple's AppleAccount.framework (macOS-only)
-  ├── src/lib.rs                            #   Rust wrapper exposing `generate_nac_data` over Obj-C
-  ├── src/validation_data.{h,m}             #   AAAbsintheContext bindings
-  └── Cargo.toml + build.rs                 #   crate manifest + cc shim build
-
-imessage/                                   # chat.db reader — used by macOS backfill + contacts
-  ├── interface.go                          #   Bridge / API interfaces consumed by the connector
-  ├── struct.go                             #   message / chat / attachment data types
-  ├── tapback.go                            #   tapback (reaction) parsing
-  └── mac/                                  # macOS-only chat.db backend (queries, Contacts/NSAttributedString shims)
-
-ipc/
-  └── ipc.go                                # JSON-RPC over Unix socket — legacy bridge ↔ client transport
-
-scripts/                                    # Setup scripts, embedded into the binary via //go:embed
-  ├── embed.go                              #   embeds the install scripts for the management CLI
-  ├── install.sh / install-linux.sh         #   interactive setup — self-hosted bridge (macOS / Linux)
-  ├── install-beeper.sh / -linux.sh         #   interactive setup — Beeper (macOS / Linux)
-  ├── bootstrap-linux.sh                    #   installs build deps
-  ├── reset-bridge.sh                       #   confirmed DB/Beeper reset; iMessage state deletion is opt-in
-  └── patch_bindings.py / .sh               #   patches uniffi-generated Go bindings for Go 1.24+ cgo types
-```
+| Path | Purpose |
+|---|---|
+| `cmd/corten-matrix/`, `pkg/cli/` | Entrypoint, management CLI, and services |
+| `pkg/connector/` | Messaging, identity, contacts, backfill, and privacy |
+| `pkg/imconfig/`, `pkg/bbctl/` | Embedded config and Beeper management |
+| `pkg/rustpushgo/` | Rust FFI wrapper and generated Go bindings |
+| `third_party/` | Pinned rustpush source and build patches |
+| `rustpush/open-absinthe/`, `nac-validation/` | Native macOS validation |
+| `imessage/` | macOS chat.db reader |
+| `scripts/`, `tools/` | Embedded setup scripts and hardware-key extractors |
 
 ## Troubleshooting
 
-- **Contact Key Verification must be off.** The bridge registers as a new iMessage device on your Apple ID and won't function while CKV is enabled. Turn it off before logging in: on iPhone, **Settings → [your name] → Contact Key Verification**; on a Mac, **System Settings → [your name] → Contact Key Verification**.
-- **chat.db backfill silently does nothing.** The bridge is missing Full Disk Access — grant it under **System Settings → Privacy & Security → Full Disk Access** (see [Receiving messages](#receiving-messages)).
-- **The extractor app won't open on the Mac.** Gatekeeper blocks the ad-hoc-signed app on first launch — see the Gatekeeper note under [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac) for the per-macOS-version override.
-- **"database is locked" in the log.** SQLite allows one writer, and the bridge writes hard during a first backfill — CloudKit sync, the backfill queue and the crypto store at once. The bridge now serializes its own SQLite pool to a single connection at startup (you'll see a `[database]` line if it had to override a higher `max_open_conns`), which removes the collisions. If you still see it, something else is writing to the same file — a second `corten-matrix` process, or a CLI subcommand run against a data dir whose service is up.
-- **A conversation is stuck empty while the rest backfilled fine.** A failed batch send used to leave a portal marked complete with nothing in it, permanently. The bridge now re-arms those on startup — look for `Re-armed backfill for portals that were marked done with no bridged messages`. It repairs each affected portal once.
-- **Reading logs.** `corten-matrix logs` (or `logs 1` for the second account) pretty-prints the live log. On disk, `logs/bridge.log` is structured JSON (rotated), and raw process stdout / crash output lands in `logs/bridge.stdout.log` — per account under `~/.local/share/corten-matrix/` and `~/.local/share/corten-matrix-1/`.
-- **Is it running at all?** `corten-matrix status`, then `corten-matrix restart` if needed — raw `launchctl` / `systemctl` equivalents are under [Management](#management).
+- **Contact Key Verification:** turn it off under your Apple account settings
+  before login (iPhone Settings or Mac System Settings → your name → Contact Key
+  Verification).
+- **chat.db history is empty:** check [Full Disk Access](#receiving-messages).
+- **Extractor blocked:** follow the [Gatekeeper instructions](#step-1-extract-hardware-key-one-time-on-a-mac).
+- **Database locked:** the bridge serializes its SQLite pool. Check for another
+  bridge process or CLI writing the same database.
+- **A conversation stays empty:** startup re-arms portals marked done without
+  bridged messages. Look for the re-arm log and inspect [sync-status](#inspecting-backfill-status)
+  before considering a reset.
+- **Service problems:** start with `corten-matrix status` and `corten-matrix logs`;
+  see [Management](#management) for log locations and platform commands.
 
 ## Chat With Us
 
