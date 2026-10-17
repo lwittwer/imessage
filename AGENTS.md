@@ -17,9 +17,13 @@ escrow recovery, or branch/release workflows.
 ## Editing
 
 - Never hand-edit `pkg/rustpushgo/rustpushgo.go` or `pkg/rustpushgo/rustpushgo.h`.
-  Run `make bindings`, then `make build`. Use `uniffi-bindgen-go` tag
-  `v0.2.2+v0.25.0` for UniFFI 0.25.0; check `scripts/patch_bindings.py` when
-  generated Go changes.
+  Run `make bindings`, then `make build`. Check `scripts/patch_bindings.py`
+  when generated Go changes. `make bindings` needs the generator matching
+  UniFFI 0.25.0:
+
+  ```bash
+  cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.2+v0.25.0
+  ```
 - `third_party/rustpush-upstream/` is prepared from
   `third_party/rustpush-upstream.sha`. Change the pin, Makefile patches, or
   repo-owned overlays/wrappers instead of the prepared tree. `corten-matrix`,
@@ -29,6 +33,9 @@ escrow recovery, or branch/release workflows.
   `IMConfig`, and `upgradeConfig` in `pkg/connector/config.go`. The embedded YAML
   is the default config source of truth. Override framework `bridge:` defaults
   in `IMConnector.Start()` after loading YAML.
+- Changes to portal IDs, DB metadata, login/session state, or account/service
+  layout can require a reset; say so explicitly. Start with
+  `pkg/connector/ids.go`, `dbmeta.go`, `identity_store.go`, and `pkg/cli/cli.go`.
 
 ## Verification
 
@@ -40,6 +47,8 @@ escrow recovery, or branch/release workflows.
   CGO_CFLAGS="-I/opt/homebrew/include" CGO_LDFLAGS="-L/opt/homebrew/lib -L$(pwd)" go test ./pkg/connector
   ```
 
+- Rust tests: `cargo test --manifest-path <crate>/Cargo.toml` for each touched
+  crate (`pkg/rustpushgo`, `rustpush/open-absinthe`, `nac-validation`).
 - Release CI checks: `bash scripts/tests/next-release-tag-test.sh` and
   `bash .github/workflows/tests/build-release-binaries-contract.sh`.
   These use synthetic inputs and do not validate private builds.

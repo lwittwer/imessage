@@ -33,7 +33,8 @@ Contact canonicalization preserves these distinctions:
   transport from portal identity only for the explicit legacy metadata fallback.
 
 Alias ordering and concurrent first messages must produce the same canonical
-portal choice.
+portal choice. Policy: `pkg/connector/contact_merge.go`; metadata:
+`pkg/connector/dbmeta.go`.
 
 ## Exact chat.db GUIDs and backfill
 
@@ -48,40 +49,51 @@ as `(smsft)`. Normalized portal identifiers cannot reconstruct them.
   never midway through backward pagination. Empty legacy metadata retains the
   contact-aware lookup across `any`, `iMessage`, and `SMS` variants.
 - Deduplicate by message GUID, including duplicates across exact GUIDs,
-  backward pages, forward fetches, and live APNs delivery.
+  backward pages, forward fetches, and live APNs delivery. Keep bridge-level
+  `AggressiveDeduplication` on for forward fetches and multi-GUID backward
+  sessions.
+
+Code: `pkg/connector/chatdb.go`, `pkg/connector/chatdb_guid_refresh.go`.
 
 ## Current SMS/iMessage routing
 
 The newest known chat.db state determines the current delivery service;
-older merged GUID histories contribute backfill only.
+older merged GUID histories contribute backfill only. The newest-first ordering
+of `GetChatsWithMessagesAfter` in `imessage/mac/messages.go` makes the first
+representative authoritative.
 
 - Never OR historical SMS values or infer current service from `ChatDBGUIDs`.
 - Persist both transitions: SMS sets `IsSms` and `SMSDestination`; iMessage
   clears both. Seed chat.db routing only after canonicalization and successful
   existing-room inspection; newer live APNs routing in the same session wins.
-- Concurrent route and GUID persistence must not overwrite each other's updates.
+- Serialize route and GUID persistence with `IMClient.smsRoutePersistMu`.
   Save failure preserves the newer runtime route and retryable portal metadata.
+
+Code: `pkg/connector/client.go`, `pkg/connector/carrier_route.go`,
+`pkg/connector/chatdb_guid_refresh.go`.
 
 ## CloudKit eligibility and scrubbing
 
-`bridge_filtered_chats` defaults off. Readers, reports, and scrub/backfill gates
-must share eligibility rules:
+`bridge_filtered_chats` defaults off. When enabled, chats iCloud files under
+Unknown Senders (delivery notices, 2FA codes) become eligible for rooms.
+Readers, `sync-status`, and scrub/backfill gates must share one eligibility
+predicate. Several CloudKit source chats can share a portal; these rules keep
+one sibling from leaking or hiding another's history:
 
-- Classify known source chats by `cloud_message.chat_id`: filtered/deleted
-  sources fail closed without suppressing an unfiltered sibling's history.
-- Empty/unrecognized source IDs retain portal-level compatibility only when
-  every live sibling is unfiltered; synthetic/recycle metadata must not disable it.
-- A known source remapped to another portal cannot authorize history through
-  the old portal. Keep it unreadable but preserve plaintext for authoritative
-  re-ingest, distinct from permanently excluded content.
-- Scrub candidates and writes stay scoped to login, receiver, and portal.
-  Ordinary delivered-body scrubbing requires exact message IDs and portal-scoped
-  Matrix delivery proof valid at the time of the write; a prefetched set is
-  only a prefilter.
-  Deleted witnesses and remapped sources cannot authorize a later chunk.
-- Pending initial backfills and active or concurrently starting restores retain
-  required plaintext. Permanently filtered/deleted rows remain eligible for
-  cleanup independently of those holds.
+- Filter each message by its known `cloud_message.chat_id`. A filtered or
+  deleted source fails closed, but must not suppress an unfiltered sibling.
+- Legacy rows with an empty or unrecognized source ID fall back to portal-level
+  eligibility only when every live sibling is unfiltered. Synthetic/recycle
+  metadata rows must not disable that fallback.
+- A known source now mapped to another portal cannot authorize history through
+  the old one. Keep such rows unreadable but retain their plaintext for
+  re-ingest; they are recoverable, unlike permanently excluded rows.
+- Scrubbing is scoped to login, receiver, and portal. An ordinary delivered
+  body is scrubbed only with its exact message ID and Matrix delivery proof for
+  that portal, rechecked in the same write. A prefetched delivered set is only a
+  prefilter; a deleted witness or remapped source cannot authorize a later chunk.
+- Pending initial backfills and active or starting restores hold the plaintext
+  they need. Permanently filtered/deleted rows may still be cleaned up.
 - Forward-backfill cancellation releases acquired capacity and bootstrap
   accounting, including when cancellation races acquisition. Unfinished history
   remains recoverable; retries cannot outlive their portal/client lifecycle.
@@ -126,6 +138,8 @@ Reset implementation must preserve these boundaries:
   deletion. Beeper deletion failure preserves local bridge state; verified
   not-found is already success in `bbctl delete`.
 
+Behavior tests: `pkg/cli/reset_test.go`.
+
 Live investigation and mutation authorization rules are in
 [AGENTS](../AGENTS.md#local-investigation).
 
@@ -155,9 +169,31 @@ On Linux, resolve scope from installed units, not just bus reachability:
 - `install-service` overwrites only managed units, preserving runtime identity
   and the XDG data directory. Reset reuses scope-aware stop verification.
 
+Code and tests: `pkg/cli/cli.go`, `pkg/cli/supervisor_test.go`,
+`pkg/cli/unit_test.go`, `scripts/reset-bridge.sh`.
+
+## Intentional upstream deviations
+
+Upstream merges must not silently reintroduce these:
+
+- **Forward-backfill delayed retry** stays removed. Enqueue acceptance does not
+  prove dispatch, the forced resync can drop before `FetchMessages`, and the
+  timer can cross client generations. Cancellation means portal deletion or
+  shutdown; startup reconciliation and backfill-task recovery cover the rest.
+- **Build-time source patches** for the omnisette provider and
+  `disable_icloud_contacts` are not retained. The provider adaptation is in
+  tracked source; the contacts patch would rewrite tracked Go/YAML.
+- **Scrubber adaptations** keep upstream's chunked, index-backed pass but add
+  the login/receiver/portal scoping, remap, and restore holds above.
+- **Management rooms** match upstream. Do not add migration, notice-replay, or
+  welcome-retry machinery for a disposable room.
+- **Release versioning**: manual versions skip the latest-release lookup, and
+  existing tags must point to the dispatched commit even for manual versions.
+
 ## Branch and stacked-PR publication
 
-`main` mirrors upstream master; active automation belongs on `beta-latest`.
+`main` mirrors upstream master; active automation, including
+`.github/workflows/codex-review-on-ready.yml`, belongs on `beta-latest`.
 Stacked PR heads and bases must remain consistent after rewrites.
 
 Publish rewritten stacks with one atomic push and explicit leases:

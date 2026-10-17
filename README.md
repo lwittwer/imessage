@@ -188,12 +188,15 @@ an interactive picker.
 
 | Command | What it does |
 |---|---|
-| `start-chat` | Open a new iMessage DM. With no arguments, the bot walks you through phone vs. email and explains the country-code format. With an argument (`start-chat +15551234567` or `start-chat someone@icloud.com`) it skips the picker. |
-| `contacts` | Search your synced contacts by name (iCloud, external CardDAV, or local macOS Contacts depending on `backfill_source` and `carddav` settings) and reply with a number to open a chat. Different from `start-chat` — use this when you don't remember the number/email. Alias: `find`. |
-| `restore-chat` | List iMessage chats in the recycle bin. Reply with a number to bring one back, including its history. |
-| `sync-status` | Show CloudKit zone state, ingested chats, bridgeable/delivered/pending messages, excluded rows, and backfill queue progress. |
-| `logout` | Sign out of iMessage. Lists active handles, you reply with a number (or `all`). The bot then walks you through the manual step at `appleid.apple.com → Devices` to fully revoke the bridge from Apple's servers. |
+| `start-chat [handle]` | Open a DM. Without an argument, a picker asks for a phone number or email. |
+| `contacts` (alias `find`) | Search synced contacts by name and reply with a number to open a chat. |
+| `restore-chat` | List recycle-bin chats; reply with a number to restore one with its history. |
+| `sync-status` | Show [backfill status](#inspecting-backfill-status). |
+| `logout` | Pick a handle (or `all`) to sign out; see [Logging out](#logging-out). |
 | `help` | Full command list, grouped by section. |
+
+Contacts come from iCloud, external CardDAV, or local macOS Contacts, depending
+on `backfill_source` and `carddav`.
 
 ### Phone-number format for `start-chat`
 
@@ -203,16 +206,11 @@ Spaces, dashes, and parentheses are stripped. Email addresses also work;
 
 ### Logging out
 
-`logout` does the bridge-side teardown automatically — disconnects from Apple, removes the login from the bridge, kicks you from portals, and wipes the local session backup so a re-login starts from a clean slate.
-
-The bridge has no API to deregister your IDS identity from Apple, so the success message walks you through the final step:
-
-1. Sign in at <https://appleid.apple.com>.
-2. Go to **Devices**.
-3. Find the entry for the bridge (often shown as a Mac, sometimes named "Apple Device").
-4. Click **Remove from account**.
-
-Until you do step 4, Apple still considers the bridge a registered iMessage device.
+`logout` disconnects from Apple, removes the bridge login, kicks you from
+portals, and wipes the local session backup. Apple has no deregistration API,
+so finish manually: sign in at <https://appleid.apple.com>, open **Devices**,
+find the bridge (often a Mac or "Apple Device"), and choose **Remove from
+account**. Until then, Apple still treats the bridge as an iMessage device.
 
 ## FaceTime
 
@@ -233,17 +231,16 @@ in the [config reference](pkg/imconfig/example-config.yaml).
 
 ## Shared Albums
 
-iCloud Shared Albums (Photo Streams) you subscribe to surface as dedicated rooms with the album's photos and videos backfilled. Use:
+Subscribed iCloud Shared Albums (Photo Streams) become rooms with their photos
+and videos backfilled. Commands are listed under **Shared Streams** in `!im help`:
 
 | Command | What it does |
-|---------|-------------|
-| `shared-albums` | Browse available Shared Albums; pick one, then pick assets to download. |
-| `shared-subscribe <album-id>` | Subscribe to a Shared Album by ID so the bridge watches it for new assets. |
-| `shared-subscribe-token <token>` | Subscribe via the one-time invitation token from an iCloud share URL (`icloud.com/sharedalbum/...`). |
-| `shared-unsubscribe <album-id>` | Unsubscribe from an album so the bridge stops watching it. |
-| `shared-state` | Dump current Shared Streams state as JSON (debugging). |
-
-A full list lives under `!im help` in the **Shared Streams** section.
+|---|---|
+| `shared-albums` | Browse albums, then pick assets to download. |
+| `shared-subscribe <album-id>` | Watch an album for new assets. |
+| `shared-subscribe-token <token>` | Subscribe with the token from an `icloud.com/sharedalbum/...` invitation URL. |
+| `shared-unsubscribe <album-id>` | Stop watching an album. |
+| `shared-state` | Dump Shared Streams state as JSON for debugging. |
 
 ## Image and video conversion
 
@@ -261,8 +258,10 @@ Attachments over `max_attachment_size_mb` (default 100) are skipped before
 download. Raise this only if the homeserver accepts larger files and the host
 has enough RAM; attachments are buffered in memory.
 
-Setup installs `libheif` regardless of the conversion setting, and `ffmpeg`
-when video conversion is enabled.
+Setup installs `libheif` when HEIC conversion is enabled and `ffmpeg` when
+video conversion is enabled. The bridge loads `libheif` at runtime and also
+uses it for HEIC dimensions and thumbnails; without it, HEIC files pass through
+unconverted and without thumbnails.
 
 ## How It Works
 
