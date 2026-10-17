@@ -33,9 +33,6 @@ escrow recovery, or branch/release workflows.
   `IMConfig`, and `upgradeConfig` in `pkg/connector/config.go`. The embedded YAML
   is the default config source of truth. Override framework `bridge:` defaults
   in `IMConnector.Start()` after loading YAML.
-- Changes to portal IDs, DB metadata, login/session state, or account/service
-  layout can require a reset; say so explicitly. Start with
-  `pkg/connector/ids.go`, `dbmeta.go`, `identity_store.go`, and `pkg/cli/cli.go`.
 
 ## Verification
 

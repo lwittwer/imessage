@@ -6,7 +6,8 @@ for operator workflows and [AGENTS](../AGENTS.md) for editing and verification
 commands.
 
 Changes to persisted IDs, metadata, sessions, or account/service layout must
-make any migration/reset requirements explicit.
+make any migration/reset requirements explicit. Likely places:
+`pkg/connector/ids.go`, `dbmeta.go`, `identity_store.go`, and `pkg/cli/cli.go`.
 
 ## Escrow bottle recovery
 
@@ -49,9 +50,9 @@ as `(smsft)`. Normalized portal identifiers cannot reconstruct them.
   never midway through backward pagination. Empty legacy metadata retains the
   contact-aware lookup across `any`, `iMessage`, and `SMS` variants.
 - Deduplicate by message GUID, including duplicates across exact GUIDs,
-  backward pages, forward fetches, and live APNs delivery. Keep bridge-level
-  `AggressiveDeduplication` on for forward fetches and multi-GUID backward
-  sessions.
+  backward pages, forward fetches, and live APNs delivery. Currently provided
+  by bridge-level `AggressiveDeduplication` for forward fetches and multi-GUID
+  backward sessions.
 
 Code: `pkg/connector/chatdb.go`, `pkg/connector/chatdb_guid_refresh.go`.
 
@@ -66,8 +67,9 @@ representative authoritative.
 - Persist both transitions: SMS sets `IsSms` and `SMSDestination`; iMessage
   clears both. Seed chat.db routing only after canonicalization and successful
   existing-room inspection; newer live APNs routing in the same session wins.
-- Serialize route and GUID persistence with `IMClient.smsRoutePersistMu`.
-  Save failure preserves the newer runtime route and retryable portal metadata.
+- Concurrent route and GUID persistence must not overwrite each other's
+  updates (currently serialized by `IMClient.smsRoutePersistMu`). Save failure
+  preserves the newer runtime route and retryable portal metadata.
 
 Code: `pkg/connector/client.go`, `pkg/connector/carrier_route.go`,
 `pkg/connector/chatdb_guid_refresh.go`.
@@ -174,19 +176,21 @@ Code and tests: `pkg/cli/cli.go`, `pkg/cli/supervisor_test.go`,
 
 ## Intentional upstream deviations
 
-Upstream merges must not silently reintroduce these:
+Why the fork currently differs from upstream. Revisit these with the reasons
+in mind rather than reverting them silently during a merge.
 
-- **Forward-backfill delayed retry** stays removed. Enqueue acceptance does not
-  prove dispatch, the forced resync can drop before `FetchMessages`, and the
-  timer can cross client generations. Cancellation means portal deletion or
+- **Forward-backfill delayed retry** was dropped: enqueue acceptance did not
+  prove dispatch, the forced resync could drop before `FetchMessages`, and the
+  timer could cross client generations. Cancellation means portal deletion or
   shutdown; startup reconciliation and backfill-task recovery cover the rest.
 - **Build-time source patches** for the omnisette provider and
   `disable_icloud_contacts` are not retained. The provider adaptation is in
   tracked source; the contacts patch would rewrite tracked Go/YAML.
 - **Scrubber adaptations** keep upstream's chunked, index-backed pass but add
   the login/receiver/portal scoping, remap, and restore holds above.
-- **Management rooms** match upstream. Do not add migration, notice-replay, or
-  welcome-retry machinery for a disposable room.
+- **Management rooms** match upstream. The integration did not add migration,
+  notice-replay, or welcome-retry machinery: the room is disposable, and those
+  gaps did not justify fork-specific lifecycle state at the time.
 - **Release versioning**: manual versions skip the latest-release lookup, and
   existing tags must point to the dispatched commit even for manual versions.
 
