@@ -2058,20 +2058,17 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 	if portal.RoomType == database.RoomTypeDM {
 		base = capsDM
 	}
-	if !c.Main.Config.ReadReceipts || !c.Main.Config.TypingNotifications {
+	// ReadReceipts stays advertised regardless of read_receipts: Matrix read
+	// receipts always sync read state to the user's own Apple devices
+	// (HandleMatrixReadReceipt); the option only withholds them from contacts.
+	if !c.Main.Config.TypingNotifications {
 		modified := *base
-		modified.ReadReceipts = c.Main.Config.ReadReceipts
-		modified.TypingNotifications = c.Main.Config.TypingNotifications
+		modified.TypingNotifications = false
 		// Vary the capability ID so bridgev2's UpdateCapabilities re-advertises
 		// the reduced feature set. It short-circuits when caps.GetID() matches
 		// the stored CapState.ID, so reusing base.ID would leave clients showing
 		// stale support after the flag is toggled. Mirrors the "+dm" convention.
-		if !c.Main.Config.ReadReceipts {
-			modified.ID += "+nordr"
-		}
-		if !c.Main.Config.TypingNotifications {
-			modified.ID += "+notyp"
-		}
+		modified.ID += "+notyp"
 		return &modified
 	}
 	return base
@@ -7179,11 +7176,12 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 }
 
 func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
-	if c.client == nil || !c.Main.Config.ReadReceipts {
+	if c.client == nil {
 		return nil
 	}
-	conv := c.portalToConversation(receipt.Portal)
-	if conv.IsSms {
+	conv, ok := receiptConversation(c.portalToConversation(receipt.Portal), c.handle,
+		c.Main.Config.ReadReceipts, receipt.ExactMessage != nil)
+	if !ok {
 		return nil
 	}
 	var forUuid *string
@@ -7213,6 +7211,25 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		return err
 	}
 	return nil
+}
+
+// receiptConversation picks the audience for a Matrix read receipt. The user's
+// own Apple devices always receive it so their read state follows Matrix.
+// Contacts receive it only for iMessage chats with notifyContacts set: carrier
+// (SMS/RCS/MMS) contacts can't receive iMessage receipts, and read_receipts:
+// false withholds them. An own-devices-only receipt is sent with the user's
+// handle as the sole participant, which rustpush delivers to the account's
+// other devices. It needs an exact message: without one rustpush would mark a
+// random message ID read. Returns false when nothing should be sent.
+func receiptConversation(conv rustpushgo.WrappedConversation, self string, notifyContacts, haveExact bool) (rustpushgo.WrappedConversation, bool) {
+	if notifyContacts && !conv.IsSms {
+		return conv, true
+	}
+	if !haveExact {
+		return conv, false
+	}
+	conv.Participants = []string{self}
+	return conv, true
 }
 
 func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {

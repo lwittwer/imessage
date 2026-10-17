@@ -114,7 +114,9 @@ type IMConfig struct {
 
 	// ReadReceipts controls whether the bridge sends read receipts to iMessage
 	// contacts when you mark a message as read in Matrix. When false, iMessage
-	// contacts will not see the "Read" indicator for your messages. Incoming
+	// contacts will not see the "Read" indicator for your messages. Your own
+	// Apple devices are marked read either way, for iMessage and SMS/RCS chats;
+	// for SMS/RCS, your iPhone's own read-receipt setting then applies. Incoming
 	// read receipts from iMessage contacts are always forwarded to Matrix.
 	// Default is true.
 	ReadReceipts bool `yaml:"read_receipts"`
