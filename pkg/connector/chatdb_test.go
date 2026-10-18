@@ -1018,7 +1018,7 @@ func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentC
 		message("KEPT-GUID", 100),
 		message("UNSENT-STUB-GUID", 200),
 		message("UNSENT-ROUTED-GUID", 300),
-		message("DELETED-ELSEWHERE-GUID", 400),
+		message("UNSENT-ALIAS-GUID", 400),
 		message("PORTAL-DELETED-GUID", 500),
 	}}
 	return client, portal, api
@@ -1047,8 +1047,9 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID), true)
-	// A tombstone routed to another portal must not hide this portal's copy.
-	insertDeletedCloudMessage(t, client.cloudStore, "DELETED-ELSEWHERE-GUID", "tel:+15550000002", true)
+	// A GUID names one message, so a tombstone stored under an alias portal
+	// ID (gid:<group_id>, merged-handle DM) still applies.
+	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ALIAS-GUID", "tel:+15550000002", true)
 	// Neither does a portal-level soft delete: the recreated room would get
 	// chat.db history with only the live-persisted messages missing.
 	insertDeletedCloudMessage(t, client.cloudStore, "PORTAL-DELETED-GUID", string(portal.ID), false)
@@ -1065,10 +1066,28 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 		for _, msg := range resp.Messages {
 			got = append(got, msg.ID)
 		}
-		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("DELETED-ELSEWHERE-GUID"), makeMessageID("PORTAL-DELETED-GUID")}
+		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("PORTAL-DELETED-GUID")}
 		if !slices.Equal(got, want) {
 			t.Fatalf("forward=%v FetchMessages returned %v, want %v", params.Forward, got, want)
 		}
+	}
+}
+
+func TestChatDBForwardHasMoreCountsTombstonedMessages(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "UNSENT-STUB-GUID"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&chatDB{api: api}).FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)},
+		Count: len(api.messages),
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Messages) != len(api.messages)-1 || !resp.HasMore {
+		t.Fatalf("forward page = %d messages, hasMore %v; want %d and true", len(resp.Messages), resp.HasMore, len(api.messages)-1)
 	}
 }
 

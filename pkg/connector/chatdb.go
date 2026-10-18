@@ -226,7 +226,8 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// bridgev2 deletes the bridge row after a successful Matrix redaction, so
 	// AggressiveDeduplication cannot catch an unsent message whose chat.db row
 	// still has its body. Fail the page rather than risk re-bridging it.
-	messages, err = c.dropDeletedChatDBMessages(ctx, params.Portal, messages)
+	rawMessageCount := len(messages)
+	messages, err = c.dropDeletedChatDBMessages(ctx, messages)
 	if err != nil {
 		return nil, err
 	}
@@ -236,9 +237,9 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		return messages[i].Time.Before(messages[j].Time)
 	})
 
-	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", rawMessageCount).Msg("Got messages from chat.db")
 	nextCursor := encodeChatDBBackfillCursor(messagesByGUID, count, params.Forward)
-	hasMore := len(messages) >= count
+	hasMore := rawMessageCount >= count
 	if !params.Forward {
 		hasMore = nextCursor != ""
 	}
@@ -490,8 +491,8 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 }
 
 // dropDeletedChatDBMessages removes messages with a per-message delete
-// tombstone (Matrix-initiated unsend or Apple-side delete) for this portal.
-func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridgev2.Portal, messages []*imessage.Message) ([]*imessage.Message, error) {
+// tombstone (Matrix-initiated unsend or Apple-side delete).
+func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, messages []*imessage.Message) ([]*imessage.Message, error) {
 	if c.cloudStore == nil || len(messages) == 0 {
 		return messages, nil
 	}
@@ -501,7 +502,7 @@ func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridge
 			guids = append(guids, msg.GUID)
 		}
 	}
-	deleted, err := c.cloudStore.deletedMessageGUIDsInPortal(ctx, string(portal.ID), guids)
+	deleted, err := c.cloudStore.deletedMessageGUIDs(ctx, guids)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check chat.db messages for delete tombstones: %w", err)
 	}

@@ -1061,11 +1061,11 @@ func TestRestoreChatKeepsMessageLevelDeletes(t *testing.T) {
 	}
 	// A CloudKit message tombstone that arrives after the portal delete must
 	// still be recorded as a per-message delete, without moving updated_ts.
-	if err := store.deleteMessageBatch(ctx, []string{"apple-deleted"}); err != nil {
+	const updatedTS = int64(12345)
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET updated_ts=$1 WHERE guid='apple-deleted'`, updatedTS); err != nil {
 		t.Fatal(err)
 	}
-	var updatedTS int64
-	if err := db.QueryRow(ctx, `SELECT updated_ts FROM cloud_message WHERE guid='apple-deleted'`).Scan(&updatedTS); err != nil {
+	if err := store.deleteMessageBatch(ctx, []string{"apple-deleted"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1094,23 +1094,59 @@ func TestRestoreChatKeepsMessageLevelDeletes(t *testing.T) {
 	}
 }
 
-func TestEnsureSchemaClassifiesLegacyDeleteStubs(t *testing.T) {
+func TestEnsureSchemaClassifiesLegacyMessageDeletes(t *testing.T) {
 	ctx := context.Background()
 	db, store := newTestCloudBackfillStore(t)
+	if _, err := db.Exec(ctx, `DELETE FROM cloud_maintenance WHERE task=$1`, legacyMessageDeleteClassificationTask); err != nil {
+		t.Fatal(err)
+	}
+	// dm-a: an unsend between live messages. dm-b: a portal-level delete
+	// followed by new live messages in the recreated room.
 	if _, err := db.Exec(ctx, `
 		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
 		VALUES ($1, 'legacy-stub', NULL, 1, FALSE, TRUE, 1, 1),
-		       ($1, 'legacy-routed', 'tel:+15550000001', 1, FALSE, TRUE, 1, 1),
-		       ($1, 'live', 'tel:+15550000001', 1, FALSE, FALSE, 1, 1)`,
+		       ($1, 'a-live-old', 'dm-a', 100, FALSE, FALSE, 1, 1),
+		       ($1, 'a-unsent', 'dm-a', 200, FALSE, TRUE, 1, 1),
+		       ($1, 'a-live-new', 'dm-a', 300, FALSE, FALSE, 1, 1),
+		       ($1, 'b-portal-deleted', 'dm-b', 100, FALSE, TRUE, 1, 1),
+		       ($1, 'b-live-new', 'dm-b', 300, FALSE, FALSE, 1, 1)`,
 		testSQLLoginID); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ensureSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for guid, want := range map[string]bool{"legacy-stub": true, "legacy-routed": false, "live": false} {
+	for guid, want := range map[string]bool{
+		"legacy-stub": true, "a-unsent": true, "a-live-old": false,
+		"b-portal-deleted": false, "b-live-new": false,
+	} {
 		if _, messageDeleted, _ := cloudMessageDeleteState(t, db, guid); messageDeleted != want {
 			t.Fatalf("%s message_deleted = %v, want %v", guid, messageDeleted, want)
 		}
+	}
+}
+
+func TestRecycleBinUndeleteKeepsMessageLevelDeletes(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	const portalID = "tel:+15550000001"
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
+		VALUES ($1, 'kept', $2, 1000, FALSE, 1, 1), ($1, 'unsent', $2, 2000, TRUE, 1, 1)`,
+		testSQLLoginID, portalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.softDeleteMessageByGUID(ctx, "unsent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := store.undeleteRecycleBinMessages(ctx, portalID, []string{"kept", "unsent"})
+	if err != nil || restored != 1 {
+		t.Fatalf("restored = %d, %v; want 1", restored, err)
+	}
+	if deleted, _, _ := cloudMessageDeleteState(t, db, "unsent"); !deleted {
+		t.Fatal("recycle-bin recovery revived an unsent message")
 	}
 }

@@ -5757,33 +5757,9 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	// recycle bin. The rows were soft-deleted during CloudKit sync when their
 	// parent chat was deleted.
 	nowMS := time.Now().UnixMilli()
-	restored := 0
-	const chunkSize = 500
-	for i := 0; i < len(allGUIDs); i += chunkSize {
-		end := i + chunkSize
-		if end > len(allGUIDs) {
-			end = len(allGUIDs)
-		}
-		chunk := allGUIDs[i:end]
-
-		placeholders := make([]string, len(chunk))
-		args := make([]any, 0, len(chunk)+3)
-		args = append(args, c.cloudStore.loginID, portalID, nowMS)
-		for j, guid := range chunk {
-			placeholders[j] = fmt.Sprintf("$%d", j+4)
-			args = append(args, guid)
-		}
-		query := fmt.Sprintf(
-			`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND guid IN (%s) AND deleted=TRUE`,
-			strings.Join(placeholders, ","),
-		)
-		result, execErr := c.cloudStore.db.Exec(ctx, query, args...)
-		if execErr != nil {
-			log.Warn().Err(execErr).Msg("Failed to undelete recovered messages from recycle bin")
-			continue
-		}
-		n, _ := result.RowsAffected()
-		restored += int(n)
+	restored, err := c.cloudStore.undeleteRecycleBinMessages(ctx, portalID, allGUIDs)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to undelete recovered messages from recycle bin")
 	}
 
 	log.Info().Str("portal_id", logPortalID).Int("recycle_bin_guids", len(allGUIDs)).
@@ -7335,8 +7311,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
-	// while preserving the UUID for echo detection.
-	if c.cloudStore != nil {
+	// while preserving the UUID for echo detection. Only after Apple accepted
+	// the unsend, matching the siblings above: on failure the message still
+	// exists, and the returned error keeps its bridge row.
+	if err == nil && c.cloudStore != nil {
 		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
 			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
 				Msg("Failed to soft-delete cloud_message after outbound unsend")
