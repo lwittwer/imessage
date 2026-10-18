@@ -2788,14 +2788,14 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	overrideRuleID := botMXID + ".dont_notify"
 	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.OverrideRule, overrideRuleID,
 		&mautrix.ReqPutPushRule{
-			Conditions: []pushrules.PushCondition{
+			Conditions: []*pushrules.PushCondition{
 				{
 					Kind:    pushrules.KindEventMatch,
 					Key:     "sender",
 					Pattern: botMXID,
 				},
 			},
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			Actions: []*pushrules.PushAction{{Action: pushrules.ActionDontNotify}},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot override push rule")
@@ -2805,7 +2805,7 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	// Sender rule (secondary catch-all for homeservers without override support).
 	err = asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
 		&mautrix.ReqPutPushRule{
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			Actions: []*pushrules.PushAction{{Action: pushrules.ActionDontNotify}},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
@@ -4644,7 +4644,7 @@ func redactMessagePartsWithBot(
 	if portal == nil || bot == nil || len(parts) == 0 {
 		return errors.New("missing portal, bot intent, or message parts")
 	}
-	result := portal.Internal().RedactMessageParts(ctx, parts, bot, timestamp)
+	result := portal.Internal().RedactMessageParts(ctx, parts, bot, timestamp, "", false)
 	if !result.Success {
 		if result.Error != nil {
 			return result.Error
