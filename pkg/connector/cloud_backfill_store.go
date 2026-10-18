@@ -338,6 +338,9 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		// soft-deleted with its whole portal. Restore-chat revives portal
 		// deletes only, and chat.db backfill skips only these rows.
 		{"message_deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
+		// Head GUID of an oversized outbound message when this row is one of
+		// its continuation chunks. See markContinuationChunk.
+		{"continuation_of", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		exists, err := columnExists(ctx, s.db, "cloud_message", col.name)
 		if err != nil {
@@ -411,9 +414,9 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if err := s.classifyLegacyMessageDeletes(ctx); err != nil {
 		return fmt.Errorf("failed to classify legacy message deletes: %w", err)
 	}
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_message_deleted_idx
-		ON cloud_message (login_id, UPPER(guid)) WHERE message_deleted=TRUE`); err != nil {
-		return fmt.Errorf("failed to create cloud message per-message delete index: %w", err)
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_tombstone_idx
+		ON cloud_message (login_id, UPPER(guid)) WHERE message_deleted=TRUE OR continuation_of<>''`); err != nil {
+		return fmt.Errorf("failed to create cloud message tombstone index: %w", err)
 	}
 
 	// Cleanup: permanently delete system/rename message rows that slipped into
@@ -488,6 +491,13 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 }
 
 const legacySystemMessageCleanupTask = "legacy-system-messages-v1"
+
+// gidSiblingChatWhere matches cloud_chat rows of the group whose UUID is bound
+// to param. CloudKit chat_id UUIDs can differ from group_id UUIDs, so a gid:
+// portal's rows may be stored under either.
+func gidSiblingChatWhere(param string) string {
+	return fmt.Sprintf("(LOWER(group_id)=LOWER(%s) OR LOWER(cloud_chat_id)=LOWER(%s))", param, param)
+}
 
 const legacyMessageDeleteClassificationTask = "legacy-message-delete-classification-v1"
 
@@ -2337,12 +2347,29 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 }
 
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
-// be re-bridged on backfill, while preserving the UUID for echo detection.
+// be re-bridged on backfill, while preserving the UUID for echo detection. It
+// records a per-message delete (message_deleted), which restore-chat keeps.
 //
-// portalID routes a stub inserted for a GUID not stored yet; pass "" when the
-// portal is unknown. Apple's SMS relay reuses UUIDs across short-code threads,
-// so an unrouted stub applies to every portal in chat.db backfill.
+// portalID routes the row if it has no portal yet; pass "" when the portal is
+// unknown. Apple's SMS relay reuses UUIDs across short-code threads, so an
+// unrouted row applies to every portal in chat.db backfill.
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid, portalID string) error {
+	return s.softDeleteRow(ctx, guid, portalID, "")
+}
+
+// markContinuationChunk soft-deletes a continuation chunk of an oversized
+// outbound message, whose text already lives in the head's Matrix event.
+// Unlike an unsend, restore-chat revives it (the restored room has no such
+// event), and chat.db backfill skips it only while headGUID is still bridged
+// in the portal.
+func (s *cloudBackfillStore) markContinuationChunk(ctx context.Context, guid, headGUID, portalID string) error {
+	return s.softDeleteRow(ctx, guid, portalID, headGUID)
+}
+
+// softDeleteRow records an unsend (continuationOf == "") or a continuation
+// chunk marker.
+func (s *cloudBackfillStore) softDeleteRow(ctx context.Context, guid, portalID, continuationOf string) error {
+	messageDeleted := continuationOf == ""
 	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
 	// 0 rows and the stub INSERT running, a concurrent CloudKit upsert
 	// could land a live (deleted=FALSE) row for this guid. ON CONFLICT DO
@@ -2357,14 +2384,19 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid, 
 		// can store them lower/mixed; a case-sensitive = miss would silently
 		// no-op and let the fail-closed delete path proceed thinking it scrubbed.
 		// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
+		// An unsend of a marked continuation keeps both marks; message_deleted
+		// wins.
 		res, err := s.db.Exec(ctx,
 			`UPDATE cloud_message
-			 SET deleted=TRUE, message_deleted=TRUE,
+			 SET deleted=TRUE,
+			     message_deleted=(message_deleted OR $4),
+			     continuation_of=CASE WHEN CAST($5 AS TEXT)<>'' THEN CAST($5 AS TEXT) ELSE continuation_of END,
+			     portal_id=COALESCE(NULLIF(portal_id, ''), NULLIF($3, '')),
 			     text=NULL, subject=NULL, sender='',
 			     tapback_emoji=NULL,
 			     body_scrubbed=TRUE
 			 WHERE login_id=$1 AND UPPER(guid)=UPPER($2)`,
-			s.loginID, guid,
+			s.loginID, guid, portalID, messageDeleted, continuationOf,
 		)
 		if err != nil {
 			return fmt.Errorf("soft-delete message %s: %w", guid, err)
@@ -2384,10 +2416,10 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid, 
 		nowMS := time.Now().UnixMilli()
 		_, err = s.db.Exec(ctx,
 			`INSERT INTO cloud_message
-				(login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, message_deleted, body_scrubbed, created_ts, updated_ts)
-			 VALUES ($1, $2, NULLIF($3, ''), $4, FALSE, TRUE, TRUE, TRUE, $5, $5)
+				(login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, message_deleted, continuation_of, body_scrubbed, created_ts, updated_ts)
+			 VALUES ($1, $2, NULLIF($3, ''), $4, FALSE, TRUE, $5, $6, TRUE, $7, $7)
 			 ON CONFLICT (login_id, guid) DO NOTHING`,
-			s.loginID, guid, portalID, nowMS, nowMS,
+			s.loginID, guid, portalID, nowMS, messageDeleted, continuationOf, nowMS,
 		)
 		if err != nil {
 			return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)
@@ -2532,7 +2564,7 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 	if strings.HasPrefix(portalID, "gid:") {
 		uuid := strings.TrimPrefix(portalID, "gid:")
 		if _, err := s.db.Exec(ctx,
-			`UPDATE cloud_chat SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2)) AND deleted=FALSE`,
+			`UPDATE cloud_chat SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND `+gidSiblingChatWhere("$2")+` AND deleted=FALSE`,
 			s.loginID, uuid, nowMS,
 		); err != nil {
 			return fmt.Errorf("failed to soft-delete cloud_chat records by group_id %s: %w", uuid, err)
@@ -2545,7 +2577,7 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 			     body_scrubbed=TRUE,
 			     updated_ts=$3
 			 WHERE login_id=$1 AND deleted=FALSE
-			   AND portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2)))`,
+			   AND portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND `+gidSiblingChatWhere("$2")+`)`,
 			s.loginID, uuid, nowMS,
 		); err != nil {
 			return fmt.Errorf("failed to soft-delete cloud_message records by group_id %s: %w", uuid, err)
@@ -2696,7 +2728,7 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 // Portal matching keeps reused SMS UUIDs from suppressing other conversations.
 // Live delivery runs this after persisting the message's route, so a
 // delete-first stub is already routed, and a portal-level delete also
-// suppresses delivery. Backfill uses deletedMessageGUIDsInPortals instead,
+// suppresses delivery. Backfill uses messageTombstonesInPortals instead,
 // which must ignore portal-level deletes so restore and recreated rooms keep
 // their history.
 func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid, portalID string) (bool, error) {
@@ -2705,19 +2737,25 @@ func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid,
 	return count > 0, err
 }
 
-// deletedMessageGUIDsInPortals returns the uppercased subset of guids that
-// were deleted or unsent individually in one of portalIDs, plus unrouted stubs
-// from softDeleteMessageByGUID. Callers pass the portal and its aliases. The
-// scope matters: Apple's SMS relay can reuse a UUID across short-code threads,
-// and a tombstone in one must not hide another. A gid: portal also matches rows
-// stored under the portal IDs of its cloud_chat group_id/cloud_chat_id
-// siblings, as in deleteLocalChatByPortalID. Portal-level soft deletes are not
-// per-message tombstones.
+// messageTombstone is a per-message record that chat.db backfill honors.
+type messageTombstone struct {
+	// MessageDeleted marks an unsend or per-message delete.
+	MessageDeleted bool
+	// ContinuationOf is the head GUID of a continuation chunk marker.
+	ContinuationOf string
+}
+
+// messageTombstonesInPortals returns tombstones, keyed by uppercased GUID, for
+// guids deleted in one of portalIDs, plus unrouted rows. Callers pass the
+// portal and its aliases. The scope matters: Apple's SMS relay can reuse a
+// UUID across short-code threads, and a tombstone in one must not hide
+// another. A gid: portal also matches rows stored under its cloud_chat
+// siblings' portal IDs. Portal-level soft deletes are not tombstones.
 //
 // The live-delivery check (isMessageDeletedInPortal) answers a different
 // question and intentionally counts portal-level deletes.
-func (s *cloudBackfillStore) deletedMessageGUIDsInPortals(ctx context.Context, portalIDs, guids []string) (map[string]struct{}, error) {
-	deleted := make(map[string]struct{})
+func (s *cloudBackfillStore) messageTombstonesInPortals(ctx context.Context, portalIDs, guids []string) (map[string]messageTombstone, error) {
+	tombstones := make(map[string]messageTombstone)
 	portalArgs := make([]any, 0, len(portalIDs))
 	portalPlaceholders := make([]string, 0, len(portalIDs))
 	var groupClauses []string
@@ -2726,9 +2764,8 @@ func (s *cloudBackfillStore) deletedMessageGUIDsInPortals(ctx context.Context, p
 		portalPlaceholders = append(portalPlaceholders, fmt.Sprintf("$%d", len(portalArgs)+1))
 		if strings.HasPrefix(portalID, "gid:") {
 			portalArgs = append(portalArgs, strings.TrimPrefix(portalID, "gid:"))
-			n := len(portalArgs) + 1
-			groupClauses = append(groupClauses, fmt.Sprintf(
-				`portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (LOWER(group_id)=LOWER($%d) OR LOWER(cloud_chat_id)=LOWER($%d)))`, n, n))
+			groupClauses = append(groupClauses, "portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND "+
+				gidSiblingChatWhere(fmt.Sprintf("$%d", len(portalArgs)+1))+")")
 		}
 	}
 	scope := []string{"portal_id IS NULL", "portal_id=''"}
@@ -2749,28 +2786,30 @@ func (s *cloudBackfillStore) deletedMessageGUIDsInPortals(ctx context.Context, p
 			placeholders[j] = fmt.Sprintf("UPPER($%d)", len(args))
 		}
 		rows, err := s.db.Query(ctx, fmt.Sprintf(`
-			SELECT UPPER(guid) FROM cloud_message
-			WHERE login_id=$1 AND message_deleted=TRUE AND deleted=TRUE
+			SELECT UPPER(guid), message_deleted, continuation_of FROM cloud_message
+			WHERE login_id=$1 AND deleted=TRUE
+			  AND (message_deleted=TRUE OR continuation_of<>'')
 			  AND (%s)
 			  AND UPPER(guid) IN (%s)`, strings.Join(scope, " OR "), strings.Join(placeholders, ",")), args...)
 		if err != nil {
-			return nil, fmt.Errorf("query deleted message GUIDs: %w", err)
+			return nil, fmt.Errorf("query message tombstones: %w", err)
 		}
 		for rows.Next() {
 			var guid string
-			if err := rows.Scan(&guid); err != nil {
+			var tombstone messageTombstone
+			if err := rows.Scan(&guid, &tombstone.MessageDeleted, &tombstone.ContinuationOf); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("scan deleted message GUID: %w", err)
+				return nil, fmt.Errorf("scan message tombstone: %w", err)
 			}
-			deleted[guid] = struct{}{}
+			tombstones[guid] = tombstone
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("read deleted message GUIDs: %w", err)
+			return nil, fmt.Errorf("read message tombstones: %w", err)
 		}
 	}
-	return deleted, nil
+	return tombstones, nil
 }
 
 // getMessagePortalID returns the unique stored route for ambiguity checks.
@@ -5530,8 +5569,8 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 
 // orphanStubReapAge is how long an unclassified NULL-portal soft-delete stub
 // must sit before deleteOrphanedMessages reaps it. Per-message tombstones
-// (message_deleted) are never reaped: chat.db backfill and restore-chat rely on
-// them after bridgev2 has dropped the bridge row. softDeleteMessageByGUID stub-inserts a
+// (message_deleted, continuation_of) are never reaped: chat.db backfill and
+// restore-chat rely on them after bridgev2 has dropped the bridge row. softDeleteMessageByGUID stub-inserts a
 // deleted=TRUE row with portal_id NULL when an Apple-side delete arrives for a
 // guid CloudKit hasn't synced yet, so the future upsert preserves the deletion.
 // A real CloudKit row would set portal_id non-NULL via the upsert; a stub still
@@ -5582,7 +5621,7 @@ func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64,
 	var total int64
 	for {
 		rows, err := s.db.Query(ctx, `
-			SELECT guid, portal_id, created_ts, deleted, message_deleted
+			SELECT guid, portal_id, created_ts, deleted, (message_deleted OR continuation_of<>'')
 			FROM cloud_message
 			WHERE login_id=$1 AND guid > $2
 			ORDER BY guid
@@ -5596,13 +5635,13 @@ func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64,
 		for rows.Next() {
 			var portalID sql.NullString
 			var createdTS int64
-			var deleted, messageDeleted bool
-			if err := rows.Scan(&lastGUID, &portalID, &createdTS, &deleted, &messageDeleted); err != nil {
+			var deleted, tombstone bool
+			if err := rows.Scan(&lastGUID, &portalID, &createdTS, &deleted, &tombstone); err != nil {
 				rows.Close()
 				return total, fmt.Errorf("failed to scan cloud message for orphan cleanup: %w", err)
 			}
 			count++
-			if !deleted || messageDeleted {
+			if !deleted || tombstone {
 				continue
 			}
 			if portalID.Valid {
@@ -5636,7 +5675,7 @@ func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64,
 			// a concurrent sync cannot be removed based on the earlier snapshot.
 			result, err := s.db.Exec(ctx, `
 				DELETE FROM cloud_message
-				WHERE login_id=$1 AND deleted=TRUE AND message_deleted=FALSE
+				WHERE login_id=$1 AND deleted=TRUE AND message_deleted=FALSE AND continuation_of=''
 				  AND guid IN (`+strings.Join(placeholders, ",")+`)
 				  AND (
 				    portal_id NOT IN (

@@ -11,6 +11,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -191,5 +192,24 @@ func TestAdmitLiveMessageWaitsForDeleteTombstone(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("live route check did not complete")
+	}
+}
+
+func TestMessageUUIDFromPartID(t *testing.T) {
+	for id, want := range map[networkid.MessageID]string{
+		"ABC": "ABC", "ABC_att0": "ABC", "ABC_att12": "ABC", "_att0": "_att0",
+	} {
+		if got := messageUUIDFromPartID(id); got != want {
+			t.Errorf("messageUUIDFromPartID(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestForgetOutboundUnsendLetsEchoThrough(t *testing.T) {
+	client := &IMClient{recentOutboundUnsends: make(map[string]time.Time)}
+	client.trackOutboundUnsend("UUID")
+	client.forgetOutboundUnsend("UUID")
+	if client.wasOutboundUnsend("UUID") {
+		t.Fatal("echo of a failed unsend was suppressed")
 	}
 }

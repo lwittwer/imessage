@@ -1141,7 +1141,7 @@ func TestRecycleBinUndeleteKeepsMessageLevelDeletes(t *testing.T) {
 	}
 }
 
-func TestDeletedMessageGUIDsInPortalsMatchesGroupAliases(t *testing.T) {
+func TestMessageTombstonesInPortalsMatchesGroupAliases(t *testing.T) {
 	ctx := context.Background()
 	db, store := newTestCloudBackfillStore(t)
 	// The bridge portal uses the chat_id; CloudKit stored rows under group_id.
@@ -1156,7 +1156,7 @@ func TestDeletedMessageGUIDsInPortalsMatchesGroupAliases(t *testing.T) {
 		       ($1, 'other-group', 'gid:other', 1, FALSE, TRUE, TRUE, 1, 1)`, testSQLLoginID); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.deletedMessageGUIDsInPortals(ctx, []string{"gid:chat-uuid"}, []string{"alias-unsent", "other-group"})
+	got, err := store.messageTombstonesInPortals(ctx, []string{"gid:chat-uuid"}, []string{"alias-unsent", "other-group"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1173,9 +1173,60 @@ func TestSoftDeleteStubRoutedToItsPortal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for portalID, want := range map[string]int{"tel:242733": 1, "tel:+15550000001": 0} {
-		got, err := store.deletedMessageGUIDsInPortals(ctx, []string{portalID}, []string{"reused-uuid"})
+		got, err := store.messageTombstonesInPortals(ctx, []string{portalID}, []string{"reused-uuid"})
 		if err != nil || len(got) != want {
 			t.Fatalf("%s: deleted = %v, %v; want %d", portalID, got, err, want)
 		}
+	}
+}
+
+func TestContinuationMarkerSurvivesSweepAndRestore(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	const portalID = "tel:+15550000001"
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, text, created_ts, updated_ts)
+		VALUES ($1, 'cont', $2, 1000, TRUE, 'tail text', 1, 1)`, testSQLLoginID, portalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.markContinuationChunk(ctx, "cont", "head", portalID); err != nil {
+		t.Fatal(err)
+	}
+	// No cloud_chat row: the sweep would reap an ordinary deleted row here.
+	if _, err := store.deleteOrphanedMessages(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, "cont"); !deleted || messageDeleted || !scrubbed {
+		t.Fatalf("marked chunk = deleted:%v message_deleted:%v scrubbed:%v", deleted, messageDeleted, scrubbed)
+	}
+	if err := store.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.undeleteCloudMessagesByPortalID(ctx, portalID); err != nil || n != 1 {
+		t.Fatalf("undeleted = %d, %v; want 1", n, err)
+	}
+	if _, err := store.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, _, scrubbed := cloudMessageDeleteState(t, db, "cont"); deleted || scrubbed {
+		t.Fatalf("restored chunk = deleted:%v scrubbed:%v; want revived for re-fetch", deleted, scrubbed)
+	}
+}
+
+func TestSoftDeleteRoutesExistingUnroutedRow(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	if err := store.softDeleteMessageByGUID(ctx, "legacy", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.softDeleteMessageByGUID(ctx, "legacy", "tel:242733"); err != nil {
+		t.Fatal(err)
+	}
+	var portalID string
+	if err := db.QueryRow(ctx, `SELECT COALESCE(portal_id, '') FROM cloud_message WHERE guid='legacy'`).Scan(&portalID); err != nil {
+		t.Fatal(err)
+	}
+	if portalID != "tel:242733" {
+		t.Fatalf("portal_id = %q, want tel:242733", portalID)
 	}
 }

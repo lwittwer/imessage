@@ -6817,10 +6817,11 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			// Soft-delete is the existing, race-safe way to say "never bridge
 			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
 			//
-			// softDeleteMessageByGUID records this as a per-message delete
-			// (message_deleted), which the orphan sweep keeps, so a later
-			// CloudKit sync cannot bring the chunk back as a duplicate tail.
-			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID, string(msg.Portal.ID)); err != nil {
+			// The orphan sweep keeps the marker, so a later CloudKit sync
+			// cannot bring the chunk back as a duplicate tail. Restore-chat
+			// revives it, because the restored room has no head event
+			// holding its text.
+			if err := c.cloudStore.markContinuationChunk(ctx, contUUID, uuid, string(msg.Portal.ID)); err != nil {
 				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
 					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
 			}
@@ -7152,11 +7153,8 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	}
 	var forUuid *string
 	if receipt.ExactMessage != nil {
-		uuid := string(receipt.ExactMessage.ID)
-		// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
-		if idx := strings.Index(uuid, "_att"); idx > 0 {
-			uuid = uuid[:idx]
-		}
+		// Rust expects a pure UUID.
+		uuid := messageUUIDFromPartID(receipt.ExactMessage.ID)
 		forUuid = &uuid
 	}
 	err := retrySendOnAPNsFlap(func() error {
@@ -7261,6 +7259,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
 		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
+			c.forgetOutboundUnsend(siblingUUID)
 			zerolog.Ctx(ctx).Warn().Err(sibErr).
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
@@ -7281,6 +7280,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		contUUID := continuationUUIDs[i]
 		c.trackOutboundUnsend(contUUID)
 		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle); contErr != nil {
+			c.forgetOutboundUnsend(contUUID)
 			zerolog.Ctx(ctx).Warn().Err(contErr).
 				Str("continuation_uuid", contUUID).
 				Msg("Failed to unsend continuation chunk on redact of split message")
@@ -7293,18 +7293,27 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		}
 	}
 
+	// The target may be an attachment part; Apple and the tombstone both key
+	// on the message UUID.
+	targetUUID := messageUUIDFromPartID(msg.TargetMessage.ID)
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	c.trackOutboundUnsend(targetUUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	_, err := c.client.SendUnsend(conv, targetUUID, 0, c.handle)
+	if err != nil {
+		// Apple may still have accepted it (e.g. a timeout after the Rust
+		// retry). Let a real echo reach handleUnsend, which writes the
+		// tombstone.
+		c.forgetOutboundUnsend(targetUUID)
+	}
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection. Only after Apple accepted
 	// the unsend, matching the siblings above: on failure the message still
 	// exists, and the returned error keeps its bridge row.
 	if err == nil && c.cloudStore != nil {
-		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID), string(msg.Portal.ID)); scrubErr != nil {
-			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
+		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, targetUUID, string(msg.Portal.ID)); scrubErr != nil {
+			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", targetUUID).
 				Msg("Failed to soft-delete cloud_message after outbound unsend")
 			scrubErrs = append(scrubErrs, scrubErr)
 		}
@@ -13976,6 +13985,24 @@ func (c *IMClient) trackOutboundUnsend(uuid string) {
 			delete(c.recentOutboundUnsends, k)
 		}
 	}
+}
+
+// messageUUIDFromPartID strips an attachment part suffix ({uuid}_att0,
+// {uuid}_att1, ...) from a bridge message ID.
+func messageUUIDFromPartID(id networkid.MessageID) string {
+	uuid := string(id)
+	if idx := strings.Index(uuid, "_att"); idx > 0 {
+		uuid = uuid[:idx]
+	}
+	return uuid
+}
+
+// forgetOutboundUnsend drops a tracked unsend whose send failed, so its echo
+// (if Apple received it anyway) is handled as an incoming unsend.
+func (c *IMClient) forgetOutboundUnsend(uuid string) {
+	c.recentOutboundUnsendsLock.Lock()
+	defer c.recentOutboundUnsendsLock.Unlock()
+	delete(c.recentOutboundUnsends, uuid)
 }
 
 func (c *IMClient) wasOutboundUnsend(uuid string) bool {
