@@ -112,11 +112,12 @@ type IMConfig struct {
 	// want the indicator or who rely on other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
 
-	// ReadReceipts controls whether the bridge sends read receipts to iMessage
-	// contacts when you mark a message as read in Matrix. When false, iMessage
-	// contacts will not see the "Read" indicator for your messages. Incoming
-	// read receipts from iMessage contacts are always forwarded to Matrix.
-	// Default is true.
+	// ReadReceipts controls whether iMessage contacts see that you read their
+	// messages in Matrix; it is the bridge's counterpart to the iPhone's "Send
+	// Read Receipts" toggle, which the bridge can't see. SMS/RCS chats follow
+	// your iPhone's read-receipt setting. Your own Apple devices are marked read
+	// either way. Incoming read receipts from iMessage contacts are always
+	// forwarded to Matrix. Default is true.
 	ReadReceipts bool `yaml:"read_receipts"`
 
 	// TypingNotifications controls whether the bridge sends typing indicators
