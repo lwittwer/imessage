@@ -987,17 +987,18 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 			args = append(args, g)
 		}
 
-		// A row already soft-deleted with its portal still gets the
-		// per-message mark so restore-chat leaves it deleted. Its updated_ts
-		// stays put: tail-timestamp gating reads it.
+		// Not message_deleted: deleting a chat on an Apple device moves its
+		// records to the recycle-bin zone, and the change feed reports each one
+		// as deleted, indistinguishable from a single-message delete. Restore
+		// must still be able to revive them.
 		query := fmt.Sprintf(
 			`UPDATE cloud_message
-			 SET deleted=TRUE, message_deleted=TRUE,
+			 SET deleted=TRUE,
 			     text=NULL, subject=NULL, sender='',
 			     tapback_emoji=NULL,
 			     body_scrubbed=TRUE,
-			     updated_ts=CASE WHEN deleted THEN updated_ts ELSE $2 END
-			 WHERE login_id=$1 AND guid IN (%s) AND (deleted=FALSE OR message_deleted=FALSE)`,
+			     updated_ts=$2
+			 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
@@ -2337,7 +2338,11 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
 // be re-bridged on backfill, while preserving the UUID for echo detection.
-func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
+//
+// portalID routes a stub inserted for a GUID not stored yet; pass "" when the
+// portal is unknown. Apple's SMS relay reuses UUIDs across short-code threads,
+// so an unrouted stub applies to every portal in chat.db backfill.
+func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid, portalID string) error {
 	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
 	// 0 rows and the stub INSERT running, a concurrent CloudKit upsert
 	// could land a live (deleted=FALSE) row for this guid. ON CONFLICT DO
@@ -2379,10 +2384,10 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 		nowMS := time.Now().UnixMilli()
 		_, err = s.db.Exec(ctx,
 			`INSERT INTO cloud_message
-				(login_id, guid, timestamp_ms, is_from_me, deleted, message_deleted, body_scrubbed, created_ts, updated_ts)
-			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, TRUE, $4, $4)
+				(login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, message_deleted, body_scrubbed, created_ts, updated_ts)
+			 VALUES ($1, $2, NULLIF($3, ''), $4, FALSE, TRUE, TRUE, TRUE, $5, $5)
 			 ON CONFLICT (login_id, guid) DO NOTHING`,
-			s.loginID, guid, nowMS, nowMS,
+			s.loginID, guid, portalID, nowMS, nowMS,
 		)
 		if err != nil {
 			return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)

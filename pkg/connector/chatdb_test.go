@@ -980,8 +980,7 @@ func (u *unsentChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatI
 	return []imessage.ChatIdentifier{{ChatGUID: u.chatGUID}}, nil
 }
 
-// Both exact GUIDs return the same rows; FetchMessages deduplicates them.
-
+// Every exact GUID returns the same rows; FetchMessages deduplicates them.
 func (u *unsentChatDBAPI) GetMessagesSinceDate(string, time.Time, string) ([]*imessage.Message, error) {
 	return u.messages, nil
 }
@@ -1048,7 +1047,7 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 	client, portal, api := newUnsentChatDBFixture(t)
 	// Matrix-initiated unsend of a message cloud_message never saw: stub
 	// tombstone without a route, written in a different case than chat.db.
-	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "unsent-stub-guid"); err != nil {
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "unsent-stub-guid", ""); err != nil {
 		t.Fatal(err)
 	}
 	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID), true)
@@ -1083,7 +1082,7 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 func TestChatDBForwardHasMoreCountsTombstonedMessages(t *testing.T) {
 	ctx := context.Background()
 	client, portal, api := newUnsentChatDBFixture(t)
-	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "UNSENT-STUB-GUID"); err != nil {
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "UNSENT-STUB-GUID", ""); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := (&chatDB{api: api}).FetchMessages(ctx, bridgev2.FetchMessagesParams{

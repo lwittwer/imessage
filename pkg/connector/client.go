@@ -4001,7 +4001,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		// and strand this Apple-side unsend as a stale, still-visible Matrix
 		// event (APNs won't replay it).
 		scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID)
+		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID, string(portalKey.ID))
 		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("target_uuid", targetGUID).
@@ -4706,7 +4706,7 @@ func (c *IMClient) prepareDeletedMessage(
 		return networkid.PortalKey{}, nil, fmt.Errorf("%w: bridge portal %s, cloud portal %s", errAppleDeletedMessagePortalAmbiguous, portalKey.ID, storedPortalID)
 	}
 	scrubCtx, cancel := context.WithTimeout(ctx, messageDeleteDBTimeout)
-	err = c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+	err = c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID, string(portalKey.ID))
 	cancel()
 	if err != nil {
 		return networkid.PortalKey{}, nil, fmt.Errorf("persist delete tombstone: %w", err)
@@ -6817,22 +6817,10 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			// Soft-delete is the existing, race-safe way to say "never bridge
 			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
 			//
-			// Known residual, deliberately not worked around. Nothing here can
-			// lose message content: the row is a contentless stub from
-			// persistMessageUUID, and the chunk's text lives in the Matrix event.
-			// The risk is the reverse — the row coming back. The pre-existing
-			// tombstone reaper (deleteOrphanedMessages) removes rows that are
-			// already deleted=TRUE and whose portal has no cloud_chat row yet,
-			// which clears the flag this relies on; a later CloudKit sync then
-			// re-inserts the row deleted=FALSE with a record_name and the chunk
-			// becomes backfillable again, showing up as a duplicate tail under a
-			// message that already contains that text. Every flag we could set
-			// lives in cloud_message so the reap takes all of them, and a
-			// bridgev2 message row would not help because CloudKit backfill
-			// dedups on the anchor cursor rather than per row. The window needs
-			// an outbound send over maxOutboundTextBytes into a portal whose chat
-			// has not synced yet, plus a reap landing inside it.
-			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); err != nil {
+			// softDeleteMessageByGUID records this as a per-message delete
+			// (message_deleted), which the orphan sweep keeps, so a later
+			// CloudKit sync cannot bring the chunk back as a duplicate tail.
+			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID, string(msg.Portal.ID)); err != nil {
 				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
 					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
 			}
@@ -7277,7 +7265,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
-			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID, string(msg.Portal.ID)); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
 					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
 				scrubErrs = append(scrubErrs, scrubErr)
@@ -7297,7 +7285,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Str("continuation_uuid", contUUID).
 				Msg("Failed to unsend continuation chunk on redact of split message")
 		} else if c.cloudStore != nil {
-			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); scrubErr != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID, string(msg.Portal.ID)); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("continuation_uuid", contUUID).
 					Msg("Failed to soft-delete continuation cloud_message on redact of split message")
 				scrubErrs = append(scrubErrs, scrubErr)
@@ -7315,7 +7303,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// the unsend, matching the siblings above: on failure the message still
 	// exists, and the returned error keeps its bridge row.
 	if err == nil && c.cloudStore != nil {
-		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
+		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID), string(msg.Portal.ID)); scrubErr != nil {
 			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
 				Msg("Failed to soft-delete cloud_message after outbound unsend")
 			scrubErrs = append(scrubErrs, scrubErr)

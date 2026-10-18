@@ -701,7 +701,7 @@ func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
 		}
 		// Stub-insert path: no cloud_message row exists for this guid, so
 		// softDeleteMessageByGUID falls through to the ON CONFLICT insert.
-		if err := store.softDeleteMessageByGUID(ctx, "uuid-never-synced"); err != nil {
+		if err := store.softDeleteMessageByGUID(ctx, "uuid-never-synced", ""); err != nil {
 			t.Fatalf("softDeleteMessageByGUID call %d: %v", i+1, err)
 		}
 		// markForwardBackfillDone's synthetic-row fallback.
@@ -749,7 +749,7 @@ func TestDeletedMessageLookupUsesFunctionalIndex(t *testing.T) {
 	if err := store.ensureSchema(ctx); err != nil {
 		t.Fatalf("ensureSchema: %v", err)
 	}
-	if err := store.softDeleteMessageByGUID(ctx, "mixed-Case-guid"); err != nil {
+	if err := store.softDeleteMessageByGUID(ctx, "mixed-Case-guid", ""); err != nil {
 		t.Fatalf("softDeleteMessageByGUID: %v", err)
 	}
 	if err := store.persistMessageUUID(ctx, "mixed-Case-guid", "gid:portal", 1, false); err != nil {
@@ -843,7 +843,7 @@ func TestConflictHandlersPreserveExpectedState(t *testing.T) {
 		}
 		// Stub-insert path: no cloud_message row exists for this guid, so
 		// softDeleteMessageByGUID falls through to the ON CONFLICT insert.
-		if err := store.softDeleteMessageByGUID(ctx, "uuid-never-synced"); err != nil {
+		if err := store.softDeleteMessageByGUID(ctx, "uuid-never-synced", ""); err != nil {
 			t.Fatalf("softDeleteMessageByGUID call %d: %v", i+1, err)
 		}
 		// markForwardBackfillDone's synthetic-row fallback.

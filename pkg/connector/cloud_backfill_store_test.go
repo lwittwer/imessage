@@ -1049,48 +1049,37 @@ func TestRestoreChatKeepsMessageLevelDeletes(t *testing.T) {
 		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, created_ts, updated_ts)
 		VALUES ($1, 'kept', $2, 1000, 'tel:+15550000001', FALSE, 'kept body', 1, 1),
 		       ($1, 'unsent', $2, 2000, '', TRUE, 'unsent body', 1, 1),
-		       ($1, 'apple-deleted', $2, 3000, 'tel:+15550000001', FALSE, 'deleted body', 1, 1)`,
+		       ($1, 'feed-deleted', $2, 3000, 'tel:+15550000001', FALSE, 'deleted body', 1, 1)`,
 		testSQLLoginID, portalID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.softDeleteMessageByGUID(ctx, "UNSENT"); err != nil {
+	if err := store.softDeleteMessageByGUID(ctx, "UNSENT", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Deleting a chat on the iPhone reports each of its records as deleted in
+	// the CloudKit change feed. That must stay restorable.
+	if err := store.deleteMessageBatch(ctx, []string{"feed-deleted"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.deleteLocalChatByPortalID(ctx, portalID); err != nil {
 		t.Fatal(err)
 	}
-	// A CloudKit message tombstone that arrives after the portal delete must
-	// still be recorded as a per-message delete, without moving updated_ts.
-	const updatedTS = int64(12345)
-	if _, err := db.Exec(ctx, `UPDATE cloud_message SET updated_ts=$1 WHERE guid='apple-deleted'`, updatedTS); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.deleteMessageBatch(ctx, []string{"apple-deleted"}); err != nil {
-		t.Fatal(err)
-	}
 
 	undeleted, err := store.undeleteCloudMessagesByPortalID(ctx, portalID)
-	if err != nil || undeleted != 1 {
-		t.Fatalf("undeleted = %d, %v; want 1", undeleted, err)
+	if err != nil || undeleted != 2 {
+		t.Fatalf("undeleted = %d, %v; want 2", undeleted, err)
 	}
 	if _, err := store.clearBodyScrubByPortalID(ctx, portalID); err != nil {
 		t.Fatal(err)
 	}
 
-	if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, "kept"); deleted || messageDeleted || scrubbed {
-		t.Fatalf("kept = deleted:%v message_deleted:%v scrubbed:%v; want restored", deleted, messageDeleted, scrubbed)
-	}
-	for _, guid := range []string{"unsent", "apple-deleted"} {
-		if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, guid); !deleted || !messageDeleted || !scrubbed {
-			t.Fatalf("%s = deleted:%v message_deleted:%v scrubbed:%v; want still deleted and scrubbed", guid, deleted, messageDeleted, scrubbed)
+	for _, guid := range []string{"kept", "feed-deleted"} {
+		if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, guid); deleted || messageDeleted || scrubbed {
+			t.Fatalf("%s = deleted:%v message_deleted:%v scrubbed:%v; want restored", guid, deleted, messageDeleted, scrubbed)
 		}
 	}
-	var updatedAfter int64
-	if err := db.QueryRow(ctx, `SELECT updated_ts FROM cloud_message WHERE guid='apple-deleted'`).Scan(&updatedAfter); err != nil {
-		t.Fatal(err)
-	}
-	if updatedAfter != updatedTS {
-		t.Fatalf("message-level restore skip changed updated_ts from %d to %d", updatedTS, updatedAfter)
+	if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, "unsent"); !deleted || !messageDeleted || !scrubbed {
+		t.Fatalf("unsent = deleted:%v message_deleted:%v scrubbed:%v; want still deleted and scrubbed", deleted, messageDeleted, scrubbed)
 	}
 }
 
@@ -1137,7 +1126,7 @@ func TestRecycleBinUndeleteKeepsMessageLevelDeletes(t *testing.T) {
 		testSQLLoginID, portalID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.softDeleteMessageByGUID(ctx, "unsent"); err != nil {
+	if err := store.softDeleteMessageByGUID(ctx, "unsent", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.deleteLocalChatByPortalID(ctx, portalID); err != nil {
@@ -1173,5 +1162,20 @@ func TestDeletedMessageGUIDsInPortalsMatchesGroupAliases(t *testing.T) {
 	}
 	if _, ok := got["ALIAS-UNSENT"]; !ok || len(got) != 1 {
 		t.Fatalf("deleted = %v, want only ALIAS-UNSENT", got)
+	}
+}
+
+func TestSoftDeleteStubRoutedToItsPortal(t *testing.T) {
+	ctx := context.Background()
+	_, store := newTestCloudBackfillStore(t)
+	// An Apple-side unsend for a short-code message that was never stored.
+	if err := store.softDeleteMessageByGUID(ctx, "reused-uuid", "tel:242733"); err != nil {
+		t.Fatal(err)
+	}
+	for portalID, want := range map[string]int{"tel:242733": 1, "tel:+15550000001": 0} {
+		got, err := store.deletedMessageGUIDsInPortals(ctx, []string{portalID}, []string{"reused-uuid"})
+		if err != nil || len(got) != want {
+			t.Fatalf("%s: deleted = %v, %v; want %d", portalID, got, err, want)
+		}
 	}
 }
