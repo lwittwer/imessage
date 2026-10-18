@@ -461,7 +461,7 @@ type IMClient struct {
 
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
-	recentOutboundUnsends     map[string]time.Time
+	recentOutboundUnsends     map[string]outboundUnsend
 	recentOutboundUnsendsLock sync.Mutex
 
 	// SMS service and destination are protected by one lock so outbound routing
@@ -2785,14 +2785,14 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	overrideRuleID := botMXID + ".dont_notify"
 	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.OverrideRule, overrideRuleID,
 		&mautrix.ReqPutPushRule{
-			Conditions: []pushrules.PushCondition{
+			Conditions: []*pushrules.PushCondition{
 				{
 					Kind:    pushrules.KindEventMatch,
 					Key:     "sender",
 					Pattern: botMXID,
 				},
 			},
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			Actions: []*pushrules.PushAction{{Action: pushrules.ActionDontNotify}},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot override push rule")
@@ -2802,7 +2802,7 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	// Sender rule (secondary catch-all for homeservers without override support).
 	err = asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
 		&mautrix.ReqPutPushRule{
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			Actions: []*pushrules.PushAction{{Action: pushrules.ActionDontNotify}},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
@@ -3998,7 +3998,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		// and strand this Apple-side unsend as a stale, still-visible Matrix
 		// event (APNs won't replay it).
 		scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID)
+		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID, string(portalKey.ID))
 		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("target_uuid", targetGUID).
@@ -4641,7 +4641,7 @@ func redactMessagePartsWithBot(
 	if portal == nil || bot == nil || len(parts) == 0 {
 		return errors.New("missing portal, bot intent, or message parts")
 	}
-	result := portal.Internal().RedactMessageParts(ctx, parts, bot, timestamp)
+	result := portal.Internal().RedactMessageParts(ctx, parts, bot, timestamp, "", false)
 	if !result.Success {
 		if result.Error != nil {
 			return result.Error
@@ -4703,7 +4703,7 @@ func (c *IMClient) prepareDeletedMessage(
 		return networkid.PortalKey{}, nil, fmt.Errorf("%w: bridge portal %s, cloud portal %s", errAppleDeletedMessagePortalAmbiguous, portalKey.ID, storedPortalID)
 	}
 	scrubCtx, cancel := context.WithTimeout(ctx, messageDeleteDBTimeout)
-	err = c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
+	err = c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID, string(portalKey.ID))
 	cancel()
 	if err != nil {
 		return networkid.PortalKey{}, nil, fmt.Errorf("persist delete tombstone: %w", err)
@@ -5754,33 +5754,9 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	// recycle bin. The rows were soft-deleted during CloudKit sync when their
 	// parent chat was deleted.
 	nowMS := time.Now().UnixMilli()
-	restored := 0
-	const chunkSize = 500
-	for i := 0; i < len(allGUIDs); i += chunkSize {
-		end := i + chunkSize
-		if end > len(allGUIDs) {
-			end = len(allGUIDs)
-		}
-		chunk := allGUIDs[i:end]
-
-		placeholders := make([]string, len(chunk))
-		args := make([]any, 0, len(chunk)+3)
-		args = append(args, c.cloudStore.loginID, portalID, nowMS)
-		for j, guid := range chunk {
-			placeholders[j] = fmt.Sprintf("$%d", j+4)
-			args = append(args, guid)
-		}
-		query := fmt.Sprintf(
-			`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND guid IN (%s) AND deleted=TRUE`,
-			strings.Join(placeholders, ","),
-		)
-		result, execErr := c.cloudStore.db.Exec(ctx, query, args...)
-		if execErr != nil {
-			log.Warn().Err(execErr).Msg("Failed to undelete recovered messages from recycle bin")
-			continue
-		}
-		n, _ := result.RowsAffected()
-		restored += int(n)
+	restored, err := c.cloudStore.undeleteRecycleBinMessages(ctx, portalID, allGUIDs)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to undelete recovered messages from recycle bin")
 	}
 
 	log.Info().Str("portal_id", logPortalID).Int("recycle_bin_guids", len(allGUIDs)).
@@ -5837,7 +5813,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 			_, insertErr := c.cloudStore.db.Exec(ctx, `
 				INSERT INTO cloud_message (login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, service, deleted, created_ts, updated_ts, record_name, has_body)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $9, $10, TRUE)
-				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=FALSE, portal_id=$4
+				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=cloud_message.message_deleted, portal_id=$4
 			`, c.cloudStore.loginID, guid, metadata.CloudChatID, portalID, metadata.TimestampMS, metadata.Sender, metadata.IsFromMe, metadata.Service, nowMS, metadata.RecordName)
 			if insertErr != nil {
 				log.Debug().Err(insertErr).Str("guid", logSafeHandle(guid)).Msg("Failed to seed cloud_message from recycle bin")
@@ -6838,22 +6814,14 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			// Soft-delete is the existing, race-safe way to say "never bridge
 			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
 			//
-			// Known residual, deliberately not worked around. Nothing here can
-			// lose message content: the row is a contentless stub from
-			// persistMessageUUID, and the chunk's text lives in the Matrix event.
-			// The risk is the reverse — the row coming back. The pre-existing
-			// tombstone reaper (deleteOrphanedMessages) removes rows that are
-			// already deleted=TRUE and whose portal has no cloud_chat row yet,
-			// which clears the flag this relies on; a later CloudKit sync then
-			// re-inserts the row deleted=FALSE with a record_name and the chunk
-			// becomes backfillable again, showing up as a duplicate tail under a
-			// message that already contains that text. Every flag we could set
-			// lives in cloud_message so the reap takes all of them, and a
-			// bridgev2 message row would not help because CloudKit backfill
-			// dedups on the anchor cursor rather than per row. The window needs
-			// an outbound send over maxOutboundTextBytes into a portal whose chat
-			// has not synced yet, plus a reap landing inside it.
-			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); err != nil {
+			// Not a per-message delete, so restore-chat revives it: the
+			// restored room has no head event holding its text.
+			//
+			// Known residual: the orphan sweep can reap this row while its
+			// portal has no cloud_chat row yet, and a later CloudKit sync then
+			// re-inserts it live, showing a duplicate tail under the head. It
+			// needs an oversized send into a chat that has not synced yet.
+			if err := c.cloudStore.markContinuationChunk(ctx, contUUID, string(msg.Portal.ID)); err != nil {
 				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
 					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
 			}
@@ -7229,12 +7197,8 @@ func (c *IMClient) readTargetUUID(msg *database.Message) (string, bool) {
 	if msg == nil || c.isMyHandle(string(msg.SenderID)) {
 		return "", false
 	}
-	uuid := string(msg.ID)
-	// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
-	if idx := strings.Index(uuid, "_att"); idx > 0 {
-		uuid = uuid[:idx]
-	}
-	return uuid, true
+	// Rust expects a pure UUID.
+	return messageUUIDFromPartID(msg.ID), true
 }
 
 // receiptConversation picks the audience for a Matrix read receipt. The user's
@@ -7335,12 +7299,13 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
-		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
+		_, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle)
+		if sibErr = c.settleOutboundUnsend(siblingUUID, sibErr); sibErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(sibErr).
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
-			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID, string(msg.Portal.ID)); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
 					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
 				scrubErrs = append(scrubErrs, scrubErr)
@@ -7355,12 +7320,13 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
 		contUUID := continuationUUIDs[i]
 		c.trackOutboundUnsend(contUUID)
-		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle); contErr != nil {
+		_, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle)
+		if contErr = c.settleOutboundUnsend(contUUID, contErr); contErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(contErr).
 				Str("continuation_uuid", contUUID).
 				Msg("Failed to unsend continuation chunk on redact of split message")
 		} else if c.cloudStore != nil {
-			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); scrubErr != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID, string(msg.Portal.ID)); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("continuation_uuid", contUUID).
 					Msg("Failed to soft-delete continuation cloud_message on redact of split message")
 				scrubErrs = append(scrubErrs, scrubErr)
@@ -7368,27 +7334,32 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		}
 	}
 
+	// The target may be an attachment part; Apple and the tombstone both key
+	// on the message UUID.
+	targetUUID := messageUUIDFromPartID(msg.TargetMessage.ID)
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	c.trackOutboundUnsend(targetUUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	_, err := c.client.SendUnsend(conv, targetUUID, 0, c.handle)
+	err = c.settleOutboundUnsend(targetUUID, err)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
-	// while preserving the UUID for echo detection.
-	if c.cloudStore != nil {
-		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID)); scrubErr != nil {
-			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", string(msg.TargetMessage.ID)).
+	// while preserving the UUID for echo detection. Only after Apple accepted
+	// the unsend, matching the siblings above: on failure the message still
+	// exists, and the returned error keeps its bridge row.
+	if err == nil && c.cloudStore != nil {
+		if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, targetUUID, string(msg.Portal.ID)); scrubErr != nil {
+			zerolog.Ctx(ctx).Error().Err(scrubErr).Str("target_uuid", targetUUID).
 				Msg("Failed to soft-delete cloud_message after outbound unsend")
 			scrubErrs = append(scrubErrs, scrubErr)
 		}
 	}
 
-	// Fail-closed: report scrub failure to bridgev2 so it doesn't proceed
-	// with future row deletion (currently a `// TODO delete msg/reaction
-	// db row` in bridgev2/portal.go:2442 — not implemented today but
-	// forward-compatible). When bridgev2 does start deleting on success,
-	// the EXISTS gate in scrubBridgedBodies goes permanently FALSE for
-	// scrubbed-fail rows, stranding plaintext.
+	// Fail-closed: bridgev2 deletes the bridge message row only when this
+	// returns nil. Reporting scrub failure keeps that row, so the EXISTS gate
+	// in scrubBridgedBodies can still find the plaintext. On success the
+	// cloud_message tombstone, not the bridge row, keeps backfill from
+	// re-bridging the message (see dropDeletedChatDBMessages).
 	if err != nil {
 		return err
 	}
@@ -14041,28 +14012,68 @@ func (c *IMClient) resolvePortalByTargetMessage(log zerolog.Logger, targetUUID s
 	return dbMessages[0].Room
 }
 
+// outboundUnsend tracks a Matrix-initiated unsend until its APNs echo.
+type outboundUnsend struct {
+	at     time.Time
+	echoed bool // handleUnsend suppressed the echo
+}
+
 func (c *IMClient) trackOutboundUnsend(uuid string) {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
-	c.recentOutboundUnsends[uuid] = time.Now()
-	for k, t := range c.recentOutboundUnsends {
-		if time.Since(t) > 5*time.Minute {
+	c.recentOutboundUnsends[uuid] = outboundUnsend{at: time.Now()}
+	for k, u := range c.recentOutboundUnsends {
+		if time.Since(u.at) > 5*time.Minute {
 			delete(c.recentOutboundUnsends, k)
 		}
 	}
 }
 
+// settleOutboundUnsend resolves a Matrix-initiated unsend after SendUnsend
+// returns. An error does not prove Apple rejected it: SendUnsend retries on
+// SendTimedOut for several seconds, and Apple's echo, suppressed by
+// handleUnsend meanwhile, shows it was accepted. Without a suppressed echo the
+// tracking is dropped so a later echo reaches handleUnsend and writes the
+// tombstone. Returns nil when the unsend should be treated as accepted.
+func (c *IMClient) settleOutboundUnsend(uuid string, sendErr error) error {
+	c.recentOutboundUnsendsLock.Lock()
+	defer c.recentOutboundUnsendsLock.Unlock()
+	if c.recentOutboundUnsends[uuid].echoed {
+		delete(c.recentOutboundUnsends, uuid)
+		return nil
+	}
+	if sendErr != nil {
+		delete(c.recentOutboundUnsends, uuid)
+	}
+	return sendErr
+}
+
+// messageUUIDFromPartID strips an attachment part suffix ({uuid}_att0,
+// {uuid}_att1, ...) from a bridge message ID.
+func messageUUIDFromPartID(id networkid.MessageID) string {
+	uuid := string(id)
+	if idx := strings.Index(uuid, "_att"); idx > 0 {
+		uuid = uuid[:idx]
+	}
+	return uuid
+}
+
 func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
-	if t, ok := c.recentOutboundUnsends[uuid]; ok {
-		if time.Since(t) < 5*time.Minute {
-			delete(c.recentOutboundUnsends, uuid)
-			return true
-		}
-		delete(c.recentOutboundUnsends, uuid)
+	u, ok := c.recentOutboundUnsends[uuid]
+	if !ok {
+		return false
 	}
-	return false
+	if time.Since(u.at) >= 5*time.Minute {
+		delete(c.recentOutboundUnsends, uuid)
+		return false
+	}
+	// Kept until settleOutboundUnsend or expiry, so a send that errors after
+	// the echo arrived can still count as accepted.
+	u.echoed = true
+	c.recentOutboundUnsends[uuid] = u
+	return true
 }
 
 // urlRegex matches URLs in message text for rich link matching.

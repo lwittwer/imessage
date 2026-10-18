@@ -94,6 +94,13 @@ one sibling from leaking or hiding another's history:
   body is scrubbed only with its exact message ID and Matrix delivery proof for
   that portal, rechecked in the same write. A prefetched delivered set is only a
   prefilter; a deleted witness or remapped source cannot authorize a later chunk.
+- A message unsent or deleted on its own (a Matrix redaction, or an Apple
+  unsend or per-message delete) stays deleted through restore-chat, and chat.db
+  backfill skips it in that portal and its aliases. bridgev2 removes the bridge
+  row after a Matrix redaction, so the per-message `cloud_message` tombstone is
+  the durable record. Portal-level deletes, and CloudKit change-feed deletes
+  that a chat delete also produces, are not: they neither survive restore nor
+  hide chat.db history from a recreated room.
 - Pending initial backfills and active or starting restores hold the plaintext
   they need. Permanently filtered/deleted rows may still be cleaned up.
 - Forward-backfill cancellation releases acquired capacity and bootstrap

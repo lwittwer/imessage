@@ -223,14 +223,23 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		messages = nonnil
 	}
 
+	// bridgev2 deletes the bridge row after a successful Matrix redaction, so
+	// AggressiveDeduplication cannot catch an unsent message whose chat.db row
+	// still has its body. Fail the page rather than risk re-bridging it.
+	rawMessageCount := len(messages)
+	messages, err = c.dropDeletedChatDBMessages(ctx, params.Portal, chatGUIDs, messages)
+	if err != nil {
+		return nil, err
+	}
+
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].Time.Before(messages[j].Time)
 	})
 
-	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", rawMessageCount).Msg("Got messages from chat.db")
 	nextCursor := encodeChatDBBackfillCursor(messagesByGUID, count, params.Forward)
-	hasMore := len(messages) >= count
+	hasMore := rawMessageCount >= count
 	if !params.Forward {
 		hasMore = nextCursor != ""
 	}
@@ -479,6 +488,46 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 		result = append(result, message)
 	}
 	return result
+}
+
+// dropDeletedChatDBMessages removes messages with a per-message delete
+// tombstone (Matrix-initiated unsend or Apple-side delete) in this portal or
+// one of its aliases: the handles whose chat.db GUIDs are merged into it.
+func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridgev2.Portal, chatGUIDs []string, messages []*imessage.Message) ([]*imessage.Message, error) {
+	if c.cloudStore == nil || len(messages) == 0 {
+		return messages, nil
+	}
+	guids := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg != nil && msg.GUID != "" {
+			guids = append(guids, msg.GUID)
+		}
+	}
+	portalIDs := []string{string(portal.ID)}
+	for _, chatGUID := range chatGUIDs {
+		if id := imessage.ParseIdentifier(chatGUID); id.LocalID != "" && !id.IsGroup {
+			portalIDs = append(portalIDs, string(identifierToPortalID(id)))
+		}
+	}
+	deleted, err := c.cloudStore.deletedMessageGUIDsInPortals(ctx, portalIDs, guids)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check chat.db messages for delete tombstones: %w", err)
+	}
+	if len(deleted) == 0 {
+		return messages, nil
+	}
+	kept := messages[:0]
+	for _, msg := range messages {
+		if msg != nil && msg.GUID != "" {
+			if _, ok := deleted[strings.ToUpper(msg.GUID)]; ok {
+				continue
+			}
+		}
+		kept = append(kept, msg)
+	}
+	zerolog.Ctx(ctx).Info().Int("dropped", len(messages)-len(kept)).
+		Msg("chat.db backfill: skipped deleted or unsent messages")
+	return kept, nil
 }
 
 func uniqueStrings(values []string) []string {

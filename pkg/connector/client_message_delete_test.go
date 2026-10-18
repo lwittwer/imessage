@@ -11,6 +11,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -192,4 +193,64 @@ func TestAdmitLiveMessageWaitsForDeleteTombstone(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("live route check did not complete")
 	}
+}
+
+func TestMessageUUIDFromPartID(t *testing.T) {
+	for id, want := range map[networkid.MessageID]string{
+		"ABC": "ABC", "ABC_att0": "ABC", "ABC_att12": "ABC", "_att0": "_att0",
+	} {
+		if got := messageUUIDFromPartID(id); got != want {
+			t.Errorf("messageUUIDFromPartID(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestSettleOutboundUnsend(t *testing.T) {
+	sendErr := errors.New("send timed out")
+	newClient := func() *IMClient {
+		client := &IMClient{recentOutboundUnsends: make(map[string]outboundUnsend)}
+		client.trackOutboundUnsend("UUID")
+		return client
+	}
+
+	t.Run("echo during retries", func(t *testing.T) {
+		client := newClient()
+		if !client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo during the send was not suppressed")
+		}
+		if err := client.settleOutboundUnsend("UUID", sendErr); err != nil {
+			t.Fatalf("unsend with a suppressed echo = %v, want accepted", err)
+		}
+	})
+
+	t.Run("echo after failure", func(t *testing.T) {
+		client := newClient()
+		if err := client.settleOutboundUnsend("UUID", sendErr); !errors.Is(err, sendErr) {
+			t.Fatalf("unsend without an echo = %v, want the send error", err)
+		}
+		if client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo after a failed unsend was suppressed")
+		}
+	})
+
+	t.Run("success before echo", func(t *testing.T) {
+		client := newClient()
+		if err := client.settleOutboundUnsend("UUID", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo after a successful unsend was not suppressed")
+		}
+	})
+
+	t.Run("success after echo clears tracking", func(t *testing.T) {
+		client := newClient()
+		client.wasOutboundUnsend("UUID")
+		if err := client.settleOutboundUnsend("UUID", nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(client.recentOutboundUnsends) != 0 {
+			t.Fatalf("tracked unsends = %v, want none", client.recentOutboundUnsends)
+		}
+	})
 }

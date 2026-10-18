@@ -355,7 +355,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		pendingAttachments:      newPendingAttachmentStore(c.Bridge.DB.Database, login.ID),
 		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
-		recentOutboundUnsends:   make(map[string]time.Time),
+		recentOutboundUnsends:   make(map[string]outboundUnsend),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
 		sharedStreamAssetCache:  make(map[string]map[string]struct{}),

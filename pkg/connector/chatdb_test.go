@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -966,5 +967,146 @@ func TestChatDBCursorStateTreatsMissingGUIDAsExhausted(t *testing.T) {
 	_, useCursor, exhausted = chatDBCursorStateForGUID(nil, "iMessage;-;+15550000002", false)
 	if useCursor || exhausted {
 		t.Fatalf("cursor state without active cursor = useCursor %v exhausted %v, want initial fetch", useCursor, exhausted)
+	}
+}
+
+type unsentChatDBAPI struct {
+	imessage.API
+	chatGUID string
+	messages []*imessage.Message
+}
+
+func (u *unsentChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	return []imessage.ChatIdentifier{{ChatGUID: u.chatGUID}}, nil
+}
+
+// Every exact GUID returns the same rows; FetchMessages deduplicates them.
+func (u *unsentChatDBAPI) GetMessagesSinceDate(string, time.Time, string) ([]*imessage.Message, error) {
+	return u.messages, nil
+}
+
+func (u *unsentChatDBAPI) GetMessagesBeforeWithLimit(string, time.Time, int) ([]*imessage.Message, error) {
+	return u.messages, nil
+}
+
+func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentChatDBAPI) {
+	t.Helper()
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, "login")
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	client := &IMClient{
+		Main:       &IMConnector{Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}}},
+		cloudStore: store,
+	}
+	chatGUID := "iMessage;-;+15550000001"
+	// The contact's second handle is merged into this portal.
+	aliasGUID := "SMS;-;+15550000002(smsft)"
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000001", Receiver: "login"},
+		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{chatGUID, aliasGUID}},
+	}}
+	message := func(guid string, ts int64) *imessage.Message {
+		return &imessage.Message{
+			GUID:     guid,
+			ItemType: imessage.ItemTypeMessage,
+			Sender:   imessage.Identifier{LocalID: "+15550000001"},
+			Text:     "body of " + guid,
+			Time:     time.Unix(ts, 0),
+		}
+	}
+	api := &unsentChatDBAPI{chatGUID: chatGUID, messages: []*imessage.Message{
+		message("KEPT-GUID", 100),
+		message("UNSENT-STUB-GUID", 200),
+		message("UNSENT-ROUTED-GUID", 300),
+		message("UNSENT-ALIAS-GUID", 400),
+		message("PORTAL-DELETED-GUID", 500),
+		message("REUSED-SMS-GUID", 600),
+	}}
+	return client, portal, api
+}
+
+func insertDeletedCloudMessage(t *testing.T, store *cloudBackfillStore, guid, portalID string, messageDeleted bool) {
+	t.Helper()
+	if _, err := store.db.Exec(context.Background(), `
+		INSERT INTO cloud_message (login_id, record_name, guid, portal_id, sender, is_from_me, service, timestamp_ms, created_ts, updated_ts, deleted, message_deleted)
+		VALUES ('login', $1, $2, $3, '', FALSE, 'iMessage', 1, 1, 1, TRUE, $4)`,
+		"record-"+guid, guid, portalID, messageDeleted); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// bridgev2 deletes a message's bridge row after a successful Matrix
+// redaction, so the bridge database no longer deduplicates an unsent message.
+// chat.db backfill must honor the cloud_message tombstone instead, or a later
+// fetch whose anchor moved back behind the unsent message re-bridges its body.
+func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	// Matrix-initiated unsend of a message cloud_message never saw: stub
+	// tombstone without a route, written in a different case than chat.db.
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "unsent-stub-guid", ""); err != nil {
+		t.Fatal(err)
+	}
+	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID), true)
+	// A tombstone stored under a merged handle's portal ID still applies.
+	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ALIAS-GUID", "tel:+15550000002", true)
+	// Apple's SMS relay reuses UUIDs across short-code threads; another
+	// thread's tombstone must not hide this portal's message.
+	insertDeletedCloudMessage(t, client.cloudStore, "REUSED-SMS-GUID", "tel:242733", true)
+	// Neither does a portal-level soft delete: the recreated room would get
+	// chat.db history with only the live-persisted messages missing.
+	insertDeletedCloudMessage(t, client.cloudStore, "PORTAL-DELETED-GUID", string(portal.ID), false)
+
+	for _, params := range []bridgev2.FetchMessagesParams{
+		{Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)}, Count: 10},
+		{Portal: portal, Count: 10},
+	} {
+		resp, err := (&chatDB{api: api}).FetchMessages(ctx, params, client)
+		if err != nil {
+			t.Fatalf("forward=%v FetchMessages failed: %v", params.Forward, err)
+		}
+		var got []networkid.MessageID
+		for _, msg := range resp.Messages {
+			got = append(got, msg.ID)
+		}
+		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("PORTAL-DELETED-GUID"), makeMessageID("REUSED-SMS-GUID")}
+		if !slices.Equal(got, want) {
+			t.Fatalf("forward=%v FetchMessages returned %v, want %v", params.Forward, got, want)
+		}
+	}
+}
+
+func TestChatDBForwardHasMoreCountsTombstonedMessages(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "UNSENT-STUB-GUID", ""); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&chatDB{api: api}).FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)},
+		Count: len(api.messages),
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Messages) != len(api.messages)-1 || !resp.HasMore {
+		t.Fatalf("forward page = %d messages, hasMore %v; want %d and true", len(resp.Messages), resp.HasMore, len(api.messages)-1)
+	}
+}
+
+func TestChatDBFetchMessagesFailsClosedWhenTombstoneLookupFails(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	if _, err := client.cloudStore.db.Exec(ctx, `DROP TABLE cloud_message`); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&chatDB{api: api}).FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)}, Count: 10,
+	}, client)
+	if err == nil {
+		t.Fatalf("FetchMessages returned %d messages without a tombstone check", len(resp.Messages))
 	}
 }

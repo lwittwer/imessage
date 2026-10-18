@@ -838,7 +838,7 @@ func completeLoginWithMeta(
 		pendingAttachments:      newPendingAttachmentStore(main.Bridge.DB.Database, loginID),
 		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
-		recentOutboundUnsends:   make(map[string]time.Time),
+		recentOutboundUnsends:   make(map[string]outboundUnsend),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
 		sharedStreamAssetCache:  make(map[string]map[string]struct{}),

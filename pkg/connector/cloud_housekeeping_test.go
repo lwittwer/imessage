@@ -189,23 +189,25 @@ func TestDeleteOrphanedMessagesPreservesLiveAndKnownPortalRows(t *testing.T) {
 		t.Fatalf("insert known chat: %v", err)
 	}
 	for _, row := range []struct {
-		guid    string
-		portal  any
-		age     time.Duration
-		deleted bool
+		guid           string
+		portal         any
+		age            time.Duration
+		deleted        bool
+		messageDeleted bool
 	}{
-		{"known-deleted", "known-portal", 48 * time.Hour, true},
-		{"orphan-deleted", "missing-portal", 48 * time.Hour, true},
-		{"orphan-live", "missing-portal", 48 * time.Hour, false},
-		{"old-null-stub", nil, 48 * time.Hour, true},
-		{"recent-null-stub", nil, time.Hour, true},
+		{"known-deleted", "known-portal", 48 * time.Hour, true, false},
+		{"orphan-deleted", "missing-portal", 48 * time.Hour, true, false},
+		{"orphan-live", "missing-portal", 48 * time.Hour, false, false},
+		// Per-message tombstones are the durable unsend record.
+		{"orphan-unsent", "missing-portal", 48 * time.Hour, true, true},
+		{"old-unsent-stub", nil, 48 * time.Hour, true, true},
 	} {
 		created := time.Now().Add(-row.age).UnixMilli()
 		if _, err := db.Exec(ctx, `
 			INSERT INTO cloud_message
-				(login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
-			VALUES ($1, $2, $3, $4, FALSE, $5, $4, $6)
-		`, testSQLLoginID, row.guid, row.portal, created, row.deleted, now); err != nil {
+				(login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, message_deleted, created_ts, updated_ts)
+			VALUES ($1, $2, $3, $4, FALSE, $5, $6, $4, $7)
+		`, testSQLLoginID, row.guid, row.portal, created, row.deleted, row.messageDeleted, now); err != nil {
 			t.Fatalf("insert %s: %v", row.guid, err)
 		}
 	}
@@ -214,12 +216,12 @@ func TestDeleteOrphanedMessagesPreservesLiveAndKnownPortalRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deleteOrphanedMessages: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("deleted = %d, want 2", deleted)
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
 	}
 	for guid, want := range map[string]bool{
 		"known-deleted": true, "orphan-deleted": false, "orphan-live": true,
-		"old-null-stub": false, "recent-null-stub": true,
+		"orphan-unsent": true, "old-unsent-stub": true,
 	} {
 		var count int
 		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM cloud_message WHERE guid=$1`, guid).Scan(&count); err != nil {
