@@ -2716,6 +2716,13 @@ func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid,
 //
 // The live-delivery check (isMessageDeletedInPortal) answers a different
 // question and intentionally counts portal-level deletes.
+//
+// TODO: cloud_message keys on (login_id, guid), and the CloudKit upsert
+// rewrites portal_id, so a reused SMS UUID collapses into one row. When thread
+// B's CloudKit record shares a UUID with a message unsent in thread A, B's row
+// inherits A's tombstone (deleted is sticky on conflict) and B's message is
+// hidden from chat.db backfill and restore-chat, while A loses its record.
+// Scoping tombstones fully needs a per-portal key or a separate tombstone table.
 func (s *cloudBackfillStore) deletedMessageGUIDsInPortals(ctx context.Context, portalIDs, guids []string) (map[string]struct{}, error) {
 	deleted := make(map[string]struct{})
 	portalArgs := make([]any, 0, len(portalIDs))
