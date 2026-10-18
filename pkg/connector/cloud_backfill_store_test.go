@@ -1030,3 +1030,87 @@ func TestParticipantSetsMatch(t *testing.T) {
 		})
 	}
 }
+
+func cloudMessageDeleteState(t *testing.T, db *dbutil.Database, guid string) (deleted, messageDeleted, scrubbed bool) {
+	t.Helper()
+	if err := db.QueryRow(context.Background(), `
+		SELECT deleted, message_deleted, body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, guid).Scan(&deleted, &messageDeleted, &scrubbed); err != nil {
+		t.Fatalf("read %s: %v", guid, err)
+	}
+	return
+}
+
+func TestRestoreChatKeepsMessageLevelDeletes(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	const portalID = "tel:+15550000001"
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, created_ts, updated_ts)
+		VALUES ($1, 'kept', $2, 1000, 'tel:+15550000001', FALSE, 'kept body', 1, 1),
+		       ($1, 'unsent', $2, 2000, '', TRUE, 'unsent body', 1, 1),
+		       ($1, 'apple-deleted', $2, 3000, 'tel:+15550000001', FALSE, 'deleted body', 1, 1)`,
+		testSQLLoginID, portalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.softDeleteMessageByGUID(ctx, "UNSENT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+		t.Fatal(err)
+	}
+	// A CloudKit message tombstone that arrives after the portal delete must
+	// still be recorded as a per-message delete, without moving updated_ts.
+	if err := store.deleteMessageBatch(ctx, []string{"apple-deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	var updatedTS int64
+	if err := db.QueryRow(ctx, `SELECT updated_ts FROM cloud_message WHERE guid='apple-deleted'`).Scan(&updatedTS); err != nil {
+		t.Fatal(err)
+	}
+
+	undeleted, err := store.undeleteCloudMessagesByPortalID(ctx, portalID)
+	if err != nil || undeleted != 1 {
+		t.Fatalf("undeleted = %d, %v; want 1", undeleted, err)
+	}
+	if _, err := store.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, "kept"); deleted || messageDeleted || scrubbed {
+		t.Fatalf("kept = deleted:%v message_deleted:%v scrubbed:%v; want restored", deleted, messageDeleted, scrubbed)
+	}
+	for _, guid := range []string{"unsent", "apple-deleted"} {
+		if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, guid); !deleted || !messageDeleted || !scrubbed {
+			t.Fatalf("%s = deleted:%v message_deleted:%v scrubbed:%v; want still deleted and scrubbed", guid, deleted, messageDeleted, scrubbed)
+		}
+	}
+	var updatedAfter int64
+	if err := db.QueryRow(ctx, `SELECT updated_ts FROM cloud_message WHERE guid='apple-deleted'`).Scan(&updatedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if updatedAfter != updatedTS {
+		t.Fatalf("message-level restore skip changed updated_ts from %d to %d", updatedTS, updatedAfter)
+	}
+}
+
+func TestEnsureSchemaClassifiesLegacyDeleteStubs(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
+		VALUES ($1, 'legacy-stub', NULL, 1, FALSE, TRUE, 1, 1),
+		       ($1, 'legacy-routed', 'tel:+15550000001', 1, FALSE, TRUE, 1, 1),
+		       ($1, 'live', 'tel:+15550000001', 1, FALSE, FALSE, 1, 1)`,
+		testSQLLoginID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for guid, want := range map[string]bool{"legacy-stub": true, "legacy-routed": false, "live": false} {
+		if _, messageDeleted, _ := cloudMessageDeleteState(t, db, guid); messageDeleted != want {
+			t.Fatalf("%s message_deleted = %v, want %v", guid, messageDeleted, want)
+		}
+	}
+}

@@ -5840,7 +5840,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 			_, insertErr := c.cloudStore.db.Exec(ctx, `
 				INSERT INTO cloud_message (login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, service, deleted, created_ts, updated_ts, record_name, has_body)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $9, $10, TRUE)
-				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=FALSE, portal_id=$4
+				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=cloud_message.message_deleted, portal_id=$4
 			`, c.cloudStore.loginID, guid, metadata.CloudChatID, portalID, metadata.TimestampMS, metadata.Sender, metadata.IsFromMe, metadata.Service, nowMS, metadata.RecordName)
 			if insertErr != nil {
 				log.Debug().Err(insertErr).Str("guid", logSafeHandle(guid)).Msg("Failed to seed cloud_message from recycle bin")

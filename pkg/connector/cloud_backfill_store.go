@@ -334,6 +334,10 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		// part string; conversion maps part>=1 to the {guid}_attN target ID.
 		{"reply_to_guid", "TEXT"},
 		{"reply_to_part", "TEXT"},
+		// TRUE when this message itself was deleted or unsent, as opposed to
+		// soft-deleted with its whole portal. Restore-chat revives portal
+		// deletes only, and chat.db backfill skips only these rows.
+		{"message_deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
 	} {
 		exists, err := columnExists(ctx, s.db, "cloud_message", col.name)
 		if err != nil {
@@ -402,6 +406,17 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		  AND body_scrubbed=FALSE
 	`, s.loginID); err != nil {
 		return fmt.Errorf("failed to scrub pre-existing soft-deleted rows: %w", err)
+	}
+
+	// Unrouted stubs only ever come from per-message deletes. Routed rows
+	// deleted before message_deleted existed cannot be classified and keep
+	// their earlier restore behavior.
+	if _, err := s.db.Exec(ctx, `
+		UPDATE cloud_message SET message_deleted=TRUE
+		WHERE login_id=$1 AND deleted=TRUE AND message_deleted=FALSE
+		  AND (portal_id IS NULL OR portal_id='')
+	`, s.loginID); err != nil {
+		return fmt.Errorf("failed to classify legacy message delete stubs: %w", err)
 	}
 
 	// Cleanup: permanently delete system/rename message rows that slipped into
@@ -946,7 +961,7 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 
 		query := fmt.Sprintf(
 			`UPDATE cloud_message
-			 SET deleted=TRUE,
+			 SET deleted=TRUE, message_deleted=TRUE,
 			     text=NULL, subject=NULL, sender='',
 			     tapback_emoji=NULL,
 			     body_scrubbed=TRUE,
@@ -956,6 +971,24 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
 			return fmt.Errorf("failed to soft-delete message batch: %w", err)
+		}
+		// A row already soft-deleted with its portal still needs the
+		// per-message mark so restore-chat leaves it deleted. Keep its
+		// updated_ts, which tail-timestamp gating reads.
+		markPlaceholders := make([]string, len(chunk))
+		markArgs := make([]any, 0, len(chunk)+1)
+		markArgs = append(markArgs, s.loginID)
+		for j, g := range chunk {
+			markPlaceholders[j] = fmt.Sprintf("$%d", j+2)
+			markArgs = append(markArgs, g)
+		}
+		markQuery := fmt.Sprintf(
+			`UPDATE cloud_message SET message_deleted=TRUE
+			 WHERE login_id=$1 AND guid IN (%s) AND deleted=TRUE AND message_deleted=FALSE`,
+			strings.Join(markPlaceholders, ","),
+		)
+		if _, err := s.db.Exec(ctx, markQuery, markArgs...); err != nil {
+			return fmt.Errorf("failed to mark message batch deleted: %w", err)
 		}
 	}
 	return nil
@@ -2308,7 +2341,7 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 		// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
 		res, err := s.db.Exec(ctx,
 			`UPDATE cloud_message
-			 SET deleted=TRUE,
+			 SET deleted=TRUE, message_deleted=TRUE,
 			     text=NULL, subject=NULL, sender='',
 			     tapback_emoji=NULL,
 			     body_scrubbed=TRUE
@@ -2333,8 +2366,8 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 		nowMS := time.Now().UnixMilli()
 		_, err = s.db.Exec(ctx,
 			`INSERT INTO cloud_message
-				(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
-			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)
+				(login_id, guid, timestamp_ms, is_from_me, deleted, message_deleted, body_scrubbed, created_ts, updated_ts)
+			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, TRUE, $4, $4)
 			 ON CONFLICT (login_id, guid) DO NOTHING`,
 			s.loginID, guid, nowMS, nowMS,
 		)
@@ -2652,7 +2685,8 @@ func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid,
 // deletedMessageGUIDsInPortal returns the uppercased subset of guids that carry
 // a per-message delete tombstone for portalID. Unrouted stubs from
 // softDeleteMessageByGUID count for every portal; a tombstone routed to another
-// portal does not hide this portal's copy.
+// portal does not hide this portal's copy, and a portal-level soft delete is
+// not a per-message tombstone.
 func (s *cloudBackfillStore) deletedMessageGUIDsInPortal(ctx context.Context, portalID string, guids []string) (map[string]struct{}, error) {
 	deleted := make(map[string]struct{})
 	const chunkSize = 500
@@ -2667,7 +2701,7 @@ func (s *cloudBackfillStore) deletedMessageGUIDsInPortal(ctx context.Context, po
 		}
 		rows, err := s.db.Query(ctx, fmt.Sprintf(`
 			SELECT UPPER(guid) FROM cloud_message
-			WHERE login_id=$1 AND deleted=TRUE
+			WHERE login_id=$1 AND deleted=TRUE AND message_deleted=TRUE
 			  AND (portal_id=$2 OR portal_id IS NULL OR portal_id='')
 			  AND UPPER(guid) IN (%s)`, strings.Join(placeholders, ",")), args...)
 		if err != nil {
@@ -3858,7 +3892,8 @@ func (s *cloudBackfillStore) getCloudChatRecordByPortalID(ctx context.Context, p
 }
 
 // undeleteCloudMessagesByPortalID reverses a portal-level soft-delete by
-// setting deleted=FALSE on all cloud_message rows for the portal.
+// setting deleted=FALSE on the portal's cloud_message rows. Messages deleted
+// or unsent individually (message_deleted) stay deleted.
 // Returns the number of rows updated.
 func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context, portalID string) (int, error) {
 	nowMS := time.Now().UnixMilli()
@@ -3884,7 +3919,7 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3
-		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
+		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE AND message_deleted=FALSE`,
 		s.loginID, portalID, nowMS,
 	)
 	if err != nil {
@@ -3914,7 +3949,7 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	nowMS := time.Now().UnixMilli()
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$3
-		 WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=TRUE`,
+		 WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=TRUE AND message_deleted=FALSE`,
 		s.loginID, portalID, nowMS,
 	)
 	if err != nil {

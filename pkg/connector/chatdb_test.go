@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -1018,16 +1019,17 @@ func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentC
 		message("UNSENT-STUB-GUID", 200),
 		message("UNSENT-ROUTED-GUID", 300),
 		message("DELETED-ELSEWHERE-GUID", 400),
+		message("PORTAL-DELETED-GUID", 500),
 	}}
 	return client, portal, api
 }
 
-func insertDeletedCloudMessage(t *testing.T, store *cloudBackfillStore, guid, portalID string) {
+func insertDeletedCloudMessage(t *testing.T, store *cloudBackfillStore, guid, portalID string, messageDeleted bool) {
 	t.Helper()
 	if _, err := store.db.Exec(context.Background(), `
-		INSERT INTO cloud_message (login_id, record_name, guid, portal_id, sender, is_from_me, service, timestamp_ms, created_ts, updated_ts, deleted)
-		VALUES ('login', $1, $2, $3, '', FALSE, 'iMessage', 1, 1, 1, TRUE)`,
-		"record-"+guid, guid, portalID); err != nil {
+		INSERT INTO cloud_message (login_id, record_name, guid, portal_id, sender, is_from_me, service, timestamp_ms, created_ts, updated_ts, deleted, message_deleted)
+		VALUES ('login', $1, $2, $3, '', FALSE, 'iMessage', 1, 1, 1, TRUE, $4)`,
+		"record-"+guid, guid, portalID, messageDeleted); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1044,9 +1046,12 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "unsent-stub-guid"); err != nil {
 		t.Fatal(err)
 	}
-	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID))
+	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID), true)
 	// A tombstone routed to another portal must not hide this portal's copy.
-	insertDeletedCloudMessage(t, client.cloudStore, "DELETED-ELSEWHERE-GUID", "tel:+15550000002")
+	insertDeletedCloudMessage(t, client.cloudStore, "DELETED-ELSEWHERE-GUID", "tel:+15550000002", true)
+	// Neither does a portal-level soft delete: the recreated room would get
+	// chat.db history with only the live-persisted messages missing.
+	insertDeletedCloudMessage(t, client.cloudStore, "PORTAL-DELETED-GUID", string(portal.ID), false)
 
 	for _, params := range []bridgev2.FetchMessagesParams{
 		{Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)}, Count: 10},
@@ -1060,8 +1065,8 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 		for _, msg := range resp.Messages {
 			got = append(got, msg.ID)
 		}
-		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("DELETED-ELSEWHERE-GUID")}
-		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("DELETED-ELSEWHERE-GUID"), makeMessageID("PORTAL-DELETED-GUID")}
+		if !slices.Equal(got, want) {
 			t.Fatalf("forward=%v FetchMessages returned %v, want %v", params.Forward, got, want)
 		}
 	}
