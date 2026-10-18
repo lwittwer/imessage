@@ -15,4 +15,14 @@ needs a per-portal key for tombstones, for example a separate tombstone table
 keyed by `(login_id, guid, portal_id)`.
 
 Raised in the PR 85 review. Rare: it needs a reused UUID and a CloudKit record
-for the other thread.
+for the other thread. Matrix redactions are refused for SMS conversations, so
+only Apple-side deletes and unsends can create these tombstones.
+
+Other write paths with the same shared-row problem, to cover with the same fix:
+
+- The recycle-bin seed upsert in `recoverMessagesFromRecycleBin` keeps a
+  `message_deleted` row deleted but rewrites its `portal_id` to the portal being
+  restored, moving the tombstone out of its thread.
+- `softDeleteMessageByGUID` only routes a newly inserted stub. When its UPDATE
+  matches an existing unrouted row (for example a legacy stub), the row stays
+  unrouted and its tombstone applies to every portal.
