@@ -1100,16 +1100,17 @@ func TestEnsureSchemaClassifiesLegacyMessageDeletes(t *testing.T) {
 	if _, err := db.Exec(ctx, `DELETE FROM cloud_maintenance WHERE task=$1`, legacyMessageDeleteClassificationTask); err != nil {
 		t.Fatal(err)
 	}
-	// dm-a: an unsend between live messages. dm-b: a portal-level delete
-	// followed by new live messages in the recreated room.
+	// Routed rows stay unclassified: dm-a looks like an unsend between live
+	// messages, but partial recycle-bin recovery leaves the same shape (dm-b:
+	// older listed row revived, newer unlisted row still portal-deleted).
 	if _, err := db.Exec(ctx, `
 		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
 		VALUES ($1, 'legacy-stub', NULL, 1, FALSE, TRUE, 1, 1),
 		       ($1, 'a-live-old', 'dm-a', 100, FALSE, FALSE, 1, 1),
 		       ($1, 'a-unsent', 'dm-a', 200, FALSE, TRUE, 1, 1),
 		       ($1, 'a-live-new', 'dm-a', 300, FALSE, FALSE, 1, 1),
-		       ($1, 'b-portal-deleted', 'dm-b', 100, FALSE, TRUE, 1, 1),
-		       ($1, 'b-live-new', 'dm-b', 300, FALSE, FALSE, 1, 1)`,
+		       ($1, 'b-revived-old', 'dm-b', 100, FALSE, FALSE, 1, 1),
+		       ($1, 'b-portal-deleted', 'dm-b', 200, FALSE, TRUE, 1, 1)`,
 		testSQLLoginID); err != nil {
 		t.Fatal(err)
 	}
@@ -1117,8 +1118,8 @@ func TestEnsureSchemaClassifiesLegacyMessageDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for guid, want := range map[string]bool{
-		"legacy-stub": true, "a-unsent": true, "a-live-old": false,
-		"b-portal-deleted": false, "b-live-new": false,
+		"legacy-stub": true, "a-unsent": false, "a-live-old": false,
+		"b-portal-deleted": false, "b-revived-old": false,
 	} {
 		if _, messageDeleted, _ := cloudMessageDeleteState(t, db, guid); messageDeleted != want {
 			t.Fatalf("%s message_deleted = %v, want %v", guid, messageDeleted, want)
@@ -1148,5 +1149,29 @@ func TestRecycleBinUndeleteKeepsMessageLevelDeletes(t *testing.T) {
 	}
 	if deleted, _, _ := cloudMessageDeleteState(t, db, "unsent"); !deleted {
 		t.Fatal("recycle-bin recovery revived an unsent message")
+	}
+}
+
+func TestDeletedMessageGUIDsInPortalsMatchesGroupAliases(t *testing.T) {
+	ctx := context.Background()
+	db, store := newTestCloudBackfillStore(t)
+	// The bridge portal uses the chat_id; CloudKit stored rows under group_id.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts)
+		VALUES ($1, 'CHAT-UUID', 'GROUP-UUID', 'gid:group-uuid', 1)`, testSQLLoginID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, message_deleted, created_ts, updated_ts)
+		VALUES ($1, 'alias-unsent', 'gid:group-uuid', 1, FALSE, TRUE, TRUE, 1, 1),
+		       ($1, 'other-group', 'gid:other', 1, FALSE, TRUE, TRUE, 1, 1)`, testSQLLoginID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.deletedMessageGUIDsInPortals(ctx, []string{"gid:chat-uuid"}, []string{"alias-unsent", "other-group"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["ALIAS-UNSENT"]; !ok || len(got) != 1 {
+		t.Fatalf("deleted = %v, want only ALIAS-UNSENT", got)
 	}
 }

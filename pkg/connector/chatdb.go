@@ -227,7 +227,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// AggressiveDeduplication cannot catch an unsent message whose chat.db row
 	// still has its body. Fail the page rather than risk re-bridging it.
 	rawMessageCount := len(messages)
-	messages, err = c.dropDeletedChatDBMessages(ctx, messages)
+	messages, err = c.dropDeletedChatDBMessages(ctx, params.Portal, chatGUIDs, messages)
 	if err != nil {
 		return nil, err
 	}
@@ -491,8 +491,9 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 }
 
 // dropDeletedChatDBMessages removes messages with a per-message delete
-// tombstone (Matrix-initiated unsend or Apple-side delete).
-func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, messages []*imessage.Message) ([]*imessage.Message, error) {
+// tombstone (Matrix-initiated unsend or Apple-side delete) in this portal or
+// one of its aliases: the handles whose chat.db GUIDs are merged into it.
+func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridgev2.Portal, chatGUIDs []string, messages []*imessage.Message) ([]*imessage.Message, error) {
 	if c.cloudStore == nil || len(messages) == 0 {
 		return messages, nil
 	}
@@ -502,7 +503,13 @@ func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, messages []*im
 			guids = append(guids, msg.GUID)
 		}
 	}
-	deleted, err := c.cloudStore.deletedMessageGUIDs(ctx, guids)
+	portalIDs := []string{string(portal.ID)}
+	for _, chatGUID := range chatGUIDs {
+		if id := imessage.ParseIdentifier(chatGUID); id.LocalID != "" && !id.IsGroup {
+			portalIDs = append(portalIDs, string(identifierToPortalID(id)))
+		}
+	}
+	deleted, err := c.cloudStore.deletedMessageGUIDsInPortals(ctx, portalIDs, guids)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check chat.db messages for delete tombstones: %w", err)
 	}

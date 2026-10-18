@@ -492,10 +492,11 @@ const legacySystemMessageCleanupTask = "legacy-system-messages-v1"
 const legacyMessageDeleteClassificationTask = "legacy-message-delete-classification-v1"
 
 // classifyLegacyMessageDeletes marks rows soft-deleted before message_deleted
-// existed. Unrouted stubs only come from per-message deletes. A portal-level
-// delete covers every row the portal held at that time, so a deleted row with
-// an older live row in the same portal was deleted on its own. Remaining rows
-// are ambiguous and keep their earlier restore behavior.
+// existed. Only unrouted stubs are unambiguous: softDeleteMessageByGUID is the
+// sole writer of a deleted row without a portal. A routed row may come from a
+// portal-level delete, and neither timeline order (partial recycle-bin
+// recovery) nor updated_ts (rewritten by every CloudKit upsert) separates the
+// two, so routed rows keep their earlier restore and backfill behavior.
 func (s *cloudBackfillStore) classifyLegacyMessageDeletes(ctx context.Context) error {
 	var completed int
 	err := s.db.QueryRow(ctx, `
@@ -507,16 +508,7 @@ func (s *cloudBackfillStore) classifyLegacyMessageDeletes(ctx context.Context) e
 	if _, err = s.db.Exec(ctx, `
 		UPDATE cloud_message SET message_deleted=TRUE
 		WHERE login_id=$1 AND deleted=TRUE AND message_deleted=FALSE
-		  AND (
-		    portal_id IS NULL OR portal_id=''
-		    OR EXISTS (
-		      SELECT 1 FROM cloud_message live
-		      WHERE live.login_id=cloud_message.login_id
-		        AND live.portal_id=cloud_message.portal_id
-		        AND live.deleted=FALSE
-		        AND live.timestamp_ms < cloud_message.timestamp_ms
-		    )
-		  )
+		  AND (portal_id IS NULL OR portal_id='')
 	`, s.loginID); err != nil {
 		return err
 	}
@@ -2697,32 +2689,65 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 }
 
 // Portal matching keeps reused SMS UUIDs from suppressing other conversations.
+// Live delivery runs this after persisting the message's route, so a
+// delete-first stub is already routed, and a portal-level delete also
+// suppresses delivery. Backfill uses deletedMessageGUIDsInPortals instead,
+// which must ignore portal-level deletes so restore and recreated rooms keep
+// their history.
 func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid, portalID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx, messageDeletedInPortalQuery, s.loginID, guid, portalID).Scan(&count)
 	return count > 0, err
 }
 
-// deletedMessageGUIDs returns the uppercased subset of guids that were deleted
-// or unsent individually. A GUID names one message, so its tombstone applies
-// whichever portal or alias the row is stored under. Portal-level soft deletes
-// are not per-message tombstones.
-func (s *cloudBackfillStore) deletedMessageGUIDs(ctx context.Context, guids []string) (map[string]struct{}, error) {
+// deletedMessageGUIDsInPortals returns the uppercased subset of guids that
+// were deleted or unsent individually in one of portalIDs, plus unrouted stubs
+// from softDeleteMessageByGUID. Callers pass the portal and its aliases. The
+// scope matters: Apple's SMS relay can reuse a UUID across short-code threads,
+// and a tombstone in one must not hide another. A gid: portal also matches rows
+// stored under the portal IDs of its cloud_chat group_id/cloud_chat_id
+// siblings, as in deleteLocalChatByPortalID. Portal-level soft deletes are not
+// per-message tombstones.
+//
+// The live-delivery check (isMessageDeletedInPortal) answers a different
+// question and intentionally counts portal-level deletes.
+func (s *cloudBackfillStore) deletedMessageGUIDsInPortals(ctx context.Context, portalIDs, guids []string) (map[string]struct{}, error) {
 	deleted := make(map[string]struct{})
+	portalArgs := make([]any, 0, len(portalIDs))
+	portalPlaceholders := make([]string, 0, len(portalIDs))
+	var groupClauses []string
+	for _, portalID := range uniqueStrings(portalIDs) {
+		portalArgs = append(portalArgs, portalID)
+		portalPlaceholders = append(portalPlaceholders, fmt.Sprintf("$%d", len(portalArgs)+1))
+		if strings.HasPrefix(portalID, "gid:") {
+			portalArgs = append(portalArgs, strings.TrimPrefix(portalID, "gid:"))
+			n := len(portalArgs) + 1
+			groupClauses = append(groupClauses, fmt.Sprintf(
+				`portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (LOWER(group_id)=LOWER($%d) OR LOWER(cloud_chat_id)=LOWER($%d)))`, n, n))
+		}
+	}
+	scope := []string{"portal_id IS NULL", "portal_id=''"}
+	if len(portalPlaceholders) > 0 {
+		scope = append(scope, "portal_id IN ("+strings.Join(portalPlaceholders, ",")+")")
+	}
+	scope = append(scope, groupClauses...)
+
 	const chunkSize = 500
 	for i := 0; i < len(guids); i += chunkSize {
 		chunk := guids[i:min(i+chunkSize, len(guids))]
-		placeholders := make([]string, len(chunk))
-		args := make([]any, 0, len(chunk)+1)
+		args := make([]any, 0, 1+len(portalArgs)+len(chunk))
 		args = append(args, s.loginID)
+		args = append(args, portalArgs...)
+		placeholders := make([]string, len(chunk))
 		for j, guid := range chunk {
-			placeholders[j] = fmt.Sprintf("UPPER($%d)", j+2)
 			args = append(args, guid)
+			placeholders[j] = fmt.Sprintf("UPPER($%d)", len(args))
 		}
 		rows, err := s.db.Query(ctx, fmt.Sprintf(`
 			SELECT UPPER(guid) FROM cloud_message
 			WHERE login_id=$1 AND message_deleted=TRUE AND deleted=TRUE
-			  AND UPPER(guid) IN (%s)`, strings.Join(placeholders, ",")), args...)
+			  AND (%s)
+			  AND UPPER(guid) IN (%s)`, strings.Join(scope, " OR "), strings.Join(placeholders, ",")), args...)
 		if err != nil {
 			return nil, fmt.Errorf("query deleted message GUIDs: %w", err)
 		}

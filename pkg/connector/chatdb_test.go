@@ -980,6 +980,8 @@ func (u *unsentChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatI
 	return []imessage.ChatIdentifier{{ChatGUID: u.chatGUID}}, nil
 }
 
+// Both exact GUIDs return the same rows; FetchMessages deduplicates them.
+
 func (u *unsentChatDBAPI) GetMessagesSinceDate(string, time.Time, string) ([]*imessage.Message, error) {
 	return u.messages, nil
 }
@@ -1001,9 +1003,11 @@ func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentC
 		cloudStore: store,
 	}
 	chatGUID := "iMessage;-;+15550000001"
+	// The contact's second handle is merged into this portal.
+	aliasGUID := "SMS;-;+15550000002(smsft)"
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		PortalKey: networkid.PortalKey{ID: "tel:+15550000001", Receiver: "login"},
-		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{chatGUID}},
+		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{chatGUID, aliasGUID}},
 	}}
 	message := func(guid string, ts int64) *imessage.Message {
 		return &imessage.Message{
@@ -1020,6 +1024,7 @@ func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentC
 		message("UNSENT-ROUTED-GUID", 300),
 		message("UNSENT-ALIAS-GUID", 400),
 		message("PORTAL-DELETED-GUID", 500),
+		message("REUSED-SMS-GUID", 600),
 	}}
 	return client, portal, api
 }
@@ -1047,9 +1052,11 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID), true)
-	// A GUID names one message, so a tombstone stored under an alias portal
-	// ID (gid:<group_id>, merged-handle DM) still applies.
+	// A tombstone stored under a merged handle's portal ID still applies.
 	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ALIAS-GUID", "tel:+15550000002", true)
+	// Apple's SMS relay reuses UUIDs across short-code threads; another
+	// thread's tombstone must not hide this portal's message.
+	insertDeletedCloudMessage(t, client.cloudStore, "REUSED-SMS-GUID", "tel:242733", true)
 	// Neither does a portal-level soft delete: the recreated room would get
 	// chat.db history with only the live-persisted messages missing.
 	insertDeletedCloudMessage(t, client.cloudStore, "PORTAL-DELETED-GUID", string(portal.ID), false)
@@ -1066,7 +1073,7 @@ func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
 		for _, msg := range resp.Messages {
 			got = append(got, msg.ID)
 		}
-		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("PORTAL-DELETED-GUID")}
+		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("PORTAL-DELETED-GUID"), makeMessageID("REUSED-SMS-GUID")}
 		if !slices.Equal(got, want) {
 			t.Fatalf("forward=%v FetchMessages returned %v, want %v", params.Forward, got, want)
 		}
