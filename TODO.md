@@ -23,3 +23,23 @@ Other write paths with the same shared-row problem, to cover with the same fix:
 - The recycle-bin seed upsert in `recoverMessagesFromRecycleBin` keeps a
   `message_deleted` row deleted but rewrites its `portal_id` to the portal being
   restored, moving the tombstone out of its thread.
+
+## Keep continuation chunks out of the live room
+
+An oversized outbound Matrix message goes out as a head iMessage plus
+continuation chunks. The head's Matrix event holds the full text, so the chunks
+must not be bridged again into the same room. `markContinuationChunk` soft-deletes
+them, which keeps CloudKit backfill from serving them while still letting
+restore-chat bring them back (a restored room has no head event).
+
+Two paths can still show the chunks as a duplicate tail under the head:
+
+- The orphan sweep can reap a chunk's row while its portal has no `cloud_chat`
+  row yet; a later CloudKit sync then re-inserts it live.
+- chat.db forward backfill does not filter plain soft deletes. After an
+  oversized send, a restart before any newer message is bridged fetches the
+  chunks past the room's forward anchor.
+
+Both predate PR 85; `beta-latest` has the same behavior. A fix needs to skip a
+chunk only while its head is still bridged in the portal, so restore keeps
+working.
