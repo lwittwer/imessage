@@ -462,6 +462,7 @@ type IMClient struct {
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
 	recentOutboundUnsends     map[string]time.Time
+	echoedOutboundUnsends     map[string]time.Time // suppressed echoes, guarded by recentOutboundUnsendsLock
 	recentOutboundUnsendsLock sync.Mutex
 
 	// SMS service and destination are protected by one lock so outbound routing
@@ -7296,8 +7297,8 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
-		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
-			c.forgetOutboundUnsend(siblingUUID)
+		_, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle)
+		if sibErr = c.settleOutboundUnsend(siblingUUID, sibErr); sibErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(sibErr).
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
@@ -7317,8 +7318,8 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
 		contUUID := continuationUUIDs[i]
 		c.trackOutboundUnsend(contUUID)
-		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle); contErr != nil {
-			c.forgetOutboundUnsend(contUUID)
+		_, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle)
+		if contErr = c.settleOutboundUnsend(contUUID, contErr); contErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(contErr).
 				Str("continuation_uuid", contUUID).
 				Msg("Failed to unsend continuation chunk on redact of split message")
@@ -7338,12 +7339,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	c.trackOutboundUnsend(targetUUID)
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendUnsend(conv, targetUUID, 0, c.handle)
-	if err != nil {
-		// Apple may still have accepted it (e.g. a timeout after the Rust
-		// retry). Let a real echo reach handleUnsend, which writes the
-		// tombstone.
-		c.forgetOutboundUnsend(targetUUID)
-	}
+	err = c.settleOutboundUnsend(targetUUID, err)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection. Only after Apple accepted
@@ -14023,6 +14019,29 @@ func (c *IMClient) trackOutboundUnsend(uuid string) {
 			delete(c.recentOutboundUnsends, k)
 		}
 	}
+	for k, t := range c.echoedOutboundUnsends {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.echoedOutboundUnsends, k)
+		}
+	}
+}
+
+// settleOutboundUnsend resolves a Matrix-initiated unsend after SendUnsend
+// returns. An error does not prove Apple rejected it: SendUnsend retries on
+// SendTimedOut for several seconds, and Apple's echo, suppressed by
+// handleUnsend meanwhile, shows it was accepted. Without a suppressed echo the
+// tracking is dropped so a later echo reaches handleUnsend and writes the
+// tombstone. Returns nil when the unsend should be treated as accepted.
+func (c *IMClient) settleOutboundUnsend(uuid string, sendErr error) error {
+	c.recentOutboundUnsendsLock.Lock()
+	defer c.recentOutboundUnsendsLock.Unlock()
+	_, echoed := c.echoedOutboundUnsends[uuid]
+	delete(c.echoedOutboundUnsends, uuid)
+	if sendErr == nil || echoed {
+		return nil
+	}
+	delete(c.recentOutboundUnsends, uuid)
+	return sendErr
 }
 
 // messageUUIDFromPartID strips an attachment part suffix ({uuid}_att0,
@@ -14035,20 +14054,16 @@ func messageUUIDFromPartID(id networkid.MessageID) string {
 	return uuid
 }
 
-// forgetOutboundUnsend drops a tracked unsend whose send failed, so its echo
-// (if Apple received it anyway) is handled as an incoming unsend.
-func (c *IMClient) forgetOutboundUnsend(uuid string) {
-	c.recentOutboundUnsendsLock.Lock()
-	defer c.recentOutboundUnsendsLock.Unlock()
-	delete(c.recentOutboundUnsends, uuid)
-}
-
 func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
 	if t, ok := c.recentOutboundUnsends[uuid]; ok {
 		if time.Since(t) < 5*time.Minute {
 			delete(c.recentOutboundUnsends, uuid)
+			if c.echoedOutboundUnsends == nil {
+				c.echoedOutboundUnsends = make(map[string]time.Time)
+			}
+			c.echoedOutboundUnsends[uuid] = time.Now()
 			return true
 		}
 		delete(c.recentOutboundUnsends, uuid)

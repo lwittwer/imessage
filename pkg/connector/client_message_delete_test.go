@@ -205,11 +205,42 @@ func TestMessageUUIDFromPartID(t *testing.T) {
 	}
 }
 
-func TestForgetOutboundUnsendLetsEchoThrough(t *testing.T) {
-	client := &IMClient{recentOutboundUnsends: make(map[string]time.Time)}
-	client.trackOutboundUnsend("UUID")
-	client.forgetOutboundUnsend("UUID")
-	if client.wasOutboundUnsend("UUID") {
-		t.Fatal("echo of a failed unsend was suppressed")
+func TestSettleOutboundUnsend(t *testing.T) {
+	sendErr := errors.New("send timed out")
+	newClient := func() *IMClient {
+		client := &IMClient{recentOutboundUnsends: make(map[string]time.Time)}
+		client.trackOutboundUnsend("UUID")
+		return client
 	}
+
+	t.Run("echo during retries", func(t *testing.T) {
+		client := newClient()
+		if !client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo during the send was not suppressed")
+		}
+		if err := client.settleOutboundUnsend("UUID", sendErr); err != nil {
+			t.Fatalf("unsend with a suppressed echo = %v, want accepted", err)
+		}
+	})
+
+	t.Run("echo after failure", func(t *testing.T) {
+		client := newClient()
+		if err := client.settleOutboundUnsend("UUID", sendErr); !errors.Is(err, sendErr) {
+			t.Fatalf("unsend without an echo = %v, want the send error", err)
+		}
+		if client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo after a failed unsend was suppressed")
+		}
+	})
+
+	t.Run("success clears echo record", func(t *testing.T) {
+		client := newClient()
+		client.wasOutboundUnsend("UUID")
+		if err := client.settleOutboundUnsend("UUID", nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(client.echoedOutboundUnsends) != 0 {
+			t.Fatalf("echo records = %v, want none", client.echoedOutboundUnsends)
+		}
+	})
 }

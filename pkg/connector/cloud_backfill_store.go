@@ -418,6 +418,11 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		ON cloud_message (login_id, UPPER(guid)) WHERE message_deleted=TRUE OR continuation_of<>''`); err != nil {
 		return fmt.Errorf("failed to create cloud message tombstone index: %w", err)
 	}
+	// Replaced by cloud_message_tombstone_idx before release; dev databases
+	// may still carry it.
+	if _, err := s.db.Exec(ctx, `DROP INDEX IF EXISTS cloud_message_message_deleted_idx`); err != nil {
+		return fmt.Errorf("failed to drop cloud_message_message_deleted_idx: %w", err)
+	}
 
 	// Cleanup: permanently delete system/rename message rows that slipped into
 	// the DB before the MsgType==0 ingest filter was added.  Two conditions
