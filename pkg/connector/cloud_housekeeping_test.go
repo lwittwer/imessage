@@ -198,8 +198,6 @@ func TestDeleteOrphanedMessagesPreservesLiveAndKnownPortalRows(t *testing.T) {
 		{"known-deleted", "known-portal", 48 * time.Hour, true, false},
 		{"orphan-deleted", "missing-portal", 48 * time.Hour, true, false},
 		{"orphan-live", "missing-portal", 48 * time.Hour, false, false},
-		{"old-null-stub", nil, 48 * time.Hour, true, false},
-		{"recent-null-stub", nil, time.Hour, true, false},
 		// Per-message tombstones are the durable unsend record.
 		{"orphan-unsent", "missing-portal", 48 * time.Hour, true, true},
 		{"old-unsent-stub", nil, 48 * time.Hour, true, true},
@@ -218,12 +216,11 @@ func TestDeleteOrphanedMessagesPreservesLiveAndKnownPortalRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deleteOrphanedMessages: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("deleted = %d, want 2", deleted)
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
 	}
 	for guid, want := range map[string]bool{
 		"known-deleted": true, "orphan-deleted": false, "orphan-live": true,
-		"old-null-stub": false, "recent-null-stub": true,
 		"orphan-unsent": true, "old-unsent-stub": true,
 	} {
 		var count int

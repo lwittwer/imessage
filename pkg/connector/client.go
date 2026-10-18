@@ -461,8 +461,7 @@ type IMClient struct {
 
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
-	recentOutboundUnsends     map[string]time.Time
-	echoedOutboundUnsends     map[string]time.Time // suppressed echoes, guarded by recentOutboundUnsendsLock
+	recentOutboundUnsends     map[string]outboundUnsend
 	recentOutboundUnsendsLock sync.Mutex
 
 	// SMS service and destination are protected by one lock so outbound routing
@@ -6815,11 +6814,14 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			// Soft-delete is the existing, race-safe way to say "never bridge
 			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
 			//
-			// The orphan sweep keeps the marker, so a later CloudKit sync
-			// cannot bring the chunk back as a duplicate tail. Restore-chat
-			// revives it, because the restored room has no head event
-			// holding its text.
-			if err := c.cloudStore.markContinuationChunk(ctx, contUUID, uuid, string(msg.Portal.ID)); err != nil {
+			// Not a per-message delete, so restore-chat revives it: the
+			// restored room has no head event holding its text.
+			//
+			// Known residual: the orphan sweep can reap this row while its
+			// portal has no cloud_chat row yet, and a later CloudKit sync then
+			// re-inserts it live, showing a duplicate tail under the head. It
+			// needs an oversized send into a chat that has not synced yet.
+			if err := c.cloudStore.markContinuationChunk(ctx, contUUID, string(msg.Portal.ID)); err != nil {
 				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
 					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
 			}
@@ -14010,18 +14012,19 @@ func (c *IMClient) resolvePortalByTargetMessage(log zerolog.Logger, targetUUID s
 	return dbMessages[0].Room
 }
 
+// outboundUnsend tracks a Matrix-initiated unsend until its APNs echo.
+type outboundUnsend struct {
+	at     time.Time
+	echoed bool // handleUnsend suppressed the echo
+}
+
 func (c *IMClient) trackOutboundUnsend(uuid string) {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
-	c.recentOutboundUnsends[uuid] = time.Now()
-	for k, t := range c.recentOutboundUnsends {
-		if time.Since(t) > 5*time.Minute {
+	c.recentOutboundUnsends[uuid] = outboundUnsend{at: time.Now()}
+	for k, u := range c.recentOutboundUnsends {
+		if time.Since(u.at) > 5*time.Minute {
 			delete(c.recentOutboundUnsends, k)
-		}
-	}
-	for k, t := range c.echoedOutboundUnsends {
-		if time.Since(t) > 5*time.Minute {
-			delete(c.echoedOutboundUnsends, k)
 		}
 	}
 }
@@ -14035,12 +14038,13 @@ func (c *IMClient) trackOutboundUnsend(uuid string) {
 func (c *IMClient) settleOutboundUnsend(uuid string, sendErr error) error {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
-	_, echoed := c.echoedOutboundUnsends[uuid]
-	delete(c.echoedOutboundUnsends, uuid)
-	if sendErr == nil || echoed {
+	if c.recentOutboundUnsends[uuid].echoed {
+		delete(c.recentOutboundUnsends, uuid)
 		return nil
 	}
-	delete(c.recentOutboundUnsends, uuid)
+	if sendErr != nil {
+		delete(c.recentOutboundUnsends, uuid)
+	}
 	return sendErr
 }
 
@@ -14057,18 +14061,19 @@ func messageUUIDFromPartID(id networkid.MessageID) string {
 func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 	c.recentOutboundUnsendsLock.Lock()
 	defer c.recentOutboundUnsendsLock.Unlock()
-	if t, ok := c.recentOutboundUnsends[uuid]; ok {
-		if time.Since(t) < 5*time.Minute {
-			delete(c.recentOutboundUnsends, uuid)
-			if c.echoedOutboundUnsends == nil {
-				c.echoedOutboundUnsends = make(map[string]time.Time)
-			}
-			c.echoedOutboundUnsends[uuid] = time.Now()
-			return true
-		}
-		delete(c.recentOutboundUnsends, uuid)
+	u, ok := c.recentOutboundUnsends[uuid]
+	if !ok {
+		return false
 	}
-	return false
+	if time.Since(u.at) >= 5*time.Minute {
+		delete(c.recentOutboundUnsends, uuid)
+		return false
+	}
+	// Kept until settleOutboundUnsend or expiry, so a send that errors after
+	// the echo arrived can still count as accepted.
+	u.echoed = true
+	c.recentOutboundUnsends[uuid] = u
+	return true
 }
 
 // urlRegex matches URLs in message text for rich link matching.

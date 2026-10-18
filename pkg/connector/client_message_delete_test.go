@@ -208,7 +208,7 @@ func TestMessageUUIDFromPartID(t *testing.T) {
 func TestSettleOutboundUnsend(t *testing.T) {
 	sendErr := errors.New("send timed out")
 	newClient := func() *IMClient {
-		client := &IMClient{recentOutboundUnsends: make(map[string]time.Time)}
+		client := &IMClient{recentOutboundUnsends: make(map[string]outboundUnsend)}
 		client.trackOutboundUnsend("UUID")
 		return client
 	}
@@ -233,14 +233,24 @@ func TestSettleOutboundUnsend(t *testing.T) {
 		}
 	})
 
-	t.Run("success clears echo record", func(t *testing.T) {
+	t.Run("success before echo", func(t *testing.T) {
+		client := newClient()
+		if err := client.settleOutboundUnsend("UUID", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !client.wasOutboundUnsend("UUID") {
+			t.Fatal("echo after a successful unsend was not suppressed")
+		}
+	})
+
+	t.Run("success after echo clears tracking", func(t *testing.T) {
 		client := newClient()
 		client.wasOutboundUnsend("UUID")
 		if err := client.settleOutboundUnsend("UUID", nil); err != nil {
 			t.Fatal(err)
 		}
-		if len(client.echoedOutboundUnsends) != 0 {
-			t.Fatalf("echo records = %v, want none", client.echoedOutboundUnsends)
+		if len(client.recentOutboundUnsends) != 0 {
+			t.Fatalf("tracked unsends = %v, want none", client.recentOutboundUnsends)
 		}
 	})
 }

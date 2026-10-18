@@ -492,10 +492,7 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 
 // dropDeletedChatDBMessages removes messages with a per-message delete
 // tombstone (Matrix-initiated unsend or Apple-side delete) in this portal or
-// one of its aliases: the handles whose chat.db GUIDs are merged into it. A
-// continuation chunk is dropped only while its head is bridged in this portal,
-// since the head's Matrix event already holds its text; a restored or
-// recreated room bridges it.
+// one of its aliases: the handles whose chat.db GUIDs are merged into it.
 func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridgev2.Portal, chatGUIDs []string, messages []*imessage.Message) ([]*imessage.Message, error) {
 	if c.cloudStore == nil || len(messages) == 0 {
 		return messages, nil
@@ -512,32 +509,12 @@ func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridge
 			portalIDs = append(portalIDs, string(identifierToPortalID(id)))
 		}
 	}
-	tombstones, err := c.cloudStore.messageTombstonesInPortals(ctx, portalIDs, guids)
+	deleted, err := c.cloudStore.deletedMessageGUIDsInPortals(ctx, portalIDs, guids)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check chat.db messages for delete tombstones: %w", err)
 	}
-	if len(tombstones) == 0 {
+	if len(deleted) == 0 {
 		return messages, nil
-	}
-	deleted := make(map[string]struct{}, len(tombstones))
-	headBridged := make(map[string]bool)
-	for guid, tombstone := range tombstones {
-		if !tombstone.MessageDeleted {
-			head := tombstone.ContinuationOf
-			bridged, ok := headBridged[head]
-			if !ok {
-				part, err := c.Main.Bridge.DB.Message.GetFirstPartByID(ctx, portal.Receiver, makeMessageID(head))
-				if err != nil {
-					return nil, fmt.Errorf("failed to look up continuation head: %w", err)
-				}
-				bridged = part != nil && part.Room == portal.PortalKey
-				headBridged[head] = bridged
-			}
-			if !bridged {
-				continue
-			}
-		}
-		deleted[guid] = struct{}{}
 	}
 	kept := messages[:0]
 	for _, msg := range messages {

@@ -1141,7 +1141,7 @@ func TestRecycleBinUndeleteKeepsMessageLevelDeletes(t *testing.T) {
 	}
 }
 
-func TestMessageTombstonesInPortalsMatchesGroupAliases(t *testing.T) {
+func TestDeletedMessageGUIDsInPortalsMatchesGroupAliases(t *testing.T) {
 	ctx := context.Background()
 	db, store := newTestCloudBackfillStore(t)
 	// The bridge portal uses the chat_id; CloudKit stored rows under group_id.
@@ -1156,7 +1156,7 @@ func TestMessageTombstonesInPortalsMatchesGroupAliases(t *testing.T) {
 		       ($1, 'other-group', 'gid:other', 1, FALSE, TRUE, TRUE, 1, 1)`, testSQLLoginID); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.messageTombstonesInPortals(ctx, []string{"gid:chat-uuid"}, []string{"alias-unsent", "other-group"})
+	got, err := store.deletedMessageGUIDsInPortals(ctx, []string{"gid:chat-uuid"}, []string{"alias-unsent", "other-group"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1173,14 +1173,14 @@ func TestSoftDeleteStubRoutedToItsPortal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for portalID, want := range map[string]int{"tel:242733": 1, "tel:+15550000001": 0} {
-		got, err := store.messageTombstonesInPortals(ctx, []string{portalID}, []string{"reused-uuid"})
+		got, err := store.deletedMessageGUIDsInPortals(ctx, []string{portalID}, []string{"reused-uuid"})
 		if err != nil || len(got) != want {
 			t.Fatalf("%s: deleted = %v, %v; want %d", portalID, got, err, want)
 		}
 	}
 }
 
-func TestContinuationMarkerSurvivesSweepAndRestore(t *testing.T) {
+func TestContinuationMarkerIsRestorable(t *testing.T) {
 	ctx := context.Background()
 	db, store := newTestCloudBackfillStore(t)
 	const portalID = "tel:+15550000001"
@@ -1189,11 +1189,7 @@ func TestContinuationMarkerSurvivesSweepAndRestore(t *testing.T) {
 		VALUES ($1, 'cont', $2, 1000, TRUE, 'tail text', 1, 1)`, testSQLLoginID, portalID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.markContinuationChunk(ctx, "cont", "head", portalID); err != nil {
-		t.Fatal(err)
-	}
-	// No cloud_chat row: the sweep would reap an ordinary deleted row here.
-	if _, err := store.deleteOrphanedMessages(ctx); err != nil {
+	if err := store.markContinuationChunk(ctx, "cont", portalID); err != nil {
 		t.Fatal(err)
 	}
 	if deleted, messageDeleted, scrubbed := cloudMessageDeleteState(t, db, "cont"); !deleted || messageDeleted || !scrubbed {
