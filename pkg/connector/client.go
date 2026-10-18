@@ -7344,12 +7344,11 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		}
 	}
 
-	// Fail-closed: report scrub failure to bridgev2 so it doesn't proceed
-	// with future row deletion (currently a `// TODO delete msg/reaction
-	// db row` in bridgev2/portal.go:2442 — not implemented today but
-	// forward-compatible). When bridgev2 does start deleting on success,
-	// the EXISTS gate in scrubBridgedBodies goes permanently FALSE for
-	// scrubbed-fail rows, stranding plaintext.
+	// Fail-closed: bridgev2 deletes the bridge message row only when this
+	// returns nil. Reporting scrub failure keeps that row, so the EXISTS gate
+	// in scrubBridgedBodies can still find the plaintext. On success the
+	// cloud_message tombstone, not the bridge row, keeps backfill from
+	// re-bridging the message (see dropDeletedChatDBMessages).
 	if err != nil {
 		return err
 	}

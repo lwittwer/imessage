@@ -223,6 +223,14 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		messages = nonnil
 	}
 
+	// bridgev2 deletes the bridge row after a successful Matrix redaction, so
+	// AggressiveDeduplication cannot catch an unsent message whose chat.db row
+	// still has its body. Fail the page rather than risk re-bridging it.
+	messages, err = c.dropDeletedChatDBMessages(ctx, params.Portal, messages)
+	if err != nil {
+		return nil, err
+	}
+
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].Time.Before(messages[j].Time)
@@ -479,6 +487,39 @@ func deduplicateChatDBMessages(messages []*imessage.Message) []*imessage.Message
 		result = append(result, message)
 	}
 	return result
+}
+
+// dropDeletedChatDBMessages removes messages with a per-message delete
+// tombstone (Matrix-initiated unsend or Apple-side delete) for this portal.
+func (c *IMClient) dropDeletedChatDBMessages(ctx context.Context, portal *bridgev2.Portal, messages []*imessage.Message) ([]*imessage.Message, error) {
+	if c.cloudStore == nil || len(messages) == 0 {
+		return messages, nil
+	}
+	guids := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg != nil && msg.GUID != "" {
+			guids = append(guids, msg.GUID)
+		}
+	}
+	deleted, err := c.cloudStore.deletedMessageGUIDsInPortal(ctx, string(portal.ID), guids)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check chat.db messages for delete tombstones: %w", err)
+	}
+	if len(deleted) == 0 {
+		return messages, nil
+	}
+	kept := messages[:0]
+	for _, msg := range messages {
+		if msg != nil && msg.GUID != "" {
+			if _, ok := deleted[strings.ToUpper(msg.GUID)]; ok {
+				continue
+			}
+		}
+		kept = append(kept, msg)
+	}
+	zerolog.Ctx(ctx).Info().Int("dropped", len(messages)-len(kept)).
+		Msg("chat.db backfill: skipped deleted or unsent messages")
+	return kept, nil
 }
 
 func uniqueStrings(values []string) []string {

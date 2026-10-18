@@ -968,3 +968,115 @@ func TestChatDBCursorStateTreatsMissingGUIDAsExhausted(t *testing.T) {
 		t.Fatalf("cursor state without active cursor = useCursor %v exhausted %v, want initial fetch", useCursor, exhausted)
 	}
 }
+
+type unsentChatDBAPI struct {
+	imessage.API
+	chatGUID string
+	messages []*imessage.Message
+}
+
+func (u *unsentChatDBAPI) GetChatsWithMessagesAfter(time.Time) ([]imessage.ChatIdentifier, error) {
+	return []imessage.ChatIdentifier{{ChatGUID: u.chatGUID}}, nil
+}
+
+func (u *unsentChatDBAPI) GetMessagesSinceDate(string, time.Time, string) ([]*imessage.Message, error) {
+	return u.messages, nil
+}
+
+func (u *unsentChatDBAPI) GetMessagesBeforeWithLimit(string, time.Time, int) ([]*imessage.Message, error) {
+	return u.messages, nil
+}
+
+func newUnsentChatDBFixture(t *testing.T) (*IMClient, *bridgev2.Portal, *unsentChatDBAPI) {
+	t.Helper()
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, "login")
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	client := &IMClient{
+		Main:       &IMConnector{Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}}},
+		cloudStore: store,
+	}
+	chatGUID := "iMessage;-;+15550000001"
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "tel:+15550000001", Receiver: "login"},
+		Metadata:  &PortalMetadata{ChatDBGUIDs: []string{chatGUID}},
+	}}
+	message := func(guid string, ts int64) *imessage.Message {
+		return &imessage.Message{
+			GUID:     guid,
+			ItemType: imessage.ItemTypeMessage,
+			Sender:   imessage.Identifier{LocalID: "+15550000001"},
+			Text:     "body of " + guid,
+			Time:     time.Unix(ts, 0),
+		}
+	}
+	api := &unsentChatDBAPI{chatGUID: chatGUID, messages: []*imessage.Message{
+		message("KEPT-GUID", 100),
+		message("UNSENT-STUB-GUID", 200),
+		message("UNSENT-ROUTED-GUID", 300),
+		message("DELETED-ELSEWHERE-GUID", 400),
+	}}
+	return client, portal, api
+}
+
+func insertDeletedCloudMessage(t *testing.T, store *cloudBackfillStore, guid, portalID string) {
+	t.Helper()
+	if _, err := store.db.Exec(context.Background(), `
+		INSERT INTO cloud_message (login_id, record_name, guid, portal_id, sender, is_from_me, service, timestamp_ms, created_ts, updated_ts, deleted)
+		VALUES ('login', $1, $2, $3, '', FALSE, 'iMessage', 1, 1, 1, TRUE)`,
+		"record-"+guid, guid, portalID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// bridgev2 deletes a message's bridge row after a successful Matrix
+// redaction, so the bridge database no longer deduplicates an unsent message.
+// chat.db backfill must honor the cloud_message tombstone instead, or a later
+// fetch whose anchor moved back behind the unsent message re-bridges its body.
+func TestChatDBFetchMessagesSkipsUnsentMessages(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	// Matrix-initiated unsend of a message cloud_message never saw: stub
+	// tombstone without a route, written in a different case than chat.db.
+	if err := client.cloudStore.softDeleteMessageByGUID(ctx, "unsent-stub-guid"); err != nil {
+		t.Fatal(err)
+	}
+	insertDeletedCloudMessage(t, client.cloudStore, "UNSENT-ROUTED-GUID", string(portal.ID))
+	// A tombstone routed to another portal must not hide this portal's copy.
+	insertDeletedCloudMessage(t, client.cloudStore, "DELETED-ELSEWHERE-GUID", "tel:+15550000002")
+
+	for _, params := range []bridgev2.FetchMessagesParams{
+		{Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)}, Count: 10},
+		{Portal: portal, Count: 10},
+	} {
+		resp, err := (&chatDB{api: api}).FetchMessages(ctx, params, client)
+		if err != nil {
+			t.Fatalf("forward=%v FetchMessages failed: %v", params.Forward, err)
+		}
+		var got []networkid.MessageID
+		for _, msg := range resp.Messages {
+			got = append(got, msg.ID)
+		}
+		want := []networkid.MessageID{makeMessageID("KEPT-GUID"), makeMessageID("DELETED-ELSEWHERE-GUID")}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("forward=%v FetchMessages returned %v, want %v", params.Forward, got, want)
+		}
+	}
+}
+
+func TestChatDBFetchMessagesFailsClosedWhenTombstoneLookupFails(t *testing.T) {
+	ctx := context.Background()
+	client, portal, api := newUnsentChatDBFixture(t)
+	if _, err := client.cloudStore.db.Exec(ctx, `DROP TABLE cloud_message`); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&chatDB{api: api}).FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal: portal, Forward: true, AnchorMessage: &database.Message{Timestamp: time.Unix(50, 0)}, Count: 10,
+	}, client)
+	if err == nil {
+		t.Fatalf("FetchMessages returned %d messages without a tombstone check", len(resp.Messages))
+	}
+}

@@ -2649,6 +2649,47 @@ func (s *cloudBackfillStore) isMessageDeletedInPortal(ctx context.Context, guid,
 	return count > 0, err
 }
 
+// deletedMessageGUIDsInPortal returns the uppercased subset of guids that carry
+// a per-message delete tombstone for portalID. Unrouted stubs from
+// softDeleteMessageByGUID count for every portal; a tombstone routed to another
+// portal does not hide this portal's copy.
+func (s *cloudBackfillStore) deletedMessageGUIDsInPortal(ctx context.Context, portalID string, guids []string) (map[string]struct{}, error) {
+	deleted := make(map[string]struct{})
+	const chunkSize = 500
+	for i := 0; i < len(guids); i += chunkSize {
+		chunk := guids[i:min(i+chunkSize, len(guids))]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.loginID, portalID)
+		for j, guid := range chunk {
+			placeholders[j] = fmt.Sprintf("UPPER($%d)", j+3)
+			args = append(args, guid)
+		}
+		rows, err := s.db.Query(ctx, fmt.Sprintf(`
+			SELECT UPPER(guid) FROM cloud_message
+			WHERE login_id=$1 AND deleted=TRUE
+			  AND (portal_id=$2 OR portal_id IS NULL OR portal_id='')
+			  AND UPPER(guid) IN (%s)`, strings.Join(placeholders, ",")), args...)
+		if err != nil {
+			return nil, fmt.Errorf("query deleted message GUIDs: %w", err)
+		}
+		for rows.Next() {
+			var guid string
+			if err := rows.Scan(&guid); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan deleted message GUID: %w", err)
+			}
+			deleted[guid] = struct{}{}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read deleted message GUIDs: %w", err)
+		}
+	}
+	return deleted, nil
+}
+
 // getMessagePortalID returns the unique stored route for ambiguity checks.
 func (s *cloudBackfillStore) getMessagePortalID(ctx context.Context, guid string) (string, error) {
 	var portalID string
