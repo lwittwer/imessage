@@ -327,6 +327,7 @@ ensure-rustpush-source:
 # Log the raw field shape of relayed SMS/RCS payloads (sms_relay_shape target),
 # including fields the upstream structs drop, to find what distinguishes
 # carrier group threads with identical members. Bodies are never logged.
+# Temporary: remove this line and the patch once captures are collected.
 	@$(RP_PATCH) rp_apply "log SMS relay payload shape" $(RUSTPUSH_DIR) \
 	  third_party/patches/rustpush/log-sms-relay-payload-shape.patch \
 	  src/imessage/messages.rs '^fn log_sms_relay_shape\('

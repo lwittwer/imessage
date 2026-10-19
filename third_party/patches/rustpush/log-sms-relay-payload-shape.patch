@@ -1,19 +1,23 @@
 diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
-index cf9420b..9c7cfe4 100644
+index cf9420b..96a8c1a 100644
 --- a/src/imessage/messages.rs
 +++ b/src/imessage/messages.rs
-@@ -1419,6 +1419,62 @@ fn normalize_sms_handle(handle: &str) -> String {
+@@ -1419,6 +1419,66 @@ fn normalize_sms_handle(handle: &str) -> String {
      }
  }
  
 +// corten-matrix: log the raw field shape of relayed SMS/RCS payloads. serde
 +// drops fields the structs above do not declare, so this walks the plist
 +// itself, to find any field that tells identical-member group threads apart.
-+// Message IDs and protocol fields print as-is, bodies by length only, and any
-+// other string or data value by length plus a short hash: enough to compare
-+// two payloads without recording the value.
++// Temporary diagnostic: remove this patch once captures are collected.
++//
++// Message IDs and protocol fields print as-is, but only at their exact known
++// paths; the same name anywhere else is treated as unknown. Body fields print
++// by length only. Every other string or data value, including each array
++// element, prints by length plus a short hash: enough to compare two payloads
++// without recording the value.
 +const SMS_RELAY_SHAPE_TARGET: &str = "sms_relay_shape";
-+const SMS_RELAY_PLAIN_KEYS: &[&str] = &["cs", "g", "guid", "replyToGuid", "chat-style", "service", "m", "sV", "fh", "b"];
++const SMS_RELAY_PLAIN_PATHS: &[&str] = &["cs", "g", "m", "sV", "fh", "b", "chat-style", "mD.guid", "mD.replyToGuid", "mD.service", "mD.sV"];
 +const SMS_RELAY_BODY_KEYS: &[&str] = &["k", "plain-body", "xhtml"];
 +
 +fn sms_relay_fingerprint(bytes: &[u8]) -> String {
@@ -23,7 +27,9 @@ index cf9420b..9c7cfe4 100644
 +fn sms_relay_shape(path: &str, key: &str, value: &Value, out: &mut Vec<String>) {
 +    let body = SMS_RELAY_BODY_KEYS.contains(&key);
 +    match value {
-+        Value::Dictionary(dict) if !body => {
++        Value::Dictionary(dict) if body => out.push(format!("{path}=dict(len={})", dict.len())),
++        Value::Array(items) if body => out.push(format!("{path}=array(len={})", items.len())),
++        Value::Dictionary(dict) => {
 +            let mut entries: Vec<(&String, &Value)> = dict.iter().collect();
 +            entries.sort_by(|a, b| a.0.cmp(b.0));
 +            for (k, v) in entries {
@@ -31,16 +37,14 @@ index cf9420b..9c7cfe4 100644
 +                sms_relay_shape(&child, k, v, out);
 +            }
 +        }
-+        Value::Array(items) if !body && !items.is_empty() && items.iter().all(|i| matches!(i, Value::Dictionary(_))) => {
++        Value::Array(items) => {
 +            out.push(format!("{path}=array(len={})", items.len()));
 +            for (i, item) in items.iter().enumerate() {
 +                sms_relay_shape(&format!("{path}[{i}]"), key, item, out);
 +            }
 +        }
-+        Value::Dictionary(dict) => out.push(format!("{path}=dict(len={})", dict.len())),
-+        Value::Array(items) => out.push(format!("{path}=array(len={})", items.len())),
 +        Value::String(s) if body => out.push(format!("{path}=str(len={})", s.len())),
-+        Value::String(s) if SMS_RELAY_PLAIN_KEYS.contains(&key) => out.push(format!("{path}={s}")),
++        Value::String(s) if SMS_RELAY_PLAIN_PATHS.contains(&path) => out.push(format!("{path}={s}")),
 +        Value::String(s) => out.push(format!("{path}=str(len={},fp={})", s.len(), sms_relay_fingerprint(s.as_bytes()))),
 +        Value::Data(d) if body => out.push(format!("{path}=data(len={})", d.len())),
 +        Value::Data(d) => out.push(format!("{path}=data(len={},fp={})", d.len(), sms_relay_fingerprint(d))),
@@ -65,7 +69,7 @@ index cf9420b..9c7cfe4 100644
  #[repr(C)]
  #[derive(Clone, Serialize, Deserialize)]
  pub struct Attachment {
-@@ -2782,6 +2838,7 @@ impl MessageInst {
+@@ -2782,6 +2842,7 @@ impl MessageInst {
              return Self::from_raw(parsed, wrapper, apns).await
          }
          if let Ok(loaded) = plist::from_value::<RawSmsIncomingMessage>(&value) {
@@ -73,7 +77,7 @@ index cf9420b..9c7cfe4 100644
              let system_recv: SystemTime = loaded.recieved_date.clone().into();
              let parts = MessageParts::parse_sms(&loaded);
              let normalized_sender = normalize_sms_handle(&loaded.sender);
-@@ -2823,6 +2880,7 @@ impl MessageInst {
+@@ -2823,6 +2884,7 @@ impl MessageInst {
              return Ok(msg);
          }
          if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {
