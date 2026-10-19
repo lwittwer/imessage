@@ -44,6 +44,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/ptr"
+	"go.mau.fi/util/variationselector"
 	"golang.org/x/sync/semaphore"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -13648,9 +13649,12 @@ func tapbackTypeToEmoji(tapbackType *uint32, tapbackEmoji *string) string {
 	}
 }
 
+// emojiToTapbackType maps a Matrix reaction key to an iMessage tapback.
+// Variation selectors are ignored when matching the classic tapbacks, because
+// Matrix clients differ on whether they send them (e.g. "👍" vs "👍\uFE0F").
 func emojiToTapbackType(emoji string) (uint32, *string) {
-	switch emoji {
-	case "❤️", "♥️":
+	switch variationselector.Remove(emoji) {
+	case "❤", "♥":
 		return 0, nil
 	case "👍":
 		return 1, nil
@@ -13658,7 +13662,7 @@ func emojiToTapbackType(emoji string) (uint32, *string) {
 		return 2, nil
 	case "😂":
 		return 3, nil
-	case "❗", "‼️":
+	case "❗", "‼":
 		return 4, nil
 	case "❓":
 		return 5, nil
