@@ -324,6 +324,12 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_apply "fallible GSA token header parsing" $(APA_DIR) \
 	  third_party/patches/apple-private-apis/fallible-gsa-token-header-parsing.patch \
 	  icloud-auth/src/client.rs '^fn parse_token_header\('
+# Log the raw field shape of relayed SMS/RCS payloads (sms_relay_shape target),
+# including fields the upstream structs drop, to find what distinguishes
+# carrier group threads with identical members. Bodies are never logged.
+	@$(RP_PATCH) rp_apply "log SMS relay payload shape" $(RUSTPUSH_DIR) \
+	  third_party/patches/rustpush/log-sms-relay-payload-shape.patch \
+	  src/imessage/messages.rs '^fn log_sms_relay_shape\('
 # Retire the former held-keys recovery override in already-prepared trees.
 # Restore this generated file from the pin, then reapply retained patches below.
 	@if [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ] && \

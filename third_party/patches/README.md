@@ -8,6 +8,7 @@ substitution. Each directory is named after the tree it applies to:
 | Directory | Apply root |
 | --- | --- |
 | `apple-private-apis/` | `third_party/rustpush-upstream/third_party/apple-private-apis` |
+| `rustpush/` | `third_party/rustpush-upstream` |
 
 The Makefile applies every patch through `rp_apply`, which verifies the
 desired end state rather than trusting that the patch ran: a patch that is
